@@ -1,10 +1,9 @@
-// ==================== CHAT SERVER - STABLE WITH ALARM (NO IDLE KICK) ====================
+// ==================== CHAT SERVER - NO ALARM, NO STORAGE ====================
 
 const C = {
-  NUMBER_CHANGE_TICKS: 90,
+  NUMBER_CHANGE_INTERVAL: 90000, // 90 detik (ganti angka)
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 500,
-  ALARM_INTERVAL: 10000,
   MAX_MESSAGE_SIZE: 5000,
 };
 
@@ -145,24 +144,11 @@ export class ChatServer {
     this._processingMessages = new Set();
     this._cleaningUp = new Set();
     this._pendingTimeouts = new Set();
-    this._isCleaningUp = false;
-    this._cleanupInProgress = false;
     
-    // Alarm system
-    this._alarmProcessing = false;
-    this._tickCount = 0;
+    // Number changer (ganti alarm)
     this.currentNumber = 1;
-    this._lastAlarmTime = Date.now();
-    this._alarmFailCount = 0;
-    this._alarmStartTime = 0;
-    this._alarmScheduled = false;
-    this._alarmTimeout = null;
-    this._alarmRescheduleAttempts = 0;
-    this._maxAlarmRescheduleAttempts = 5;
-    
-    // Heartbeat
-    this._heartbeatInterval = null;
-    this._lastHeartbeatTime = Date.now();
+    this._numberInterval = null;
+    this._lastNumberChange = Date.now();
     
     // Initialize rooms
     for (const room of ROOMS) {
@@ -170,237 +156,48 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    // Initialize state from storage
-    this._initState();
+    // Start number changer
+    this._startNumberChanger();
   }
   
-  // ==================== INIT STATE ====================
+  // ==================== NUMBER CHANGER (GANTI ALARM) ====================
   
-  async _initState() {
-    try {
-      const savedNumber = await this.state.storage.get("currentNumber");
-      if (savedNumber !== undefined) this.currentNumber = savedNumber;
-      
-      const savedTick = await this.state.storage.get("tickCount");
-      if (savedTick !== undefined) this._tickCount = savedTick;
-      
-      const lastAlive = await this.state.storage.get("lastAlive");
-      if (lastAlive && (Date.now() - lastAlive > 120000)) {
-        console.log("Server was down for more than 2 minutes, resetting some states");
-      }
-      
-      await this.state.storage.put("lastAlive", Date.now());
-    } catch(e) {
-      // Use defaults
+  _startNumberChanger() {
+    if (this._numberInterval) {
+      clearInterval(this._numberInterval);
     }
     
-    this._scheduleAlarm(100);
-    this._startHeartbeat();
-  }
-  
-  // ==================== HEARTBEAT ====================
-  
-  _startHeartbeat() {
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-    }
-    
-    this._heartbeatInterval = setInterval(() => {
+    // Cek setiap 10 detik, tapi ganti angka setiap 90 detik
+    this._numberInterval = setInterval(() => {
       if (!this.closing && !this.isDestroyed) {
-        this._doHeartbeat();
+        this._checkAndChangeNumber();
       }
-    }, 15000);
+    }, 10000); // Cek setiap 10 detik
   }
   
-  async _doHeartbeat() {
-    try {
-      this._lastHeartbeatTime = Date.now();
-      await this.state.storage.put("lastAlive", Date.now());
-      
-      if (!this._alarmScheduled && !this._alarmProcessing) {
-        console.log("Heartbeat: Alarm not running, restarting...");
-        await this._scheduleAlarm(100);
-      }
-      
-      if (this.wsSet.size === 0 && !this._cleanupInProgress) {
-        if (this._tickCount % 5 === 0) {
-          await this._saveState();
-        }
-      }
-    } catch(e) {
-      // Ignore
+  _checkAndChangeNumber() {
+    const now = Date.now();
+    if (now - this._lastNumberChange >= C.NUMBER_CHANGE_INTERVAL) {
+      this._changeNumber();
+      this._lastNumberChange = now;
     }
   }
   
-  // ==================== ALARM SYSTEM ====================
-  
-  async _scheduleAlarm(delayMs = C.ALARM_INTERVAL) {
-    if (this.closing || this.isDestroyed) {
-      this._alarmScheduled = false;
-      return;
-    }
+  _changeNumber() {
+    this.currentNumber = this.currentNumber < 6 ? this.currentNumber + 1 : 1;
     
-    if (this._alarmTimeout) {
-      clearTimeout(this._alarmTimeout);
-      this._alarmTimeout = null;
-    }
-    
-    try {
-      await this.state.storage.setAlarm(Date.now() + delayMs);
-      this._alarmScheduled = true;
-      this._lastAlarmTime = Date.now();
-      this._alarmRescheduleAttempts = 0;
-      await this.state.storage.put("alarmScheduled", true);
-      await this.state.storage.put("lastAlarmSchedule", Date.now());
-    } catch(e) {
-      this._alarmScheduled = false;
-      this._alarmRescheduleAttempts++;
-      
-      try {
-        await this.state.storage.put("alarmScheduled", false);
-        await this.state.storage.put("lastAlarmError", Date.now());
-      } catch(e2) {}
-      
-      const backoffDelay = Math.min(5000 * Math.pow(2, this._alarmRescheduleAttempts), 30000);
-      
-      this._alarmTimeout = setTimeout(() => {
-        if (!this.closing && !this.isDestroyed && this._alarmRescheduleAttempts < this._maxAlarmRescheduleAttempts) {
-          this._scheduleAlarm(backoffDelay);
-        } else if (this._alarmRescheduleAttempts >= this._maxAlarmRescheduleAttempts) {
-          this._alarmScheduled = false;
-          this._alarmRescheduleAttempts = 0;
-          this._alarmProcessing = false;
-          
-          setTimeout(() => {
-            if (!this.closing && !this.isDestroyed) {
-              this._scheduleAlarm(5000);
-            }
-          }, 10000);
-        }
-      }, 5000);
-    }
-  }
-  
-  async _cleanupDeadConnections() {
-    if (this._cleanupInProgress) return;
-    this._cleanupInProgress = true;
-    
-    try {
-      const toRemove = [];
-      
-      for (const ws of this.wsSet) {
-        if (!ws || ws.readyState !== 1 || ws._closing) {
-          toRemove.push(ws);
-        }
+    // Update semua room
+    for (const room of this.rooms.values()) {
+      if (room) {
+        room.setNumber(this.currentNumber);
       }
-      
-      for (const ws of toRemove) {
-        try {
-          await this.cleanup(ws);
-        } catch(e) {
-          // Ignore cleanup errors
-        }
-      }
-    } catch(e) {
-      // Ignore
-    } finally {
-      this._cleanupInProgress = false;
-    }
-  }
-  
-  async _saveState() {
-    try {
-      await this.state.storage.put("currentNumber", this.currentNumber);
-      await this.state.storage.put("tickCount", this._tickCount);
-      await this.state.storage.put("lastAlive", Date.now());
-    } catch(e) {
-      console.error("Failed to save state:", e.message);
-    }
-  }
-  
-  async _recoverFromStaleState() {
-    try {
-      if (!this._alarmScheduled && !this._alarmProcessing && !this.closing && !this.isDestroyed) {
-        console.log("Recovering stale server state...");
-        
-        const lastAlive = await this.state.storage.get("lastAlive");
-        const alarmScheduled = await this.state.storage.get("alarmScheduled");
-        
-        if (!alarmScheduled || (lastAlive && Date.now() - lastAlive > 60000)) {
-          await this._scheduleAlarm(100);
-          await this._saveState();
-          console.log("Server recovered successfully");
-        }
-      }
-    } catch(e) {
-      console.error("Recovery failed:", e.message);
-    }
-  }
-  
-  async alarm() {
-    if (this.closing || this.isDestroyed) {
-      this._alarmScheduled = false;
-      return;
     }
     
-    this._lastHeartbeatTime = Date.now();
-    
-    if (this._alarmProcessing) {
-      if (Date.now() - this._alarmStartTime > 30000) {
-        this._alarmProcessing = false;
-        this._alarmFailCount++;
-        
-        if (!this.closing && !this.isDestroyed) {
-          await this._scheduleAlarm(C.ALARM_INTERVAL);
-        }
-      }
-      return;
-    }
-    
-    this._alarmProcessing = true;
-    this._alarmStartTime = Date.now();
-    this._lastAlarmTime = Date.now();
-    
-    try {
-      await this._cleanupDeadConnections();
-      
-      this._tickCount = (this._tickCount || 0) + 1;
-      
-      if (this._tickCount % C.NUMBER_CHANGE_TICKS === 0) {
-        this.currentNumber = this.currentNumber < 6 ? this.currentNumber + 1 : 1;
-        
-        for (const room of this.rooms.values()) {
-          if (room) {
-            room.setNumber(this.currentNumber);
-          }
-        }
-        
-        const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
-        for (const [room, clients] of this.roomClients) {
-          if (clients && clients.size > 0) {
-            await this._broadcastToRoom(room, numberMsg);
-          }
-        }
-      }
-      
-      await this._saveState();
-      this._alarmFailCount = 0;
-      
-      await this.state.storage.put("alarmScheduled", true);
-      await this.state.storage.put("lastAlive", Date.now());
-      
-    } catch(e) {
-      this._alarmFailCount++;
-      console.error("Alarm error:", e.message);
-      
-      try {
-        await this.state.storage.put("lastAlarmError", Date.now());
-      } catch(e2) {}
-    } finally {
-      this._alarmProcessing = false;
-      
-      if (!this.closing && !this.isDestroyed) {
-        await this._scheduleAlarm(C.ALARM_INTERVAL);
+    // Broadcast ke semua room
+    const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
+    for (const [room, clients] of this.roomClients) {
+      if (clients && clients.size > 0) {
+        this._broadcastToRoom(room, numberMsg);
       }
     }
   }
@@ -446,7 +243,7 @@ export class ChatServer {
     try {
       await this._broadcastToRoom(room, JSON.stringify(msg));
     } catch(e) {
-      // Ignore broadcast errors
+      // Ignore
     }
   }
   
@@ -511,13 +308,12 @@ export class ChatServer {
   // ==================== CLEANUP ====================
   
   async cleanup(ws) {
-    if (!ws || ws._cleaning || this._cleaningUp.has(ws) || this._isCleaningUp) {
+    if (!ws || ws._cleaning || this._cleaningUp.has(ws) || this.closing || this.isDestroyed) {
       return;
     }
     
     ws._cleaning = true;
     this._cleaningUp.add(ws);
-    this._isCleaningUp = true;
     
     try {
       const username = ws.username;
@@ -590,7 +386,6 @@ export class ChatServer {
     } finally {
       ws._cleaning = false;
       this._cleaningUp.delete(ws);
-      this._isCleaningUp = false;
       
       try {
         if (ws && ws.readyState === 1) {
@@ -664,11 +459,9 @@ export class ChatServer {
           const roomMan = this.rooms.get(multiRoomname);
           if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
           
-          // ============ MULTI JOIN: SIMPAN KURSI KE MAP ============
           const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
           if (!seat) break;
           
-          // Simpan dengan flag isMulti: true
           this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
           this.userRoom.set(multiUsername, multiRoomname);
           if (!this.userCountry.has(multiUsername)) {
@@ -684,7 +477,6 @@ export class ChatServer {
           const roomClients = this.roomClients.get(multiRoomname);
           if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
           
-          // Kirim data kursi yang baru dibuat
           const seatData = roomMan.getSeat(seat);
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
           
@@ -695,7 +487,6 @@ export class ChatServer {
           
           await this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
           
-          // Kirim semua state ke user multi
           setTimeout(() => {
             if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
               this.sendAllStateTo(ws, multiRoomname, true);
@@ -773,13 +564,11 @@ export class ChatServer {
           ws.room = roomName;
           ws.roomname = roomName;
           
-          // ============ AMBIL DATA KURSI DARI MAP ============
           const roomMan = this.rooms.get(roomName);
           const seatData = roomMan ? roomMan.getSeat(seatNumber) : null;
           
           this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
           
-          // Kirim data kursi yang tersimpan
           if (seatData) {
             this.safeSend(ws, ["kursiData", roomName, seatNumber, seatData]);
             this.safeSend(ws, ["numberKursiSaya", seatNumber]);
@@ -802,13 +591,11 @@ export class ChatServer {
           break;
         }
         
-        // ============ UPDATE KURSI - SUPPORT MULTI ============
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           const roomMan = this.rooms.get(kursiRoom);
           if (!roomMan) break;
           
-          // UPDATE DATA DI MAP KURSI
           const updated = roomMan.updateSeat(kursiSeat, {
             noimageUrl: kursiNoimg, 
             namauser: kursiName, 
@@ -821,16 +608,11 @@ export class ChatServer {
           
           if (updated) {
             const updatedSeat = roomMan.getSeat(kursiSeat);
-            
-            // BROADCAST KE SEMUA USER DI ROOM
             await this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
             
-            // JIKA MULTI USER, UPDATE JUGA DI userSeat
             if (kursiName) {
               const seatInfo = this.userSeat.get(kursiName);
               if (seatInfo && seatInfo.isMulti) {
-                // MULTI USER - Data sudah diupdate di roomMan.seats
-                // Kirim update ke semua koneksi multi user ini
                 const connections = this.userConnections.get(kursiName);
                 if (connections) {
                   for (const conn of connections) {
@@ -1064,7 +846,6 @@ export class ChatServer {
           
           this.safeSend(ws, ["numberKursiSaya", existingSeatInfo.seat]);
           
-          // ============ KIRIM DATA KURSI YANG TERSIMPAN DI MAP ============
           if (seatData) {
             this.safeSend(ws, ["kursiData", existingSeatInfo.room, existingSeatInfo.seat, seatData]);
           }
@@ -1196,19 +977,6 @@ export class ChatServer {
   // ==================== FETCH ====================
   
   async fetch(req) {
-    if (!this._alarmScheduled && !this._alarmProcessing && !this.closing && !this.isDestroyed) {
-      await this._recoverFromStaleState();
-    }
-    
-    if (!this._alarmProcessing && !this.closing && !this.isDestroyed) {
-      try {
-        await this.alarm();
-        await this._scheduleAlarm(C.ALARM_INTERVAL);
-      } catch(e) {
-        // Ignore
-      }
-    }
-    
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
     }
@@ -1224,20 +992,11 @@ export class ChatServer {
         
         return new Response(JSON.stringify({
           status: "alive",
-          alarmScheduled: this._alarmScheduled,
-          alarmProcessing: this._alarmProcessing,
-          lastAlarm: this._lastAlarmTime,
-          timeSinceLastAlarm: Date.now() - this._lastAlarmTime,
-          tickCount: this._tickCount,
           currentNumber: this.currentNumber,
           wsConnections: this.wsSet.size,
           userCount: this.userConnections.size,
-          alarmFailCount: this._alarmFailCount,
           roomCounts: roomCounts,
-          pendingTimeouts: this._pendingTimeouts.size,
-          cleaningUp: this._cleaningUp.size,
-          heartbeatActive: this._heartbeatInterval !== null,
-          lastHeartbeat: this._lastHeartbeatTime
+          uptime: Date.now() - this._lastNumberChange
         }), { 
           headers: { 
             "Content-Type": "application/json",
@@ -1252,50 +1011,6 @@ export class ChatServer {
             "Content-Type": "text/plain",
             "Cache-Control": "no-cache"
           } 
-        });
-      }
-      
-      if (url.pathname === "/keep-alive" && req.method === "POST") {
-        if (!this._alarmProcessing) {
-          await this.alarm();
-          await this._scheduleAlarm(C.ALARM_INTERVAL);
-        }
-        await this._saveState();
-        return new Response(JSON.stringify({
-          success: true,
-          alarmScheduled: this._alarmScheduled,
-          timestamp: Date.now()
-        }), { 
-          headers: { 
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache"
-          } 
-        });
-      }
-      
-      if (url.pathname === "/status") {
-        return new Response(JSON.stringify({
-          alive: true,
-          alarmRunning: this._alarmScheduled || this._alarmProcessing,
-          wsCount: this.wsSet.size,
-          userCount: this.userConnections.size,
-          uptime: Date.now() - this._lastAlarmTime,
-          timestamp: Date.now()
-        }), { 
-          headers: { 
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache"
-          } 
-        });
-      }
-      
-      if (url.pathname === "/trigger-alarm" && req.method === "POST") {
-        await this.alarm();
-        return new Response(JSON.stringify({ 
-          success: true, 
-          message: "Alarm triggered manually" 
-        }), { 
-          headers: { "Content-Type": "application/json" } 
         });
       }
       
@@ -1321,7 +1036,7 @@ export class ChatServer {
       
       const upgrade = req.headers.get("Upgrade");
       if (upgrade !== "websocket") {
-        return new Response("Chat Server - ALARM ACTIVE", { 
+        return new Response("Chat Server - NO ALARM", { 
           status: 200,
           headers: {
             "Cache-Control": "no-cache"
@@ -1373,9 +1088,9 @@ export class ChatServer {
     }
     this._pendingTimeouts.clear();
     
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-      this._heartbeatInterval = null;
+    if (this._numberInterval) {
+      clearInterval(this._numberInterval);
+      this._numberInterval = null;
     }
     
     const wsCopy = Array.from(this.wsSet);
@@ -1410,28 +1125,12 @@ export class ChatServer {
     }
     
     this.currentNumber = 1;
-    this._tickCount = 0;
-    this._alarmProcessing = false;
-    this._alarmScheduled = false;
-    this._alarmFailCount = 0;
-    this._alarmRescheduleAttempts = 0;
-    this._lastHeartbeatTime = Date.now();
-    
-    if (this._alarmTimeout) {
-      clearTimeout(this._alarmTimeout);
-      this._alarmTimeout = null;
-    }
+    this._lastNumberChange = Date.now();
     
     this.closing = false;
     this.isDestroyed = false;
     
-    try {
-      await this.alarm();
-      await this._scheduleAlarm(C.ALARM_INTERVAL);
-      this._startHeartbeat();
-    } catch(e) {
-      // Ignore
-    }
+    this._startNumberChanger();
   }
   
   // ==================== WEB SOCKET EVENTS ====================
@@ -1458,20 +1157,15 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-      this._heartbeatInterval = null;
+    if (this._numberInterval) {
+      clearInterval(this._numberInterval);
+      this._numberInterval = null;
     }
     
     for (const timeout of this._pendingTimeouts) {
       clearTimeout(timeout);
     }
     this._pendingTimeouts.clear();
-    
-    if (this._alarmTimeout) {
-      clearTimeout(this._alarmTimeout);
-      this._alarmTimeout = null;
-    }
     
     const wsCopy = Array.from(this.wsSet);
     for (const ws of wsCopy) {
@@ -1512,6 +1206,33 @@ export class ChatServer {
       return country;
     } catch(e) { 
       return "Unknown"; 
+    }
+  }
+  
+  async _cleanupDeadConnections() {
+    if (this._cleanupInProgress) return;
+    this._cleanupInProgress = true;
+    
+    try {
+      const toRemove = [];
+      
+      for (const ws of this.wsSet) {
+        if (!ws || ws.readyState !== 1 || ws._closing) {
+          toRemove.push(ws);
+        }
+      }
+      
+      for (const ws of toRemove) {
+        try {
+          await this.cleanup(ws);
+        } catch(e) {
+          // Ignore cleanup errors
+        }
+      }
+    } catch(e) {
+      // Ignore
+    } finally {
+      this._cleanupInProgress = false;
     }
   }
 }
