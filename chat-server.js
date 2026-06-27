@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - SIMPLIFIED VERSION ====================
+// ==================== CHAT SERVER - NO KICK INACTIVE USER ====================
 
 const C = {
   NUMBER_CHANGE_TICKS: 180,  // 180 ticks × 5 detik = 15 menit
@@ -234,13 +234,9 @@ export class ChatServer {
       const toRemove = [];
       
       for (const ws of this.wsSet) {
+        // HANYA hapus koneksi yang sudah mati/terputus
+        // TIDAK ADA KICK untuk user yang tidak aktif
         if (!ws || ws.readyState !== 1 || ws._closing) {
-          toRemove.push(ws);
-          continue;
-        }
-        
-        // Hapus koneksi yang tidak aktif > 5 menit
-        if (ws._lastActivity && (Date.now() - ws._lastActivity > 300000)) {
           toRemove.push(ws);
         }
       }
@@ -311,7 +307,6 @@ export class ChatServer {
     
     try {
       ws.send(JSON.stringify(msg));
-      ws._lastActivity = Date.now();
       return true;
     } catch(e) {
       this.cleanup(ws).catch(() => {});
@@ -445,8 +440,6 @@ export class ChatServer {
     if (!ws || ws.readyState !== 1 || ws._closing || this._cleaningUp.has(ws) || this.closing || this.isDestroyed) {
       return;
     }
-    
-    ws._lastActivity = Date.now();
     
     if (this._processingMessages.has(ws)) return;
     this._processingMessages.add(ws);
@@ -1032,7 +1025,6 @@ export class ChatServer {
       server._closing = false;
       server.clientCountry = clientCountry;
       server._wsId = Date.now() + Math.random();
-      server._lastActivity = Date.now();
       
       if (!this.wsSet.has(server)) {
         this.wsSet.add(server);
