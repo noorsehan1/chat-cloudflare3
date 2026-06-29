@@ -262,16 +262,11 @@ export class GameServer {
       return;
     }
     
-    // ============ FIX: CLEANUP OLD ROOM ============
     if (oldRoom) {
-      // Hapus dari room lama
       this._removeClientFromRoom(oldRoom, wsId);
       
-      // Jika ada game di room lama dan sudah selesai, cleanup
       const oldGame = this.activeGames.get(oldRoom);
       if (oldGame && (oldGame._gameEnded || !oldGame._isActive)) {
-        // Game sudah selesai, biarkan cleanup timer handle
-        // Tapi pastikan player dihapus dari game
         if (username && oldGame.players && oldGame.players.has(username)) {
           oldGame.players.delete(username);
           oldGame.playerWsId?.delete(username);
@@ -279,15 +274,13 @@ export class GameServer {
       }
     }
     
-    // ============ FIX: CLEANUP GAME DI ROOM BARU ============
-    // Cek apakah ada game di room baru yang sudah selesai
+    // ============ CLEANUP TOTAL: HAPUS GAME DI ROOM BARU ============
     const newGame = this.activeGames.get(roomName);
-    if (newGame && (newGame._gameEnded || !newGame._isActive)) {
-      // Game sudah selesai, cleanup
+    if (newGame) {
+      // HAPUS TOTAL GAME APAPUN DI ROOM BARU
       this._deleteGame(roomName, newGame);
     }
     
-    // Tambahkan ke room baru
     this._addClient(roomName, ws, username, false);
     ws.username = username;
     
@@ -320,7 +313,6 @@ export class GameServer {
         activePlayers: this._getActivePlayers(roomGame).length
       }]);
     } else {
-      // ============ FIX: KIRIM STATUS IDLE ============
       this._safeSend(ws, ["gameLowCardStatus", {
         room: room,
         running: false,
@@ -333,7 +325,7 @@ export class GameServer {
         numbers: [],
         totalPlayers: 0,
         activePlayers: 0,
-        canStart: true // Flag bahwa bisa start game
+        canStart: true
       }]);
     }
   }
@@ -1198,12 +1190,10 @@ export class GameServer {
         return;
       }
       
-      // ============ FIX: CEK GAME DI ROOM ============
+      // ============ CLEANUP TOTAL: HAPUS GAME APAPUN DI ROOM ============
       const existingRoomGame = this.activeGames.get(room);
-      
-      // Jika ada game di room dan masih aktif, cek status
       if (existingRoomGame) {
-        // Jika game masih aktif dan belum selesai
+        // Jika game masih aktif, cek
         if (existingRoomGame._isActive && !existingRoomGame._gameEnded && existingRoomGame.players) {
           if (existingRoomGame.players.has(usernameClean) && !existingRoomGame.eliminated?.has(usernameClean)) {
             this._safeSend(ws, ["gameLowCardInfo", `Game already running`]);
@@ -1212,17 +1202,13 @@ export class GameServer {
           } else if (existingRoomGame.eliminated?.has(usernameClean)) {
             this._safeSend(ws, ["gameLowCardError", `You are eliminated`]);
             return;
-          } else {
-            this._safeSend(ws, ["gameLowCardError", `Game already running`]);
-            return;
           }
         }
         
-        // ============ FIX: HAPUS GAME YANG SUDAH SELESAI ============
-        // Jika game sudah selesai, cleanup dulu
-        if (existingRoomGame._gameEnded || !existingRoomGame._isActive) {
-          this._deleteGame(room, existingRoomGame);
-        }
+        // HAPUS TOTAL GAME APAPUN (aktif maupun selesai)
+        this._deleteGame(room, existingRoomGame);
+        // Tunggu sebentar
+        await new Promise(r => setTimeout(r, 100));
       }
       
       const now = Date.now();
