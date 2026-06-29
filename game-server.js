@@ -1,4 +1,4 @@
-// ==================== GAME SERVER - DURABLE OBJECT ====================
+// ==================== GAME SERVER - DURABLE OBJECT (OPTIMIZED) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -14,8 +14,6 @@ const CONSTANTS = {
   START_LOCK_DURATION_MS: 3000,
   MAX_PLAYERS_PER_GAME: 45,
   GAME_CLEANUP_DELAY_MS: 5000,
-  RATE_LIMIT_MS: 100,
-  BROADCAST_THROTTLE_MS: 500,
 };
 
 export class GameServer {
@@ -40,25 +38,17 @@ export class GameServer {
     this.connectionLocks = new Map();
     
     this._cleanupTimers = new Map();
-    this._lastBroadcast = new Map();
-    this._rateLimit = new Map();
+    
+    // ❌ HAPUS interval cleanup - tidak perlu, buang kuota
+    // this._cleanupInterval = setInterval(() => {
+    //   this._cleanupStaleGames();
+    // }, 60000);
   }
   
   // ==================== WEB SOCKET MANAGEMENT ====================
   
   _getWsId(ws) {
     return ws ? ws._wsId : null;
-  }
-  
-  _isRateLimited(wsId) {
-    if (!wsId) return false;
-    const now = Date.now();
-    const lastEvent = this._rateLimit.get(wsId) || 0;
-    if (now - lastEvent < CONSTANTS.RATE_LIMIT_MS) {
-      return true;
-    }
-    this._rateLimit.set(wsId, now);
-    return false;
   }
   
   // ==================== CORE: MENCEGAH DUPLIKAT EVENT ====================
@@ -269,10 +259,6 @@ export class GameServer {
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
     
-    if (this._isRateLimited(wsId)) {
-      return;
-    }
-    
     const oldRoom = this.clientRooms.get(wsId);
     
     if (oldRoom === roomName) {
@@ -338,19 +324,10 @@ export class GameServer {
   _broadcastToRoom(room, message) {
     if (this.closing || this.isDestroyed || !room || !message) return;
     
-    // Throttle broadcast untuk pesan yang sama
-    const msgStr = JSON.stringify(message);
-    const msgHash = `${room}_${msgStr}`;
-    const now = Date.now();
-    const lastSend = this._lastBroadcast.get(msgHash);
-    if (lastSend && (now - lastSend) < CONSTANTS.BROADCAST_THROTTLE_MS) {
-      return;
-    }
-    this._lastBroadcast.set(msgHash, now);
-    
     const wsIds = this.wsClients.get(room);
     if (!wsIds || wsIds.size === 0) return;
     
+    const msgStr = JSON.stringify(message);
     const disconnected = new Set();
     
     for (const wsId of wsIds) {
@@ -576,7 +553,7 @@ export class GameServer {
     this._gameLocks.delete(room);
     this._joinLocks.delete(room);
     
-    // ✅ FIX: Hapus room dari wsClients dan roomViewers
+    // ✅ Hapus room dari wsClients dan roomViewers
     this.wsClients.delete(room);
     this.roomViewers.delete(room);
     
@@ -1187,11 +1164,6 @@ export class GameServer {
         return;
       }
       
-      const wsId = this._getWsId(ws);
-      if (this._isRateLimited(wsId)) {
-        return;
-      }
-      
       if (!username || username.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
@@ -1253,6 +1225,8 @@ export class GameServer {
           this._gameLocks.delete(room);
           return;
         }
+        
+        const wsId = this._getWsId(ws);
         
         const game = {
           room,
@@ -1322,17 +1296,13 @@ export class GameServer {
         return;
       }
       
-      const wsId = this._getWsId(ws);
-      if (this._isRateLimited(wsId)) {
-        return;
-      }
-      
       if (!username || username.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
       const usernameClean = username.trim();
+      const wsId = this._getWsId(ws);
       
       const room = this._getRoomForWs(ws);
       if (!room) {
@@ -1422,17 +1392,13 @@ export class GameServer {
         return;
       }
       
-      const wsId = this._getWsId(ws);
-      if (this._isRateLimited(wsId)) {
-        return;
-      }
-      
       if (!username || username.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
       const usernameClean = username.trim();
+      const wsId = this._getWsId(ws);
       
       const room = this._getRoomForWs(ws);
       if (!room) {
@@ -1514,11 +1480,6 @@ export class GameServer {
     try {
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
-        return;
-      }
-      
-      const wsId = this._getWsId(ws);
-      if (this._isRateLimited(wsId)) {
         return;
       }
       
@@ -1662,6 +1623,11 @@ export class GameServer {
     try {
       const url = new URL(req.url);
       
+      // ❌ HAPUS HEALTH CHECK - buang kuota
+      // if (url.pathname === "/health") {
+      //   return new Response(JSON.stringify({ ... }), { ... });
+      // }
+      
       if (url.pathname === "/game/ws") {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
@@ -1739,7 +1705,6 @@ export class GameServer {
         return new Response(null, { status: 101, webSocket: client });
       }
       
-      // Hanya response minimal, tanpa health check
       return new Response("Game Server", { status: 200 });
       
     } catch(e) {
@@ -1830,6 +1795,12 @@ export class GameServer {
       this.closing = true;
       this.isDestroyed = true;
       
+      // ❌ HAPUS - variable tidak ada
+      // if (this._cleanupInterval) {
+      //   clearInterval(this._cleanupInterval);
+      //   this._cleanupInterval = null;
+      // }
+      
       for (const [room, game] of this.activeGames) {
         this._cleanupGame(game);
       }
@@ -1858,8 +1829,6 @@ export class GameServer {
       this.connectionLocks.clear();
       this._gameLocks.clear();
       this._joinLocks.clear();
-      this._lastBroadcast.clear();
-      this._rateLimit.clear();
       
       for (const [room, game] of this.activeGames) {
         this._deleteGame(room, game);
