@@ -7,7 +7,3 @@ bindings = [
   { name = "CHAT_SERVER", class_name = "ChatServer" },
   { name = "GAME_SERVER", class_name = "GameServer" }
 ]
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["ChatServer", "GameServer"]
