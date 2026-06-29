@@ -1,4 +1,4 @@
-// ==================== GAME SERVER - DURABLE OBJECT (OPTIMIZED) ====================
+// ==================== GAME SERVER - DURABLE OBJECT (FIXED) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -38,11 +38,6 @@ export class GameServer {
     this.connectionLocks = new Map();
     
     this._cleanupTimers = new Map();
-    
-    // ❌ HAPUS interval cleanup - tidak perlu, buang kuota
-    // this._cleanupInterval = setInterval(() => {
-    //   this._cleanupStaleGames();
-    // }, 60000);
   }
   
   // ==================== WEB SOCKET MANAGEMENT ====================
@@ -539,6 +534,7 @@ export class GameServer {
     game._isEvaluating = false;
   }
   
+  // ✅ FIX: Hapus semua data game termasuk wsClients dan roomViewers
   _deleteGame(room, game) {
     if (this._cleanupTimers.has(room)) {
       clearTimeout(this._cleanupTimers.get(room));
@@ -553,7 +549,7 @@ export class GameServer {
     this._gameLocks.delete(room);
     this._joinLocks.delete(room);
     
-    // ✅ Hapus room dari wsClients dan roomViewers
+    // ✅ HARUS HAPUS INI! Kalau tidak, switchRoom akan menganggap room masih ada
     this.wsClients.delete(room);
     this.roomViewers.delete(room);
     
@@ -1623,11 +1619,6 @@ export class GameServer {
     try {
       const url = new URL(req.url);
       
-      // ❌ HAPUS HEALTH CHECK - buang kuota
-      // if (url.pathname === "/health") {
-      //   return new Response(JSON.stringify({ ... }), { ... });
-      // }
-      
       if (url.pathname === "/game/ws") {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
@@ -1794,12 +1785,6 @@ export class GameServer {
       if (this.isDestroyed) return;
       this.closing = true;
       this.isDestroyed = true;
-      
-      // ❌ HAPUS - variable tidak ada
-      // if (this._cleanupInterval) {
-      //   clearInterval(this._cleanupInterval);
-      //   this._cleanupInterval = null;
-      // }
       
       for (const [room, game] of this.activeGames) {
         this._cleanupGame(game);
