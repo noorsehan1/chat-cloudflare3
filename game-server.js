@@ -487,7 +487,9 @@ export class GameServer {
       try {
         this._cleanupTimers.delete(room);
         this._deleteGame(room, game);
-      } catch(e) {}
+      } catch(e) {
+        console.error('Error in cleanup:', e);
+      }
     }, CONSTANTS.GAME_CLEANUP_DELAY_MS);
     
     this._cleanupTimers.set(room, timer);
@@ -521,6 +523,9 @@ export class GameServer {
     game._isActive = false;
     game._gameEnded = true;
     game._isEvaluating = false;
+    game.registrationOpen = false;
+    game._phase = 'idle';
+    game.playerWsId = null;
   }
   
   _deleteGame(room, game) {
@@ -530,14 +535,39 @@ export class GameServer {
     }
     
     if (game) {
-      game.playerWsId = null;
       this._cleanupGame(game);
     }
+    
     this.activeGames.delete(room);
     this._gameLocks.delete(room);
     this._joinLocks.delete(room);
+    this.roomViewers.delete(room);
     
     this._broadcastToRoom(room, ["gameLowCardEnd", []]);
+    
+    const wsIds = this.wsClients.get(room);
+    if (wsIds) {
+      for (const wsId of wsIds) {
+        const ws = this.wsMap.get(wsId);
+        if (ws) {
+          ws.room = null;
+          ws.game = null;
+        }
+      }
+      this.wsClients.delete(room);
+    }
+    
+    for (const [wsId, clientRoom] of this.clientRooms) {
+      if (clientRoom === room) {
+        this.clientRooms.delete(wsId);
+      }
+    }
+    
+    for (const [username, conn] of this.userConnections) {
+      if (conn.room === room) {
+        this.userConnections.delete(username);
+      }
+    }
   }
   
   // ==================== REGISTRATION ====================
@@ -1113,26 +1143,27 @@ export class GameServer {
       
       const usernameClean = username.trim();
       
-      const existingGames = this._findAllGamesByUsername(usernameClean);
-      if (existingGames.length > 0) {
-        this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
-      }
-      
       const room = this._getRoomForWs(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
       }
       
-      const existingRoomGame = this.activeGames.get(room);
-      if (existingRoomGame && existingRoomGame._isActive && !existingRoomGame._gameEnded && existingRoomGame.players) {
-        if (existingRoomGame.players.has(usernameClean) && !existingRoomGame.eliminated?.has(usernameClean)) {
-          this._safeSend(ws, ["gameLowCardInfo", `Game already running`]);
-          this._safeSend(ws, ["gameLowCardStartSuccess", existingRoomGame.hostName, existingRoomGame.betAmount]);
-          return;
-        } else if (existingRoomGame.eliminated?.has(usernameClean)) {
-          this._safeSend(ws, ["gameLowCardError", `You are eliminated`]);
-          return;
+      // Check and cleanup existing game
+      const existingGame = this.activeGames.get(room);
+      if (existingGame) {
+        if (existingGame._gameEnded || !existingGame._isActive) {
+          this._deleteGame(room, existingGame);
+          await new Promise(r => setTimeout(r, 100));
+        } else if (existingGame.players && existingGame.players.has(usernameClean)) {
+          if (!existingGame.eliminated?.has(usernameClean)) {
+            this._safeSend(ws, ["gameLowCardInfo", `Game already running`]);
+            this._safeSend(ws, ["gameLowCardStartSuccess", existingGame.hostName, existingGame.betAmount]);
+            return;
+          } else {
+            this._safeSend(ws, ["gameLowCardError", `You are eliminated`]);
+            return;
+          }
         } else {
           this._safeSend(ws, ["gameLowCardError", `Game already running`]);
           return;
@@ -1155,11 +1186,6 @@ export class GameServer {
           return;
         }
         
-        if (existingRoomGame) {
-          await this.forceEndGame(room);
-          await new Promise(r => setTimeout(r, 300));
-        }
-        
         const betAmount = parseInt(bet, 10) || 0;
         if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
           this._safeSend(ws, ["gameLowCardError", `Invalid bet (0 or 100-${CONSTANTS.MAX_BET})`]);
@@ -1168,6 +1194,30 @@ export class GameServer {
         }
         
         const wsId = this._getWsId(ws);
+        
+        // Clean room data before creating new game
+        this._gameLocks.delete(room);
+        this._joinLocks.delete(room);
+        this.roomViewers.delete(room);
+        
+        const wsIds = this.wsClients.get(room);
+        if (wsIds) {
+          for (const id of wsIds) {
+            const clientWs = this.wsMap.get(id);
+            if (clientWs && clientWs !== ws) {
+              try {
+                clientWs.close(1000, "New game starting");
+              } catch(e) {}
+            }
+          }
+          this.wsClients.delete(room);
+        }
+        
+        for (const [id, clientRoom] of this.clientRooms) {
+          if (clientRoom === room) {
+            this.clientRooms.delete(id);
+          }
+        }
         
         const game = {
           room,
@@ -1218,11 +1268,13 @@ export class GameServer {
         }, CONSTANTS.START_LOCK_DURATION_MS);
         
       } catch(e) {
+        console.error('Error starting game:', e);
         this._deleteGame(room, this.activeGames.get(room));
         this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
         this._gameLocks.delete(room);
       }
     } catch(e) {
+      console.error('Start game error:', e);
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
     }
   }
@@ -1456,6 +1508,53 @@ export class GameServer {
         this._deleteGame(room, game);
       }
     } catch(e) {}
+  }
+  
+  async forceCleanupRoom(room) {
+    try {
+      const game = this.activeGames.get(room);
+      if (game) {
+        this._deleteGame(room, game);
+      }
+      
+      this._gameLocks.delete(room);
+      this._joinLocks.delete(room);
+      this.roomViewers.delete(room);
+      
+      const wsIds = this.wsClients.get(room);
+      if (wsIds) {
+        for (const wsId of wsIds) {
+          const ws = this.wsMap.get(wsId);
+          if (ws) {
+            ws.room = null;
+            ws.game = null;
+          }
+        }
+        this.wsClients.delete(room);
+      }
+      
+      for (const [wsId, clientRoom] of this.clientRooms) {
+        if (clientRoom === room) {
+          this.clientRooms.delete(wsId);
+        }
+      }
+      
+      for (const [username, conn] of this.userConnections) {
+        if (conn.room === room) {
+          this.userConnections.delete(username);
+        }
+      }
+      
+      if (this._cleanupTimers.has(room)) {
+        clearTimeout(this._cleanupTimers.get(room));
+        this._cleanupTimers.delete(room);
+      }
+      
+      return true;
+    } catch(e) {
+      console.error('Force cleanup error:', e);
+      return false;
+    }
   }
   
   getGame(room) {
