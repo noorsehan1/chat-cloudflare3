@@ -978,7 +978,7 @@ export class ChatServer {
           this.sendAllStateTo(ws, roomName, true);
         }
       } catch(e) {}
-    }, 500);
+    }, 1000);
     
     return true;
   }
