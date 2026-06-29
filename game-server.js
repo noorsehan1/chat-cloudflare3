@@ -576,6 +576,10 @@ export class GameServer {
     this._gameLocks.delete(room);
     this._joinLocks.delete(room);
     
+    // ✅ FIX: Hapus room dari wsClients dan roomViewers
+    this.wsClients.delete(room);
+    this.roomViewers.delete(room);
+    
     this._broadcastToRoom(room, ["gameLowCardEnd", []]);
   }
   
@@ -1825,11 +1829,6 @@ export class GameServer {
       if (this.isDestroyed) return;
       this.closing = true;
       this.isDestroyed = true;
-      
-      if (this._cleanupInterval) {
-        clearInterval(this._cleanupInterval);
-        this._cleanupInterval = null;
-      }
       
       for (const [room, game] of this.activeGames) {
         this._cleanupGame(game);
