@@ -14,6 +14,7 @@ const CONSTANTS = {
   START_LOCK_DURATION_MS: 3000,
   MAX_PLAYERS_PER_GAME: 45,
   GAME_CLEANUP_DELAY_MS: 5000,
+  KEEP_ALIVE_INTERVAL_MS: 900000, // 15 MENIT
 };
 
 export class GameServer {
@@ -43,6 +44,44 @@ export class GameServer {
     this._cleanupInterval = setInterval(() => {
       this._cleanupStaleGames();
     }, 60000);
+    
+    // ==================== KEEP-ALIVE (15 MENIT) ====================
+    this._mainInterval = null;
+    this._lastActivityTime = Date.now();
+    this._startMainInterval();
+  }
+  
+  // ==================== KEEP-ALIVE METHOD ====================
+  
+  _startMainInterval() {
+    if (this._mainInterval) {
+      clearInterval(this._mainInterval);
+    }
+    
+    this._mainInterval = setInterval(() => {
+      if (!this.closing && !this.isDestroyed) {
+        this._doMainTask();
+      }
+    }, CONSTANTS.KEEP_ALIVE_INTERVAL_MS);
+  }
+  
+  _doMainTask() {
+    try {
+      this._lastActivityTime = Date.now();
+      
+      // Broadcast keep-alive ke semua room yang ada game aktif
+      for (const [room, game] of this.activeGames) {
+        if (game && game._isActive && !game._gameEnded) {
+          this._broadcastToRoom(room, ["_keepAlive", Date.now()]);
+        }
+      }
+      
+      // Cleanup game yang sudah selesai
+      this._cleanupStaleGames();
+      
+    } catch(e) {
+      // Silent error
+    }
   }
   
   // ==================== WEB SOCKET MANAGEMENT ====================
@@ -1824,6 +1863,12 @@ export class GameServer {
       if (this.isDestroyed) return;
       this.closing = true;
       this.isDestroyed = true;
+      
+      // ==================== CLEANUP KEEP-ALIVE ====================
+      if (this._mainInterval) {
+        clearInterval(this._mainInterval);
+        this._mainInterval = null;
+      }
       
       if (this._cleanupInterval) {
         clearInterval(this._cleanupInterval);
