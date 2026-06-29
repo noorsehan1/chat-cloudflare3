@@ -1,4 +1,4 @@
-// ==================== GAME SERVER - DURABLE OBJECT (FIXED) ====================
+// ==================== GAME SERVER - DURABLE OBJECT (FULL FIXED) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -253,6 +253,33 @@ export class GameServer {
     
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
+    
+    // ✅ FIX: Cek apakah game masih aktif di room ini
+    const game = this.activeGames.get(roomName);
+    if (!game || game._gameEnded || !game._isActive) {
+      // Game sudah selesai/tidak ada, reset clientRooms agar bisa start ulang
+      this.clientRooms.delete(wsId);
+      if (ws) {
+        ws.room = null;
+        ws.username = null;
+      }
+      // Kirim status idle ke client
+      this._safeSend(ws, ["gameLowCardStatus", {
+        room: roomName,
+        running: false,
+        phase: 'idle',
+        round: 0,
+        betAmount: 0,
+        registrationOpen: false,
+        players: [],
+        eliminated: [],
+        numbers: [],
+        totalPlayers: 0,
+        activePlayers: 0
+      }]);
+      this._safeSend(ws, ["switchRoomSuccess", roomName]);
+      return;
+    }
     
     const oldRoom = this.clientRooms.get(wsId);
     
