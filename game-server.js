@@ -1658,29 +1658,6 @@ export class GameServer {
     try {
       const url = new URL(req.url);
       
-      if (url.pathname === "/health") {
-        return new Response(JSON.stringify({
-          status: "alive",
-          games: this.activeGames.size,
-          wsClients: this.wsClients.size,
-          clients: this.clientRooms.size,
-          wsMap: this.wsMap.size,
-          roomViewers: Array.from(this.roomViewers.entries()).map(([room, viewers]) => ({ room, viewers: Array.from(viewers) })),
-          userConnections: Array.from(this.userConnections.entries()).map(([user, conn]) => ({ 
-            user, 
-            wsId: conn.wsId,
-            room: conn.room,
-            timestamp: conn.timestamp
-          })),
-          connectionLocks: Array.from(this.connectionLocks.keys()),
-          cleanupTimers: this._cleanupTimers.size,
-          wsIdCounter: this._wsIdCounter,
-          joinLocks: this._joinLocks.size
-        }), {
-          headers: { "Content-Type": "application/json" }
-        });
-      }
-      
       if (url.pathname === "/game/ws") {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
