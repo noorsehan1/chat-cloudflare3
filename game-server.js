@@ -1,4 +1,4 @@
-// ==================== GAME SERVER - DURABLE OBJECT (OPTIMIZED) ====================
+// ==================== GAME SERVER - DURABLE OBJECT ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -14,9 +14,8 @@ const CONSTANTS = {
   START_LOCK_DURATION_MS: 3000,
   MAX_PLAYERS_PER_GAME: 45,
   GAME_CLEANUP_DELAY_MS: 5000,
-  RATE_LIMIT_MS: 2000,
-  HEALTH_CACHE_MS: 10000,
-  MAX_GAME_AGE_MS: 600000,
+  RATE_LIMIT_MS: 100,
+  BROADCAST_THROTTLE_MS: 500,
 };
 
 export class GameServer {
@@ -39,22 +38,27 @@ export class GameServer {
     
     this.userConnections = new Map();
     this.connectionLocks = new Map();
-    this._submitCooldown = new Map();
-    this._healthCache = null;
-    this._healthCacheTime = 0;
-    this._cleanupTimers = new Map();
-    this._pendingCleanup = new Set();
     
-    // OPTIMASI: Hapus interval cleanup
-    // this._cleanupInterval = setInterval(() => {
-    //   this._cleanupStaleGames();
-    // }, 60000);
+    this._cleanupTimers = new Map();
+    this._lastBroadcast = new Map();
+    this._rateLimit = new Map();
   }
   
   // ==================== WEB SOCKET MANAGEMENT ====================
   
   _getWsId(ws) {
     return ws ? ws._wsId : null;
+  }
+  
+  _isRateLimited(wsId) {
+    if (!wsId) return false;
+    const now = Date.now();
+    const lastEvent = this._rateLimit.get(wsId) || 0;
+    if (now - lastEvent < CONSTANTS.RATE_LIMIT_MS) {
+      return true;
+    }
+    this._rateLimit.set(wsId, now);
+    return false;
   }
   
   // ==================== CORE: MENCEGAH DUPLIKAT EVENT ====================
@@ -265,6 +269,10 @@ export class GameServer {
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
     
+    if (this._isRateLimited(wsId)) {
+      return;
+    }
+    
     const oldRoom = this.clientRooms.get(wsId);
     
     if (oldRoom === roomName) {
@@ -295,7 +303,7 @@ export class GameServer {
   _sendGameStatusToWs(ws, room) {
     const roomGame = this.activeGames.get(room);
     if (roomGame && roomGame._isActive && !roomGame._gameEnded) {
-      this._safeSend(ws, ["gameStatus", {
+      this._safeSend(ws, ["gameLowCardStatus", {
         room: room,
         running: true,
         phase: roomGame._phase || 'idle',
@@ -309,7 +317,7 @@ export class GameServer {
         activePlayers: this._getActivePlayers(roomGame).length
       }]);
     } else {
-      this._safeSend(ws, ["gameStatus", {
+      this._safeSend(ws, ["gameLowCardStatus", {
         room: room,
         running: false,
         phase: 'idle',
@@ -327,18 +335,25 @@ export class GameServer {
   
   // ==================== BROADCAST ====================
   
-  _broadcastToRoom(room, message, excludeWsId = null) {
+  _broadcastToRoom(room, message) {
     if (this.closing || this.isDestroyed || !room || !message) return;
+    
+    // Throttle broadcast untuk pesan yang sama
+    const msgStr = JSON.stringify(message);
+    const msgHash = `${room}_${msgStr}`;
+    const now = Date.now();
+    const lastSend = this._lastBroadcast.get(msgHash);
+    if (lastSend && (now - lastSend) < CONSTANTS.BROADCAST_THROTTLE_MS) {
+      return;
+    }
+    this._lastBroadcast.set(msgHash, now);
     
     const wsIds = this.wsClients.get(room);
     if (!wsIds || wsIds.size === 0) return;
     
-    const msgStr = JSON.stringify(message);
     const disconnected = new Set();
     
     for (const wsId of wsIds) {
-      if (excludeWsId && wsId === excludeWsId) continue;
-      
       const ws = this.wsMap.get(wsId);
       if (ws && ws.readyState === 1) {
         try {
@@ -576,10 +591,10 @@ export class GameServer {
     
     let timeLeft = 20;
     
-    // OPTIMASI: Gunakan recursive setTimeout
-    const tick = () => {
+    const timer = setInterval(() => {
       try {
         if (!this._isGameRunning(game) || !game.registrationOpen || timeLeft < 0) {
+          clearInterval(timer);
           game._registrationTimer = null;
           return;
         }
@@ -589,20 +604,19 @@ export class GameServer {
         }
         
         if (timeLeft === 0) {
+          clearInterval(timer);
           game._registrationTimer = null;
           this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP!"]);
           this._closeRegistration(room, game);
-          return;
         }
-        
         timeLeft--;
-        game._registrationTimer = setTimeout(tick, 1000);
       } catch(e) {
+        clearInterval(timer);
         game._registrationTimer = null;
       }
-    };
+    }, 1000);
     
-    game._registrationTimer = setTimeout(tick, 1000);
+    game._registrationTimer = timer;
   }
   
   _closeRegistration(room, game) {
@@ -611,7 +625,7 @@ export class GameServer {
       game.registrationOpen = false;
       
       if (game._registrationTimer) {
-        clearTimeout(game._registrationTimer);
+        clearInterval(game._registrationTimer);
         game._registrationTimer = null;
       }
       
@@ -757,10 +771,10 @@ export class GameServer {
     
     let timeLeft = 20;
     
-    // OPTIMASI: Gunakan recursive setTimeout
-    const tick = () => {
+    const timer = setInterval(() => {
       try {
         if (!this._isGameRunning(game) || game.drawTimeExpired || timeLeft < 0) {
+          clearInterval(timer);
           game._drawTimer = null;
           return;
         }
@@ -770,20 +784,19 @@ export class GameServer {
         }
         
         if (timeLeft === 0) {
+          clearInterval(timer);
           game._drawTimer = null;
           this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP!"]);
           this._closeDrawPhase(room, game);
-          return;
         }
-        
         timeLeft--;
-        game._drawTimer = setTimeout(tick, 1000);
       } catch(e) {
+        clearInterval(timer);
         game._drawTimer = null;
       }
-    };
+    }, 1000);
     
-    game._drawTimer = setTimeout(tick, 1000);
+    game._drawTimer = timer;
   }
   
   _closeDrawPhase(room, game) {
@@ -794,7 +807,7 @@ export class GameServer {
       game.evaluationLocked = true;
       
       if (game._drawTimer) {
-        clearTimeout(game._drawTimer);
+        clearInterval(game._drawTimer);
         game._drawTimer = null;
       }
       
@@ -832,30 +845,25 @@ export class GameServer {
         .filter(id => !game.eliminated?.has(id) && !game.numbers?.has(id))
         .slice(0, CONSTANTS.MAX_BOT_DRAWS_PER_ROUND);
       
-      if (notDrawn.length === 0) return;
-      
-      // OPTIMASI: Batch bot draws
-      const delay = this._getRandomDrawDelay();
-      const timeout = setTimeout(() => {
-        try {
-          const currentGame = this._safeGetGame(room);
-          if (!this._isGameRunning(currentGame) || currentGame.drawTimeExpired || currentGame.evaluationLocked) {
-            currentGame?._botTimeouts?.delete(timeout);
-            return;
-          }
-          
-          for (const botId of notDrawn) {
-            if (!currentGame.numbers?.has(botId) && !currentGame.eliminated?.has(botId)) {
+      for (const botId of notDrawn) {
+        const timeout = setTimeout(() => {
+          try {
+            const currentGame = this._safeGetGame(room);
+            if (this._isGameRunning(currentGame) && 
+                !currentGame.drawTimeExpired &&
+                !currentGame.evaluationLocked &&
+                !currentGame.numbers?.has(botId) &&
+                !currentGame.eliminated?.has(botId)) {
               this._handleBotDraw(room, botId, currentGame);
             }
+            currentGame?._botTimeouts?.delete(timeout);
+          } catch(e) {
+            // Silent error
           }
-          currentGame?._botTimeouts?.delete(timeout);
-        } catch(e) {
-          // Silent error
-        }
-      }, delay);
-      
-      game._botTimeouts.add(timeout);
+        }, this._getRandomDrawDelay());
+        
+        game._botTimeouts.add(timeout);
+      }
     } catch(e) {
       // Silent error
     }
@@ -1175,6 +1183,11 @@ export class GameServer {
         return;
       }
       
+      const wsId = this._getWsId(ws);
+      if (this._isRateLimited(wsId)) {
+        return;
+      }
+      
       if (!username || username.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
@@ -1236,8 +1249,6 @@ export class GameServer {
           this._gameLocks.delete(room);
           return;
         }
-        
-        const wsId = this._getWsId(ws);
         
         const game = {
           room,
@@ -1307,13 +1318,17 @@ export class GameServer {
         return;
       }
       
+      const wsId = this._getWsId(ws);
+      if (this._isRateLimited(wsId)) {
+        return;
+      }
+      
       if (!username || username.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
       const usernameClean = username.trim();
-      const wsId = this._getWsId(ws);
       
       const room = this._getRoomForWs(ws);
       if (!room) {
@@ -1403,28 +1418,23 @@ export class GameServer {
         return;
       }
       
+      const wsId = this._getWsId(ws);
+      if (this._isRateLimited(wsId)) {
+        return;
+      }
+      
       if (!username || username.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
       const usernameClean = username.trim();
-      const wsId = this._getWsId(ws);
       
       const room = this._getRoomForWs(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
       }
-      
-      // OPTIMASI: Rate limiting
-      const rateKey = `${room}_${usernameClean}`;
-      const lastSubmit = this._submitCooldown.get(rateKey);
-      if (lastSubmit && Date.now() - lastSubmit < CONSTANTS.RATE_LIMIT_MS) {
-        this._safeSend(ws, ["gameLowCardError", "Please wait before submitting again"]);
-        return;
-      }
-      this._submitCooldown.set(rateKey, Date.now());
       
       const game = this.activeGames.get(room);
       
@@ -1500,6 +1510,11 @@ export class GameServer {
     try {
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
+        return;
+      }
+      
+      const wsId = this._getWsId(ws);
+      if (this._isRateLimited(wsId)) {
         return;
       }
       
@@ -1643,47 +1658,6 @@ export class GameServer {
     try {
       const url = new URL(req.url);
       
-      if (url.pathname === "/health") {
-        // OPTIMASI: Cache health check
-        const now = Date.now();
-        if (this._healthCache && (now - this._healthCacheTime) < CONSTANTS.HEALTH_CACHE_MS) {
-          return new Response(this._healthCache, {
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-        
-        const healthData = {
-          status: "alive",
-          games: this.activeGames.size,
-          wsClients: this.wsClients.size,
-          clients: this.clientRooms.size,
-          wsMap: this.wsMap.size,
-          roomViewers: Array.from(this.roomViewers.entries()).map(([room, viewers]) => ({ 
-            room, 
-            viewers: Array.from(viewers) 
-          })),
-          userConnections: Array.from(this.userConnections.entries()).map(([user, conn]) => ({ 
-            user, 
-            wsId: conn.wsId,
-            room: conn.room,
-            timestamp: conn.timestamp
-          })),
-          connectionLocks: Array.from(this.connectionLocks.keys()),
-          cleanupTimers: this._cleanupTimers.size,
-          wsIdCounter: this._wsIdCounter,
-          joinLocks: this._joinLocks.size,
-          submitCooldown: this._submitCooldown.size
-        };
-        
-        const jsonStr = JSON.stringify(healthData);
-        this._healthCache = jsonStr;
-        this._healthCacheTime = now;
-        
-        return new Response(jsonStr, {
-          headers: { "Content-Type": "application/json" }
-        });
-      }
-      
       if (url.pathname === "/game/ws") {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
@@ -1761,6 +1735,7 @@ export class GameServer {
         return new Response(null, { status: 101, webSocket: client });
       }
       
+      // Hanya response minimal, tanpa health check
       return new Response("Game Server", { status: 200 });
       
     } catch(e) {
@@ -1884,31 +1859,13 @@ export class GameServer {
       this.connectionLocks.clear();
       this._gameLocks.clear();
       this._joinLocks.clear();
-      this._submitCooldown.clear();
-      this._healthCache = null;
-      this._healthCacheTime = 0;
+      this._lastBroadcast.clear();
+      this._rateLimit.clear();
       
       for (const [room, game] of this.activeGames) {
         this._deleteGame(room, game);
       }
       this.activeGames.clear();
-    } catch(e) {
-      // Silent error
-    }
-  }
-  
-  // ==================== CLEANUP STALE GAMES ====================
-  
-  _cleanupStaleGames() {
-    try {
-      const now = Date.now();
-      for (const [room, game] of this.activeGames) {
-        if (!game._isActive || game._gameEnded) {
-          if (game._createdAt && (now - game._createdAt) > CONSTANTS.MAX_GAME_AGE_MS) {
-            this._scheduleGameCleanup(room, game);
-          }
-        }
-      }
     } catch(e) {
       // Silent error
     }
