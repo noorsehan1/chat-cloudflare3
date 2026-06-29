@@ -1,6 +1,6 @@
 // ==================== GAME SERVER - DURABLE OBJECT ====================
 
- const CONSTANTS = {
+const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
   REGISTRATION_TIME_MS: 20000,
   DRAW_TIME_MS: 20000,
@@ -12,7 +12,7 @@
   EVALUATION_TIMEOUT_MS: 30000,
   START_LOCK_DURATION_MS: 3000,
   MAX_PLAYERS_PER_GAME: 45,
-  GAME_CLEANUP_DELAY_MS: 5000,
+  GAME_CLEANUP_DELAY_MS: 3000,
 };
 
 export class GameServer {
@@ -97,10 +97,12 @@ export class GameServer {
       return;
     }
     
+    // Jika sudah di room yang sama, return
     if (ws.room === room) {
       return;
     }
     
+    // Jika di room berbeda, pindahkan
     if (ws.room && ws.room !== room) {
       this._removeClientFromRoom(ws.room, wsId);
     }
@@ -565,22 +567,31 @@ export class GameServer {
       this._cleanupGame(game);
     }
     
+    // Hapus game dari activeGames
     this.activeGames.delete(room);
+    
+    // Hapus semua locks
     this._gameLocks.delete(room);
     this._joinLocks.delete(room);
     this.roomViewers.delete(room);
     
+    // Broadcast game ended
     this._broadcastToRoom(room, ["gameLowCardEnd", []]);
     
+    // Reset game reference di ws
     const wsIds = this.wsClients.get(room);
     if (wsIds) {
       for (const wsId of wsIds) {
         const ws = this.wsMap.get(wsId);
         if (ws) {
           ws.game = null;
+          // JANGAN set ws.room = null
         }
       }
     }
+    
+    // JANGAN hapus wsClients, clientRooms, atau userConnections
+    // Biarkan client tetap di room untuk game berikutnya
   }
   
   // ==================== REGISTRATION ====================
@@ -1153,18 +1164,24 @@ export class GameServer {
       
       const usernameClean = username.trim();
       
+      // Ambil room dari ws
       const room = this._getRoomForWs(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
       }
       
+      // 🔥 PERBAIKAN: Cek dan cleanup game yang sudah selesai
       const existingGame = this.activeGames.get(room);
       if (existingGame) {
+        // Jika game sudah berakhir atau tidak aktif, hapus
         if (existingGame._gameEnded || !existingGame._isActive) {
+          // Hapus game tapi PERTAHANKAN client di room
           this._deleteGame(room, existingGame);
-          await new Promise(r => setTimeout(r, 100));
+          // Tunggu sebentar untuk memastikan cleanup selesai
+          await new Promise(r => setTimeout(r, 200));
         } else if (existingGame.players && existingGame.players.has(usernameClean)) {
+          // Jika player masih dalam game yang aktif
           if (!existingGame.eliminated?.has(usernameClean)) {
             this._safeSend(ws, ["gameLowCardInfo", `Game already running`]);
             this._safeSend(ws, ["gameLowCardStartSuccess", existingGame.hostName, existingGame.betAmount]);
@@ -1204,9 +1221,15 @@ export class GameServer {
         
         const wsId = this._getWsId(ws);
         
+        // 🔥 PERBAIKAN: Bersihkan semua data room sebelum membuat game baru
         this._gameLocks.delete(room);
         this._joinLocks.delete(room);
         this.roomViewers.delete(room);
+        
+        // 🔥 PERBAIKAN: Pastikan tidak ada game tersisa
+        if (this.activeGames.has(room)) {
+          this.activeGames.delete(room);
+        }
         
         const game = {
           room,
@@ -1241,6 +1264,7 @@ export class GameServer {
         
         this.activeGames.set(room, game);
         
+        // Pastikan ws terdaftar di room
         if (!ws.room || ws.room !== room) {
           this._addClient(room, ws, usernameClean, false);
         }
@@ -1259,11 +1283,13 @@ export class GameServer {
         }, CONSTANTS.START_LOCK_DURATION_MS);
         
       } catch(e) {
+        console.error('Error starting game:', e);
         this._deleteGame(room, this.activeGames.get(room));
         this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
         this._gameLocks.delete(room);
       }
     } catch(e) {
+      console.error('Start game error:', e);
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
     }
   }
