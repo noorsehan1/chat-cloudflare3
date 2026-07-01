@@ -1154,12 +1154,12 @@ export class GameServer {
     }
   }
   
-  // ==================== ✅ PERBAIKAN: CHECK GAME RUNNING - HANYA running: true ====================
+  // ==================== ✅ PERBAIKAN: CHECK GAME RUNNING - STRING ====================
   
   async checkGameRunning(ws, roomname) {
     try {
       if (this.isDestroyed) {
-        this._safeSend(ws, ["gameStatus", { running: false }]);
+        this._safeSend(ws, ["gameStatus", { running: "false" }]);
         return;
       }
       
@@ -1173,7 +1173,7 @@ export class GameServer {
       }
       
       if (!room) {
-        this._safeSend(ws, ["gameStatus", { running: false }]);
+        this._safeSend(ws, ["gameStatus", { running: "false" }]);
         return;
       }
       
@@ -1182,11 +1182,11 @@ export class GameServer {
       // ✅ CEK APAKAH GAME RUNNING
       const isRunning = game && game._isActive && !game._gameEnded && game.players && game.players.size > 0;
       
-      // ✅ HANYA KIRIM running: true ATAU running: false
-      this._safeSend(ws, ["gameStatus", { running: !!isRunning }]);
+      // ✅ KIRIM STRING "true" ATAU "false"
+      this._safeSend(ws, ["gameStatus", { running: isRunning ? "true" : "false" }]);
       
     } catch(e) {
-      this._safeSend(ws, ["gameStatus", { running: false }]);
+      this._safeSend(ws, ["gameStatus", { running: "false" }]);
     }
   }
   
