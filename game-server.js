@@ -1154,12 +1154,12 @@ export class GameServer {
     }
   }
   
-  // ==================== CHECK GAME RUNNING ====================
+  // ==================== ✅ PERBAIKAN: CHECK GAME RUNNING - HANYA running: true ====================
   
   async checkGameRunning(ws, roomname) {
     try {
       if (this.isDestroyed) {
-        this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
+        this._safeSend(ws, ["gameStatus", { running: false }]);
         return;
       }
       
@@ -1173,30 +1173,20 @@ export class GameServer {
       }
       
       if (!room) {
-        this._safeSend(ws, ["gameLowCardError", "Room name is required"]);
+        this._safeSend(ws, ["gameStatus", { running: false }]);
         return;
       }
       
       const game = this.activeGames.get(room);
       
-      if (!game || !game._isActive || game._gameEnded || !game.players) {
-        this._safeSend(ws, ["gameStatus", { running: false }]);
-        return;
-      }
+      // ✅ CEK APAKAH GAME RUNNING
+      const isRunning = game && game._isActive && !game._gameEnded && game.players && game.players.size > 0;
       
-      this._safeSend(ws, ["gameStatus", { 
-        running: true,
-        phase: game._phase || 'idle',
-        round: game.round || 0,
-        players: Array.from(game.players?.values() || []).map(p => p.name),
-        betAmount: game.betAmount || 0,
-        registrationOpen: game.registrationOpen || false,
-        eliminated: Array.from(game.eliminated || []),
-        totalPlayers: game.players?.size || 0,
-        activePlayers: this._getActivePlayers(game).length
-      }]);
+      // ✅ HANYA KIRIM running: true ATAU running: false
+      this._safeSend(ws, ["gameStatus", { running: !!isRunning }]);
+      
     } catch(e) {
-      this._safeSend(ws, ["gameLowCardError", "Error checking game"]);
+      this._safeSend(ws, ["gameStatus", { running: false }]);
     }
   }
   
