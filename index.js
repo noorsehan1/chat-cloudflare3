@@ -11,15 +11,15 @@ const RATE_LIMIT = {
   burstWindowMs: 1000,    // 1 detik
 };
 
-// ✅ GABUNGKAN BURST & RATE LIMIT DALAM 1 MAP
+// ✅ INI BOLEH DI GLOBAL SCOPE (hanya deklarasi Map)
 const rateLimitTracker = new Map();
 
+// ✅ FUNGSI INI BOLEH DI GLOBAL SCOPE
 function checkRateLimit(ip) {
   const now = Date.now();
   const record = rateLimitTracker.get(ip);
   
   if (!record) {
-    // First request
     rateLimitTracker.set(ip, {
       count: 1,
       burstCount: 1,
@@ -29,26 +29,24 @@ function checkRateLimit(ip) {
     return true;
   }
   
-  // ✅ CEK BURST (1 DETIK)
+  // CEK BURST (1 DETIK)
   if ((now - record.burstStart) <= RATE_LIMIT.burstWindowMs) {
     if (record.burstCount >= RATE_LIMIT.burstLimit) {
-      return false; // Burst limit exceeded
+      return false;
     }
     record.burstCount++;
   } else {
-    // Reset burst counter
     record.burstCount = 1;
     record.burstStart = now;
   }
   
-  // ✅ CEK RATE LIMIT (1 MENIT)
+  // CEK RATE LIMIT (1 MENIT)
   if ((now - record.windowStart) <= RATE_LIMIT.windowMs) {
     if (record.count >= RATE_LIMIT.maxRequests) {
-      return false; // Rate limit exceeded
+      return false;
     }
     record.count++;
   } else {
-    // Reset window
     record.count = 1;
     record.windowStart = now;
   }
@@ -67,23 +65,28 @@ function getClientIP(request) {
   }
 }
 
-// ✅ CLEANUP SETIAP 5 MENIT
-setInterval(() => {
+// ✅ CLEANUP DILAKUKAN DI DALAM REQUEST (BUKAN SETINTERVAL)
+function cleanupRateLimiter() {
   const now = Date.now();
   for (const [ip, record] of rateLimitTracker) {
     if ((now - record.windowStart) > RATE_LIMIT.windowMs) {
       rateLimitTracker.delete(ip);
     }
   }
-}, 300000); // 5 menit
+}
 
 export default {
   async fetch(request, env) {
     try {
+      // ✅ CLEANUP DI SETIAP REQUEST (10% CHANCE)
+      if (Math.random() < 0.1) {
+        cleanupRateLimiter();
+      }
+      
       const url = new URL(request.url);
       const path = url.pathname;
       
-      // ✅ DDOS PROTECTION - CEK RATE LIMIT
+      // DDOS PROTECTION - CEK RATE LIMIT
       const ip = getClientIP(request);
       if (!checkRateLimit(ip)) {
         return new Response("Too many requests. Please wait.", { 
@@ -95,7 +98,7 @@ export default {
         });
       }
       
-      // 🔥 CEK APAKAH WEBSOCKET?
+      // CEK APAKAH WEBSOCKET?
       const upgrade = request.headers.get("Upgrade");
       if (upgrade !== "websocket") {
         return new Response("WebSocket only", { 
@@ -104,14 +107,14 @@ export default {
         });
       }
       
-      // 🔥 ROUTE: GAME SERVER
+      // ROUTE: GAME SERVER
       if (path === "/game/ws") {
         const id = env.GAME_SERVER.idFromName("main");
         const obj = env.GAME_SERVER.get(id);
         return obj.fetch(request);
       }
       
-      // 🔥 DEFAULT: CHAT SERVER
+      // DEFAULT: CHAT SERVER
       const id = env.CHAT_SERVER.idFromName("main");
       const obj = env.CHAT_SERVER.get(id);
       return obj.fetch(request);
