@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (REALTIME ONLY - NO HISTORY) ====================
+// ==================== GAME-SERVER.JS (OPTIMIZED - NO ALARM, TRANSLATE WORK) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -14,29 +14,28 @@ const CONSTANTS = {
   START_LOCK_DURATION_MS: 3000,
   MAX_PLAYERS_PER_GAME: 45,
   GAME_CLEANUP_DELAY_MS: 5000,
-  BATCH_SIZE: 3,
-  ALARM_10_DETIK: 10000,
+  BATCH_SIZE: 2,
   CLEANUP_TIK: 90,
   STALE_GAME_TIMEOUT_MS: 600000,
   STUCK_DRAW_TIMEOUT_MS: 60000,
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
-  QUIZ_INTERVAL_MS: 20000,
+  QUIZ_INTERVAL_MS: 30000,
   QUIZ_TIME_LIMIT_MS: 15000,
   TRANSLATE_LIMIT: 30,
   QUIZ_BREAK_MS: 2000,
   QUIZ_START_DELAY_MS: 5000,
-  MAX_RETRY_INIT_QUIZ: 3,
-  MAX_BROADCAST_BATCH: 5,
+  MAX_RETRY_INIT_QUIZ: 2,
+  MAX_BROADCAST_BATCH: 3,
   MAX_SHUTDOWN_WAIT_MS: 5000,
-  MAX_WS_CLIENTS: 100,
-  MAX_ARRAY_SIZE: 100,
+  MAX_WS_CLIENTS: 50,
+  MAX_ARRAY_SIZE: 50,
   CIRCUIT_BREAKER_THRESHOLD: 2,
   CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
-  QUIZ_SWITCH_DELAY_MS: 3000,
+  QUIZ_SWITCH_DELAY_MS: 2000,
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
-  SCHEDULER_INTERVAL_MS: 120000,
+  SCHEDULER_INTERVAL_MS: 180000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -113,15 +112,15 @@ export class GameServer {
       this.quizAutoEnabled = false;
       this.quizAutoTimer = null;
       
-      // ✅ INIT VIA SETTIMEOUT
+      // ✅ INIT VIA SETTIMEOUT (TIDAK BLOCKING)
       setTimeout(() => {
         this._initAsync();
       }, 0);
       
-      // ALARM
-      if (this.state && this.state.storage) {
-        this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
-      }
+      // ❌ ALARM DINONAKTIFKAN UNTUK FREE TIER
+      // if (this.state && this.state.storage) {
+      //   this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
+      // }
       
     } catch(e) {
       console.error("Constructor error:", e);
@@ -800,31 +799,11 @@ export class GameServer {
     }
   }
   
-  // ==================== ALARM ====================
+  // ==================== ALARM DINONAKTIFKAN ====================
+  // ❌ ALARM DIHAPUS UNTUK FREE TIER
+  // async alarm() { ... }
   
-  async alarm() {
-    if (this.closing || this.isDestroyed) return;
-    try {
-      this._tikCounter++;
-      if (this._tikCounter % 6 === 0) {
-        this._checkStuckGames();
-      }
-      if (this._tikCounter >= CONSTANTS.CLEANUP_TIK) {
-        this._cleanupStaleGames();
-        this._cleanupDeadConnections();
-        this._cleanupStaleBroadcastCounters();
-        this._cleanupStaleSwitchLocks();
-        this._tikCounter = 0;
-      }
-    } catch(e) {}
-    try {
-      if (this.state && this.state.storage) {
-        await this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
-      }
-    } catch(e) {}
-  }
-  
-  // ==================== TRANSLATION ====================
+  // ==================== TRANSLATION (TETAP WORK) ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1146,7 +1125,7 @@ export class GameServer {
     
     const msgStr = JSON.stringify(message);
     const wsIdArray = Array.from(wsIds);
-    const batchSize = Math.min(CONSTANTS.BATCH_SIZE, 3);
+    const batchSize = Math.min(CONSTANTS.BATCH_SIZE, 2);
     const disconnected = [];
     
     for (let i = 0; i < wsIdArray.length && i < 15; i += batchSize) {
@@ -1216,29 +1195,43 @@ export class GameServer {
     };
   }
   
+  // ==================== BROADCAST QUIZ QUESTION (DENGAN TRANSLATE) ====================
+  
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds) return;
     const wsIdArray = Array.from(wsIds);
+    
     for (const wsId of wsIdArray) {
       try {
         const ws = this.wsMap.get(wsId);
         if (!ws || ws.readyState !== 1) continue;
+        
+        // ✅ AMBIL BAHASA USER
         const lang = this._getUserLanguage(ws);
+        
         let finalQuestion = question;
         let finalOptions = options;
+        
+        // ✅ TRANSLATE JIKA BUKAN BAHASA INGGRIS
         if (lang !== 'en' && !this.translateLimitReached && finalQuestion && typeof finalQuestion === 'string') {
           try {
             finalQuestion = await this._translateText(question, lang);
             finalOptions = await this._translateOptions(options, lang);
-          } catch(e) {}
+          } catch(e) {
+            // Jika gagal, tetap kirim bahasa Inggris
+          }
         }
+        
         const questionObj = {
           question: finalQuestion || '',
           options: finalOptions || { A: '', B: '', C: '', D: '' }
         };
+        
         this._safeSend(ws, ["quizQuestion", questionObj]);
-      } catch(e) {}
+      } catch(e) {
+        // Silent fail untuk satu user
+      }
     }
   }
   
