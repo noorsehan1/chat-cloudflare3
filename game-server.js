@@ -35,7 +35,7 @@ const CONSTANTS = {
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
-  SCHEDULER_INTERVAL_MS: 180000,
+  SCHEDULER_INTERVAL_MS: 60000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -310,35 +310,6 @@ export class GameServer {
     return { minutes, seconds, isRunning: false };
   }
   
-  // ==================== GET REMAINING SESSION TIME ====================
-  
-  _getRemainingSessionTime() {
-    const hour = this._getCurrentUTCHours();
-    const schedules = [
-      { start: 0, end: 2 },
-      { start: 4, end: 6 },
-      { start: 8, end: 10 },
-      { start: 12, end: 14 },
-      { start: 16, end: 18 },
-      { start: 20, end: 22 }
-    ];
-    
-    for (const schedule of schedules) {
-      if (hour >= schedule.start && hour < schedule.end) {
-        const endTime = new Date();
-        endTime.setUTCHours(schedule.end, 0, 0, 0);
-        const remainingMs = endTime.getTime() - Date.now();
-        const remainingMinutes = Math.floor(remainingMs / 60000);
-        return { isActive: true, remainingMinutes };
-      }
-    }
-    
-    const nextStart = this._getNextQuizStartTime();
-    const waitMs = nextStart.getTime() - Date.now();
-    const waitMinutes = Math.floor(waitMs / 60000);
-    return { isActive: false, waitMinutes };
-  }
-  
   // ==================== QUIZ AUTO SCHEDULER ====================
   
   _startQuizScheduler() {
@@ -354,7 +325,9 @@ export class GameServer {
           return;
         }
         this._checkQuizAutoStatus();
-      } catch(e) {}
+      } catch(e) {
+        console.error("Scheduler error:", e);
+      }
     }, CONSTANTS.SCHEDULER_INTERVAL_MS);
   }
   
@@ -364,14 +337,23 @@ export class GameServer {
       
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
+          console.log("🔥 Scheduler: Enabling quiz...");
           this.quizAutoEnabled = true;
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏳ Quiz will start soon!",
+            true
+          ]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
+        } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+          console.log("🔥 Scheduler: No question, starting...");
+          await this._showQuestion();
         }
       } else {
         if (this.quizAutoEnabled) {
+          console.log("🔥 Scheduler: Disabling quiz...");
           this.quizAutoEnabled = false;
           await this.resetQuiz();
-          
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
             "⏸️ Quiz is currently offline. Next session will start according to schedule.",
@@ -381,6 +363,24 @@ export class GameServer {
       }
     } catch(e) {
       console.error("Check quiz auto status error:", e);
+    }
+  }
+  
+  // ==================== FORCE START QUIZ IF TIME ====================
+  
+  _forceStartQuizIfTime() {
+    try {
+      if (!this._isQuizTime()) return;
+      if (this.currentQuestion) return;
+      if (this._quizTimeout) return;
+      if (this.isQuizWaiting) return;
+      if (this._quizStartTimeout) return;
+      
+      console.log("🔥 Force starting quiz...");
+      this.quizAutoEnabled = true;
+      this._showQuestion();
+    } catch(e) {
+      console.error("Force start quiz error:", e);
     }
   }
   
@@ -414,12 +414,7 @@ export class GameServer {
         message = `⏰ Quiz is running! ${remaining}`;
         canType = false;
       } else if (isQuizTime && !isQuizActive) {
-        const sessionInfo = this._getRemainingSessionTime();
-        if (sessionInfo.isActive) {
-          message = `⏳ Quiz will start soon! (${sessionInfo.remainingMinutes}m remaining in this session)`;
-        } else {
-          message = `⏳ Quiz will start soon!`;
-        }
+        message = `⏳ Quiz will start soon!`;
         canType = true;
       } else {
         const totalSeconds = timeLeft.minutes * 60 + timeLeft.seconds;
@@ -521,6 +516,14 @@ export class GameServer {
             await this._initQuiz();
           }
           
+          // ✅ CEK APAKAH SUDAH JAM QUIZ
+          if (this._isQuizTime()) {
+            if (!this.quizAutoEnabled) {
+              this.quizAutoEnabled = true;
+              this._startQuizIfNeeded();
+            }
+          }
+          
           setTimeout(() => {
             try {
               if (this.closing || this.isDestroyed) return;
@@ -550,6 +553,14 @@ export class GameServer {
       if (roomName === QUIZ_ROOM) {
         if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
           await this._initQuiz();
+        }
+        
+        // ✅ CEK APAKAH SUDAH JAM QUIZ
+        if (this._isQuizTime()) {
+          if (!this.quizAutoEnabled) {
+            this.quizAutoEnabled = true;
+            this._startQuizIfNeeded();
+          }
         }
         
         setTimeout(() => {
@@ -705,6 +716,7 @@ export class GameServer {
       }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
 
     } catch(e) {
+      console.error("Show question error:", e);
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
@@ -796,8 +808,30 @@ export class GameServer {
           return;
         }
         
-        if (!this._isQuizTime()) {
+        // ✅ CEK APAKAH SUDAH JAM QUIZ
+        if (this._isQuizTime()) {
+          
+          // ✅ JIKA QUIZ BELUM ENABLED, AKTIFKAN
+          if (!this.quizAutoEnabled) {
+            console.log("🔥 Quiz time detected! Enabling quiz...");
+            this.quizAutoEnabled = true;
+            this._broadcastToRoom(QUIZ_ROOM, [
+              "quizTimeLeft",
+              "⏳ Quiz will start soon!",
+              true
+            ]);
+          }
+          
+          // ✅ JIKA TIDAK ADA PERTANYAAN, MULAI
+          if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+            console.log("🔥 Starting quiz question...");
+            this._showQuestion();
+          }
+          
+        } else {
+          // ❌ JAM HABIS - MATIKAN QUIZ
           if (this.quizAutoEnabled) {
+            console.log("🔥 Quiz time ended! Disabling quiz...");
             this.quizAutoEnabled = false;
             this.resetQuiz();
             this._broadcastToRoom(QUIZ_ROOM, [
@@ -806,15 +840,7 @@ export class GameServer {
               true
             ]);
           }
-          return;
         }
-        
-        const clients = this.wsClients.get(QUIZ_ROOM);
-        if (!clients || clients.size === 0) return;
-        if (!this.quizAutoEnabled) return;
-        if (this.currentQuestion || this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) return;
-        
-        this._showQuestion();
         
       } catch(e) {
         console.error("Quiz loop error:", e);
@@ -1094,6 +1120,10 @@ export class GameServer {
     try {
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients || clients.size === 0) return;
+      
+      // ✅ FORCE START JIKA SUDAH WAKTUNYA
+      this._forceStartQuizIfTime();
+      
       if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
         this._initQuiz().then(() => {
           if (!this.closing && !this.isDestroyed) {
@@ -1103,7 +1133,9 @@ export class GameServer {
         return;
       }
       this._startQuizIfNeeded();
-    } catch(e) {}
+    } catch(e) {
+      console.error("Ensure quiz running error:", e);
+    }
   }
   
   _startQuizIfNeeded() {
@@ -1121,7 +1153,9 @@ export class GameServer {
         }
         this._showQuestion();
       }
-    } catch(e) {}
+    } catch(e) {
+      console.error("Start quiz if needed error:", e);
+    }
   }
   
   async forceStartQuiz() {
