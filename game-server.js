@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (OPTIMIZED - NO ALARM, TRANSLATE WORK) ====================
+// ==================== GAME-SERVER.JS (OPTIMIZED - NO ALARM, TRANSLATE WORK, DELAY 5s) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -31,7 +31,7 @@ const CONSTANTS = {
   MAX_ARRAY_SIZE: 50,
   CIRCUIT_BREAKER_THRESHOLD: 2,
   CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
-  QUIZ_SWITCH_DELAY_MS: 2000,
+  QUIZ_SWITCH_DELAY_MS: 5000, // ✅ 5 DETIK DELAY
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
@@ -421,7 +421,7 @@ export class GameServer {
     }
   }
   
-  // ==================== SWITCH ROOM ====================
+  // ==================== SWITCH ROOM (DENGAN DELAY 5 DETIK) ====================
   
   async switchRoom(ws, room, username = null) {
     if (this.isDestroyed) {
@@ -453,12 +453,15 @@ export class GameServer {
           if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
             await this._initQuiz();
           }
+          
+          // ✅ DELAY 5 DETIK SEBELUM KIRIM TIME LEFT
           setTimeout(() => {
             try {
               if (this.closing || this.isDestroyed) return;
               this._sendQuizTimeLeftToUser(ws);
             } catch(e) {}
           }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
+          
           this._startQuizIfNeeded();
         }
         return;
@@ -482,12 +485,15 @@ export class GameServer {
         if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
           await this._initQuiz();
         }
+        
+        // ✅ DELAY 5 DETIK SEBELUM KIRIM TIME LEFT
         setTimeout(() => {
           try {
             if (this.closing || this.isDestroyed) return;
             this._sendQuizTimeLeftToUser(ws);
           } catch(e) {}
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
+        
         this._startQuizIfNeeded();
       }
       
