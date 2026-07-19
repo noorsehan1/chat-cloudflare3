@@ -31,7 +31,7 @@ const CONSTANTS = {
   MAX_ARRAY_SIZE: 50,
   CIRCUIT_BREAKER_THRESHOLD: 2,
   CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
-  QUIZ_SWITCH_DELAY_MS: 5000, // ✅ 5 DETIK DELAY
+  QUIZ_SWITCH_DELAY_MS: 5000,
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
@@ -380,6 +380,7 @@ export class GameServer {
         canType = true;
       }
       
+      // ✅ FORMAT YANG DIMINTA CLIENT: ["quizTimeLeft", message, canType]
       this._safeSend(ws, ["quizTimeLeft", message, canType]);
       return true;
     } catch(e) {
