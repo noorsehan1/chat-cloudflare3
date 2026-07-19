@@ -356,7 +356,7 @@ export class GameServer {
           await this.resetQuiz();
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz is currently offline. Next session will start according to schedule.",
+            "⏸️ Quiz is offline. Check schedule for next session.",
             true
           ]);
         }
@@ -437,7 +437,7 @@ export class GameServer {
           countdown = parts.join(" ");
         }
         
-        message = `⏸️ Quiz is offline. Next session starts in ${countdown}`;
+        message = `⏸️ Quiz is offline. Starts in ${countdown}`;
         canType = true;
       }
       
@@ -483,7 +483,7 @@ export class GameServer {
     }
   }
   
-  // ==================== SWITCH ROOM (DENGAN DELAY 5 DETIK) ====================
+  // ==================== SWITCH ROOM (DENGAN DELAY 5 DETIK - HANYA 1 EVENT) ====================
   
   async switchRoom(ws, room, username = null) {
     if (this.isDestroyed) {
@@ -516,22 +516,19 @@ export class GameServer {
             await this._initQuiz();
           }
           
-          // ✅ CEK APAKAH SUDAH JAM QUIZ
           if (this._isQuizTime()) {
             if (!this.quizAutoEnabled) {
               this.quizAutoEnabled = true;
-              this._startQuizIfNeeded();
             }
           }
           
+          // ✅ HANYA 1 EVENT SETELAH DELAY 5 DETIK
           setTimeout(() => {
             try {
               if (this.closing || this.isDestroyed) return;
               this._sendQuizTimeLeftToUser(ws);
             } catch(e) {}
           }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
-          
-          this._startQuizIfNeeded();
         }
         return;
       }
@@ -555,22 +552,19 @@ export class GameServer {
           await this._initQuiz();
         }
         
-        // ✅ CEK APAKAH SUDAH JAM QUIZ
         if (this._isQuizTime()) {
           if (!this.quizAutoEnabled) {
             this.quizAutoEnabled = true;
-            this._startQuizIfNeeded();
           }
         }
         
+        // ✅ HANYA 1 EVENT SETELAH DELAY 5 DETIK
         setTimeout(() => {
           try {
             if (this.closing || this.isDestroyed) return;
             this._sendQuizTimeLeftToUser(ws);
           } catch(e) {}
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
-        
-        this._startQuizIfNeeded();
       }
       
     } finally {
@@ -587,7 +581,7 @@ export class GameServer {
         if (clients && clients.size > 0) {
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz is currently offline. Next session will start according to schedule.",
+            "⏸️ Quiz is offline. Check schedule for next session.",
             true
           ]);
         }
@@ -599,7 +593,7 @@ export class GameServer {
         if (clients && clients.size > 0) {
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz is currently offline.",
+            "⏸️ Quiz is offline.",
             true
           ]);
         }
@@ -836,7 +830,7 @@ export class GameServer {
             this.resetQuiz();
             this._broadcastToRoom(QUIZ_ROOM, [
               "quizTimeLeft",
-              "⏸️ Quiz session has ended. Next session will start according to schedule.",
+              "⏸️ Quiz is offline. Check schedule for next session.",
               true
             ]);
           }
