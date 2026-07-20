@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL - MATCH WITH CLIENT) ====================
+// ==================== GAME-SERVER.JS (CLEAN - NO MONITORING) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 5,
@@ -27,7 +27,7 @@ const CONSTANTS = {
   MAX_RETRY_INIT_QUIZ: 2,
   MAX_BROADCAST_BATCH: 2,
   MAX_SHUTDOWN_WAIT_MS: 5000,
-  MAX_WS_CLIENTS: 50,
+  MAX_WS_CLIENTS: 100,
   MAX_ARRAY_SIZE: 50,
   CIRCUIT_BREAKER_THRESHOLD: 2,
   CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
@@ -36,6 +36,7 @@ const CONSTANTS = {
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
   SCHEDULER_INTERVAL_MS: 60000,
+  BROADCAST_CHUNK_SIZE: 10,
 };
 
 const QUIZ_SCHEDULE = {
@@ -108,6 +109,11 @@ export class GameServer {
       this.quizAutoEnabled = false;
       this.quizAutoTimer = null;
       
+      this._messageQueue = new Map();
+      this._queueTimer = null;
+      
+      this._startCleanupInterval();
+      
       setTimeout(() => {
         this._initAsync();
       }, 0);
@@ -115,6 +121,384 @@ export class GameServer {
     } catch(e) {
       throw e;
     }
+  }
+  
+  _startCleanupInterval() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+    }
+    this._cleanupInterval = setInterval(() => {
+      try {
+        if (this.closing || this.isDestroyed) {
+          clearInterval(this._cleanupInterval);
+          this._cleanupInterval = null;
+          return;
+        }
+        this._tikCounter++;
+        
+        this._cleanupDeadConnections();
+        this._cleanupStaleGames();
+        this._cleanupStaleBroadcastCounters();
+        this._cleanupStaleSwitchLocks();
+        this._checkStuckGames();
+        
+        this._optimizeMemoryUsage();
+        
+      } catch(e) {}
+    }, CONSTANTS.CLEANUP_INTERVAL_MS || 30000);
+  }
+  
+  _optimizeMemoryUsage() {
+    for (const [room, queue] of this._messageQueue) {
+      if (queue.length > CONSTANTS.MAX_MESSAGE_QUEUE_SIZE) {
+        queue.splice(0, queue.length - CONSTANTS.MAX_MESSAGE_QUEUE_SIZE);
+      }
+    }
+    
+    if (this.questionTranslations.size > 500) {
+      const keys = Array.from(this.questionTranslations.keys());
+      const toDelete = keys.slice(0, keys.length - 400);
+      for (const key of toDelete) {
+        this.questionTranslations.delete(key);
+      }
+    }
+  }
+  
+  _broadcastToRoom(room, message) {
+    if (this.closing || this.isDestroyed || !room || !message) return;
+    const wsIds = this.wsClients.get(room);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    const now = Date.now();
+    const reset = this._roomBroadcastReset.get(room) || 0;
+    const count = this._roomBroadcastCount.get(room) || 0;
+    
+    if (now > reset) {
+      this._roomBroadcastReset.set(room, now + 1000);
+      this._roomBroadcastCount.set(room, 1);
+    } else {
+      if (count > CONSTANTS.MAX_BROADCAST_BATCH) return;
+      this._roomBroadcastCount.set(room, count + 1);
+    }
+    
+    const msgStr = JSON.stringify(message);
+    const wsIdArray = Array.from(wsIds);
+    
+    const chunkSize = CONSTANTS.BROADCAST_CHUNK_SIZE || 10;
+    const disconnected = [];
+    
+    for (let i = 0; i < wsIdArray.length; i += chunkSize) {
+      const chunk = wsIdArray.slice(i, i + chunkSize);
+      for (const wsId of chunk) {
+        const ws = this.wsMap.get(wsId);
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {
+            disconnected.push(wsId);
+          }
+        } else {
+          disconnected.push(wsId);
+        }
+      }
+    }
+    
+    if (disconnected.length > 0) {
+      for (const wsId of disconnected) {
+        const ws = this.wsMap.get(wsId);
+        if (ws) {
+          this._removeClient(room, ws);
+        } else {
+          this._removeClientFromRoom(room, wsId);
+          this.clientRooms.delete(wsId);
+        }
+      }
+    }
+  }
+  
+  _safeSend(ws, message) {
+    if (!ws || ws.readyState !== 1) return false;
+    try {
+      ws.send(JSON.stringify(message));
+      return true;
+    } catch(e) {
+      const wsId = this._getWsId(ws);
+      if (wsId) {
+        if (!this._messageQueue.has(wsId)) {
+          this._messageQueue.set(wsId, []);
+        }
+        const queue = this._messageQueue.get(wsId);
+        if (queue.length < CONSTANTS.MAX_MESSAGE_QUEUE_SIZE) {
+          queue.push(message);
+          this._processQueue(wsId);
+        }
+      }
+      return false;
+    }
+  }
+  
+  _processQueue(wsId) {
+    if (!this._queueTimer) {
+      this._queueTimer = setTimeout(() => {
+        this._queueTimer = null;
+        this._flushQueues();
+      }, 100);
+    }
+  }
+  
+  _flushQueues() {
+    for (const [wsId, queue] of this._messageQueue) {
+      if (queue.length === 0) continue;
+      const ws = this.wsMap.get(wsId);
+      if (!ws || ws.readyState !== 1) {
+        this._messageQueue.delete(wsId);
+        continue;
+      }
+      const messages = queue.splice(0, 10);
+      for (const msg of messages) {
+        try {
+          ws.send(JSON.stringify(msg));
+        } catch(e) {
+          queue.unshift(msg);
+          break;
+        }
+      }
+      if (queue.length > 0) {
+        this._processQueue(wsId);
+      } else {
+        this._messageQueue.delete(wsId);
+      }
+    }
+  }
+  
+  async fetch(req) {
+    if (this.closing || this.isDestroyed) {
+      return new Response("Shutting down", { status: 503 });
+    }
+    try {
+      const url = new URL(req.url);
+      
+      if (url.pathname === "/game/ws") {
+        const upgrade = req.headers.get("Upgrade");
+        if (upgrade !== "websocket") {
+          return new Response("WebSocket only", { status: 400 });
+        }
+        
+        if (this.wsMap.size >= CONSTANTS.MAX_WS_CLIENTS) {
+          return new Response("Server at maximum capacity", { status: 503 });
+        }
+        
+        try {
+          const pair = new WebSocketPair();
+          const [client, server] = [pair[0], pair[1]];
+          
+          const wsId = ++this._wsIdCounter;
+          server._wsId = wsId;
+          server._closing = false;
+          server.room = null;
+          server.roomname = null;
+          server._createdAt = Date.now();
+          server.username = null;
+          
+          const cf = req.cf;
+          let country = 'US';
+          if (cf && cf.country) {
+            country = cf.country;
+          }
+          server._country = country;
+          const lang = this._countryToLanguage(country);
+          this.userLanguage.set(wsId, lang);
+          this.userCountry.set(wsId, country);
+          
+          try { 
+            this.state.acceptWebSocket(server);
+          } catch(e) { 
+            return new Response("WebSocket acceptance failed", { status: 500 }); 
+          }
+          
+          server.addEventListener("message", async (event) => {
+            try {
+              const data = JSON.parse(event.data);
+              if (!Array.isArray(data) || data.length === 0) return;
+              await this.handleEvent(server, data);
+            } catch(e) {
+              this._safeSend(server, ["gameLowCardError", e.message || "Error"]);
+            }
+          });
+          
+          server.addEventListener("close", () => {
+            try {
+              this._handleDisconnect(server);
+            } catch(e) {}
+          });
+          
+          server.addEventListener("error", () => {
+            try {
+              this._handleDisconnect(server);
+            } catch(e) {}
+          });
+          
+          return new Response(null, { status: 101, webSocket: client });
+          
+        } catch(e) {
+          return new Response("WebSocket creation failed", { status: 500 });
+        }
+      }
+      
+      return new Response("Game Server", { status: 200 });
+      
+    } catch(e) {
+      return new Response("Internal Server Error", { status: 500 });
+    }
+  }
+  
+  _handleDisconnect(server) {
+    if (!server) return;
+    const wsId = this._getWsId(server);
+    const username = server.username;
+    if (server.room || server.roomname) {
+      const room = server.room || server.roomname;
+      this._removeClient(room, server);
+    }
+    this.userLanguage.delete(wsId);
+    this.userCountry.delete(wsId);
+    if (username) {
+      const conn = this.userConnections.get(username);
+      if (conn && conn.wsId === wsId) {
+        this.userConnections.delete(username);
+      }
+    }
+    if (wsId) {
+      this.clientRooms.delete(wsId);
+      this.wsMap.delete(wsId);
+      this._messageQueue.delete(wsId);
+    }
+    server.room = null;
+    server.roomname = null;
+    server._wsId = null;
+    server.username = null;
+    
+    const clients = this.wsClients.get(QUIZ_ROOM);
+    if (clients && clients.size > 0) {
+      this.ensureQuizRunning();
+    }
+  }
+  
+  async webSocketClose(ws) {
+    this._handleDisconnect(ws);
+  }
+  
+  async webSocketError(ws) {
+    this._handleDisconnect(ws);
+  }
+  
+  async webSocketMessage(ws, msg) {
+    try {
+      if (!ws || ws._closing || this.closing || this.isDestroyed) return;
+      if (!ws._wsId) return;
+      const data = JSON.parse(msg);
+      if (!Array.isArray(data) || data.length === 0) return;
+      await this.handleEvent(ws, data);
+    } catch(e) {
+      this._safeSend(ws, ["gameLowCardError", e.message || "Error"]);
+    }
+  }
+  
+  async destroy() {
+    try {
+      if (this.isDestroyed) return;
+      this.closing = true;
+      this.isDestroyed = true;
+      
+      if (this._cleanupInterval) {
+        clearInterval(this._cleanupInterval);
+        this._cleanupInterval = null;
+      }
+      if (this.quizAutoTimer) {
+        clearInterval(this.quizAutoTimer);
+        this.quizAutoTimer = null;
+      }
+      if (this.quizTimer) {
+        clearInterval(this.quizTimer);
+        this.quizTimer = null;
+      }
+      if (this._translateResetInterval) {
+        clearInterval(this._translateResetInterval);
+        this._translateResetInterval = null;
+      }
+      if (this._queueTimer) {
+        clearTimeout(this._queueTimer);
+        this._queueTimer = null;
+      }
+      
+      const timeoutKeys = ['_quizTimeout', '_quizBreakTimeout', '_quizStartTimeout'];
+      for (const key of timeoutKeys) {
+        if (this[key]) {
+          clearTimeout(this[key]);
+          this[key] = null;
+        }
+      }
+      
+      for (const [room, game] of this.activeGames) {
+        if (game) {
+          const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
+          for (const key of timers) {
+            if (game[key]) {
+              clearTimeout(game[key]);
+              clearInterval(game[key]);
+              game[key] = null;
+            }
+          }
+          if (game._botTimeouts) {
+            for (const id of game._botTimeouts) clearTimeout(id);
+            game._botTimeouts.clear();
+            game._botTimeouts = null;
+          }
+          game.players = null;
+          game.botPlayers = null;
+          game.numbers = null;
+          game.tanda = null;
+          game.eliminated = null;
+          game.playerWsId = null;
+        }
+      }
+      
+      for (const [room, timer] of this._cleanupTimers) {
+        clearTimeout(timer);
+      }
+      this._cleanupTimers.clear();
+      
+      this.quizQuestionCache = {};
+      this.questionTranslations.clear();
+      this.userLanguage.clear();
+      this.userCountry.clear();
+      this.wsClients.clear();
+      this.clientRooms.clear();
+      this.wsMap.clear();
+      this.roomViewers.clear();
+      this.userConnections.clear();
+      this.connectionLocks.clear();
+      this._gameLocks.clear();
+      this._joinLocks.clear();
+      this._switchLocks.clear();
+      this._gameStartFlags.clear();
+      this._roomBroadcastCount.clear();
+      this._roomBroadcastReset.clear();
+      this.quizAnswered.clear();
+      this.activeGames.clear();
+      this._messageQueue.clear();
+      
+      for (const [room, wsIds] of this.wsClients) {
+        for (const wsId of wsIds) {
+          const ws = this.wsMap.get(wsId);
+          if (ws) {
+            try {
+              ws.close(1000, "Game server shutting down");
+            } catch(e) {}
+          }
+        }
+      }
+    } catch(e) {}
   }
   
   async _initAsync() {
@@ -1209,67 +1593,6 @@ export class GameServer {
     }
   }
   
-  _broadcastToRoom(room, message) {
-    if (this.closing || this.isDestroyed || !room || !message) return;
-    const wsIds = this.wsClients.get(room);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const now = Date.now();
-    const reset = this._roomBroadcastReset.get(room) || 0;
-    const count = this._roomBroadcastCount.get(room) || 0;
-    
-    if (now > reset) {
-      this._roomBroadcastReset.set(room, now + 1000);
-      this._roomBroadcastCount.set(room, 1);
-    } else {
-      if (count > CONSTANTS.MAX_BROADCAST_BATCH) return;
-      this._roomBroadcastCount.set(room, count + 1);
-    }
-    
-    const msgStr = JSON.stringify(message);
-    const wsIdArray = Array.from(wsIds);
-    const batchSize = Math.min(CONSTANTS.BATCH_SIZE, 2);
-    const disconnected = [];
-    
-    for (let i = 0; i < wsIdArray.length && i < 10; i += batchSize) {
-      const batch = wsIdArray.slice(i, i + batchSize);
-      for (const wsId of batch) {
-        const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1) {
-          try {
-            ws.send(msgStr);
-          } catch(e) {
-            disconnected.push(wsId);
-          }
-        } else {
-          disconnected.push(wsId);
-        }
-      }
-    }
-    
-    if (disconnected.length > 0) {
-      for (const wsId of disconnected) {
-        const ws = this.wsMap.get(wsId);
-        if (ws) {
-          this._removeClient(room, ws);
-        } else {
-          this._removeClientFromRoom(room, wsId);
-          this.clientRooms.delete(wsId);
-        }
-      }
-    }
-  }
-  
-  _safeSend(ws, message) {
-    if (!ws || ws.readyState !== 1) return false;
-    try {
-      ws.send(JSON.stringify(message));
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-  
   _shuffleQuestionOptions(question) {
     if (!question || !question.options) {
       return { options: { A: '', B: '', C: '', D: '' }, correct: 'A' };
@@ -1804,6 +2127,39 @@ export class GameServer {
     }
     
     sendUpdate.call(this);
+  }
+  
+  _closeRegistration(room, game) {
+    try {
+      if (!game || !game._isActive || game._gameEnded || game.evaluationLocked) return;
+      if (!game.registrationOpen) return;
+      
+      game.registrationOpen = false;
+      if (game._registrationTimer) {
+        clearTimeout(game._registrationTimer);
+        game._registrationTimer = null;
+      }
+      
+      const activePlayerCount = this._getActivePlayers(game).length;
+      if (activePlayerCount < 2) {
+        this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
+        game._gameEnded = true;
+        game._isActive = false;
+        game._endTime = Date.now();
+        this._scheduleGameCleanup(room, game);
+        return;
+      }
+      
+      if (!game._botsAdded) {
+        const needed = Math.min(4 - activePlayerCount, CONSTANTS.MAX_BOTS_PER_GAME);
+        if (needed > 0) {
+          this._addBots(room, needed);
+          game._botsAdded = true;
+        }
+      }
+      
+      this._startDrawPhase(room, game);
+    } catch(e) {}
   }
   
   _startDrawCountdown(room, game) {
@@ -2544,298 +2900,12 @@ export class GameServer {
           this.wsMap.delete(wsId);
           this.userLanguage.delete(wsId);
           this.userCountry.delete(wsId);
+          this._messageQueue.delete(wsId);
           for (const [username, conn] of this.userConnections) {
             if (conn && conn.wsId === wsId) {
               this.userConnections.delete(username);
               break;
             }
-          }
-        }
-      }
-    } catch(e) {}
-  }
-  
-  async fetch(req) {
-    if (this.closing || this.isDestroyed) {
-      return new Response("Shutting down", { status: 503 });
-    }
-    try {
-      const url = new URL(req.url);
-      
-      if (url.pathname === "/game/health") {
-        return new Response(JSON.stringify({
-          status: this.isDestroyed ? 'down' : 'healthy',
-          games: this.activeGames ? this.activeGames.size : 0,
-          connections: this.wsMap ? this.wsMap.size : 0,
-          questions: this.quizQuestionCache && this.quizQuestionCache['en'] ? 
-                     this.quizQuestionCache['en'].length : 0,
-          kvAvailable: !!(this.env && this.env.QUESTIONS),
-          quizAutoEnabled: this.quizAutoEnabled || false,
-          isQuizRunning: !!this.currentQuestion,
-          timestamp: Date.now()
-        }), { 
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      if (url.pathname === "/game/ws") {
-        const upgrade = req.headers.get("Upgrade");
-        if (upgrade !== "websocket") {
-          return new Response("WebSocket only", { status: 400 });
-        }
-        
-        try {
-          const pair = new WebSocketPair();
-          const [client, server] = [pair[0], pair[1]];
-          
-          const wsId = ++this._wsIdCounter;
-          server._wsId = wsId;
-          server._closing = false;
-          server.room = null;
-          server.roomname = null;
-          server._createdAt = Date.now();
-          server.username = null;
-          
-          const cf = req.cf;
-          let country = 'US';
-          if (cf && cf.country) {
-            country = cf.country;
-          }
-          server._country = country;
-          const lang = this._countryToLanguage(country);
-          this.userLanguage.set(wsId, lang);
-          this.userCountry.set(wsId, country);
-          
-          try { 
-            this.state.acceptWebSocket(server);
-          } catch(e) { 
-            return new Response("WebSocket acceptance failed", { status: 500 }); 
-          }
-          
-          server.addEventListener("message", async (event) => {
-            try {
-              const data = JSON.parse(event.data);
-              if (!Array.isArray(data) || data.length === 0) return;
-              await this.handleEvent(server, data);
-            } catch(e) {
-              this._safeSend(server, ["gameLowCardError", e.message || "Error"]);
-            }
-          });
-          
-          server.addEventListener("close", () => {
-            try {
-              if (server.room || server.roomname) {
-                const room = server.room || server.roomname;
-                const wsId = this._getWsId(server);
-                const username = server.username;
-                this._removeClient(room, server);
-                this.userLanguage.delete(wsId);
-                this.userCountry.delete(wsId);
-                if (username) {
-                  const conn = this.userConnections.get(username);
-                  if (conn && conn.wsId === wsId) {
-                    this.userConnections.delete(username);
-                  }
-                }
-              }
-              const clients = this.wsClients.get(QUIZ_ROOM);
-              if (clients && clients.size > 0) {
-                this.ensureQuizRunning();
-              }
-            } catch(e) {}
-          });
-          
-          server.addEventListener("error", () => {
-            try {
-              if (server.room || server.roomname) {
-                const room = server.room || server.roomname;
-                const wsId = this._getWsId(server);
-                const username = server.username;
-                this._removeClient(room, server);
-                this.userLanguage.delete(wsId);
-                this.userCountry.delete(wsId);
-                if (username) {
-                  const conn = this.userConnections.get(username);
-                  if (conn && conn.wsId === wsId) {
-                    this.userConnections.delete(username);
-                  }
-                }
-              }
-            } catch(e) {}
-          });
-          
-          return new Response(null, { status: 101, webSocket: client });
-          
-        } catch(e) {
-          return new Response("WebSocket creation failed", { status: 500 });
-        }
-      }
-      
-      return new Response("Game Server", { status: 200 });
-      
-    } catch(e) {
-      return new Response("Internal Server Error: " + e.message, { status: 500 });
-    }
-  }
-  
-  async webSocketMessage(ws, msg) {
-    try {
-      if (!ws || ws._closing || this.closing || this.isDestroyed) return;
-      if (!ws._wsId) return;
-      const data = JSON.parse(msg);
-      if (!Array.isArray(data) || data.length === 0) return;
-      await this.handleEvent(ws, data);
-    } catch(e) {
-      this._safeSend(ws, ["gameLowCardError", e.message || "Error"]);
-    }
-  }
-  
-  async webSocketClose(ws) {
-    try {
-      if (!ws) return;
-      const wsId = this._getWsId(ws);
-      const username = ws.username;
-      if (ws.room || ws.roomname) {
-        const room = ws.room || ws.roomname;
-        this._removeClient(room, ws);
-      }
-      this.userLanguage.delete(wsId);
-      this.userCountry.delete(wsId);
-      if (username) {
-        const conn = this.userConnections.get(username);
-        if (conn && conn.wsId === wsId) {
-          this.userConnections.delete(username);
-        }
-      }
-      if (wsId) {
-        this.clientRooms.delete(wsId);
-        this.wsMap.delete(wsId);
-      }
-      ws.room = null;
-      ws.roomname = null;
-      ws._wsId = null;
-      ws.username = null;
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (clients && clients.size > 0) {
-        this.ensureQuizRunning();
-      }
-    } catch(e) {}
-  }
-  
-  async webSocketError(ws) {
-    try {
-      if (!ws) return;
-      const wsId = this._getWsId(ws);
-      const username = ws.username;
-      if (ws.room || ws.roomname) {
-        const room = ws.room || ws.roomname;
-        this._removeClient(room, ws);
-      }
-      this.userLanguage.delete(wsId);
-      this.userCountry.delete(wsId);
-      if (username) {
-        const conn = this.userConnections.get(username);
-        if (conn && conn.wsId === wsId) {
-          this.userConnections.delete(username);
-        }
-      }
-      if (wsId) {
-        this.clientRooms.delete(wsId);
-        this.wsMap.delete(wsId);
-      }
-      ws.room = null;
-      ws.roomname = null;
-      ws._wsId = null;
-      ws.username = null;
-    } catch(e) {}
-  }
-  
-  async destroy() {
-    try {
-      if (this.isDestroyed) return;
-      this.closing = true;
-      this.isDestroyed = true;
-      
-      if (this.quizAutoTimer) {
-        clearInterval(this.quizAutoTimer);
-        this.quizAutoTimer = null;
-      }
-      if (this.quizTimer) {
-        clearInterval(this.quizTimer);
-        this.quizTimer = null;
-      }
-      if (this._translateResetInterval) {
-        clearInterval(this._translateResetInterval);
-        this._translateResetInterval = null;
-      }
-      if (this._quizTimeout) {
-        clearTimeout(this._quizTimeout);
-        this._quizTimeout = null;
-      }
-      if (this._quizBreakTimeout) {
-        clearTimeout(this._quizBreakTimeout);
-        this._quizBreakTimeout = null;
-      }
-      if (this._quizStartTimeout) {
-        clearTimeout(this._quizStartTimeout);
-        this._quizStartTimeout = null;
-      }
-      
-      for (const [room, game] of this.activeGames) {
-        if (game) {
-          const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
-          for (const key of timers) {
-            if (game[key]) {
-              clearTimeout(game[key]);
-              clearInterval(game[key]);
-              game[key] = null;
-            }
-          }
-          if (game._botTimeouts) {
-            for (const id of game._botTimeouts) clearTimeout(id);
-            game._botTimeouts.clear();
-            game._botTimeouts = null;
-          }
-          game.players = null;
-          game.botPlayers = null;
-          game.numbers = null;
-          game.tanda = null;
-          game.eliminated = null;
-          game.playerWsId = null;
-        }
-      }
-      
-      for (const [room, timer] of this._cleanupTimers) {
-        clearTimeout(timer);
-      }
-      this._cleanupTimers.clear();
-      
-      this.quizQuestionCache = {};
-      this.questionTranslations.clear();
-      this.userLanguage.clear();
-      this.userCountry.clear();
-      this.wsClients.clear();
-      this.clientRooms.clear();
-      this.wsMap.clear();
-      this.roomViewers.clear();
-      this.userConnections.clear();
-      this.connectionLocks.clear();
-      this._gameLocks.clear();
-      this._joinLocks.clear();
-      this._switchLocks.clear();
-      this._gameStartFlags.clear();
-      this._roomBroadcastCount.clear();
-      this._roomBroadcastReset.clear();
-      this.quizAnswered.clear();
-      this.activeGames.clear();
-      
-      for (const [room, wsIds] of this.wsClients) {
-        for (const wsId of wsIds) {
-          const ws = this.wsMap.get(wsId);
-          if (ws) {
-            try {
-              ws.close(1000, "Game server shutting down");
-            } catch(e) {}
           }
         }
       }
