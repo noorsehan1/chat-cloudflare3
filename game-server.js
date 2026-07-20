@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL - TRANSLATE ALL QUESTIONS TO USER LANGUAGE) ====================
+// ==================== GAME-SERVER.JS (NO CHAT - QUIZ + GAME ONLY) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -21,13 +21,13 @@ const CONSTANTS = {
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
   QUIZ_INTERVAL_MS: 30000,
   QUIZ_TIME_LIMIT_MS: 15000,
-  TRANSLATE_LIMIT: 999999,        // ✅ Tidak terbatas (DeepLX gratis)
+  TRANSLATE_LIMIT: 999999,
   QUIZ_BREAK_MS: 2000,
   QUIZ_START_DELAY_MS: 5000,
   MAX_RETRY_INIT_QUIZ: 2,
   MAX_BROADCAST_BATCH: 3,
   MAX_SHUTDOWN_WAIT_MS: 5000,
-  MAX_WS_CLIENTS: 200,
+  MAX_WS_CLIENTS: 50,
   MAX_ARRAY_SIZE: 50,
   CIRCUIT_BREAKER_THRESHOLD: 2,
   CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
@@ -37,17 +37,12 @@ const CONSTANTS = {
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
   SCHEDULER_INTERVAL_MS: 60000,
   // ✅ KONFIGURASI UNTUK 10.000 SOAL
-  QUIZ_BATCH_SIZE: 100,              // Ambil 100 soal per batch
-  QUIZ_BATCH_THRESHOLD: 20,          // Load batch baru jika sisa < 20
-  MAX_QUESTIONS: 10000,              // Total soal di KV
-  // ✅ KONFIGURASI DEEPLX
-  DEEPLX_URL: 'https://your-worker.workers.dev/translate', // Ganti dengan URL DeepLX Anda
-  DEEPLX_TIMEOUT: 5000,
-  // ✅ BAHASA YANG DIDUKUNG
-  SUPPORTED_LANGUAGES: [
-    'id', 'ms', 'ja', 'ko', 'th', 'vi', 'zh', 'hi', 
-    'ar', 'ru', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'tr'
-  ],
+  QUIZ_BATCH_SIZE: 100,
+  QUIZ_BATCH_THRESHOLD: 20,
+  MAX_QUESTIONS: 10000,
+  // ✅ DeepLX Config - HANYA UNTUK QUIZ
+  DEEPLX_API_URL: 'https://api.deeplx.org/translate',
+  DEEPLX_TIMEOUT_MS: 3000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -104,19 +99,19 @@ export class GameServer {
       this._quizStartTime = null;
       
       // ✅ TRACKING UNTUK 10.000 SOAL
-      this._allQuestions = [];              // Semua soal (10.000)
-      this._currentQuestions = [];          // Soal aktif di cache (100)
-      this._currentBatchStart = 0;          // Index awal batch (0, 100, 200, dst)
-      this._currentBatchEnd = 0;            // Index akhir batch (99, 199, 299, dst)
-      this._isAllQuestionsLoaded = false;   // Flag sudah load semua
-      this._questionPointer = 0;            // Pointer soal dalam batch
+      this._allQuestions = [];
+      this._currentQuestions = [];
+      this._currentBatchStart = 0;
+      this._currentBatchEnd = 0;
+      this._isAllQuestionsLoaded = false;
+      this._questionPointer = 0;
       
-      // TRANSLATION
+      // ✅ DEEPLX TRANSLATION - HANYA UNTUK QUIZ
       this.translateCount = 0;
       this.translateDate = new Date().toUTCString();
       this.translateLimitReached = false;
-      this.userLanguage = new Map();        // ✅ MAP: wsId → language code
-      this.userCountry = new Map();         // ✅ MAP: wsId → country code
+      this.userLanguage = new Map();
+      this.userCountry = new Map();
       
       // TIMERS
       this._quizTimeout = null;
@@ -578,20 +573,18 @@ export class GameServer {
     }
   }
   
-  // ==================== ✅ LOAD SEMUA SOAL DARI KV (10.000) ====================
+  // ==================== LOAD SEMUA SOAL DARI KV (10.000) ====================
   
   async _loadAllQuestionsFromKV() {
     try {
       if (!this.env || !this.env.QUESTIONS) return false;
       
-      // ✅ AMBIL SEMUA SOAL DARI KV
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
       
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
         
-        // ✅ SIMPAN SEMUA SOAL DENGAN NOMOR URUT
         this._allQuestions = cached.questions.map((q, index) => ({
-          id: index + 1,  // Nomor urut 1, 2, 3, ... 10000
+          id: index + 1,
           question: q.question || '',
           options: q.options || { A: '', B: '', C: '', D: '' },
           correct: q.correct || 'A',
@@ -604,7 +597,6 @@ export class GameServer {
         this._currentBatchEnd = 0;
         this._questionPointer = 0;
         
-        // ✅ AMBIL BATCH PERTAMA (100 SOAL PERTAMA: 1-100)
         this._loadNextBatch();
         
         console.log(`✅ Loaded ${this._allQuestions.length} questions from KV`);
@@ -619,21 +611,15 @@ export class GameServer {
     }
   }
   
-  // ==================== ✅ AMBIL BATCH BERIKUTNYA (URUT) ====================
-  
   _loadNextBatch() {
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
       return false;
     }
     
-    const totalQuestions = this._allQuestions.length; // 10.000
+    const totalQuestions = this._allQuestions.length;
+    let startIndex = this._currentBatchEnd;
     
-    // ✅ HITUNG BATCH BERIKUTNYA
-    let startIndex = this._currentBatchEnd; // Mulai dari akhir batch sebelumnya
-    
-    // ✅ CEK APAKAH SUDAH MELEWATI TOTAL SOAL
     if (startIndex >= totalQuestions) {
-      // ✅ RESET KE AWAL (1 - 100)
       console.log("🔄 All 10,000 questions have been used! Resetting to question 1...");
       startIndex = 0;
       this._currentBatchStart = 0;
@@ -646,26 +632,20 @@ export class GameServer {
       ]);
     }
     
-    // ✅ HITUNG AKHIR BATCH (start + 100)
     let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
-    
-    // ✅ AMBIL SOAL DARI startIndex SAMPAI endIndex
     const batch = this._allQuestions.slice(startIndex, endIndex);
     
-    // ✅ SIMPAN BATCH KE CACHE
     this.quizQuestionCache['en'] = batch;
     this._currentQuestions = batch;
     this._currentBatchStart = startIndex;
     this._currentBatchEnd = endIndex;
-    this._questionPointer = 0; // Reset pointer untuk batch baru
+    this._questionPointer = 0;
     
     const startNum = startIndex + 1;
     const endNum = endIndex;
     
     console.log(`📚 Loaded questions ${startNum} to ${endNum} (${batch.length} questions)`);
-    console.log(`📚 Next batch will start from ${endNum + 1}`);
     
-    // ✅ BROADCAST STATUS KE USER
     this._broadcastToRoom(QUIZ_ROOM, [
       "quizBatchLoaded",
       {
@@ -681,22 +661,18 @@ export class GameServer {
     return true;
   }
   
-  // ==================== ✅ CEK DAN LOAD BATCH BARU ====================
-  
   _checkAndLoadNextBatch() {
     const currentQuestions = this.quizQuestionCache['en'] || [];
     
-    // ✅ JIKA SOAL TINGGAL SEDIKIT (< 20), LOAD BATCH BARU
     if (currentQuestions.length < CONSTANTS.QUIZ_BATCH_THRESHOLD) {
       console.log(`⚠️ ${currentQuestions.length} questions remaining, loading next batch...`);
       this._loadNextBatch();
       return true;
     }
     
-    // ✅ CEK APAKAH SUDAH MENCAPAI AKHIR
     if (this._currentBatchEnd >= this._allQuestions.length && this._isAllQuestionsLoaded) {
       console.log("🔄 Reached end of all questions! Resetting...");
-      this._loadNextBatch(); // Akan reset ke awal
+      this._loadNextBatch();
       return true;
     }
     
@@ -740,7 +716,6 @@ export class GameServer {
         return;
       }
 
-      // ✅ CEK APAKAH PERLU LOAD BATCH BARU
       this._checkAndLoadNextBatch();
 
       let questions = this.quizQuestionCache['en'];
@@ -757,22 +732,18 @@ export class GameServer {
         if (!questions || questions.length === 0) return;
       }
 
-      // ✅ AMBIL SOAL BERURUTAN (bukan random)
       if (this._questionPointer >= questions.length) {
-        // ✅ JIKA POINTER MELEWATI BATCH, LOAD BATCH BARU
         this._loadNextBatch();
         questions = this.quizQuestionCache['en'];
         if (!questions || questions.length === 0) return;
         this._questionPointer = 0;
       }
       
-      // ✅ AMBIL SOAL BERDASARKAN POINTER
       const q = questions[this._questionPointer];
-      this._questionPointer++; // Naikkan pointer untuk soal berikutnya
+      this._questionPointer++;
       
       if (!q || !q.options) return;
 
-      // ✅ SHUFFLE OPTIONS (biar acak)
       const shuffled = this._shuffleQuestionOptions(q);
       
       this.currentQuestion = {
@@ -786,7 +757,6 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
 
-      // ✅ KIRIM PERTANYAAN KE CLIENT (DENGAN TRANSLATE PER USER)
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -986,7 +956,7 @@ export class GameServer {
     }, CONSTANTS.QUIZ_INTERVAL_MS);
   }
   
-  // ==================== HANDLE EVENT ====================
+  // ==================== HANDLE EVENT (TANPA CHAT) ====================
   
   async handleEvent(ws, data) {
     try {
@@ -1066,177 +1036,8 @@ export class GameServer {
         return;
       }
       
-      // ✅ USER SET LANGUAGE MANUAL
-      if (evt === "setLanguage") {
-        const [_, lang] = data;
-        const wsId = this._getWsId(ws);
-        if (wsId && lang) {
-          this.userLanguage.set(wsId, lang);
-          this._safeSend(ws, ["languageSet", lang, true]);
-        }
-        return;
-      }
-      
-      // ✅ GET USER LANGUAGE
-      if (evt === "getUserLanguage") {
-        const wsId = this._getWsId(ws);
-        const lang = wsId ? this.userLanguage.get(wsId) || 'en' : 'en';
-        this._safeSend(ws, ["userLanguage", lang]);
-        return;
-      }
-      
-      if (evt === "getRoomUsers") {
-        return;
-      }
-      
-      // ===== CHAT EVENTS =====
-      if (evt === "setIdTarget") {
-        const [_, id, roomname] = data;
-        this.myIdTarget = id || "";
-        this.roomnama = roomname || "";
-        return;
-      }
-      
-      if (evt === "setIdTarget2") {
-        const [_, id, baru] = data;
-        this.myIdTarget = id || "";
-        if (id && this.roomnama) {
-          this._broadcastToRoom(this.roomnama, ["joinRoom", this.roomnama]);
-        }
-        return;
-      }
-      
-      if (evt === "joinRoom") {
-        const [_, roomname] = data;
-        if (roomname) {
-          this.roomnama = roomname;
-          this._broadcastToRoom(roomname, ["rooMasuk", this._getSeatNumber(ws), roomname]);
-          this._safeSend(ws, ["numberKursiSaya", this._getSeatNumber(ws)]);
-        }
-        return;
-      }
-      
-      if (evt === "chat") {
-        const [_, roomname, noImageURL, username, message, usernameColor, chatTextColor] = data;
-        this._broadcastToRoom(roomname, [
-          "chat",
-          roomname || "",
-          noImageURL || "",
-          username || "",
-          message || "",
-          usernameColor || "",
-          chatTextColor || ""
-        ]);
-        return;
-      }
-      
-      if (evt === "private") {
-        const [_, idtarget, noimageUrl, message, sender] = data;
-        this._sendPrivate(idtarget, noimageUrl, message, sender);
-        return;
-      }
-      
-      if (evt === "sendnotif") {
-        const [_, idtarget, noimageUrl, username, deskripsi] = data;
-        this._sendNotif(idtarget, noimageUrl, username, deskripsi);
-        return;
-      }
-      
-      if (evt === "removeKursiAndPoint") {
-        const [_, roomName, seatNumber] = data;
-        this._broadcastToRoom(roomName, ["removeKursi", roomName, seatNumber]);
-        return;
-      }
-      
-      if (evt === "resetRoom") {
-        const [_, roomName] = data;
-        this._broadcastToRoom(roomName, ["resetRoom", roomName]);
-        return;
-      }
-      
-      if (evt === "updatePoint") {
-        const [_, roomname, seat, x, y, fast] = data;
-        this._broadcastToRoom(roomname, ["pointUpdated", roomname, seat, x, y, fast]);
-        return;
-      }
-      
-      if (evt === "updateKursi") {
-        const [_, roomname, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
-        this._broadcastToRoom(roomname, [
-          "kursiUpdated",
-          roomname, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda
-        ]);
-        return;
-      }
-      
-      if (evt === "modwarning") {
-        const [_, roomName] = data;
-        this._broadcastToRoom(roomName, ["modwarning", roomName]);
-        return;
-      }
-      
-      if (evt === "getOnlineUsers") {
-        const users = this._getOnlineUsers();
-        this._safeSend(ws, ["allOnlineUsers", users]);
-        return;
-      }
-      
-      if (evt === "isUserOnline") {
-        const [_, userId, tanda] = data;
-        const isOnline = this._isUserOnline(userId);
-        this._safeSend(ws, ["userOnlineStatus", userId, isOnline, tanda || ""]);
-        return;
-      }
-      
-      if (evt === "getAllRoomsUserCount") {
-        const roomCounts = this._getAllRoomsUserCount();
-        this._safeSend(ws, ["allRoomsUserCount", roomCounts]);
-        return;
-      }
-      
-      if (evt === "getCurrentNumber") {
-        const number = Math.floor(Math.random() * 12) + 1;
-        this._safeSend(ws, ["currentNumber", number]);
-        return;
-      }
-      
-      if (evt === "gift") {
-        const [_, roomname, sender, receiver, giftName] = data;
-        this._broadcastToRoom(roomname, ["gift", roomname, sender, receiver, giftName, Date.now()]);
-        return;
-      }
-      
-      if (evt === "rollangak") {
-        const [_, roomname, username, angka] = data;
-        this._broadcastToRoom(roomname, ["rollangakBroadcast", roomname, username, angka]);
-        return;
-      }
-      
-      if (evt === "setMuteType") {
-        const [_, isMuted, roomname] = data;
-        this._broadcastToRoom(roomname, ["muteStatusChanged", isMuted, roomname]);
-        return;
-      }
-      
-      if (evt === "getMuteType") {
-        const [_, roomname] = data;
-        this._safeSend(ws, ["muteTypeResponse", false, roomname]);
-        return;
-      }
-      
-      if (evt === "isInRoom") {
-        const isInRoom = this.roomnama && this.roomnama.length > 0;
-        this._safeSend(ws, ["inRoomStatus", isInRoom]);
-        return;
-      }
-      
-      if (evt === "onDestroy") {
-        const room = this.roomnama;
-        if (room) {
-          this._broadcastToRoom(room, ["removeKursi", room, this._getSeatNumber(ws)]);
-        }
-        return;
-      }
+      // ❌ SEMUA CHAT EVENT DIHAPUS
+      // Tidak ada: chat, private, notif, gift, rollangak, setMuteType, dll
       
       // ===== GAME EVENTS =====
       const room = this._ensureRoomConsistency(ws);
@@ -1275,7 +1076,7 @@ export class GameServer {
     }
   }
   
-  // ==================== ✅ GET QUIZ STATUS ====================
+  // ==================== GET QUIZ STATUS ====================
   
   _getQuizStatus() {
     try {
@@ -1303,687 +1104,7 @@ export class GameServer {
     }
   }
   
-  // ==================== CHAT HELPER METHODS ====================
-  
-  _getSeatNumber(ws) {
-    if (!ws) return -1;
-    const wsId = this._getWsId(ws);
-    if (!wsId) return -1;
-    return (wsId % 45) + 1;
-  }
-  
-  _getOnlineUsers() {
-    const users = [];
-    for (const [username, conn] of this.userConnections) {
-      if (conn && conn.ws && conn.ws.readyState === 1) {
-        users.push(username);
-      }
-    }
-    return users;
-  }
-  
-  _isUserOnline(userId) {
-    if (!userId) return false;
-    const conn = this.userConnections.get(userId);
-    return conn && conn.ws && conn.ws.readyState === 1;
-  }
-  
-  _getAllRoomsUserCount() {
-    const result = [];
-    for (const [room, wsIds] of this.wsClients) {
-      if (room === QUIZ_ROOM) continue;
-      result.push({
-        roomName: room,
-        userCount: wsIds ? wsIds.size : 0
-      });
-    }
-    return result;
-  }
-  
-  _sendPrivate(idtarget, noimageUrl, message, sender) {
-    const wsId = this._getWsIdByUsername(idtarget);
-    if (wsId) {
-      const ws = this.wsMap.get(wsId);
-      if (ws && ws.readyState === 1) {
-        this._safeSend(ws, ["private", idtarget, noimageUrl, message, Date.now(), sender]);
-        return;
-      }
-    }
-    const senderWsId = this._getWsIdByUsername(sender);
-    if (senderWsId) {
-      const senderWs = this.wsMap.get(senderWsId);
-      if (senderWs) {
-        this._safeSend(senderWs, ["privateFailed", idtarget, "User offline"]);
-      }
-    }
-  }
-  
-  _sendNotif(idtarget, noimageUrl, username, deskripsi) {
-    const wsId = this._getWsIdByUsername(idtarget);
-    if (wsId) {
-      const ws = this.wsMap.get(wsId);
-      if (ws && ws.readyState === 1) {
-        this._safeSend(ws, ["notif", idtarget, noimageUrl, username, Date.now()]);
-      }
-    }
-  }
-  
-  _getWsIdByUsername(username) {
-    if (!username) return null;
-    const conn = this.userConnections.get(username);
-    return conn ? conn.wsId : null;
-  }
-  
-  // ==================== ✅ COUNTRY TO LANGUAGE (LENGKAP) ====================
-  
-  _countryToLanguage(countryCode) {
-    if (!countryCode) return 'en';
-    
-    const map = {
-      // ===== ASIA =====
-      'ID': 'id',    // Indonesia
-      'MY': 'ms',    // Malaysia
-      'SG': 'zh',    // Singapore
-      'PH': 'tl',    // Philippines
-      'JP': 'ja',    // Japan
-      'CN': 'zh',    // China
-      'TW': 'zh',    // Taiwan
-      'HK': 'zh',    // Hong Kong
-      'KR': 'ko',    // Korea
-      'IN': 'hi',    // India
-      'TH': 'th',    // Thailand
-      'VN': 'vi',    // Vietnam
-      'MM': 'my',    // Myanmar
-      'KH': 'km',    // Cambodia
-      'LA': 'lo',    // Laos
-      'BD': 'bn',    // Bangladesh
-      'PK': 'ur',    // Pakistan
-      'LK': 'si',    // Sri Lanka
-      'NP': 'ne',    // Nepal
-      
-      // ===== EUROPE =====
-      'GB': 'en',    // UK
-      'US': 'en',    // USA
-      'AU': 'en',    // Australia
-      'CA': 'en',    // Canada
-      'NZ': 'en',    // New Zealand
-      'FR': 'fr',    // France
-      'DE': 'de',    // Germany
-      'ES': 'es',    // Spain
-      'IT': 'it',    // Italy
-      'PT': 'pt',    // Portugal
-      'NL': 'nl',    // Netherlands
-      'RU': 'ru',    // Russia
-      'UA': 'uk',    // Ukraine
-      'PL': 'pl',    // Poland
-      'TR': 'tr',    // Turkey
-      'GR': 'el',    // Greece
-      'SE': 'sv',    // Sweden
-      'NO': 'no',    // Norway
-      'DK': 'da',    // Denmark
-      'FI': 'fi',    // Finland
-      'IE': 'en',    // Ireland
-      'CH': 'de',    // Switzerland
-      'AT': 'de',    // Austria
-      'BE': 'nl',    // Belgium
-      'HU': 'hu',    // Hungary
-      'CZ': 'cs',    // Czech
-      'SK': 'sk',    // Slovakia
-      'RO': 'ro',    // Romania
-      'BG': 'bg',    // Bulgaria
-      'HR': 'hr',    // Croatia
-      'RS': 'sr',    // Serbia
-      'SI': 'sl',    // Slovenia
-      'LT': 'lt',    // Lithuania
-      'LV': 'lv',    // Latvia
-      'EE': 'et',    // Estonia
-      'IS': 'is',    // Iceland
-      'MT': 'mt',    // Malta
-      'AL': 'sq',    // Albania
-      'MK': 'mk',    // North Macedonia
-      'BA': 'bs',    // Bosnia
-      
-      // ===== MIDDLE EAST =====
-      'SA': 'ar',    // Saudi Arabia
-      'AE': 'ar',    // UAE
-      'QA': 'ar',    // Qatar
-      'KW': 'ar',    // Kuwait
-      'BH': 'ar',    // Bahrain
-      'OM': 'ar',    // Oman
-      'YE': 'ar',    // Yemen
-      'SY': 'ar',    // Syria
-      'LB': 'ar',    // Lebanon
-      'JO': 'ar',    // Jordan
-      'IQ': 'ar',    // Iraq
-      'EG': 'ar',    // Egypt
-      'LY': 'ar',    // Libya
-      'TN': 'ar',    // Tunisia
-      'DZ': 'ar',    // Algeria
-      'MA': 'ar',    // Morocco
-      'MR': 'ar',    // Mauritania
-      'SD': 'ar',    // Sudan
-      'PS': 'ar',    // Palestine
-      'IL': 'he',    // Israel
-      'IR': 'fa',    // Iran
-      'AF': 'ps',    // Afghanistan
-      'AM': 'hy',    // Armenia
-      
-      // ===== AMERICAS =====
-      'MX': 'es',    // Mexico
-      'BR': 'pt',    // Brazil
-      'AR': 'es',    // Argentina
-      'CO': 'es',    // Colombia
-      'CL': 'es',    // Chile
-      'PE': 'es',    // Peru
-      'VE': 'es',    // Venezuela
-      'EC': 'es',    // Ecuador
-      'BO': 'es',    // Bolivia
-      'PY': 'es',    // Paraguay
-      'UY': 'es',    // Uruguay
-      'GT': 'es',    // Guatemala
-      'HN': 'es',    // Honduras
-      'NI': 'es',    // Nicaragua
-      'CR': 'es',    // Costa Rica
-      'PA': 'es',    // Panama
-      'SV': 'es',    // El Salvador
-      'DO': 'es',    // Dominican Republic
-      'CU': 'es',    // Cuba
-      
-      // ===== AFRICA =====
-      'ZA': 'en',    // South Africa
-      'NG': 'en',    // Nigeria
-      'KE': 'en',    // Kenya
-      'GH': 'en',    // Ghana
-      'TZ': 'en',    // Tanzania
-      'UG': 'en',    // Uganda
-      'ZM': 'en',    // Zambia
-      'ZW': 'en',    // Zimbabwe
-      'MW': 'en',    // Malawi
-      'SL': 'en',    // Sierra Leone
-      'LR': 'en',    // Liberia
-      'GM': 'en',    // Gambia
-      'BW': 'en',    // Botswana
-      'NA': 'en',    // Namibia
-      'MG': 'mg',    // Madagascar
-      'MU': 'en',    // Mauritius
-      'SC': 'en',    // Seychelles
-      
-      // ===== OCEANIA =====
-      'FJ': 'en',    // Fiji
-      'PG': 'en',    // Papua New Guinea
-      'SB': 'en',    // Solomon Islands
-      'VU': 'en',    // Vanuatu
-      'WS': 'en',    // Samoa
-      'TO': 'en',    // Tonga
-      'KI': 'en',    // Kiribati
-      'TV': 'en',    // Tuvalu
-      'NR': 'en',    // Nauru
-      'PW': 'en',    // Palau
-      'FM': 'en',    // Micronesia
-      'MH': 'en',    // Marshall Islands
-    };
-    
-    const lang = map[countryCode.toUpperCase()];
-    return lang || 'en';
-  }
-  
-  // ==================== TRANSLATE DENGAN DEEPLX ====================
-  
-  _resetTranslateCounterDaily() {
-    if (this._translateResetInterval) {
-      clearInterval(this._translateResetInterval);
-      this._translateResetInterval = null;
-    }
-    this._translateResetInterval = setInterval(() => {
-      try {
-        if (this.closing || this.isDestroyed) {
-          clearInterval(this._translateResetInterval);
-          this._translateResetInterval = null;
-          return;
-        }
-        const now = new Date().toUTCString();
-        if (now !== this.translateDate) {
-          this.translateDate = now;
-          this.translateCount = 0;
-          this.translateLimitReached = false;
-          this.questionTranslations.clear();
-          this._translationCircuitBreaker.isOpen = false;
-          this._translationCircuitBreaker.failures = 0;
-        }
-      } catch(e) {}
-    }, 60000);
-  }
-  
-  _getUserLanguage(ws) {
-    if (!ws) return 'en';
-    const wsId = this._getWsId(ws);
-    if (!wsId) return 'en';
-    return this.userLanguage.get(wsId) || 'en';
-  }
-  
-  // ✅ TRANSLATE MENGGUNAKAN DEEPLX (GRATIS SELAMANYA)
-  async _translateText(text, targetLang) {
-    if (targetLang === 'en' || !text || typeof text !== 'string') return text;
-    
-    // ✅ Cek cache memory
-    const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
-    if (this.questionTranslations.has(cacheKey)) {
-      return this.questionTranslations.get(cacheKey);
-    }
-    
-    // ✅ Cek di KV cache
-    try {
-      if (this.env && this.env.QUESTIONS) {
-        const kvKey = `trans_${Buffer.from(text).toString('base64').substring(0, 50)}_${targetLang}`;
-        const cached = await this.env.QUESTIONS.get(kvKey);
-        if (cached) {
-          this.questionTranslations.set(cacheKey, cached);
-          return cached;
-        }
-      }
-    } catch(e) {}
-    
-    // ✅ Circuit breaker jika DeepLX error
-    if (this._translationCircuitBreaker.isOpen) {
-      const now = Date.now();
-      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
-        this._translationCircuitBreaker.isOpen = false;
-        this._translationCircuitBreaker.failures = 0;
-      } else {
-        return text;
-      }
-    }
-    
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT);
-      
-      // ✅ Panggil DeepLX API
-      const response = await fetch(CONSTANTS.DEEPLX_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: text,
-          source_lang: 'EN',
-          target_lang: targetLang.toUpperCase()
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      
-      if (data && data.data) {
-        const translated = data.data;
-        
-        // ✅ Simpan ke cache memory
-        this.questionTranslations.set(cacheKey, translated);
-        
-        // ✅ Simpan ke KV cache
-        try {
-          if (this.env && this.env.QUESTIONS) {
-            const kvKey = `trans_${Buffer.from(text).toString('base64').substring(0, 50)}_${targetLang}`;
-            await this.env.QUESTIONS.put(kvKey, translated, { expirationTtl: 86400 * 30 }); // 30 hari
-          }
-        } catch(e) {}
-        
-        this.translateCount++;
-        this._translationCircuitBreaker.failures = 0;
-        return translated;
-      }
-      
-      return text;
-    } catch(e) {
-      console.error(`DeepLX translate error (${targetLang}):`, e.message);
-      this._translationCircuitBreaker.failures++;
-      this._translationCircuitBreaker.lastFailureTime = Date.now();
-      if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
-        this._translationCircuitBreaker.isOpen = true;
-      }
-      return text;
-    }
-  }
-  
-  async _translateOptions(options, targetLang) {
-    if (targetLang === 'en' || !options) {
-      return options;
-    }
-    const translatedOptions = {};
-    const keys = ['A', 'B', 'C', 'D'];
-    for (const key of keys) {
-      if (options[key] && typeof options[key] === 'string') {
-        try {
-          translatedOptions[key] = await this._translateText(options[key], targetLang);
-        } catch(e) {
-          translatedOptions[key] = options[key];
-        }
-      } else {
-        translatedOptions[key] = options[key] || '';
-      }
-    }
-    return translatedOptions;
-  }
-  
-  // ==================== LOAD QUESTIONS ====================
-  
-  async _loadQuestionsFromKV() {
-    return this._loadAllQuestionsFromKV();
-  }
-  
-  async _initQuiz(retryCount = 0) {
-    try {
-      const loaded = await this._loadAllQuestionsFromKV();
-      if (loaded) {
-        this._startQuizLoop();
-        this._resetTranslateCounterDaily();
-        return true;
-      }
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    } catch(e) {
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    }
-  }
-  
-  ensureQuizRunning() {
-    try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients || clients.size === 0) return;
-      
-      this._forceStartQuizIfTime();
-      
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        this._initQuiz().then(() => {
-          if (!this.closing && !this.isDestroyed) {
-            this._startQuizIfNeeded();
-          }
-        });
-        return;
-      }
-      this._startQuizIfNeeded();
-    } catch(e) {
-      console.error("Ensure quiz running error:", e);
-    }
-  }
-  
-  _startQuizIfNeeded() {
-    try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients || clients.size === 0) return;
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-          this._initQuiz().then(() => {
-            if (!this.closing && !this.isDestroyed) {
-              this._showQuestion();
-            }
-          });
-          return;
-        }
-        this._showQuestion();
-      }
-    } catch(e) {
-      console.error("Start quiz if needed error:", e);
-    }
-  }
-  
-  async forceStartQuiz() {
-    try {
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        await this._initQuiz();
-      }
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        return { success: false, message: "No questions available" };
-      }
-      if (this.currentQuestion || this._quizTimeout || this.isQuizWaiting) {
-        return { 
-          success: true, 
-          message: "Quiz already running",
-          questions: this._allQuestions.length 
-        };
-      }
-      this.quizAnswered = new Set();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this.currentQuestion = null;
-      if (this._quizTimeout) clearTimeout(this._quizTimeout);
-      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
-      if (this._quizStartTimeout) clearTimeout(this._quizStartTimeout);
-      this.isQuizWaiting = false;
-      await this._showQuestion();
-      return { 
-        success: true, 
-        message: "Quiz started!",
-        questions: this._allQuestions.length 
-      };
-    } catch(e) {
-      return { success: false, message: e.message };
-    }
-  }
-  
-  async startQuizWithDelay(delayMs = CONSTANTS.QUIZ_START_DELAY_MS) {
-    try {
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        await this._initQuiz();
-      }
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        return { success: false, message: "No questions available" };
-      }
-      if (this.currentQuestion || this._quizTimeout || this.isQuizWaiting) {
-        return { 
-          success: true, 
-          message: "Quiz already running",
-          questions: this._allQuestions.length 
-        };
-      }
-      this.quizAnswered = new Set();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this.currentQuestion = null;
-      if (this._quizTimeout) clearTimeout(this._quizTimeout);
-      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
-      if (this._quizStartTimeout) clearTimeout(this._quizStartTimeout);
-      this.isQuizWaiting = true;
-      this._quizStartTimeout = setTimeout(() => {
-        try {
-          if (this.closing || this.isDestroyed) {
-            this._quizStartTimeout = null;
-            return;
-          }
-          this.isQuizWaiting = false;
-          this._quizStartTimeout = null;
-          this._showQuestion();
-        } catch(e) {
-          this._quizStartTimeout = null;
-          this.isQuizWaiting = false;
-        }
-      }, delayMs);
-      return { 
-        success: true, 
-        message: `Quiz will start in ${delayMs/1000} seconds`,
-        questions: this._allQuestions.length 
-      };
-    } catch(e) {
-      return { success: false, message: e.message };
-    }
-  }
-  
-  async resetQuiz() {
-    try {
-      if (this._quizTimeout) clearTimeout(this._quizTimeout);
-      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
-      if (this._quizStartTimeout) clearTimeout(this._quizStartTimeout);
-      this.isQuizWaiting = false;
-      this.currentQuestion = null;
-      this.quizAnswered = new Set();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this._quizStartTime = null;
-      
-      // ✅ RESET KE AWAL
-      this._currentBatchStart = 0;
-      this._currentBatchEnd = 0;
-      this._questionPointer = 0;
-      this._currentQuestions = [];
-      this.questionTranslations.clear();
-      
-      // ✅ LOAD BATCH PERTAMA (1-100)
-      if (this._isAllQuestionsLoaded) {
-        this._loadNextBatch();
-      }
-      
-      return { success: true, message: "Quiz reset to question 1" };
-    } catch(e) {
-      return { success: false, message: e.message };
-    }
-  }
-  
-  // ==================== BROADCAST ====================
-  
-  _broadcastToRoom(room, message) {
-    if (this.closing || this.isDestroyed || !room || !message) return;
-    const wsIds = this.wsClients.get(room);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const now = Date.now();
-    const reset = this._roomBroadcastReset.get(room) || 0;
-    const count = this._roomBroadcastCount.get(room) || 0;
-    
-    if (now > reset) {
-      this._roomBroadcastReset.set(room, now + 1000);
-      this._roomBroadcastCount.set(room, 1);
-    } else {
-      if (count > CONSTANTS.MAX_BROADCAST_BATCH) return;
-      this._roomBroadcastCount.set(room, count + 1);
-    }
-    
-    const msgStr = JSON.stringify(message);
-    const wsIdArray = Array.from(wsIds);
-    const batchSize = Math.min(CONSTANTS.BATCH_SIZE, 2);
-    const disconnected = [];
-    
-    for (let i = 0; i < wsIdArray.length && i < 15; i += batchSize) {
-      const batch = wsIdArray.slice(i, i + batchSize);
-      for (const wsId of batch) {
-        const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1) {
-          try {
-            ws.send(msgStr);
-          } catch(e) {
-            disconnected.push(wsId);
-          }
-        } else {
-          disconnected.push(wsId);
-        }
-      }
-    }
-    
-    if (disconnected.length > 0) {
-      for (const wsId of disconnected) {
-        const ws = this.wsMap.get(wsId);
-        if (ws) {
-          this._removeClient(room, ws);
-        } else {
-          this._removeClientFromRoom(room, wsId);
-          this.clientRooms.delete(wsId);
-        }
-      }
-    }
-  }
-  
-  _safeSend(ws, message) {
-    if (!ws || ws.readyState !== 1) return false;
-    try {
-      ws.send(JSON.stringify(message));
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-  
-  // ==================== SHUFFLE HELPERS ====================
-  
-  _shuffleQuestionOptions(question) {
-    if (!question || !question.options) {
-      return { options: { A: '', B: '', C: '', D: '' }, correct: 'A' };
-    }
-    const options = question.options;
-    const keys = ['A', 'B', 'C', 'D'];
-    const entries = keys.map(key => ({
-      key: key,
-      text: options[key] || '',
-      isCorrect: key === question.correct
-    }));
-    const shuffled = this._shuffleArray(entries);
-    const newOptions = {};
-    const newKeys = ['A', 'B', 'C', 'D'];
-    let newCorrect = '';
-    shuffled.forEach((item, index) => {
-      const newKey = newKeys[index];
-      newOptions[newKey] = item.text;
-      if (item.isCorrect) newCorrect = newKey;
-    });
-    return {
-      options: newOptions,
-      correct: newCorrect || 'A'
-    };
-  }
-  
-  // ✅ BROADCAST QUIZ QUESTION DENGAN TRANSLATE PER USER
-  async _broadcastQuizQuestion(question, options) {
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds) return;
-    const wsIdArray = Array.from(wsIds);
-    
-    for (const wsId of wsIdArray) {
-      try {
-        const ws = this.wsMap.get(wsId);
-        if (!ws || ws.readyState !== 1) continue;
-        
-        const lang = this._getUserLanguage(ws);
-        
-        let finalQuestion = question;
-        let finalOptions = options;
-        
-        // ✅ Translate ke bahasa user (DeepLX - GRATIS)
-        if (lang !== 'en' && finalQuestion && typeof finalQuestion === 'string') {
-          try {
-            finalQuestion = await this._translateText(question, lang);
-            finalOptions = await this._translateOptions(options, lang);
-          } catch(e) {
-            // Fallback ke English jika error
-            console.error(`Translate error for ${lang}:`, e.message);
-          }
-        }
-        
-        const questionObj = {
-          question: finalQuestion || '',
-          options: finalOptions || { A: '', B: '', C: '', D: '' }
-        };
-        
-        this._safeSend(ws, ["quizQuestion", questionObj]);
-      } catch(e) {
-        console.error("Broadcast quiz error:", e);
-      }
-    }
-  }
-  
-  _shuffleArray(array) {
-    if (!array || !Array.isArray(array) || array.length === 0) return array || [];
-    const arr = array.length > CONSTANTS.MAX_ARRAY_SIZE ? array.slice(0, CONSTANTS.MAX_ARRAY_SIZE) : [...array];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-  }
-  
-  // ==================== WEBSOCKET HELPERS ====================
+  // ==================== WEB SOCKET HELPERS ====================
   
   _getWsId(ws) {
     return ws ? ws._wsId : null;
@@ -2016,36 +1137,6 @@ export class GameServer {
     return room;
   }
   
-  _lockUserConnection(username) {
-    if (this.connectionLocks.has(username)) return false;
-    this.connectionLocks.set(username, true);
-    return true;
-  }
-  
-  _unlockUserConnection(username) {
-    this.connectionLocks.delete(username);
-  }
-  
-  _forceCleanupUserConnections(username, excludeWsId = null) {
-    const conn = this.userConnections.get(username);
-    if (!conn) return;
-    if (excludeWsId !== null && conn.wsId === excludeWsId) return;
-    const oldWs = this.wsMap.get(conn.wsId);
-    if (oldWs && oldWs.readyState === 1) {
-      try { oldWs.close(1000, "Replaced by new connection"); } catch(e) {}
-    }
-    if (conn.room) this._removeClientFromRoom(conn.room, conn.wsId);
-    this.wsMap.delete(conn.wsId);
-    this.clientRooms.delete(conn.wsId);
-    this.userLanguage.delete(conn.wsId);
-    this.userCountry.delete(conn.wsId);
-    if (conn.room && this.roomViewers.has(conn.room)) {
-      this.roomViewers.get(conn.room).delete(username);
-      if (this.roomViewers.get(conn.room).size === 0) this.roomViewers.delete(conn.room);
-    }
-    this.userConnections.delete(username);
-  }
-  
   _addClient(room, ws, username = null, isNewConnection = false) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
@@ -2054,7 +1145,6 @@ export class GameServer {
       return;
     }
     if (username && isNewConnection) {
-      this._forceCleanupUserConnections(username, wsId);
       this.userConnections.set(username, {
         wsId: wsId,
         ws: ws,
@@ -2128,17 +1218,291 @@ export class GameServer {
     ws.username = null;
   }
   
-  _ensureSingleConnection(room, username, newWs, newWsId) {
-    if (!newWs) return newWsId;
-    const game = this.activeGames.get(room);
-    if (!game) return newWsId;
-    this._forceCleanupUserConnections(username, newWsId);
-    game.playerWsId.set(username, newWsId);
-    this._addClient(room, newWs, username, true);
-    return newWsId;
+  // ==================== DEEPLX TRANSLATE (HANYA UNTUK QUIZ) ====================
+  
+  _resetTranslateCounterDaily() {
+    if (this._translateResetInterval) {
+      clearInterval(this._translateResetInterval);
+      this._translateResetInterval = null;
+    }
+    this._translateResetInterval = setInterval(() => {
+      try {
+        if (this.closing || this.isDestroyed) {
+          clearInterval(this._translateResetInterval);
+          this._translateResetInterval = null;
+          return;
+        }
+        const now = new Date().toUTCString();
+        if (now !== this.translateDate) {
+          this.translateDate = now;
+          this.translateCount = 0;
+          this.translateLimitReached = false;
+          this.questionTranslations.clear();
+          this._translationCircuitBreaker.isOpen = false;
+          this._translationCircuitBreaker.failures = 0;
+        }
+      } catch(e) {}
+    }, 60000);
   }
   
-  _sendGameStatusToWs(ws, room) {}
+  _countryToLanguage(countryCode) {
+    if (!countryCode) return 'en';
+    const map = {
+      'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id',
+      'JP': 'ja', 'CN': 'zh', 'TW': 'zh', 'HK': 'zh',
+      'KR': 'ko', 'IN': 'hi', 'TH': 'th', 'VN': 'vi',
+      'GB': 'en', 'US': 'en', 'AU': 'en', 'CA': 'en',
+      'NZ': 'en', 'FR': 'fr', 'DE': 'de', 'ES': 'es',
+      'IT': 'it', 'PT': 'pt', 'NL': 'nl', 'RU': 'ru',
+      'UA': 'ru', 'PL': 'pl', 'TR': 'tr',
+      'QA': 'ar', 'SA': 'ar', 'AE': 'ar', 'KW': 'ar', 'BH': 'ar',
+      'OM': 'ar', 'YE': 'ar', 'SY': 'ar', 'LB': 'ar', 'PS': 'ar',
+      'SD': 'ar', 'LY': 'ar', 'TN': 'ar', 'DZ': 'ar', 'MA': 'ar',
+      'MR': 'ar', 'IQ': 'ar', 'JO': 'ar', 'EG': 'ar',
+      'MX': 'es', 'BR': 'pt', 'AR': 'es', 'CO': 'es',
+      'CL': 'es', 'PE': 'es',
+      'ZA': 'en', 'NG': 'en', 'KE': 'en',
+    };
+    return map[countryCode.toUpperCase()] || 'en';
+  }
+  
+  _getUserLanguage(ws) {
+    if (!ws) return 'en';
+    const wsId = this._getWsId(ws);
+    if (!wsId) return 'en';
+    return this.userLanguage.get(wsId) || 'en';
+  }
+  
+  // ✅ DEEPLX TRANSLATE - HANYA UNTUK QUIZ
+  async _translateText(text, targetLang) {
+    if (targetLang === 'en') return text;
+    if (this.translateLimitReached) return text;
+    if (!text || typeof text !== 'string') return text;
+    
+    if (this._translationCircuitBreaker.isOpen) {
+      const now = Date.now();
+      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+      } else {
+        return text;
+      }
+    }
+    
+    const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
+    if (this.questionTranslations.has(cacheKey)) {
+      return this.questionTranslations.get(cacheKey);
+    }
+    
+    if (this.translateCount >= CONSTANTS.TRANSLATE_LIMIT) {
+      this.translateLimitReached = true;
+      return text;
+    }
+    
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS || 3000);
+      
+      const response = await fetch(CONSTANTS.DEEPLX_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: text,
+          source_lang: 'EN',
+          target_lang: targetLang.toUpperCase()
+        }),
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`DeepLX HTTP ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      if (data && data.data && typeof data.data === 'string') {
+        const translated = data.data;
+        this.questionTranslations.set(cacheKey, translated);
+        this.translateCount++;
+        this._translationCircuitBreaker.failures = 0;
+        return translated;
+      }
+      
+      if (data && data.translations && data.translations[0] && data.translations[0].text) {
+        const translated = data.translations[0].text;
+        this.questionTranslations.set(cacheKey, translated);
+        this.translateCount++;
+        this._translationCircuitBreaker.failures = 0;
+        return translated;
+      }
+      
+      throw new Error('Invalid DeepLX response format');
+      
+    } catch(e) {
+      console.error(`DeepLX translate error for ${targetLang}:`, e.message);
+      this._translationCircuitBreaker.failures++;
+      this._translationCircuitBreaker.lastFailureTime = Date.now();
+      if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
+        this._translationCircuitBreaker.isOpen = true;
+      }
+      return text;
+    }
+  }
+  
+  async _translateOptions(options, targetLang) {
+    if (targetLang === 'en' || this.translateLimitReached || !options) {
+      return options;
+    }
+    const translatedOptions = {};
+    const keys = ['A', 'B', 'C', 'D'];
+    for (const key of keys) {
+      if (options[key] && typeof options[key] === 'string') {
+        try {
+          translatedOptions[key] = await this._translateText(options[key], targetLang);
+        } catch(e) {
+          translatedOptions[key] = options[key];
+        }
+      } else {
+        translatedOptions[key] = options[key] || '';
+      }
+    }
+    return translatedOptions;
+  }
+  
+  async _broadcastQuizQuestion(question, options) {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds) return;
+    const wsIdArray = Array.from(wsIds);
+    
+    for (const wsId of wsIdArray) {
+      try {
+        const ws = this.wsMap.get(wsId);
+        if (!ws || ws.readyState !== 1) continue;
+        
+        const lang = this._getUserLanguage(ws);
+        
+        let finalQuestion = question;
+        let finalOptions = options;
+        
+        if (lang !== 'en' && !this.translateLimitReached && finalQuestion && typeof finalQuestion === 'string') {
+          try {
+            finalQuestion = await this._translateText(question, lang);
+            finalOptions = await this._translateOptions(options, lang);
+          } catch(e) {}
+        }
+        
+        const questionObj = {
+          question: finalQuestion || '',
+          options: finalOptions || { A: '', B: '', C: '', D: '' }
+        };
+        
+        this._safeSend(ws, ["quizQuestion", questionObj]);
+      } catch(e) {}
+    }
+  }
+  
+  _shuffleQuestionOptions(question) {
+    if (!question || !question.options) {
+      return { options: { A: '', B: '', C: '', D: '' }, correct: 'A' };
+    }
+    const options = question.options;
+    const keys = ['A', 'B', 'C', 'D'];
+    const entries = keys.map(key => ({
+      key: key,
+      text: options[key] || '',
+      isCorrect: key === question.correct
+    }));
+    const shuffled = this._shuffleArray(entries);
+    const newOptions = {};
+    const newKeys = ['A', 'B', 'C', 'D'];
+    let newCorrect = '';
+    shuffled.forEach((item, index) => {
+      const newKey = newKeys[index];
+      newOptions[newKey] = item.text;
+      if (item.isCorrect) newCorrect = newKey;
+    });
+    return {
+      options: newOptions,
+      correct: newCorrect || 'A'
+    };
+  }
+  
+  _shuffleArray(array) {
+    if (!array || !Array.isArray(array) || array.length === 0) return array || [];
+    const arr = array.length > CONSTANTS.MAX_ARRAY_SIZE ? array.slice(0, CONSTANTS.MAX_ARRAY_SIZE) : [...array];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+  
+  // ==================== BROADCAST ====================
+  
+  _broadcastToRoom(room, message) {
+    if (this.closing || this.isDestroyed || !room || !message) return;
+    const wsIds = this.wsClients.get(room);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    const now = Date.now();
+    const reset = this._roomBroadcastReset.get(room) || 0;
+    const count = this._roomBroadcastCount.get(room) || 0;
+    
+    if (now > reset) {
+      this._roomBroadcastReset.set(room, now + 1000);
+      this._roomBroadcastCount.set(room, 1);
+    } else {
+      if (count > CONSTANTS.MAX_BROADCAST_BATCH) return;
+      this._roomBroadcastCount.set(room, count + 1);
+    }
+    
+    const msgStr = JSON.stringify(message);
+    const wsIdArray = Array.from(wsIds);
+    const batchSize = Math.min(CONSTANTS.BATCH_SIZE, 2);
+    const disconnected = [];
+    
+    for (let i = 0; i < wsIdArray.length && i < 15; i += batchSize) {
+      const batch = wsIdArray.slice(i, i + batchSize);
+      for (const wsId of batch) {
+        const ws = this.wsMap.get(wsId);
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {
+            disconnected.push(wsId);
+          }
+        } else {
+          disconnected.push(wsId);
+        }
+      }
+    }
+    
+    if (disconnected.length > 0) {
+      for (const wsId of disconnected) {
+        const ws = this.wsMap.get(wsId);
+        if (ws) {
+          this._removeClient(room, ws);
+        } else {
+          this._removeClientFromRoom(room, wsId);
+          this.clientRooms.delete(wsId);
+        }
+      }
+    }
+  }
+  
+  _safeSend(ws, message) {
+    if (!ws || ws.readyState !== 1) return false;
+    try {
+      ws.send(JSON.stringify(message));
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
   
   // ==================== GAME LOWCARD METHODS ====================
   
@@ -3270,10 +2634,6 @@ export class GameServer {
           kvAvailable: !!(this.env && this.env.QUESTIONS),
           quizAutoEnabled: this.quizAutoEnabled || false,
           isQuizRunning: !!this.currentQuestion,
-          translateCount: this.translateCount,
-          translateLimit: CONSTANTS.TRANSLATE_LIMIT,
-          usingDeepLX: true,
-          supportedLanguages: CONSTANTS.SUPPORTED_LANGUAGES,
           quizProgress: this._getQuizStatus(),
           timestamp: Date.now()
         }), { 
@@ -3299,20 +2659,15 @@ export class GameServer {
           server._createdAt = Date.now();
           server.username = null;
           
-          // ✅ DETEKSI NEGARA DARI CLOUDFLARE
           const cf = req.cf;
           let country = 'US';
           if (cf && cf.country) {
             country = cf.country;
           }
           server._country = country;
-          
-          // ✅ DETEKSI BAHASA DARI NEGARA
           const lang = this._countryToLanguage(country);
           this.userLanguage.set(wsId, lang);
           this.userCountry.set(wsId, country);
-          
-          console.log(`🌍 User connected from: ${country}, language: ${lang}`);
           
           try { 
             this.state.acceptWebSocket(server);
