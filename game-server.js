@@ -44,7 +44,7 @@ const CONSTANTS = {
     START_HOUR: 0,  // Jam mulai (UTC)
     END_HOUR: 23,   // Jam selesai (UTC)
   },
-  // ✅ DEEPLX CONFIG
+  // ✅ DEEPLX CONFIG - DENGAN PROTEKSI LIMIT
   DEEPLX_API_URLS: [
     'https://api.deeplx.org/translate',
     'https://deeplx.vercel.app/translate',
@@ -53,10 +53,14 @@ const CONSTANTS = {
     'https://deeplx.azurewebsites.net/translate',
   ],
   DEEPLX_TIMEOUT_MS: 8000,
-  DEEPLX_DELAY_MS: 500,
-  DEEPLX_BATCH_SIZE: 10,
-  DEEPLX_BATCH_DELAY_MS: 2000,
+  DEEPLX_DELAY_MS: 1500,              // ✅ DITINGKATKAN DARI 500 JADI 1500
+  DEEPLX_BATCH_SIZE: 5,               // ✅ DITURUNKAN DARI 10 JADI 5
+  DEEPLX_BATCH_DELAY_MS: 3000,        // ✅ DITINGKATKAN DARI 2000 JADI 3000
   DEEPLX_MAX_RETRIES: 3,
+  // ✅ CF LIMIT PROTECTION
+  CF_SUBREQUEST_LIMIT: 50,            // Maksimal subrequest per request
+  CF_CPU_TIME_LIMIT_MS: 9000,         // 90% dari 10ms CPU time
+  CF_MEMORY_LIMIT_MB: 128,            // Memory limit
 };
 
 const QUIZ_SCHEDULE = {
@@ -118,7 +122,7 @@ export class GameServer {
     this._isAllQuestionsLoaded = false;
     this._questionPointer = 0;
     
-    // ✅ DEEPLX TRANSLATION - TANPA CACHE
+    // ✅ DEEPLX TRANSLATION - DENGAN PROTEKSI
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -126,6 +130,12 @@ export class GameServer {
     this.userCountry = new Map();
     this._translationQueue = [];
     this._isProcessingQueue = false;
+    
+    // ✅ CF PROTECTION
+    this._requestCount = 0;
+    this._requestResetTime = Date.now() + 60000; // Reset per menit
+    this._cpuTimeUsed = 0;
+    this._subRequestCount = 0;
     
     // TIMERS
     this._quizTimeout = null;
@@ -162,6 +172,58 @@ export class GameServer {
     }, 2000);
   }
   
+  // ==================== ✅ CF PROTECTION METHODS ====================
+  
+  _checkCFLimits() {
+    const now = Date.now();
+    
+    // Reset counter per menit
+    if (now > this._requestResetTime) {
+      this._requestCount = 0;
+      this._requestResetTime = now + 60000;
+      this._subRequestCount = 0;
+      this._cpuTimeUsed = 0;
+    }
+    
+    // Cek limit subrequest (max 50 per menit untuk free plan)
+    if (this._subRequestCount > CONSTANTS.CF_SUBREQUEST_LIMIT) {
+      console.warn(`⚠️ CF subrequest limit reached: ${this._subRequestCount}`);
+      return false;
+    }
+    
+    return true;
+  }
+  
+  _incrementSubRequest() {
+    this._subRequestCount++;
+    this._requestCount++;
+  }
+  
+  _canTranslate() {
+    // Cek CF limits
+    if (!this._checkCFLimits()) {
+      return false;
+    }
+    
+    // Cek translate limit
+    if (this.translateLimitReached) {
+      return false;
+    }
+    
+    // Cek circuit breaker
+    if (this._translationCircuitBreaker.isOpen) {
+      const now = Date.now();
+      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+      } else {
+        return false;
+      }
+    }
+    
+    return true;
+  }
+  
   // ==================== UTC TIME HELPERS ====================
   
   _getCurrentUTCTime() {
@@ -178,7 +240,6 @@ export class GameServer {
     const hour = this._getCurrentUTCHours();
     const schedule = CONSTANTS.GAME_SCHEDULE || { START_HOUR: 0, END_HOUR: 23 };
     
-    // Jika START_HOUR > END_HOUR (misal 22 - 6), berarti melewati tengah malam
     if (schedule.START_HOUR > schedule.END_HOUR) {
       return hour >= schedule.START_HOUR || hour < schedule.END_HOUR;
     }
@@ -187,11 +248,6 @@ export class GameServer {
   }
   
   _getGameType(room) {
-    // ✅ LOGIKA BARU:
-    // - Jika dalam jam main game DAN tidak ada game aktif -> false (bisa main)
-    // - Jika dalam jam main game DAN ada game aktif -> false (sedang game)
-    // - Jika diluar jam main game -> true (tidak bisa main)
-    
     const isInGameTime = this._isGameTime();
     
     // Jika diluar jam main game -> true (tidak bisa main)
@@ -199,7 +255,7 @@ export class GameServer {
       return true;
     }
     
-    // Jika dalam jam main game -> false (bisa main, baik ada game atau tidak)
+    // Jika dalam jam main game -> false (bisa main)
     return false;
   }
   
@@ -556,15 +612,12 @@ export class GameServer {
             this._sendQuizTimeLeftToUser(ws);
           }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
         } else {
-          // ✅ KIRIM GAME TYPE SAAT MASUK ROOM
           const gameType = this._getGameType(roomName);
           this._safeSend(ws, ["gameType", gameType]);
           
-          // ✅ KIRIM STATUS GAME
           const game = this.activeGames.get(roomName);
           const isRunning = game && game._isActive && !game._gameEnded;
           if (isRunning) {
-            // Kirim status game yang sedang berjalan
             this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
           }
         }
@@ -601,15 +654,12 @@ export class GameServer {
           this._sendQuizTimeLeftToUser(ws);
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
       } else {
-        // ✅ KIRIM GAME TYPE SAAT MASUK ROOM
         const gameType = this._getGameType(roomName);
         this._safeSend(ws, ["gameType", gameType]);
         
-        // ✅ KIRIM STATUS GAME
         const game = this.activeGames.get(roomName);
         const isRunning = game && game._isActive && !game._gameEnded;
         if (isRunning) {
-          // Kirim status game yang sedang berjalan
           this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
         }
       }
@@ -625,6 +675,7 @@ export class GameServer {
     if (!this.env || !this.env.QUESTIONS) return false;
     
     try {
+      this._incrementSubRequest();
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
       
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
@@ -830,6 +881,7 @@ export class GameServer {
             points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
             
             if (this.env && this.env.QUESTIONS) {
+              this._incrementSubRequest();
               await this.env.QUESTIONS.put(
                 CONSTANTS.QUIZ_POINT_KEY,
                 JSON.stringify(points)
@@ -1054,6 +1106,7 @@ export class GameServer {
     if (evt === "deleteQuizLastWeekWinner") {
       try {
         if (this.env && this.env.QUESTIONS) {
+          this._incrementSubRequest();
           await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
           this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
         } else {
@@ -1247,7 +1300,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== ✅ DEEPLX TRANSLATE - TANPA CACHE ====================
+  // ==================== ✅ DEEPLX TRANSLATE - DENGAN PROTEKSI CF ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1266,7 +1319,6 @@ export class GameServer {
         this.translateCount = 0;
         this.translateLimitReached = false;
         
-        // ✅ RESET CIRCUIT BREAKER
         this._translationCircuitBreaker.isOpen = false;
         this._translationCircuitBreaker.failures = 0;
         if (this._translationCircuitBreaker.resetTimer) {
@@ -1305,13 +1357,17 @@ export class GameServer {
     return this.userLanguage.get(wsId) || 'en';
   }
   
-  // ✅ DELAY HELPER
   _delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
   
-  // ✅ TRANSLATE SATU TEKS - TANPA CACHE
+  // ✅ TRANSLATE SATU TEKS - DENGAN PROTEKSI CF
   async _translateSingleText(text, targetLang, retryCount = 0) {
+    // ✅ CEK APAKAH BOLEH TRANSLATE
+    if (!this._canTranslate()) {
+      return text;
+    }
+    
     if (targetLang === 'en') return text;
     if (this.translateLimitReached) return text;
     if (!text || typeof text !== 'string') return text;
@@ -1322,16 +1378,14 @@ export class GameServer {
       return text;
     }
     
-    // ✅ CIRCUIT BREAKER - DENGAN AUTO RESET
+    // ✅ CIRCUIT BREAKER
     if (this._translationCircuitBreaker.isOpen) {
       const now = Date.now();
       if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
-        // ✅ AUTO RESET
         this._translationCircuitBreaker.isOpen = false;
         this._translationCircuitBreaker.failures = 0;
         console.log("🔄 Circuit breaker auto-reset");
       } else {
-        console.log(`⏳ Circuit breaker open, waiting... (${Math.round((CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS - (now - this._translationCircuitBreaker.lastFailureTime))/1000)}s remaining)`);
         return text;
       }
     }
@@ -1346,6 +1400,12 @@ export class GameServer {
     
     for (const apiUrl of apiUrls) {
       try {
+        // ✅ CEK SUBREQUEST LIMIT
+        if (!this._checkCFLimits()) {
+          console.warn("⚠️ CF subrequest limit reached, skipping translate");
+          return text;
+        }
+        
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS || 8000);
         
@@ -1361,6 +1421,7 @@ export class GameServer {
         });
         
         clearTimeout(timeoutId);
+        this._incrementSubRequest();
         
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
@@ -1368,7 +1429,6 @@ export class GameServer {
         
         const data = await response.json();
         
-        // ✅ CEK RESPONSE FORMAT
         let translated = null;
         if (data && data.data && typeof data.data === 'string') {
           translated = data.data;
@@ -1381,10 +1441,8 @@ export class GameServer {
         }
         
         if (translated) {
-          // ✅ LANGSUNG TRANSLATE TANPA CACHE
           this.translateCount++;
           this._translationCircuitBreaker.failures = 0;
-          console.log(`✅ DeepLX translated: "${text.substring(0, 30)}..." -> "${translated.substring(0, 30)}..."`);
           return translated;
         }
         
@@ -1405,7 +1463,6 @@ export class GameServer {
       this._translationCircuitBreaker.isOpen = true;
       console.log(`🔴 Circuit breaker OPEN (${this._translationCircuitBreaker.failures} failures)`);
       
-      // ✅ AUTO RESET SETELAH TIMEOUT
       if (this._translationCircuitBreaker.resetTimer) {
         clearTimeout(this._translationCircuitBreaker.resetTimer);
       }
@@ -1417,28 +1474,43 @@ export class GameServer {
       }, CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS);
     }
     
-    return text; // Return original text
+    return text;
   }
   
-  // ✅ TRANSLATE BATCH DENGAN DELAY - TANPA CACHE
+  // ✅ TRANSLATE BATCH - DENGAN PROTEKSI CF
   async _translateBatch(texts, targetLang) {
     if (!texts || texts.length === 0) return [];
     if (targetLang === 'en') return texts;
     if (this.translateLimitReached) return texts;
     
+    // ✅ CEK CF LIMIT SEBELUM MULAI
+    if (!this._checkCFLimits()) {
+      console.warn("⚠️ CF limit reached, skipping batch translate");
+      return texts;
+    }
+    
     const results = [];
     const total = texts.length;
-    const delayMs = CONSTANTS.DEEPLX_DELAY_MS || 500;
-    const batchSize = CONSTANTS.DEEPLX_BATCH_SIZE || 10;
+    const delayMs = CONSTANTS.DEEPLX_DELAY_MS || 1500;
+    const batchSize = CONSTANTS.DEEPLX_BATCH_SIZE || 5;
     
-    console.log(`🔄 Translating ${total} texts to ${targetLang} (delay: ${delayMs}ms)`);
+    console.log(`🔄 Translating ${total} texts to ${targetLang} (delay: ${delayMs}ms, batch: ${batchSize})`);
     
     for (let i = 0; i < total; i++) {
+      // ✅ CEK LIMIT SETIAP ITERASI
+      if (!this._checkCFLimits()) {
+        console.warn(`⚠️ CF limit reached at ${i}/${total}, returning partial results`);
+        // Isi sisa dengan text asli
+        for (let j = i; j < total; j++) {
+          results.push(texts[j]);
+        }
+        break;
+      }
+      
       const text = texts[i];
       const startTime = Date.now();
       
       try {
-        // ✅ TRANSLATE TANPA CACHE
         let translated = await this._translateSingleText(text, targetLang);
         results.push(translated);
         
@@ -1447,22 +1519,20 @@ export class GameServer {
         
       } catch(e) {
         console.error(`❌ [${i+1}/${total}] Failed:`, e.message);
-        results.push(text); // Fallback
+        results.push(text);
       }
       
-      // ✅ JEDA ANTAR REQUEST
       if (i < total - 1) {
         await this._delay(delayMs);
       }
       
-      // ✅ JEDA EKSTRA SETELAH BATCH
       if ((i + 1) % batchSize === 0 && i < total - 1) {
         console.log(`⏳ Batch complete, waiting ${CONSTANTS.DEEPLX_BATCH_DELAY_MS}ms...`);
-        await this._delay(CONSTANTS.DEEPLX_BATCH_DELAY_MS || 2000);
+        await this._delay(CONSTANTS.DEEPLX_BATCH_DELAY_MS || 3000);
       }
     }
     
-    console.log(`✅ Completed ${total} translations to ${targetLang}`);
+    console.log(`✅ Completed ${results.length}/${total} translations to ${targetLang}`);
     return results;
   }
   
@@ -1476,7 +1546,6 @@ export class GameServer {
     const texts = [];
     const textMap = {};
     
-    // ✅ KUMPULKAN SEMUA TEKS
     for (const key of keys) {
       if (options[key] && typeof options[key] === 'string') {
         texts.push(options[key]);
@@ -1486,10 +1555,8 @@ export class GameServer {
     
     if (texts.length === 0) return options;
     
-    // ✅ TRANSLATE BATCH TANPA CACHE
     const translatedTexts = await this._translateBatch(texts, targetLang);
     
-    // ✅ MAP HASIL
     let idx = 0;
     for (const key of keys) {
       if (textMap[key]) {
@@ -1510,7 +1577,6 @@ export class GameServer {
     if (!wsIds) return;
     const wsIdArray = Array.from(wsIds);
     
-    // ✅ KUMPULKAN USER BERDASARKAN BAHASA
     const usersByLang = new Map();
     
     for (const wsId of wsIdArray) {
@@ -1526,30 +1592,28 @@ export class GameServer {
       } catch(e) {}
     }
     
-    // ✅ KIRIM KE MASING-MASING BAHASA
     for (const [lang, users] of usersByLang) {
       try {
         let finalQuestion = question;
         let finalOptions = options;
         
-        // ✅ TRANSLATE KE BAHASA USER - TANPA CACHE
         if (lang !== 'en' && !this.translateLimitReached) {
           try {
-            // Translate question
-            finalQuestion = await this._translateSingleText(question, lang);
-            // Translate options
-            finalOptions = await this._translateOptions(options, lang);
-            
-            console.log(`✅ Translated to ${lang} for ${users.length} users`);
+            // ✅ CEK CF LIMIT SEBELUM TRANSLATE
+            if (this._canTranslate()) {
+              finalQuestion = await this._translateSingleText(question, lang);
+              finalOptions = await this._translateOptions(options, lang);
+              console.log(`✅ Translated to ${lang} for ${users.length} users`);
+            } else {
+              console.warn(`⚠️ Skipping translate to ${lang} due to CF limits`);
+            }
           } catch(e) {
             console.error(`Translate error for ${lang}:`, e.message);
-            // Fallback ke Inggris
             finalQuestion = question;
             finalOptions = options;
           }
         }
         
-        // ✅ KIRIM KE USER
         const questionObj = {
           question: finalQuestion || '',
           options: finalOptions || { A: '', B: '', C: '', D: '' }
@@ -1562,7 +1626,6 @@ export class GameServer {
       } catch(e) {
         console.error(`Error broadcasting to lang ${lang}:`, e);
         
-        // ✅ FALLBACK: Kirim versi Inggris
         const fallbackObj = {
           question: question || '',
           options: options || { A: '', B: '', C: '', D: '' }
@@ -2343,7 +2406,6 @@ export class GameServer {
         return;
       }
       
-      // ✅ CEK GAME TYPE - JIKA TRUE (DILUAR JAM) MAKA TIDAK BISA START
       const gameType = this._getGameType(room);
       if (gameType) {
         this._safeSend(ws, ["gameLowCardError", "Game is not available at this time"]);
@@ -2421,7 +2483,6 @@ export class GameServer {
         this.activeGames.set(room, game);
         this._addClient(room, ws, usernameClean, false);
         
-        // ✅ KIRIM GAME LOWCARD START SUCCESS
         this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._broadcastToRoom(room, ["gameLowCardStart", game.betAmount, usernameClean]);
         this._startRegistration(room, game);
@@ -2493,7 +2554,6 @@ export class GameServer {
         return;
       }
       
-      // ✅ CEK GAME TYPE - JIKA TRUE (DILUAR JAM) MAKA TIDAK BISA JOIN
       const gameType = this._getGameType(room);
       if (gameType) {
         this._safeSend(ws, ["gameLowCardError", "Game is not available at this time"]);
@@ -2831,6 +2891,8 @@ export class GameServer {
           translateCount: this.translateCount,
           translateLimitReached: this.translateLimitReached,
           circuitBreakerOpen: this._translationCircuitBreaker.isOpen,
+          subRequestCount: this._subRequestCount,
+          cfLimitRemaining: Math.max(0, CONSTANTS.CF_SUBREQUEST_LIMIT - this._subRequestCount),
           timestamp: Date.now()
         }), { 
           headers: { 'Content-Type': 'application/json' }
