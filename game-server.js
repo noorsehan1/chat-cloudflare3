@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FIX DEEPLX TRANSLATE) ====================
+// ==================== GAME-SERVER.JS (FIX TRANSLATE TIDAK WORK) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -21,7 +21,7 @@ const CONSTANTS = {
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
   QUIZ_INTERVAL_MS: 30000,
   QUIZ_TIME_LIMIT_MS: 15000,
-  TRANSLATE_LIMIT: 999999,
+  TRANSLATE_LIMIT: 999999,            // ✅ UNLIMITED
   QUIZ_BREAK_MS: 2000,
   QUIZ_START_DELAY_MS: 5000,
   MAX_RETRY_INIT_QUIZ: 2,
@@ -29,8 +29,8 @@ const CONSTANTS = {
   MAX_SHUTDOWN_WAIT_MS: 5000,
   MAX_WS_CLIENTS: 50,
   MAX_ARRAY_SIZE: 50,
-  CIRCUIT_BREAKER_THRESHOLD: 2,
-  CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
+  CIRCUIT_BREAKER_THRESHOLD: 5,       // ✅ DINAUKAN DARI 2 JADI 5
+  CIRCUIT_BREAKER_TIMEOUT_MS: 60000,  // ✅ DINAUKAN DARI 30 DETIK JADI 60 DETIK
   QUIZ_SWITCH_DELAY_MS: 5000,
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
@@ -39,14 +39,18 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   QUIZ_BATCH_THRESHOLD: 20,
   MAX_QUESTIONS: 10000,
-  // ✅ DEEPLX CONFIG - BANYAK PILIHAN API
+  // ✅ DEEPLX CONFIG - LEBIH BANYAK API
   DEEPLX_API_URLS: [
     'https://api.deeplx.org/translate',
     'https://deeplx.vercel.app/translate',
     'https://deeplx.deno.dev/translate',
     'https://deeplx.mingming.dev/translate',
+    'https://deeplx.azurewebsites.net/translate',
   ],
-  DEEPLX_TIMEOUT_MS: 5000,
+  DEEPLX_TIMEOUT_MS: 8000,            // ✅ DINAUKAN DARI 3 DETIK JADI 8 DETIK
+  DEEPLX_DELAY_MS: 500,               // Jeda antar request
+  DEEPLX_BATCH_SIZE: 10,
+  DEEPLX_BATCH_DELAY_MS: 2000,
   DEEPLX_MAX_RETRIES: 3,
 };
 
@@ -110,12 +114,14 @@ export class GameServer {
     this._isAllQuestionsLoaded = false;
     this._questionPointer = 0;
     
-    // DEEPLX TRANSLATION
+    // ✅ DEEPLX TRANSLATION - RESET COUNTER
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
     this.userLanguage = new Map();
     this.userCountry = new Map();
+    this._translationQueue = [];        // ✅ QUEUE UNTUK TRANSLATE
+    this._isProcessingQueue = false;    // ✅ FLAG QUEUE
     
     // TIMERS
     this._quizTimeout = null;
@@ -123,10 +129,12 @@ export class GameServer {
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
     
+    // ✅ CIRCUIT BREAKER - RESET OTOMATIS
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
-      isOpen: false
+      isOpen: false,
+      resetTimer: null
     };
     
     this.quizAutoEnabled = false;
@@ -736,7 +744,6 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
 
-      // ✅ KIRIM PERTANYAAN (AKAN DI-TRANSLATE DI DALAM FUNGSI)
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1181,7 +1188,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== ✅ DEEPLX TRANSLATE - FIXED ====================
+  // ==================== ✅ DEEPLX TRANSLATE - FIXED (TIDAK BERHENTI) ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1200,8 +1207,14 @@ export class GameServer {
         this.translateCount = 0;
         this.translateLimitReached = false;
         this.questionTranslations.clear();
+        
+        // ✅ RESET CIRCUIT BREAKER
         this._translationCircuitBreaker.isOpen = false;
         this._translationCircuitBreaker.failures = 0;
+        if (this._translationCircuitBreaker.resetTimer) {
+          clearTimeout(this._translationCircuitBreaker.resetTimer);
+          this._translationCircuitBreaker.resetTimer = null;
+        }
       }
     }, 60000);
   }
@@ -1234,39 +1247,47 @@ export class GameServer {
     return this.userLanguage.get(wsId) || 'en';
   }
   
-  // ✅ DEEPLX TRANSLATE - DENGAN RETRY DAN FALLBACK
-  async _translateText(text, targetLang) {
+  // ✅ DELAY HELPER
+  _delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+  
+  // ✅ TRANSLATE SATU TEKS - DENGAN RETRY
+  async _translateSingleText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (this.translateLimitReached) return text;
     if (!text || typeof text !== 'string') return text;
     
-    // Cek cache
+    // ✅ CEK CACHE
     const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
     if (this.questionTranslations.has(cacheKey)) {
       return this.questionTranslations.get(cacheKey);
     }
     
-    // Circuit breaker
-    if (this._translationCircuitBreaker.isOpen) {
-      const now = Date.now();
-      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
-        this._translationCircuitBreaker.isOpen = false;
-        this._translationCircuitBreaker.failures = 0;
-      } else {
-        return text;
-      }
-    }
-    
+    // ✅ CEK LIMIT
     if (this.translateCount >= CONSTANTS.TRANSLATE_LIMIT) {
       this.translateLimitReached = true;
       return text;
+    }
+    
+    // ✅ CIRCUIT BREAKER - DENGAN AUTO RESET
+    if (this._translationCircuitBreaker.isOpen) {
+      const now = Date.now();
+      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
+        // ✅ AUTO RESET
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+        console.log("🔄 Circuit breaker auto-reset");
+      } else {
+        console.log(`⏳ Circuit breaker open, waiting... (${Math.round((CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS - (now - this._translationCircuitBreaker.lastFailureTime))/1000)}s remaining)`);
+        return text;
+      }
     }
     
     // ✅ COBA SEMUA API URL
     const apiUrls = CONSTANTS.DEEPLX_API_URLS || [
       'https://api.deeplx.org/translate',
       'https://deeplx.vercel.app/translate',
-      'https://deeplx.deno.dev/translate',
     ];
     
     let lastError = null;
@@ -1274,13 +1295,11 @@ export class GameServer {
     for (const apiUrl of apiUrls) {
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS || 5000);
+        const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS || 8000);
         
         const response = await fetch(apiUrl, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             text: text,
             source_lang: 'EN',
@@ -1297,44 +1316,31 @@ export class GameServer {
         
         const data = await response.json();
         
-        // ✅ CEK RESPONSE FORMAT YANG BERBEDA
+        // ✅ CEK RESPONSE FORMAT
         let translated = null;
-        
-        // Format 1: { data: "translated text" }
         if (data && data.data && typeof data.data === 'string') {
           translated = data.data;
-        }
-        // Format 2: { translations: [{ text: "translated text" }] }
-        else if (data && data.translations && Array.isArray(data.translations) && data.translations.length > 0) {
+        } else if (data && data.translations && Array.isArray(data.translations) && data.translations.length > 0) {
           translated = data.translations[0].text;
-        }
-        // Format 3: { result: "translated text" }
-        else if (data && data.result && typeof data.result === 'string') {
+        } else if (data && data.result && typeof data.result === 'string') {
           translated = data.result;
-        }
-        // Format 4: { text: "translated text" }
-        else if (data && data.text && typeof data.text === 'string') {
+        } else if (data && data.text && typeof data.text === 'string') {
           translated = data.text;
-        }
-        // Format 5: { code: 200, data: "translated text" }
-        else if (data && data.code === 200 && data.data && typeof data.data === 'string') {
-          translated = data.data;
         }
         
         if (translated) {
           this.questionTranslations.set(cacheKey, translated);
           this.translateCount++;
           this._translationCircuitBreaker.failures = 0;
-          console.log(`✅ DeepLX translated: ${text.substring(0, 20)}... -> ${translated.substring(0, 20)}...`);
+          console.log(`✅ DeepLX translated: "${text.substring(0, 30)}..." -> "${translated.substring(0, 30)}..."`);
           return translated;
         }
         
-        throw new Error('Invalid DeepLX response format');
+        throw new Error('Invalid response format');
         
       } catch(e) {
         console.warn(`DeepLX API ${apiUrl} failed:`, e.message);
         lastError = e;
-        // Lanjut ke API berikutnya
       }
     }
     
@@ -1342,11 +1348,70 @@ export class GameServer {
     console.error(`DeepLX translate error for ${targetLang}:`, lastError?.message);
     this._translationCircuitBreaker.failures++;
     this._translationCircuitBreaker.lastFailureTime = Date.now();
+    
     if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
       this._translationCircuitBreaker.isOpen = true;
+      console.log(`🔴 Circuit breaker OPEN (${this._translationCircuitBreaker.failures} failures)`);
+      
+      // ✅ AUTO RESET SETELAH TIMEOUT
+      if (this._translationCircuitBreaker.resetTimer) {
+        clearTimeout(this._translationCircuitBreaker.resetTimer);
+      }
+      this._translationCircuitBreaker.resetTimer = setTimeout(() => {
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+        this._translationCircuitBreaker.resetTimer = null;
+        console.log("🔄 Circuit breaker reset by timer");
+      }, CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS);
     }
     
     return text; // Return original text
+  }
+  
+  // ✅ TRANSLATE BATCH DENGAN DELAY - TIDAK BERHENTI
+  async _translateBatch(texts, targetLang) {
+    if (!texts || texts.length === 0) return [];
+    if (targetLang === 'en') return texts;
+    if (this.translateLimitReached) return texts;
+    
+    const results = [];
+    const total = texts.length;
+    const delayMs = CONSTANTS.DEEPLX_DELAY_MS || 500;
+    const batchSize = CONSTANTS.DEEPLX_BATCH_SIZE || 10;
+    
+    console.log(`🔄 Translating ${total} texts to ${targetLang} (delay: ${delayMs}ms)`);
+    
+    for (let i = 0; i < total; i++) {
+      const text = texts[i];
+      const startTime = Date.now();
+      
+      try {
+        // ✅ TRANSLATE DENGAN RETRY
+        let translated = await this._translateSingleText(text, targetLang);
+        results.push(translated);
+        
+        const elapsed = Date.now() - startTime;
+        console.log(`✅ [${i+1}/${total}] Done (${elapsed}ms)`);
+        
+      } catch(e) {
+        console.error(`❌ [${i+1}/${total}] Failed:`, e.message);
+        results.push(text); // Fallback
+      }
+      
+      // ✅ JEDA ANTAR REQUEST
+      if (i < total - 1) {
+        await this._delay(delayMs);
+      }
+      
+      // ✅ JEDA EKSTRA SETELAH BATCH
+      if ((i + 1) % batchSize === 0 && i < total - 1) {
+        console.log(`⏳ Batch complete, waiting ${CONSTANTS.DEEPLX_BATCH_DELAY_MS}ms...`);
+        await this._delay(CONSTANTS.DEEPLX_BATCH_DELAY_MS || 2000);
+      }
+    }
+    
+    console.log(`✅ Completed ${total} translations to ${targetLang}`);
+    return results;
   }
   
   async _translateOptions(options, targetLang) {
@@ -1356,14 +1421,28 @@ export class GameServer {
     
     const translatedOptions = {};
     const keys = ['A', 'B', 'C', 'D'];
+    const texts = [];
+    const textMap = {};
     
+    // ✅ KUMPULKAN SEMUA TEKS
     for (const key of keys) {
       if (options[key] && typeof options[key] === 'string') {
-        try {
-          translatedOptions[key] = await this._translateText(options[key], targetLang);
-        } catch(e) {
-          translatedOptions[key] = options[key];
-        }
+        texts.push(options[key]);
+        textMap[key] = options[key];
+      }
+    }
+    
+    if (texts.length === 0) return options;
+    
+    // ✅ TRANSLATE BATCH
+    const translatedTexts = await this._translateBatch(texts, targetLang);
+    
+    // ✅ MAP HASIL
+    let idx = 0;
+    for (const key of keys) {
+      if (textMap[key]) {
+        translatedOptions[key] = translatedTexts[idx] || textMap[key];
+        idx++;
       } else {
         translatedOptions[key] = options[key] || '';
       }
@@ -1372,10 +1451,15 @@ export class GameServer {
     return translatedOptions;
   }
   
+  // ==================== BROADCAST QUIZ ====================
+  
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds) return;
     const wsIdArray = Array.from(wsIds);
+    
+    // ✅ KUMPULKAN USER BERDASARKAN BAHASA
+    const usersByLang = new Map();
     
     for (const wsId of wsIdArray) {
       try {
@@ -1383,30 +1467,62 @@ export class GameServer {
         if (!ws || ws.readyState !== 1) continue;
         
         const lang = this._getUserLanguage(ws);
-        
+        if (!usersByLang.has(lang)) {
+          usersByLang.set(lang, []);
+        }
+        usersByLang.get(lang).push(ws);
+      } catch(e) {}
+    }
+    
+    // ✅ KIRIM KE MASING-MASING BAHASA
+    for (const [lang, users] of usersByLang) {
+      try {
         let finalQuestion = question;
         let finalOptions = options;
         
-        if (lang !== 'en' && !this.translateLimitReached && finalQuestion && typeof finalQuestion === 'string') {
+        // ✅ TRANSLATE KE BAHASA USER
+        if (lang !== 'en' && !this.translateLimitReached) {
           try {
-            finalQuestion = await this._translateText(question, lang);
+            // Translate question
+            finalQuestion = await this._translateSingleText(question, lang);
+            // Translate options
             finalOptions = await this._translateOptions(options, lang);
+            
+            console.log(`✅ Translated to ${lang} for ${users.length} users`);
           } catch(e) {
             console.error(`Translate error for ${lang}:`, e.message);
+            // Fallback ke Inggris
+            finalQuestion = question;
+            finalOptions = options;
           }
         }
         
+        // ✅ KIRIM KE USER
         const questionObj = {
           question: finalQuestion || '',
           options: finalOptions || { A: '', B: '', C: '', D: '' }
         };
         
-        this._safeSend(ws, ["quizQuestion", questionObj]);
+        for (const ws of users) {
+          this._safeSend(ws, ["quizQuestion", questionObj]);
+        }
+        
       } catch(e) {
-        console.error("Broadcast question error:", e);
+        console.error(`Error broadcasting to lang ${lang}:`, e);
+        
+        // ✅ FALLBACK: Kirim versi Inggris
+        const fallbackObj = {
+          question: question || '',
+          options: options || { A: '', B: '', C: '', D: '' }
+        };
+        for (const ws of users) {
+          this._safeSend(ws, ["quizQuestion", fallbackObj]);
+        }
       }
     }
   }
+  
+  // ==================== SHUFFLE HELPERS ====================
   
   _shuffleQuestionOptions(question) {
     if (!question || !question.options) {
@@ -1507,7 +1623,7 @@ export class GameServer {
     }
   }
   
-  // ==================== GAME LOWCARD METHODS (LENGKAP) ====================
+  // ==================== GAME LOWCARD METHODS ====================
   
   _isGameActuallyRunning(game) {
     if (!game) return false;
@@ -2638,6 +2754,9 @@ export class GameServer {
           quizAutoEnabled: this.quizAutoEnabled || false,
           isQuizRunning: !!this.currentQuestion,
           quizProgress: this._getQuizStatus(),
+          translateCount: this.translateCount,
+          translateLimitReached: this.translateLimitReached,
+          circuitBreakerOpen: this._translationCircuitBreaker.isOpen,
           timestamp: Date.now()
         }), { 
           headers: { 'Content-Type': 'application/json' }
@@ -2853,6 +2972,10 @@ export class GameServer {
       if (this._quizStartTimeout) {
         clearTimeout(this._quizStartTimeout);
         this._quizStartTimeout = null;
+      }
+      if (this._translationCircuitBreaker.resetTimer) {
+        clearTimeout(this._translationCircuitBreaker.resetTimer);
+        this._translationCircuitBreaker.resetTimer = null;
       }
       
       for (const [room, game] of this.activeGames) {
