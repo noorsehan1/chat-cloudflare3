@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (REMOVE NEXT SESSION SCHEDULER) ====================
+// ==================== GAME-SERVER.JS (FULL CLASS - CLEAN) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -247,6 +247,46 @@ export class GameServer {
     return false;
   }
   
+  _getNextQuizStartTime() {
+    const now = this._getCurrentUTCTime();
+    const schedules = [
+      QUIZ_SCHEDULE.SESSION1,
+      QUIZ_SCHEDULE.SESSION2,
+      QUIZ_SCHEDULE.SESSION3,
+      QUIZ_SCHEDULE.SESSION4,
+      QUIZ_SCHEDULE.SESSION5,
+      QUIZ_SCHEDULE.SESSION6
+    ];
+    for (const schedule of schedules) {
+      const startTime = new Date(now);
+      startTime.setUTCHours(schedule.start, 0, 0, 0);
+      if (startTime > now) {
+        return startTime;
+      }
+    }
+    const tomorrow = new Date(now);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    tomorrow.setUTCHours(QUIZ_SCHEDULE.SESSION1.start, 0, 0, 0);
+    return tomorrow;
+  }
+  
+  _getTimeLeftUntilNextEvent() {
+    const now = Date.now();
+    const nextStart = this._getNextQuizStartTime();
+    const timeLeft = nextStart.getTime() - now;
+    
+    if (timeLeft <= 0) {
+      return { hours: 0, minutes: 0, seconds: 0, isRunning: this._isQuizTime() };
+    }
+    
+    const totalSeconds = Math.floor(timeLeft / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    
+    return { hours, minutes, seconds, isRunning: false };
+  }
+  
   _startQuizScheduler() {
     if (this.quizAutoTimer) {
       clearInterval(this.quizAutoTimer);
@@ -267,6 +307,7 @@ export class GameServer {
   async _checkQuizAutoStatus() {
     try {
       const isQuizTime = this._isQuizTime();
+      const timeLeft = this._getTimeLeftUntilNextEvent();
       
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
@@ -292,15 +333,29 @@ export class GameServer {
           this.quizAutoEnabled = false;
           await this.resetQuiz();
           
+          let timeString = "";
+          if (timeLeft.hours > 0) {
+            timeString = `${timeLeft.hours}h `;
+          }
+          if (timeLeft.minutes > 0 || timeLeft.hours > 0) {
+            timeString += `${timeLeft.minutes}m `;
+          }
+          if (timeLeft.seconds > 0 && timeLeft.hours === 0 && timeLeft.minutes === 0) {
+            timeString = `${timeLeft.seconds}s`;
+          }
+          if (!timeString) {
+            timeString = "0m";
+          }
+          
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizNotification",
-            "📢 Quiz session has ended! See you next time!",
+            `📢 Quiz session has ended! Next session in ${timeString.trim()}`,
             "info"
           ]);
           
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz is offline. Check schedule for next session.",
+            `⏸️ Quiz is offline. Starts in ${timeString.trim()}`,
             true
           ]);
         }
@@ -321,14 +376,12 @@ export class GameServer {
     } catch(e) {}
   }
   
-  // ==================== HAPUS: _getNextQuizStartTime, _getTimeLeftUntilNextEvent, _getQuizSessionEndTime, _getTimeRemainingInSession ====================
-  // Tidak digunakan lagi karena notifikasi sudah dihandle saat masuk room
-  
   _sendQuizTimeLeftToUser(ws) {
     if (!ws || ws.readyState !== 1) return false;
     
     try {
       const isQuizTime = this._isQuizTime();
+      const timeLeft = this._getTimeLeftUntilNextEvent();
       const isQuizActive = this.currentQuestion !== null && this._quizTimeout !== null;
       const isQuizWaiting = this.isQuizWaiting || this._quizStartTimeout !== null;
       
@@ -339,20 +392,7 @@ export class GameServer {
         canType = false;
         
         if (isQuizActive) {
-          let remaining = "";
-          if (this._quizStartTime) {
-            const elapsed = (Date.now() - this._quizStartTime) / 1000;
-            const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
-            const left = Math.max(0, total - elapsed);
-            const minutes = Math.floor(left / 60);
-            const seconds = Math.floor(left % 60);
-            if (minutes > 0) {
-              remaining = `${minutes}m ${seconds}s remaining`;
-            } else {
-              remaining = `${seconds}s remaining`;
-            }
-          }
-          message = `⏰ Quiz is running! ${remaining}`;
+          message = `⏰ Quiz is running!`;
           this._safeSend(ws, ["quizNotification", "📢 Quiz has started! Answer the questions now!", "info"]);
         } else if (isQuizWaiting) {
           message = `⏳ Quiz will start soon!`;
@@ -362,9 +402,23 @@ export class GameServer {
           this._safeSend(ws, ["quizNotification", "📢 Quiz session is active! Get ready!", "info"]);
         }
       } else {
-        message = `⏸️ Quiz is offline.`;
+        let timeString = "";
+        if (timeLeft.hours > 0) {
+          timeString = `${timeLeft.hours}h `;
+        }
+        if (timeLeft.minutes > 0 || timeLeft.hours > 0) {
+          timeString += `${timeLeft.minutes}m `;
+        }
+        if (timeLeft.seconds > 0 && timeLeft.hours === 0 && timeLeft.minutes === 0) {
+          timeString = `${timeLeft.seconds}s`;
+        }
+        if (!timeString) {
+          timeString = "0m";
+        }
+        
+        message = `⏸️ Quiz is offline. Starts in ${timeString.trim()}`;
         canType = true;
-        this._safeSend(ws, ["quizNotification", "📢 Quiz is offline. Check schedule for next session.", "info"]);
+        this._safeSend(ws, ["quizNotification", `📢 Quiz is offline. Next session in ${timeString.trim()}`, "info"]);
       }
       
       this._safeSend(ws, ["quizTimeLeft", message, canType]);
@@ -500,9 +554,24 @@ export class GameServer {
       if (!this._isQuizTime()) {
         const clients = this.wsClients.get(QUIZ_ROOM);
         if (clients && clients.size > 0) {
+          const timeLeft = this._getTimeLeftUntilNextEvent();
+          let timeString = "";
+          if (timeLeft.hours > 0) {
+            timeString = `${timeLeft.hours}h `;
+          }
+          if (timeLeft.minutes > 0 || timeLeft.hours > 0) {
+            timeString += `${timeLeft.minutes}m `;
+          }
+          if (timeLeft.seconds > 0 && timeLeft.hours === 0 && timeLeft.minutes === 0) {
+            timeString = `${timeLeft.seconds}s`;
+          }
+          if (!timeString) {
+            timeString = "0m";
+          }
+          
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz is offline.",
+            `⏸️ Quiz is offline. Starts in ${timeString.trim()}`,
             true
           ]);
         }
@@ -514,7 +583,7 @@ export class GameServer {
         if (clients && clients.size > 0) {
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz is offline.",
+            "⏳ Quiz will start soon!",
             false
           ]);
         }
@@ -763,15 +832,30 @@ export class GameServer {
             this.quizAutoEnabled = false;
             this.resetQuiz();
             
+            const timeLeft = this._getTimeLeftUntilNextEvent();
+            let timeString = "";
+            if (timeLeft.hours > 0) {
+              timeString = `${timeLeft.hours}h `;
+            }
+            if (timeLeft.minutes > 0 || timeLeft.hours > 0) {
+              timeString += `${timeLeft.minutes}m `;
+            }
+            if (timeLeft.seconds > 0 && timeLeft.hours === 0 && timeLeft.minutes === 0) {
+              timeString = `${timeLeft.seconds}s`;
+            }
+            if (!timeString) {
+              timeString = "0m";
+            }
+            
             this._broadcastToRoom(QUIZ_ROOM, [
               "quizNotification",
-              "📢 Quiz session has ended! (2 hours completed) See you next time!",
+              `📢 Quiz session has ended! Next session in ${timeString.trim()}`,
               "info"
             ]);
             
             this._broadcastToRoom(QUIZ_ROOM, [
               "quizTimeLeft",
-              "⏸️ Quiz is offline.",
+              `⏸️ Quiz is offline. Starts in ${timeString.trim()}`,
               true
             ]);
           }
