@@ -2351,8 +2351,12 @@ export class GameServer {
         game.playerWsId.set(usernameClean, wsId);
         this.activeGames.set(room, game);
         this._addClient(room, ws, usernameClean, false);
+        
+        // ✅ KIRIM GAME LOWCARD START SUCCESS
+        this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._broadcastToRoom(room, ["gameLowCardStart", game.betAmount, usernameClean]);
         this._startRegistration(room, game);
+        
         setTimeout(() => {
           try {
             this._gameStartFlags.delete(startKey);
