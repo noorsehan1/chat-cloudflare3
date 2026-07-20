@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (4 BOTS) ====================
+// ==================== GAME-SERVER.JS (FULL - MATCH WITH CLIENT) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 5,
@@ -27,7 +27,7 @@ const CONSTANTS = {
   MAX_RETRY_INIT_QUIZ: 2,
   MAX_BROADCAST_BATCH: 2,
   MAX_SHUTDOWN_WAIT_MS: 5000,
-  MAX_WS_CLIENTS: 200,
+  MAX_WS_CLIENTS: 50,
   MAX_ARRAY_SIZE: 50,
   CIRCUIT_BREAKER_THRESHOLD: 2,
   CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
@@ -1687,20 +1687,15 @@ export class GameServer {
     return result;
   }
   
-  // ============ BOT FUNCTIONS ============
-  
   _addBots(room, count) {
     try {
       const game = this.activeGames.get(room);
       if (!this._isGameActuallyRunning(game)) return;
-      
-      const botNames = ["BOT_A", "BOT_B", "BOT_C", "BOT_D"];
+      const botNames = ["moz1", "moz2", "moz3", "moz4"];
       const existingBots = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
       const existingBotCount = existingBots.length;
       const maxBotsToAdd = Math.min(count, CONSTANTS.MAX_BOTS_PER_GAME - existingBotCount);
-      
       if (maxBotsToAdd <= 0) return;
-      
       for (let i = 0; i < maxBotsToAdd; i++) {
         const botId = `BOT_${room}_${i}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
         const botName = botNames[(existingBotCount + i) % botNames.length];
@@ -1719,11 +1714,9 @@ export class GameServer {
     try {
       if (!this._isGameActuallyRunning(game) || !game.botPlayers) return;
       if (!game._botTimeouts) game._botTimeouts = new Set();
-      
       const notDrawn = Array.from(game.botPlayers.keys())
         .filter(id => !game.eliminated?.has(id) && !game.numbers?.has(id))
         .slice(0, CONSTANTS.MAX_BOT_DRAWS_PER_ROUND);
-      
       for (const botId of notDrawn) {
         const delay = this._getRandomDrawDelay();
         const timeout = setTimeout(() => {
@@ -1748,14 +1741,12 @@ export class GameServer {
     try {
       if (!this._isGameActuallyRunning(game) || game.numbers?.has(botId) || game.drawTimeExpired || game.evaluationLocked) return;
       if (game.eliminated?.has(botId)) return;
-      
       const number = this._getBotNumberByRound(game.round);
       const tanda = this._getRandomCardTanda();
       game.numbers.set(botId, number);
       game.tanda.set(botId, tanda);
       const botName = game.players.get(botId)?.name || botId;
       this._broadcastToRoom(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
-      
       const activeIds = this._getActivePlayerIds(game);
       if (game.numbers.size === activeIds.length && !game.evaluationLocked && !game.drawTimeExpired && this._isGameActuallyRunning(game)) {
         game.evaluationLocked = true;
@@ -1779,8 +1770,6 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
     } catch(e) {}
   }
-  
-  // ============ ORIGINAL GAME FUNCTIONS ============
   
   _startRegistration(room, game) {
     if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
@@ -1815,50 +1804,6 @@ export class GameServer {
     }
     
     sendUpdate.call(this);
-  }
-  
-  _closeRegistration(room, game) {
-    try {
-      if (!game || !game._isActive || game._gameEnded || game.evaluationLocked) return;
-      if (!game.registrationOpen) return;
-      
-      game.registrationOpen = false;
-      if (game._registrationTimer) {
-        clearTimeout(game._registrationTimer);
-        game._registrationTimer = null;
-      }
-      
-      let activePlayerCount = this._getActivePlayers(game).length;
-      
-      // ✅ FIX: Jika hanya host (1 player), tambahkan 3 bot
-      if (activePlayerCount < 2) {
-        // Tambahkan 3 bot agar total 4 player (1 host + 3 bot)
-        const botsToAdd = 3;
-        this._addBots(room, botsToAdd);
-        activePlayerCount = this._getActivePlayers(game).length;
-      }
-      
-      // Jika masih kurang dari 2 player, end game
-      if (activePlayerCount < 2) {
-        this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
-        game._gameEnded = true;
-        game._isActive = false;
-        game._endTime = Date.now();
-        this._scheduleGameCleanup(room, game);
-        return;
-      }
-      
-      // Tambahkan bot jika player masih kurang dari 4
-      if (!game._botsAdded) {
-        const needed = Math.min(CONSTANTS.MAX_BOTS_PER_GAME, 4 - activePlayerCount);
-        if (needed > 0) {
-          this._addBots(room, needed);
-          game._botsAdded = true;
-        }
-      }
-      
-      this._startDrawPhase(room, game);
-    } catch(e) {}
   }
   
   _startDrawCountdown(room, game) {
@@ -2116,7 +2061,7 @@ export class GameServer {
       const activePlayers = this._getActivePlayers(game);
       if (activePlayers.length < 2) {
         if (!game._botsAdded) {
-          const needed = Math.min(CONSTANTS.MAX_BOTS_PER_GAME, 4 - activePlayers.length);
+          const needed = Math.min(4 - activePlayers.length, CONSTANTS.MAX_BOTS_PER_GAME);
           if (needed > 0) {
             this._addBots(room, needed);
             game._botsAdded = true;
