@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULLY MATCHED WITH JAVA CLIENT) ====================
+// ==================== GAME-SERVER.JS (FULL WITH DEEPLX TRANSLATE) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -21,13 +21,13 @@ const CONSTANTS = {
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
   QUIZ_INTERVAL_MS: 30000,
   QUIZ_TIME_LIMIT_MS: 15000,
-  TRANSLATE_LIMIT: 30,
+  TRANSLATE_LIMIT: 999999,        // ✅ Tidak terbatas (DeepLX gratis)
   QUIZ_BREAK_MS: 2000,
   QUIZ_START_DELAY_MS: 5000,
   MAX_RETRY_INIT_QUIZ: 2,
   MAX_BROADCAST_BATCH: 3,
   MAX_SHUTDOWN_WAIT_MS: 5000,
-  MAX_WS_CLIENTS: 50,
+  MAX_WS_CLIENTS: 200,
   MAX_ARRAY_SIZE: 50,
   CIRCUIT_BREAKER_THRESHOLD: 2,
   CIRCUIT_BREAKER_TIMEOUT_MS: 30000,
@@ -36,6 +36,14 @@ const CONSTANTS = {
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
   SCHEDULER_INTERVAL_MS: 60000,
+  // ✅ KONFIGURASI UNTUK 10.000 SOAL
+  QUIZ_BATCH_SIZE: 100,              // Ambil 100 soal per batch
+  QUIZ_BATCH_THRESHOLD: 20,          // Load batch baru jika sisa < 20
+  MAX_QUESTIONS: 10000,              // Total soal di KV
+  // ✅ KONFIGURASI DEEPLX
+  DEEPLX_URL: 'https://your-worker.workers.dev/translate', // Ganti dengan URL Worker Anda
+  DEEPLX_TIMEOUT: 3000,
+  SUPPORTED_LANGUAGES: ['id', 'ja', 'ko', 'th', 'vi', 'ar', 'ru', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'tr', 'hi'],
 };
 
 const QUIZ_SCHEDULE = {
@@ -90,6 +98,14 @@ export class GameServer {
       this.quizQuestionCache = {};
       this.questionTranslations = new Map();
       this._quizStartTime = null;
+      
+      // ✅ TRACKING UNTUK 10.000 SOAL
+      this._allQuestions = [];              // Semua soal (10.000)
+      this._currentQuestions = [];          // Soal aktif di cache (100)
+      this._currentBatchStart = 0;          // Index awal batch (0, 100, 200, dst)
+      this._currentBatchEnd = 0;            // Index akhir batch (99, 199, 299, dst)
+      this._isAllQuestionsLoaded = false;   // Flag sudah load semua
+      this._questionPointer = 0;            // Pointer soal dalam batch
       
       // TRANSLATION
       this.translateCount = 0;
@@ -500,7 +516,7 @@ export class GameServer {
       
       if (oldRoom === roomName) {
         if (roomName === QUIZ_ROOM) {
-          if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+          if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
             await this._initQuiz();
           }
           
@@ -535,7 +551,7 @@ export class GameServer {
       }
       
       if (roomName === QUIZ_ROOM) {
-        if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           await this._initQuiz();
         }
         
@@ -556,6 +572,131 @@ export class GameServer {
     } finally {
       this._switchLocks.delete(lockKey);
     }
+  }
+  
+  // ==================== ✅ LOAD SEMUA SOAL DARI KV (10.000) ====================
+  
+  async _loadAllQuestionsFromKV() {
+    try {
+      if (!this.env || !this.env.QUESTIONS) return false;
+      
+      // ✅ AMBIL SEMUA SOAL DARI KV
+      const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
+      
+      if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
+        
+        // ✅ SIMPAN SEMUA SOAL DENGAN NOMOR URUT
+        this._allQuestions = cached.questions.map((q, index) => ({
+          id: index + 1,  // Nomor urut 1, 2, 3, ... 10000
+          question: q.question || '',
+          options: q.options || { A: '', B: '', C: '', D: '' },
+          correct: q.correct || 'A',
+          category: q.category || 'General',
+          difficulty: q.difficulty || 'medium'
+        }));
+        
+        this._isAllQuestionsLoaded = true;
+        this._currentBatchStart = 0;
+        this._currentBatchEnd = 0;
+        this._questionPointer = 0;
+        
+        // ✅ AMBIL BATCH PERTAMA (100 SOAL PERTAMA: 1-100)
+        this._loadNextBatch();
+        
+        console.log(`✅ Loaded ${this._allQuestions.length} questions from KV`);
+        return true;
+      }
+      
+      console.log("❌ No questions found in KV");
+      return false;
+    } catch(e) {
+      console.error("Load all questions error:", e);
+      return false;
+    }
+  }
+  
+  // ==================== ✅ AMBIL BATCH BERIKUTNYA (URUT) ====================
+  
+  _loadNextBatch() {
+    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+      return false;
+    }
+    
+    const totalQuestions = this._allQuestions.length; // 10.000
+    
+    // ✅ HITUNG BATCH BERIKUTNYA
+    let startIndex = this._currentBatchEnd; // Mulai dari akhir batch sebelumnya
+    
+    // ✅ CEK APAKAH SUDAH MELEWATI TOTAL SOAL
+    if (startIndex >= totalQuestions) {
+      // ✅ RESET KE AWAL (1 - 100)
+      console.log("🔄 All 10,000 questions have been used! Resetting to question 1...");
+      startIndex = 0;
+      this._currentBatchStart = 0;
+      this._questionPointer = 0;
+      
+      this._broadcastToRoom(QUIZ_ROOM, [
+        "quizNotification",
+        "📢 All 10,000 questions have been answered! Starting from question 1 again!",
+        "info"
+      ]);
+    }
+    
+    // ✅ HITUNG AKHIR BATCH (start + 100)
+    let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
+    
+    // ✅ AMBIL SOAL DARI startIndex SAMPAI endIndex
+    const batch = this._allQuestions.slice(startIndex, endIndex);
+    
+    // ✅ SIMPAN BATCH KE CACHE
+    this.quizQuestionCache['en'] = batch;
+    this._currentQuestions = batch;
+    this._currentBatchStart = startIndex;
+    this._currentBatchEnd = endIndex;
+    this._questionPointer = 0; // Reset pointer untuk batch baru
+    
+    const startNum = startIndex + 1;
+    const endNum = endIndex;
+    
+    console.log(`📚 Loaded questions ${startNum} to ${endNum} (${batch.length} questions)`);
+    console.log(`📚 Next batch will start from ${endNum + 1}`);
+    
+    // ✅ BROADCAST STATUS KE USER
+    this._broadcastToRoom(QUIZ_ROOM, [
+      "quizBatchLoaded",
+      {
+        start: startNum,
+        end: endNum,
+        total: totalQuestions,
+        remaining: totalQuestions - endNum,
+        batch: Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE) + 1,
+        totalBatches: Math.ceil(totalQuestions / CONSTANTS.QUIZ_BATCH_SIZE)
+      }
+    ]);
+    
+    return true;
+  }
+  
+  // ==================== ✅ CEK DAN LOAD BATCH BARU ====================
+  
+  _checkAndLoadNextBatch() {
+    const currentQuestions = this.quizQuestionCache['en'] || [];
+    
+    // ✅ JIKA SOAL TINGGAL SEDIKIT (< 20), LOAD BATCH BARU
+    if (currentQuestions.length < CONSTANTS.QUIZ_BATCH_THRESHOLD) {
+      console.log(`⚠️ ${currentQuestions.length} questions remaining, loading next batch...`);
+      this._loadNextBatch();
+      return true;
+    }
+    
+    // ✅ CEK APAKAH SUDAH MENCAPAI AKHIR
+    if (this._currentBatchEnd >= this._allQuestions.length && this._isAllQuestionsLoaded) {
+      console.log("🔄 Reached end of all questions! Resetting...");
+      this._loadNextBatch(); // Akan reset ke awal
+      return true;
+    }
+    
+    return false;
   }
   
   // ==================== QUIZ CORE ====================
@@ -595,19 +736,39 @@ export class GameServer {
         return;
       }
 
+      // ✅ CEK APAKAH PERLU LOAD BATCH BARU
+      this._checkAndLoadNextBatch();
+
       let questions = this.quizQuestionCache['en'];
       if (!questions || questions.length === 0) {
-        const loaded = await this._loadQuestionsFromKV();
-        if (!loaded) return;
+        const loaded = this._loadNextBatch();
+        if (!loaded) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizError",
+            "No questions available! Please add questions to KV."
+          ]);
+          return;
+        }
         questions = this.quizQuestionCache['en'];
         if (!questions || questions.length === 0) return;
       }
 
-      const maxIndex = Math.min(questions.length, 30);
-      const randomIndex = Math.floor(Math.random() * maxIndex);
-      const q = questions[randomIndex];
+      // ✅ AMBIL SOAL BERURUTAN (bukan random)
+      if (this._questionPointer >= questions.length) {
+        // ✅ JIKA POINTER MELEWATI BATCH, LOAD BATCH BARU
+        this._loadNextBatch();
+        questions = this.quizQuestionCache['en'];
+        if (!questions || questions.length === 0) return;
+        this._questionPointer = 0;
+      }
+      
+      // ✅ AMBIL SOAL BERDASARKAN POINTER
+      const q = questions[this._questionPointer];
+      this._questionPointer++; // Naikkan pointer untuk soal berikutnya
+      
       if (!q || !q.options) return;
 
+      // ✅ SHUFFLE OPTIONS (biar acak)
       const shuffled = this._shuffleQuestionOptions(q);
       
       this.currentQuestion = {
@@ -621,6 +782,7 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
 
+      // ✅ KIRIM PERTANYAAN KE CLIENT (dengan translate)
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -863,7 +1025,6 @@ export class GameServer {
           .sort((a, b) => b.score - a.score)
           .slice(0, limit);
         
-        // Format for Java client: ["username|score", ...]
         const result = sorted.map(item => `${item.username}|${item.score}`);
         this._safeSend(ws, ["quizLeaderboard", result]);
         return;
@@ -892,6 +1053,12 @@ export class GameServer {
         } catch(e) {
           this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
         }
+        return;
+      }
+      
+      if (evt === "getQuizStatus") {
+        const status = this._getQuizStatus();
+        this._safeSend(ws, ["quizStatus", status]);
         return;
       }
       
@@ -1085,13 +1252,40 @@ export class GameServer {
     }
   }
   
+  // ==================== ✅ GET QUIZ STATUS ====================
+  
+  _getQuizStatus() {
+    try {
+      const total = this._allQuestions.length || 0;
+      const currentBatchStart = this._currentBatchStart + 1;
+      const currentBatchEnd = this._currentBatchEnd;
+      const pointer = this._questionPointer;
+      const remainingInBatch = (this.quizQuestionCache['en'] || []).length - pointer;
+      const nextBatchStart = currentBatchEnd + 1;
+      
+      return {
+        total: total,
+        currentBatchStart: currentBatchStart,
+        currentBatchEnd: currentBatchEnd,
+        pointer: pointer,
+        remainingInBatch: remainingInBatch,
+        nextBatchStart: nextBatchStart,
+        currentBatch: Math.floor(this._currentBatchStart / CONSTANTS.QUIZ_BATCH_SIZE) + 1,
+        totalBatches: Math.ceil(total / CONSTANTS.QUIZ_BATCH_SIZE),
+        isComplete: this._currentBatchEnd >= total,
+        progress: total > 0 ? Math.round((this._currentBatchEnd / total) * 100) : 0
+      };
+    } catch(e) {
+      return { error: e.message };
+    }
+  }
+  
   // ==================== CHAT HELPER METHODS ====================
   
   _getSeatNumber(ws) {
     if (!ws) return -1;
     const wsId = this._getWsId(ws);
     if (!wsId) return -1;
-    // Simple mapping: use wsId as seat number (1-45)
     return (wsId % 45) + 1;
   }
   
@@ -1132,7 +1326,6 @@ export class GameServer {
         return;
       }
     }
-    // Send failure to sender
     const senderWsId = this._getWsIdByUsername(sender);
     if (senderWsId) {
       const senderWs = this.wsMap.get(senderWsId);
@@ -1158,9 +1351,7 @@ export class GameServer {
     return conn ? conn.wsId : null;
   }
   
-  // ==================== ALARM DINONAKTIFKAN ====================
-  
-  // ==================== TRANSLATION ====================
+  // ==================== ✅ TRANSLATE DENGAN DEEPLX (GRATIS SELAMANYA) ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1215,11 +1406,29 @@ export class GameServer {
     return this.userLanguage.get(wsId) || 'en';
   }
   
+  // ✅ TRANSLATE MENGGUNAKAN DEEPLX (GRATIS SELAMANYA)
   async _translateText(text, targetLang) {
-    if (targetLang === 'en') return text;
-    if (this.translateLimitReached) return text;
-    if (!text || typeof text !== 'string') return text;
+    if (targetLang === 'en' || !text || typeof text !== 'string') return text;
     
+    // ✅ Cek cache memory
+    const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
+    if (this.questionTranslations.has(cacheKey)) {
+      return this.questionTranslations.get(cacheKey);
+    }
+    
+    // ✅ Cek di KV cache
+    try {
+      if (this.env && this.env.QUESTIONS) {
+        const kvKey = `trans_${Buffer.from(text).toString('base64').substring(0, 50)}_${targetLang}`;
+        const cached = await this.env.QUESTIONS.get(kvKey);
+        if (cached) {
+          this.questionTranslations.set(cacheKey, cached);
+          return cached;
+        }
+      }
+    } catch(e) {}
+    
+    // ✅ Circuit breaker jika DeepLX error
     if (this._translationCircuitBreaker.isOpen) {
       const now = Date.now();
       if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
@@ -1230,45 +1439,59 @@ export class GameServer {
       }
     }
     
-    const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
-    if (this.questionTranslations.has(cacheKey)) {
-      return this.questionTranslations.get(cacheKey);
-    }
-    
-    if (this.translateCount >= CONSTANTS.TRANSLATE_LIMIT) {
-      this.translateLimitReached = true;
-      return text;
-    }
-    
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1500);
+      const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT);
       
-      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
-      const response = await fetch(url, { signal: controller.signal });
+      // ✅ Panggil DeepLX API
+      const response = await fetch(CONSTANTS.DEEPLX_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: text,
+          source_lang: 'EN',
+          target_lang: targetLang.toUpperCase()
+        }),
+        signal: controller.signal
+      });
       clearTimeout(timeoutId);
       
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
-      if (data && data[0] && data[0][0] && data[0][0][0]) {
-        const translated = data[0][0][0];
+      
+      if (data && data.data) {
+        const translated = data.data;
+        
+        // ✅ Simpan ke cache memory
         this.questionTranslations.set(cacheKey, translated);
+        
+        // ✅ Simpan ke KV cache
+        try {
+          if (this.env && this.env.QUESTIONS) {
+            const kvKey = `trans_${Buffer.from(text).toString('base64').substring(0, 50)}_${targetLang}`;
+            await this.env.QUESTIONS.put(kvKey, translated, { expirationTtl: 86400 * 30 }); // 30 hari
+          }
+        } catch(e) {}
+        
         this.translateCount++;
         this._translationCircuitBreaker.failures = 0;
         return translated;
       }
+      
+      return text;
     } catch(e) {
+      console.error(`DeepLX translate error (${targetLang}):`, e.message);
       this._translationCircuitBreaker.failures++;
       this._translationCircuitBreaker.lastFailureTime = Date.now();
       if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
         this._translationCircuitBreaker.isOpen = true;
       }
+      return text;
     }
-    return text;
   }
   
   async _translateOptions(options, targetLang) {
-    if (targetLang === 'en' || this.translateLimitReached || !options) {
+    if (targetLang === 'en' || !options) {
       return options;
     }
     const translatedOptions = {};
@@ -1290,29 +1513,12 @@ export class GameServer {
   // ==================== LOAD QUESTIONS ====================
   
   async _loadQuestionsFromKV() {
-    try {
-      if (!this.env || !this.env.QUESTIONS) return false;
-      const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
-      if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
-        const questions = cached.questions.slice(0, CONSTANTS.MAX_ARRAY_SIZE);
-        this.quizQuestionCache['en'] = questions.map(q => ({
-          question: q.question || '',
-          options: q.options || { A: '', B: '', C: '', D: '' },
-          correct: q.correct || 'A',
-          category: q.category || 'General',
-          difficulty: q.difficulty || 'medium'
-        }));
-        return true;
-      }
-      return false;
-    } catch(e) {
-      return false;
-    }
+    return this._loadAllQuestionsFromKV();
   }
   
   async _initQuiz(retryCount = 0) {
     try {
-      const loaded = await this._loadQuestionsFromKV();
+      const loaded = await this._loadAllQuestionsFromKV();
       if (loaded) {
         this._startQuizLoop();
         this._resetTranslateCounterDaily();
@@ -1337,7 +1543,7 @@ export class GameServer {
       
       this._forceStartQuizIfTime();
       
-      if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
         this._initQuiz().then(() => {
           if (!this.closing && !this.isDestroyed) {
             this._startQuizIfNeeded();
@@ -1356,7 +1562,7 @@ export class GameServer {
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients || clients.size === 0) return;
       if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-        if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           this._initQuiz().then(() => {
             if (!this.closing && !this.isDestroyed) {
               this._showQuestion();
@@ -1373,17 +1579,17 @@ export class GameServer {
   
   async forceStartQuiz() {
     try {
-      if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
         await this._initQuiz();
       }
-      if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
         return { success: false, message: "No questions available" };
       }
       if (this.currentQuestion || this._quizTimeout || this.isQuizWaiting) {
         return { 
           success: true, 
           message: "Quiz already running",
-          questions: this.quizQuestionCache['en'].length 
+          questions: this._allQuestions.length 
         };
       }
       this.quizAnswered = new Set();
@@ -1398,7 +1604,7 @@ export class GameServer {
       return { 
         success: true, 
         message: "Quiz started!",
-        questions: this.quizQuestionCache['en'].length 
+        questions: this._allQuestions.length 
       };
     } catch(e) {
       return { success: false, message: e.message };
@@ -1407,17 +1613,17 @@ export class GameServer {
   
   async startQuizWithDelay(delayMs = CONSTANTS.QUIZ_START_DELAY_MS) {
     try {
-      if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
         await this._initQuiz();
       }
-      if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
         return { success: false, message: "No questions available" };
       }
       if (this.currentQuestion || this._quizTimeout || this.isQuizWaiting) {
         return { 
           success: true, 
           message: "Quiz already running",
-          questions: this.quizQuestionCache['en'].length 
+          questions: this._allQuestions.length 
         };
       }
       this.quizAnswered = new Set();
@@ -1445,7 +1651,7 @@ export class GameServer {
       return { 
         success: true, 
         message: `Quiz will start in ${delayMs/1000} seconds`,
-        questions: this.quizQuestionCache['en'].length 
+        questions: this._allQuestions.length 
       };
     } catch(e) {
       return { success: false, message: e.message };
@@ -1463,7 +1669,20 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
       this._quizStartTime = null;
-      return { success: true, message: "Quiz reset successfully" };
+      
+      // ✅ RESET KE AWAL
+      this._currentBatchStart = 0;
+      this._currentBatchEnd = 0;
+      this._questionPointer = 0;
+      this._currentQuestions = [];
+      this.questionTranslations.clear();
+      
+      // ✅ LOAD BATCH PERTAMA (1-100)
+      if (this._isAllQuestionsLoaded) {
+        this._loadNextBatch();
+      }
+      
+      return { success: true, message: "Quiz reset to question 1" };
     } catch(e) {
       return { success: false, message: e.message };
     }
@@ -1560,6 +1779,7 @@ export class GameServer {
     };
   }
   
+  // ✅ BROADCAST QUIZ QUESTION DENGAN TRANSLATE PER USER
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds) return;
@@ -1575,11 +1795,15 @@ export class GameServer {
         let finalQuestion = question;
         let finalOptions = options;
         
-        if (lang !== 'en' && !this.translateLimitReached && finalQuestion && typeof finalQuestion === 'string') {
+        // ✅ Translate ke bahasa user (DeepLX - GRATIS)
+        if (lang !== 'en' && finalQuestion && typeof finalQuestion === 'string') {
           try {
             finalQuestion = await this._translateText(question, lang);
             finalOptions = await this._translateOptions(options, lang);
-          } catch(e) {}
+          } catch(e) {
+            // Fallback ke English jika error
+            console.error(`Translate error for ${lang}:`, e.message);
+          }
         }
         
         const questionObj = {
@@ -2885,11 +3109,14 @@ export class GameServer {
           status: this.isDestroyed ? 'down' : 'healthy',
           games: this.activeGames ? this.activeGames.size : 0,
           connections: this.wsMap ? this.wsMap.size : 0,
-          questions: this.quizQuestionCache && this.quizQuestionCache['en'] ? 
-                     this.quizQuestionCache['en'].length : 0,
+          questions: this._allQuestions ? this._allQuestions.length : 0,
           kvAvailable: !!(this.env && this.env.QUESTIONS),
           quizAutoEnabled: this.quizAutoEnabled || false,
           isQuizRunning: !!this.currentQuestion,
+          translateCount: this.translateCount,
+          translateLimit: CONSTANTS.TRANSLATE_LIMIT,
+          usingDeepLX: true,
+          quizProgress: this._getQuizStatus(),
           timestamp: Date.now()
         }), { 
           headers: { 'Content-Type': 'application/json' }
