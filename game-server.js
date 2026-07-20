@@ -21,7 +21,7 @@ const CONSTANTS = {
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
   QUIZ_INTERVAL_MS: 30000,
   QUIZ_TIME_LIMIT_MS: 15000,
-  TRANSLATE_LIMIT: 999999,            // ✅ UNLIMITED
+  TRANSLATE_LIMIT: 999999,
   QUIZ_BREAK_MS: 2000,
   QUIZ_START_DELAY_MS: 5000,
   MAX_RETRY_INIT_QUIZ: 2,
@@ -29,8 +29,8 @@ const CONSTANTS = {
   MAX_SHUTDOWN_WAIT_MS: 5000,
   MAX_WS_CLIENTS: 50,
   MAX_ARRAY_SIZE: 50,
-  CIRCUIT_BREAKER_THRESHOLD: 5,       // ✅ DINAUKAN DARI 2 JADI 5
-  CIRCUIT_BREAKER_TIMEOUT_MS: 60000,  // ✅ DINAUKAN DARI 30 DETIK JADI 60 DETIK
+  CIRCUIT_BREAKER_THRESHOLD: 5,
+  CIRCUIT_BREAKER_TIMEOUT_MS: 60000,
   QUIZ_SWITCH_DELAY_MS: 5000,
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
@@ -39,7 +39,12 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   QUIZ_BATCH_THRESHOLD: 20,
   MAX_QUESTIONS: 10000,
-  // ✅ DEEPLX CONFIG - LEBIH BANYAK API
+  // ✅ GAME SCHEDULE - JAM MAIN GAME
+  GAME_SCHEDULE: {
+    START_HOUR: 0,  // Jam mulai (UTC)
+    END_HOUR: 23,   // Jam selesai (UTC)
+  },
+  // ✅ DEEPLX CONFIG
   DEEPLX_API_URLS: [
     'https://api.deeplx.org/translate',
     'https://deeplx.vercel.app/translate',
@@ -47,8 +52,8 @@ const CONSTANTS = {
     'https://deeplx.mingming.dev/translate',
     'https://deeplx.azurewebsites.net/translate',
   ],
-  DEEPLX_TIMEOUT_MS: 8000,            // ✅ DINAUKAN DARI 3 DETIK JADI 8 DETIK
-  DEEPLX_DELAY_MS: 500,               // Jeda antar request
+  DEEPLX_TIMEOUT_MS: 8000,
+  DEEPLX_DELAY_MS: 500,
   DEEPLX_BATCH_SIZE: 10,
   DEEPLX_BATCH_DELAY_MS: 2000,
   DEEPLX_MAX_RETRIES: 3,
@@ -119,8 +124,8 @@ export class GameServer {
     this.translateLimitReached = false;
     this.userLanguage = new Map();
     this.userCountry = new Map();
-    this._translationQueue = [];        // ✅ QUEUE UNTUK TRANSLATE
-    this._isProcessingQueue = false;    // ✅ FLAG QUEUE
+    this._translationQueue = [];
+    this._isProcessingQueue = false;
     
     // TIMERS
     this._quizTimeout = null;
@@ -128,7 +133,7 @@ export class GameServer {
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
     
-    // ✅ CIRCUIT BREAKER - RESET OTOMATIS
+    // ✅ CIRCUIT BREAKER
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
@@ -165,6 +170,37 @@ export class GameServer {
   
   _getCurrentUTCHours() {
     return new Date().getUTCHours();
+  }
+  
+  // ==================== ✅ GAME TIME CHECK ====================
+  
+  _isGameTime() {
+    const hour = this._getCurrentUTCHours();
+    const schedule = CONSTANTS.GAME_SCHEDULE || { START_HOUR: 0, END_HOUR: 23 };
+    
+    // Jika START_HOUR > END_HOUR (misal 22 - 6), berarti melewati tengah malam
+    if (schedule.START_HOUR > schedule.END_HOUR) {
+      return hour >= schedule.START_HOUR || hour < schedule.END_HOUR;
+    }
+    
+    return hour >= schedule.START_HOUR && hour < schedule.END_HOUR;
+  }
+  
+  _getGameType(room) {
+    // ✅ LOGIKA BARU:
+    // - Jika dalam jam main game DAN tidak ada game aktif -> false (bisa main)
+    // - Jika dalam jam main game DAN ada game aktif -> false (sedang game)
+    // - Jika diluar jam main game -> true (tidak bisa main)
+    
+    const isInGameTime = this._isGameTime();
+    
+    // Jika diluar jam main game -> true (tidak bisa main)
+    if (!isInGameTime) {
+      return true;
+    }
+    
+    // Jika dalam jam main game -> false (bisa main, baik ada game atau tidak)
+    return false;
   }
   
   // ==================== WEEKLY HELPERS ====================
@@ -519,6 +555,18 @@ export class GameServer {
             if (this.closing || this.isDestroyed) return;
             this._sendQuizTimeLeftToUser(ws);
           }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
+        } else {
+          // ✅ KIRIM GAME TYPE SAAT MASUK ROOM
+          const gameType = this._getGameType(roomName);
+          this._safeSend(ws, ["gameType", gameType]);
+          
+          // ✅ KIRIM STATUS GAME
+          const game = this.activeGames.get(roomName);
+          const isRunning = game && game._isActive && !game._gameEnded;
+          if (isRunning) {
+            // Kirim status game yang sedang berjalan
+            this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
+          }
         }
         return;
       }
@@ -552,6 +600,18 @@ export class GameServer {
           if (this.closing || this.isDestroyed) return;
           this._sendQuizTimeLeftToUser(ws);
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
+      } else {
+        // ✅ KIRIM GAME TYPE SAAT MASUK ROOM
+        const gameType = this._getGameType(roomName);
+        this._safeSend(ws, ["gameType", gameType]);
+        
+        // ✅ KIRIM STATUS GAME
+        const game = this.activeGames.get(roomName);
+        const isRunning = game && game._isActive && !game._gameEnded;
+        if (isRunning) {
+          // Kirim status game yang sedang berjalan
+          this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
+        }
       }
       
     } finally {
@@ -2282,6 +2342,15 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
         return;
       }
+      
+      // ✅ CEK GAME TYPE - JIKA TRUE (DILUAR JAM) MAKA TIDAK BISA START
+      const gameType = this._getGameType(room);
+      if (gameType) {
+        this._safeSend(ws, ["gameLowCardError", "Game is not available at this time"]);
+        this._safeSend(ws, ["gameType", gameType]);
+        return;
+      }
+      
       const startKey = `start_${room}`;
       if (this._gameStartFlags.has(startKey)) {
         this._safeSend(ws, ["gameLowCardError", "Game is already starting..."]);
@@ -2423,6 +2492,15 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
       }
+      
+      // ✅ CEK GAME TYPE - JIKA TRUE (DILUAR JAM) MAKA TIDAK BISA JOIN
+      const gameType = this._getGameType(room);
+      if (gameType) {
+        this._safeSend(ws, ["gameLowCardError", "Game is not available at this time"]);
+        this._safeSend(ws, ["gameType", gameType]);
+        return;
+      }
+      
       const lockKey = `join_${room}_${usernameClean}`;
       if (this._joinLocks.has(lockKey)) {
         this._safeSend(ws, ["gameLowCardError", "Join in progress, please wait"]);
