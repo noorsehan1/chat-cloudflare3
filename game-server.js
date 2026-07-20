@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (NO CHAT - QUIZ + GAME ONLY) ====================
+// ==================== GAME-SERVER.JS (FIXED - NO CHAT, QUIZ + GAME ONLY) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -36,11 +36,9 @@ const CONSTANTS = {
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
   SCHEDULER_INTERVAL_MS: 60000,
-  // ✅ KONFIGURASI UNTUK 10.000 SOAL
   QUIZ_BATCH_SIZE: 100,
   QUIZ_BATCH_THRESHOLD: 20,
   MAX_QUESTIONS: 10000,
-  // ✅ DeepLX Config - HANYA UNTUK QUIZ
   DEEPLX_API_URL: 'https://api.deeplx.org/translate',
   DEEPLX_TIMEOUT_MS: 3000,
 };
@@ -58,104 +56,94 @@ const QUIZ_ROOM = "Quiz";
 
 export class GameServer {
   constructor(state, env) {
-    try {
-      this.state = state;
-      this.env = env;
-      this.closing = false;
-      this.isDestroyed = false;
-      this._initialized = false;
-      
-      // GAME MAPS
-      this.activeGames = new Map();
-      this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
-      this._gameLocks = new Map();
-      this._joinLocks = new Map();
-      this._switchLocks = new Map();
-      
-      // WEBSOCKET MAPS
-      this._wsIdCounter = 0;
-      this.wsClients = new Map();
-      this.clientRooms = new Map();
-      this.wsMap = new Map();
-      this.roomViewers = new Map();
-      this.userConnections = new Map();
-      this.connectionLocks = new Map();
-      this._cleanupTimers = new Map();
-      this._roomBroadcastCount = new Map();
-      this._roomBroadcastReset = new Map();
-      this._tikCounter = 0;
-      this._gameStartFlags = new Map();
-      
-      // QUIZ
-      this.quizAnswered = new Set();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this.quizTimer = null;
-      this.isQuizRunning = false;
-      this.currentQuestion = null;
-      this.isQuizWaiting = false;
-      this.quizQuestionCache = {};
-      this.questionTranslations = new Map();
-      this._quizStartTime = null;
-      
-      // ✅ TRACKING UNTUK 10.000 SOAL
-      this._allQuestions = [];
-      this._currentQuestions = [];
-      this._currentBatchStart = 0;
-      this._currentBatchEnd = 0;
-      this._isAllQuestionsLoaded = false;
-      this._questionPointer = 0;
-      
-      // ✅ DEEPLX TRANSLATION - HANYA UNTUK QUIZ
-      this.translateCount = 0;
-      this.translateDate = new Date().toUTCString();
-      this.translateLimitReached = false;
-      this.userLanguage = new Map();
-      this.userCountry = new Map();
-      
-      // TIMERS
-      this._quizTimeout = null;
-      this._translateResetInterval = null;
-      this._quizBreakTimeout = null;
-      this._quizStartTimeout = null;
-      
-      this._translationCircuitBreaker = {
-        failures: 0,
-        lastFailureTime: 0,
-        isOpen: false
-      };
-      
-      this.quizAutoEnabled = false;
-      this.quizAutoTimer = null;
-      
-      setTimeout(() => {
-        this._initAsync();
-      }, 0);
-      
-    } catch(e) {
-      console.error("Constructor error:", e);
-      throw e;
-    }
+    // ✅ JANGAN GUNAKAN TRY-CATCH DI CONSTRUCTOR
+    this.state = state;
+    this.env = env;
+    this.closing = false;
+    this.isDestroyed = false;
+    this._initialized = false;
+    
+    // GAME MAPS
+    this.activeGames = new Map();
+    this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
+    this._gameLocks = new Map();
+    this._joinLocks = new Map();
+    this._switchLocks = new Map();
+    
+    // WEBSOCKET MAPS
+    this._wsIdCounter = 0;
+    this.wsClients = new Map();
+    this.clientRooms = new Map();
+    this.wsMap = new Map();
+    this.roomViewers = new Map();
+    this.userConnections = new Map();
+    this.connectionLocks = new Map();
+    this._cleanupTimers = new Map();
+    this._roomBroadcastCount = new Map();
+    this._roomBroadcastReset = new Map();
+    this._tikCounter = 0;
+    this._gameStartFlags = new Map();
+    
+    // QUIZ
+    this.quizAnswered = new Set();
+    this.quizHasWinner = false;
+    this.quizWinner = null;
+    this.quizTimer = null;
+    this.isQuizRunning = false;
+    this.currentQuestion = null;
+    this.isQuizWaiting = false;
+    this.quizQuestionCache = {};
+    this.questionTranslations = new Map();
+    this._quizStartTime = null;
+    
+    // TRACKING UNTUK 10.000 SOAL
+    this._allQuestions = [];
+    this._currentQuestions = [];
+    this._currentBatchStart = 0;
+    this._currentBatchEnd = 0;
+    this._isAllQuestionsLoaded = false;
+    this._questionPointer = 0;
+    
+    // DEEPLX TRANSLATION
+    this.translateCount = 0;
+    this.translateDate = new Date().toUTCString();
+    this.translateLimitReached = false;
+    this.userLanguage = new Map();
+    this.userCountry = new Map();
+    
+    // TIMERS
+    this._quizTimeout = null;
+    this._translateResetInterval = null;
+    this._quizBreakTimeout = null;
+    this._quizStartTimeout = null;
+    
+    this._translationCircuitBreaker = {
+      failures: 0,
+      lastFailureTime: 0,
+      isOpen: false
+    };
+    
+    this.quizAutoEnabled = false;
+    this.quizAutoTimer = null;
+    
+    // ✅ PASTIKAN INIT BERJALAN
+    this._initAsync();
   }
   
-  // ==================== ASYNC INIT ====================
+  // ==================== ASYNC INIT - TANPA TRY-CATCH BERLEBIH ====================
   
   async _initAsync() {
     if (this._initialized) return;
     this._initialized = true;
     
-    try {
-      await this._initQuiz();
-      this._startQuizScheduler();
-      await this._checkAndResetWeeklyPoints();
-      
-      setTimeout(() => {
-        this.ensureQuizRunning();
-      }, 2000);
-      
-    } catch(e) {
-      console.error("Init async error:", e);
-    }
+    // ✅ JANGAN PAKAI TRY-CATCH YANG MENUTUPI ERROR
+    await this._initQuiz();
+    this._startQuizScheduler();
+    await this._checkAndResetWeeklyPoints();
+    
+    setTimeout(() => {
+      this.ensureQuizRunning();
+    }, 2000);
   }
   
   // ==================== UTC TIME HELPERS ====================
@@ -180,8 +168,8 @@ export class GameServer {
   }
   
   async _getQuizPoints() {
+    if (!this.env || !this.env.QUESTIONS) return {};
     try {
-      if (!this.env || !this.env.QUESTIONS) return {};
       const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json');
       return points || {};
     } catch(e) {
@@ -190,8 +178,8 @@ export class GameServer {
   }
   
   async _getLastWeekWinner() {
+    if (!this.env || !this.env.QUESTIONS) return null;
     try {
-      if (!this.env || !this.env.QUESTIONS) return null;
       const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
       return winner || null;
     } catch(e) {
@@ -200,9 +188,9 @@ export class GameServer {
   }
   
   async _checkAndResetWeeklyPoints() {
+    if (!this.env || !this.env.QUESTIONS) return false;
+    
     try {
-      if (!this.env || !this.env.QUESTIONS) return false;
-      
       const currentWeek = this._getCurrentWeek();
       const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
       
@@ -325,16 +313,12 @@ export class GameServer {
       this.quizAutoTimer = null;
     }
     this.quizAutoTimer = setInterval(() => {
-      try {
-        if (this.closing || this.isDestroyed) {
-          clearInterval(this.quizAutoTimer);
-          this.quizAutoTimer = null;
-          return;
-        }
-        this._checkQuizAutoStatus();
-      } catch(e) {
-        console.error("Scheduler error:", e);
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this.quizAutoTimer);
+        this.quizAutoTimer = null;
+        return;
       }
+      this._checkQuizAutoStatus();
     }, CONSTANTS.SCHEDULER_INTERVAL_MS);
   }
   
@@ -373,18 +357,14 @@ export class GameServer {
   // ==================== FORCE START QUIZ IF TIME ====================
   
   _forceStartQuizIfTime() {
-    try {
-      if (!this._isQuizTime()) return;
-      if (this.currentQuestion) return;
-      if (this._quizTimeout) return;
-      if (this.isQuizWaiting) return;
-      if (this._quizStartTimeout) return;
-      
-      this.quizAutoEnabled = true;
-      this._showQuestion();
-    } catch(e) {
-      console.error("Force start quiz error:", e);
-    }
+    if (!this._isQuizTime()) return;
+    if (this.currentQuestion) return;
+    if (this._quizTimeout) return;
+    if (this.isQuizWaiting) return;
+    if (this._quizStartTimeout) return;
+    
+    this.quizAutoEnabled = true;
+    this._showQuestion();
   }
   
   // ==================== SEND TO USER ====================
@@ -447,7 +427,6 @@ export class GameServer {
       this._safeSend(ws, ["quizTimeLeft", message, canType]);
       return true;
     } catch(e) {
-      console.error("Send quiz time left error:", e);
       return false;
     }
   }
@@ -526,10 +505,8 @@ export class GameServer {
           }
           
           setTimeout(() => {
-            try {
-              if (this.closing || this.isDestroyed) return;
-              this._sendQuizTimeLeftToUser(ws);
-            } catch(e) {}
+            if (this.closing || this.isDestroyed) return;
+            this._sendQuizTimeLeftToUser(ws);
           }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
         }
         return;
@@ -561,10 +538,8 @@ export class GameServer {
         }
         
         setTimeout(() => {
-          try {
-            if (this.closing || this.isDestroyed) return;
-            this._sendQuizTimeLeftToUser(ws);
-          } catch(e) {}
+          if (this.closing || this.isDestroyed) return;
+          this._sendQuizTimeLeftToUser(ws);
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
       }
       
@@ -573,12 +548,12 @@ export class GameServer {
     }
   }
   
-  // ==================== LOAD SEMUA SOAL DARI KV (10.000) ====================
+  // ==================== LOAD SEMUA SOAL DARI KV ====================
   
   async _loadAllQuestionsFromKV() {
+    if (!this.env || !this.env.QUESTIONS) return false;
+    
     try {
-      if (!this.env || !this.env.QUESTIONS) return false;
-      
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
       
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
@@ -807,20 +782,15 @@ export class GameServer {
           this.isQuizWaiting = true;
 
           this._quizBreakTimeout = setTimeout(() => {
-            try {
-              if (this.closing || this.isDestroyed) {
-                this._quizBreakTimeout = null;
-                return;
-              }
-              this.isQuizWaiting = false;
+            if (this.closing || this.isDestroyed) {
               this._quizBreakTimeout = null;
-              this.currentQuestion = null;
-              if (!this.closing && !this.isDestroyed) {
-                this.ensureQuizRunning();
-              }
-            } catch(e) {
-              this.isQuizWaiting = false;
-              this._quizBreakTimeout = null;
+              return;
+            }
+            this.isQuizWaiting = false;
+            this._quizBreakTimeout = null;
+            this.currentQuestion = null;
+            if (!this.closing && !this.isDestroyed) {
+              this.ensureQuizRunning();
             }
           }, CONSTANTS.QUIZ_BREAK_MS);
 
@@ -917,162 +887,150 @@ export class GameServer {
     }
     
     this.quizTimer = setInterval(() => {
-      try {
-        if (this.closing || this.isDestroyed) {
-          clearInterval(this.quizTimer);
-          this.quizTimer = null;
-          return;
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this.quizTimer);
+        this.quizTimer = null;
+        return;
+      }
+      
+      if (this._isQuizTime()) {
+        if (!this.quizAutoEnabled) {
+          this.quizAutoEnabled = true;
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏳ Quiz will start soon!",
+            true
+          ]);
         }
         
-        if (this._isQuizTime()) {
-          if (!this.quizAutoEnabled) {
-            this.quizAutoEnabled = true;
-            this._broadcastToRoom(QUIZ_ROOM, [
-              "quizTimeLeft",
-              "⏳ Quiz will start soon!",
-              true
-            ]);
-          }
-          
-          if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-            this._showQuestion();
-          }
-          
-        } else {
-          if (this.quizAutoEnabled) {
-            this.quizAutoEnabled = false;
-            this.resetQuiz();
-            this._broadcastToRoom(QUIZ_ROOM, [
-              "quizTimeLeft",
-              "⏸️ Quiz is offline. Check schedule for next session.",
-              true
-            ]);
-          }
+        if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+          this._showQuestion();
         }
         
-      } catch(e) {
-        console.error("Quiz loop error:", e);
+      } else {
+        if (this.quizAutoEnabled) {
+          this.quizAutoEnabled = false;
+          this.resetQuiz();
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏸️ Quiz is offline. Check schedule for next session.",
+            true
+          ]);
+        }
       }
     }, CONSTANTS.QUIZ_INTERVAL_MS);
   }
   
-  // ==================== HANDLE EVENT (TANPA CHAT) ====================
+  // ==================== HANDLE EVENT ====================
   
   async handleEvent(ws, data) {
-    try {
-      if (this.isDestroyed || !ws || !data || !data[0]) return;
-      const evt = data[0];
-      
-      // ===== QUIZ EVENTS =====
-      if (evt === "switchRoom") {
-        const [_, room, username] = data;
-        await this.switchRoom(ws, room, username);
-        return;
+    if (this.isDestroyed || !ws || !data || !data[0]) return;
+    const evt = data[0];
+    
+    // ===== QUIZ EVENTS =====
+    if (evt === "switchRoom") {
+      const [_, room, username] = data;
+      await this.switchRoom(ws, room, username);
+      return;
+    }
+    
+    if (evt === "submitQuizAnswer") {
+      const [_, username, answer] = data;
+      await this.submitQuizAnswer(ws, username, answer);
+      return;
+    }
+    
+    if (evt === "getQuizLastWeekWinner") {
+      const winner = await this._getLastWeekWinner();
+      if (winner) {
+        this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
+      } else {
+        this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
+      }
+      return;
+    }
+    
+    if (evt === "getQuizLeaderboard") {
+      let limit = 10;
+      if (data.length > 1 && typeof data[1] === 'number') {
+        limit = Math.min(data[1], 30);
       }
       
-      if (evt === "submitQuizAnswer") {
-        const [_, username, answer] = data;
-        await this.submitQuizAnswer(ws, username, answer);
-        return;
+      const points = await this._getQuizPoints();
+      
+      const sorted = Object.entries(points)
+        .map(([username, score]) => ({ username, score }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+      
+      const result = sorted.map(item => `${item.username}|${item.score}`);
+      this._safeSend(ws, ["quizLeaderboard", result]);
+      return;
+    }
+    
+    if (evt === "getQuizUserPoints") {
+      let username = "";
+      if (data.length > 1 && typeof data[1] === 'string') {
+        username = data[1];
       }
       
-      if (evt === "getQuizLastWeekWinner") {
-        const winner = await this._getLastWeekWinner();
-        if (winner) {
-          this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
+      const points = await this._getQuizPoints();
+      const userPoints = points[username] || 0;
+      this._safeSend(ws, ["quizUserPoints", username, userPoints]);
+      return;
+    }
+    
+    if (evt === "deleteQuizLastWeekWinner") {
+      try {
+        if (this.env && this.env.QUESTIONS) {
+          await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
+          this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
         } else {
-          this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
+          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
         }
-        return;
+      } catch(e) {
+        this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
       }
-      
-      if (evt === "getQuizLeaderboard") {
-        let limit = 10;
-        if (data.length > 1 && typeof data[1] === 'number') {
-          limit = Math.min(data[1], 30);
-        }
-        
-        const points = await this._getQuizPoints();
-        
-        const sorted = Object.entries(points)
-          .map(([username, score]) => ({ username, score }))
-          .sort((a, b) => b.score - a.score)
-          .slice(0, limit);
-        
-        const result = sorted.map(item => `${item.username}|${item.score}`);
-        this._safeSend(ws, ["quizLeaderboard", result]);
-        return;
-      }
-      
-      if (evt === "getQuizUserPoints") {
-        let username = "";
-        if (data.length > 1 && typeof data[1] === 'string') {
-          username = data[1];
-        }
-        
-        const points = await this._getQuizPoints();
-        const userPoints = points[username] || 0;
-        this._safeSend(ws, ["quizUserPoints", username, userPoints]);
-        return;
-      }
-      
-      if (evt === "deleteQuizLastWeekWinner") {
-        try {
-          if (this.env && this.env.QUESTIONS) {
-            await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
-            this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
-          } else {
-            this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
-          }
-        } catch(e) {
-          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
-        }
-        return;
-      }
-      
-      if (evt === "getQuizStatus") {
-        const status = this._getQuizStatus();
-        this._safeSend(ws, ["quizStatus", status]);
-        return;
-      }
-      
-      // ❌ SEMUA CHAT EVENT DIHAPUS
-      // Tidak ada: chat, private, notif, gift, rollangak, setMuteType, dll
-      
-      // ===== GAME EVENTS =====
-      const room = this._ensureRoomConsistency(ws);
-      if (!room) {
-        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
-        return;
-      }
-      
-      if (room === QUIZ_ROOM) {
-        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
-        return;
-      }
-      
-      switch (evt) {
-        case "gameLowCardStart":
-          await this.startGame(ws, data[1], data[2]);
-          break;
-        case "gameLowCardJoin":
-          await this.joinGame(ws, data[1]);
-          break;
-        case "gameLowCardNumber":
-          await this.submitNumber(ws, data[1], data[2] || "", data[3]);
-          break;
-        case "gameLowCardLeave":
-          await this.leaveGame(ws, data[1]);
-          break;
-        case "checkGameRunning":
-          await this.checkGameRunning(ws, data[1]);
-          break;
-        default:
-          this._safeSend(ws, ["gameLowCardError", `Unknown event: ${evt}`]);
-          break;
-      }
-    } catch(e) {
-      this._safeSend(ws, ["gameLowCardError", "Game error: " + (e.message || "Unknown")]);
+      return;
+    }
+    
+    if (evt === "getQuizStatus") {
+      const status = this._getQuizStatus();
+      this._safeSend(ws, ["quizStatus", status]);
+      return;
+    }
+    
+    // ===== GAME EVENTS =====
+    const room = this._ensureRoomConsistency(ws);
+    if (!room) {
+      this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
+      return;
+    }
+    
+    if (room === QUIZ_ROOM) {
+      this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
+      return;
+    }
+    
+    switch (evt) {
+      case "gameLowCardStart":
+        await this.startGame(ws, data[1], data[2]);
+        break;
+      case "gameLowCardJoin":
+        await this.joinGame(ws, data[1]);
+        break;
+      case "gameLowCardNumber":
+        await this.submitNumber(ws, data[1], data[2] || "", data[3]);
+        break;
+      case "gameLowCardLeave":
+        await this.leaveGame(ws, data[1]);
+        break;
+      case "checkGameRunning":
+        await this.checkGameRunning(ws, data[1]);
+        break;
+      default:
+        this._safeSend(ws, ["gameLowCardError", `Unknown event: ${evt}`]);
+        break;
     }
   }
   
@@ -1104,7 +1062,7 @@ export class GameServer {
     }
   }
   
-  // ==================== WEB SOCKET HELPERS ====================
+  // ==================== WEBSOCKET HELPERS ====================
   
   _getWsId(ws) {
     return ws ? ws._wsId : null;
@@ -1226,22 +1184,20 @@ export class GameServer {
       this._translateResetInterval = null;
     }
     this._translateResetInterval = setInterval(() => {
-      try {
-        if (this.closing || this.isDestroyed) {
-          clearInterval(this._translateResetInterval);
-          this._translateResetInterval = null;
-          return;
-        }
-        const now = new Date().toUTCString();
-        if (now !== this.translateDate) {
-          this.translateDate = now;
-          this.translateCount = 0;
-          this.translateLimitReached = false;
-          this.questionTranslations.clear();
-          this._translationCircuitBreaker.isOpen = false;
-          this._translationCircuitBreaker.failures = 0;
-        }
-      } catch(e) {}
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._translateResetInterval);
+        this._translateResetInterval = null;
+        return;
+      }
+      const now = new Date().toUTCString();
+      if (now !== this.translateDate) {
+        this.translateDate = now;
+        this.translateCount = 0;
+        this.translateLimitReached = false;
+        this.questionTranslations.clear();
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+      }
     }, 60000);
   }
   
@@ -1273,7 +1229,6 @@ export class GameServer {
     return this.userLanguage.get(wsId) || 'en';
   }
   
-  // ✅ DEEPLX TRANSLATE - HANYA UNTUK QUIZ
   async _translateText(text, targetLang) {
     if (targetLang === 'en') return text;
     if (this.translateLimitReached) return text;
@@ -1504,7 +1459,7 @@ export class GameServer {
     }
   }
   
-  // ==================== GAME LOWCARD METHODS ====================
+  // ==================== GAME LOWCARD METHODS (LENGKAP) ====================
   
   _isGameActuallyRunning(game) {
     if (!game) return false;
@@ -2647,6 +2602,10 @@ export class GameServer {
           return new Response("WebSocket only", { status: 400 });
         }
         
+        if (this.wsMap.size >= CONSTANTS.MAX_WS_CLIENTS) {
+          return new Response("Server at maximum capacity", { status: 503 });
+        }
+        
         try {
           const pair = new WebSocketPair();
           const [client, server] = [pair[0], pair[1]];
@@ -2907,5 +2866,68 @@ export class GameServer {
         }
       }
     } catch(e) {}
+  }
+  
+  // ==================== ENSURE QUIZ RUNNING ====================
+  
+  ensureQuizRunning() {
+    try {
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      if (!clients || clients.size === 0) return;
+      
+      this._forceStartQuizIfTime();
+      
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        this._initQuiz().then(() => {
+          if (!this.closing && !this.isDestroyed) {
+            this._startQuizIfNeeded();
+          }
+        });
+        return;
+      }
+      this._startQuizIfNeeded();
+    } catch(e) {
+      console.error("Ensure quiz running error:", e);
+    }
+  }
+  
+  _startQuizIfNeeded() {
+    try {
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      if (!clients || clients.size === 0) return;
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+          this._initQuiz().then(() => {
+            if (!this.closing && !this.isDestroyed) {
+              this._showQuestion();
+            }
+          });
+          return;
+        }
+        this._showQuestion();
+      }
+    } catch(e) {
+      console.error("Start quiz if needed error:", e);
+    }
+  }
+  
+  async _initQuiz(retryCount = 0) {
+    try {
+      const loaded = await this._loadAllQuestionsFromKV();
+      if (loaded) {
+        this._startQuizLoop();
+        this._resetTranslateCounterDaily();
+        return true;
+      }
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+      }
+      return false;
+    } catch(e) {
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+      }
+      return false;
+    }
   }
 }
