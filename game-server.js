@@ -737,16 +737,19 @@ export class GameServer {
         return;
       }
       
+      // ✅ CEK APAKAH SEDANG JAM QUIZ - TOLAK JAWABAN
       if (this._isQuizTime()) {
         this._safeSend(ws, ["quizError", "Quiz is currently running! Please wait until session ends."]);
         return;
       }
       
+      // ✅ CEK APAKAH ADA PERTANYAAN AKTIF
       if (!this.currentQuestion) {
         this._safeSend(ws, ["quizError", "No active question."]);
         return;
       }
       
+      // ✅ CEK APAKAH QUIZ TIMEOUT MASIH AKTIF
       if (!this._quizTimeout) {
         this._safeSend(ws, ["quizError", "Question time is over!"]);
         return;
