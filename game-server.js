@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL - MATCH WITH CLIENT) ====================
+// ==================== GAME-SERVER.JS (FULL CLASS - WITH WEEKLY RESET LOGIC) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 5,
@@ -148,6 +148,15 @@ export class GameServer {
     return `${year}-W${String(week).padStart(2, '0')}`;
   }
   
+  _parseWeekNumber(weekString) {
+    if (!weekString) return 0;
+    const parts = weekString.split('-W');
+    if (parts.length === 2) {
+      return parseInt(parts[1], 10);
+    }
+    return 0;
+  }
+  
   async _getQuizPoints() {
     try {
       if (!this.env || !this.env.QUESTIONS) return {};
@@ -166,14 +175,63 @@ export class GameServer {
       const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
       
       if (savedWeek !== currentWeek) {
+        const points = await this._getQuizPoints();
+        
+        let winner = null;
+        let highestScore = 0;
+        
+        for (const [username, score] of Object.entries(points)) {
+          if (score > highestScore) {
+            highestScore = score;
+            winner = username;
+          }
+        }
+        
+        const savedWeekNumber = this._parseWeekNumber(savedWeek);
+        const currentWeekNumber = this._parseWeekNumber(currentWeek);
+        const weekDifference = currentWeekNumber - savedWeekNumber;
+        
+        if (winner) {
+          const winnerData = {
+            username: winner,
+            score: highestScore,
+            week: savedWeek || currentWeek
+          };
+          
+          await this.env.QUESTIONS.put(
+            CONSTANTS.QUIZ_LAST_WEEK_WINNER,
+            JSON.stringify(winnerData)
+          );
+          
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizLastWeekWinner",
+            {
+              username: winner,
+              score: highestScore,
+              week: savedWeek || currentWeek
+            }
+          ]);
+        }
+        
         await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify({}));
         await this.env.QUESTIONS.put(CONSTANTS.QUIZ_WEEK_KEY, currentWeek);
+        
+        let resetMessage = "New quiz week started! Points reset.";
+        let notificationType = "info";
+        
+        if (weekDifference > 1) {
+          resetMessage = `⚠️ Server was offline for ${weekDifference} weeks. Points have been reset to week ${currentWeek}.`;
+          notificationType = "warning";
+        }
         
         this._broadcastToRoom(QUIZ_ROOM, [
           "quizWeekReset",
           {
             week: currentWeek,
-            message: "New quiz week started! Points reset."
+            message: resetMessage,
+            weeksMissed: weekDifference,
+            lastWinner: winner || null,
+            type: notificationType
           }
         ]);
         
