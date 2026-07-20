@@ -1,7 +1,7 @@
-// ==================== GAME-SERVER.JS (FULL CLASS - WITH WEEKLY RESET LOGIC) ====================
+// ==================== GAME-SERVER.JS (FULL CLASS - OPTIMIZED FOR 45 USERS + TRANSLATE) ====================
 
 const CONSTANTS = {
-  MAX_LOWCARD_GAMES: 5,
+  MAX_LOWCARD_GAMES: 3,
   REGISTRATION_TIME_MS: 20000,
   DRAW_TIME_MS: 20000,
   EVALUATION_DELAY_MS: 2000,
@@ -14,12 +14,12 @@ const CONSTANTS = {
   START_LOCK_DURATION_MS: 3000,
   MAX_PLAYERS_PER_GAME: 45,
   GAME_CLEANUP_DELAY_MS: 5000,
-  BATCH_SIZE: 1,
+  BATCH_SIZE: 2,
   CLEANUP_TIK: 120,
   STALE_GAME_TIMEOUT_MS: 600000,
   STUCK_DRAW_TIMEOUT_MS: 60000,
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
-  QUIZ_INTERVAL_MS: 30000,
+  QUIZ_INTERVAL_MS: 60000,
   QUIZ_TIME_LIMIT_MS: 15000,
   TRANSLATE_LIMIT: 999999,
   QUIZ_BREAK_MS: 2000,
@@ -35,7 +35,8 @@ const CONSTANTS = {
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
-  SCHEDULER_INTERVAL_MS: 60000,
+  SCHEDULER_INTERVAL_MS: 120000,
+  MAX_TRANSLATE_PER_BROADCAST: 10,
 };
 
 const QUIZ_SCHEDULE = {
@@ -645,7 +646,8 @@ export class GameServer {
         "success"
       ]);
 
-      await this._broadcastQuizQuestion(
+      // ✅ OPTIMIZED BROADCAST WITH TRANSLATE (GROUP BY LANGUAGE)
+      await this._broadcastQuizQuestionOptimized(
         this.currentQuestion.question,
         this.currentQuestion.options
       );
@@ -1020,6 +1022,12 @@ export class GameServer {
     if (!ws) return 'en';
     const wsId = this._getWsId(ws);
     if (!wsId) return 'en';
+    
+    // ✅ CACHE BAHASA PER USER
+    if (!this.userLanguage.has(wsId)) {
+      const lang = this._countryToLanguage(ws._country || 'US');
+      this.userLanguage.set(wsId, lang);
+    }
     return this.userLanguage.get(wsId) || 'en';
   }
   
@@ -1089,6 +1097,69 @@ export class GameServer {
       }
     }
     return translatedOptions;
+  }
+  
+  // ✅ OPTIMIZED BROADCAST - GROUP BY LANGUAGE (1 TRANSLATE PER LANGUAGE)
+  async _broadcastQuizQuestionOptimized(question, options) {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds) return;
+    
+    const wsIdArray = Array.from(wsIds);
+    if (wsIdArray.length === 0) return;
+    
+    // ✅ GROUP BY LANGUAGE
+    const langGroups = {};
+    for (const wsId of wsIdArray) {
+      const ws = this.wsMap.get(wsId);
+      if (!ws || ws.readyState !== 1) continue;
+      const lang = this._getUserLanguage(ws);
+      if (!langGroups[lang]) langGroups[lang] = [];
+      langGroups[lang].push(wsId);
+    }
+    
+    // ✅ TRANSLATE PER LANGUAGE (1 KALI PER BAHASA, BUKAN PER USER)
+    const translations = {};
+    const langKeys = Object.keys(langGroups);
+    
+    for (const lang of langKeys) {
+      if (lang !== 'en') {
+        try {
+          const translatedQ = await this._translateText(question, lang);
+          const translatedO = await this._translateOptions(options, lang);
+          translations[lang] = { question: translatedQ, options: translatedO };
+        } catch(e) {
+          // Jika gagal, pakai bahasa Inggris
+          translations[lang] = { question, options };
+        }
+      }
+    }
+    
+    // ✅ KIRIM KE SEMUA USER (BATCH)
+    for (const [lang, ids] of Object.entries(langGroups)) {
+      const qObj = lang === 'en' 
+        ? { question, options }
+        : (translations[lang] || { question, options });
+      
+      const batchSize = 5;
+      for (let i = 0; i < ids.length; i += batchSize) {
+        const batch = ids.slice(i, i + batchSize);
+        for (const wsId of batch) {
+          const ws = this.wsMap.get(wsId);
+          if (ws && ws.readyState === 1) {
+            this._safeSend(ws, ["quizQuestion", qObj]);
+          }
+        }
+        // ✅ JEDA ANTAR BATCH UNTUK HINDARI CPU SPIKE
+        if (i + batchSize < ids.length) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      }
+    }
+  }
+  
+  // ✅ OLD METHOD - KEEP FOR COMPATIBILITY
+  async _broadcastQuizQuestion(question, options) {
+    return this._broadcastQuizQuestionOptimized(question, options);
   }
   
   async _loadQuestionsFromKV() {
@@ -1289,7 +1360,9 @@ export class GameServer {
     const batchSize = Math.min(CONSTANTS.BATCH_SIZE, 2);
     const disconnected = [];
     
-    for (let i = 0; i < wsIdArray.length && i < 10; i += batchSize) {
+    // ✅ HANYA 10 USER PER LOOP (HINDARI CPU SPIKE)
+    const maxUsers = Math.min(wsIdArray.length, 10);
+    for (let i = 0; i < maxUsers; i += batchSize) {
       const batch = wsIdArray.slice(i, i + batchSize);
       for (const wsId of batch) {
         const ws = this.wsMap.get(wsId);
@@ -1352,38 +1425,6 @@ export class GameServer {
       options: newOptions,
       correct: newCorrect || 'A'
     };
-  }
-  
-  async _broadcastQuizQuestion(question, options) {
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds) return;
-    const wsIdArray = Array.from(wsIds);
-    
-    for (const wsId of wsIdArray) {
-      try {
-        const ws = this.wsMap.get(wsId);
-        if (!ws || ws.readyState !== 1) continue;
-        
-        const lang = this._getUserLanguage(ws);
-        
-        let finalQuestion = question;
-        let finalOptions = options;
-        
-        if (lang !== 'en' && finalQuestion && typeof finalQuestion === 'string') {
-          try {
-            finalQuestion = await this._translateText(question, lang);
-            finalOptions = await this._translateOptions(options, lang);
-          } catch(e) {}
-        }
-        
-        const questionObj = {
-          question: finalQuestion || '',
-          options: finalOptions || { A: '', B: '', C: '', D: '' }
-        };
-        
-        this._safeSend(ws, ["quizQuestion", questionObj]);
-      } catch(e) {}
-    }
   }
   
   _shuffleArray(array) {
