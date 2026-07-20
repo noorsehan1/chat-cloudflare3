@@ -103,7 +103,6 @@ export class GameServer {
     this.currentQuestion = null;
     this.isQuizWaiting = false;
     this.quizQuestionCache = {};
-    this.questionTranslations = new Map();
     this._quizStartTime = null;
     
     // TRACKING UNTUK 10.000 SOAL
@@ -114,7 +113,7 @@ export class GameServer {
     this._isAllQuestionsLoaded = false;
     this._questionPointer = 0;
     
-    // ✅ DEEPLX TRANSLATION - RESET COUNTER
+    // ✅ DEEPLX TRANSLATION - TANPA CACHE
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -1188,7 +1187,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== ✅ DEEPLX TRANSLATE - FIXED (TIDAK BERHENTI) ====================
+  // ==================== ✅ DEEPLX TRANSLATE - TANPA CACHE ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1206,7 +1205,6 @@ export class GameServer {
         this.translateDate = now;
         this.translateCount = 0;
         this.translateLimitReached = false;
-        this.questionTranslations.clear();
         
         // ✅ RESET CIRCUIT BREAKER
         this._translationCircuitBreaker.isOpen = false;
@@ -1252,17 +1250,11 @@ export class GameServer {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
   
-  // ✅ TRANSLATE SATU TEKS - DENGAN RETRY
+  // ✅ TRANSLATE SATU TEKS - TANPA CACHE
   async _translateSingleText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (this.translateLimitReached) return text;
     if (!text || typeof text !== 'string') return text;
-    
-    // ✅ CEK CACHE
-    const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
-    if (this.questionTranslations.has(cacheKey)) {
-      return this.questionTranslations.get(cacheKey);
-    }
     
     // ✅ CEK LIMIT
     if (this.translateCount >= CONSTANTS.TRANSLATE_LIMIT) {
@@ -1329,7 +1321,7 @@ export class GameServer {
         }
         
         if (translated) {
-          this.questionTranslations.set(cacheKey, translated);
+          // ✅ LANGSUNG TRANSLATE TANPA CACHE
           this.translateCount++;
           this._translationCircuitBreaker.failures = 0;
           console.log(`✅ DeepLX translated: "${text.substring(0, 30)}..." -> "${translated.substring(0, 30)}..."`);
@@ -1368,7 +1360,7 @@ export class GameServer {
     return text; // Return original text
   }
   
-  // ✅ TRANSLATE BATCH DENGAN DELAY - TIDAK BERHENTI
+  // ✅ TRANSLATE BATCH DENGAN DELAY - TANPA CACHE
   async _translateBatch(texts, targetLang) {
     if (!texts || texts.length === 0) return [];
     if (targetLang === 'en') return texts;
@@ -1386,7 +1378,7 @@ export class GameServer {
       const startTime = Date.now();
       
       try {
-        // ✅ TRANSLATE DENGAN RETRY
+        // ✅ TRANSLATE TANPA CACHE
         let translated = await this._translateSingleText(text, targetLang);
         results.push(translated);
         
@@ -1434,7 +1426,7 @@ export class GameServer {
     
     if (texts.length === 0) return options;
     
-    // ✅ TRANSLATE BATCH
+    // ✅ TRANSLATE BATCH TANPA CACHE
     const translatedTexts = await this._translateBatch(texts, targetLang);
     
     // ✅ MAP HASIL
@@ -1480,7 +1472,7 @@ export class GameServer {
         let finalQuestion = question;
         let finalOptions = options;
         
-        // ✅ TRANSLATE KE BAHASA USER
+        // ✅ TRANSLATE KE BAHASA USER - TANPA CACHE
         if (lang !== 'en' && !this.translateLimitReached) {
           try {
             // Translate question
@@ -3008,7 +3000,6 @@ export class GameServer {
       this._cleanupTimers.clear();
       
       this.quizQuestionCache = {};
-      this.questionTranslations.clear();
       this.userLanguage.clear();
       this.userCountry.clear();
       this.wsClients.clear();
