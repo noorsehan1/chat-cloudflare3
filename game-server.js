@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL - NO TRANSLATE LIMIT) ====================
+// ==================== GAME-SERVER.JS (FULL - MATCH WITH CLIENT) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 5,
@@ -158,16 +158,6 @@ export class GameServer {
     }
   }
   
-  async _getLastWeekWinner() {
-    try {
-      if (!this.env || !this.env.QUESTIONS) return null;
-      const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
-      return winner || null;
-    } catch(e) {
-      return null;
-    }
-  }
-  
   async _checkAndResetWeeklyPoints() {
     try {
       if (!this.env || !this.env.QUESTIONS) return false;
@@ -176,40 +166,6 @@ export class GameServer {
       const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
       
       if (savedWeek !== currentWeek) {
-        const points = await this._getQuizPoints();
-        
-        let winner = null;
-        let highestScore = 0;
-        
-        for (const [username, score] of Object.entries(points)) {
-          if (score > highestScore) {
-            highestScore = score;
-            winner = username;
-          }
-        }
-        
-        if (winner) {
-          const winnerData = {
-            username: winner,
-            score: highestScore,
-            week: savedWeek || currentWeek
-          };
-          
-          await this.env.QUESTIONS.put(
-            CONSTANTS.QUIZ_LAST_WEEK_WINNER,
-            JSON.stringify(winnerData)
-          );
-          
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizLastWeekWinner",
-            {
-              username: winner,
-              score: highestScore,
-              week: savedWeek || currentWeek
-            }
-          ]);
-        }
-        
         await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify({}));
         await this.env.QUESTIONS.put(CONSTANTS.QUIZ_WEEK_KEY, currentWeek);
         
@@ -724,78 +680,68 @@ export class GameServer {
     }
   }
   
- // ==================== PERUBAHAN DI submitQuizAnswer() ====================
-
-async submitQuizAnswer(ws, username, answer) {
-  try {
-    if (!ws || !username) {
-      this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
-      return;
+  async submitQuizAnswer(ws, username, answer) {
+    try {
+      if (!ws || !username) {
+        this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
+        return;
+      }
+      
+      const room = this._ensureRoomConsistency(ws);
+      if (room !== QUIZ_ROOM) {
+        this._sendQuizErrorWithTime(ws, "ERROR", "Quiz only available in Quiz room");
+        return;
+      }
+      
+      if (!this.currentQuestion) {
+        this._safeSend(ws, ["quizError", "No active question."]);
+        return;
+      }
+      
+      if (!this._quizTimeout) {
+        this._safeSend(ws, ["quizError", "Question time is over!"]);
+        return;
+      }
+      
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      if (!clients || clients.size === 0) {
+        this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
+        return;
+      }
+      
+      if (this.quizHasWinner) {
+        this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
+        return;
+      }
+      
+      if (this.quizAnswered.has(username)) {
+        this._safeSend(ws, ["quizError", "You already answered!"]);
+        return;
+      }
+      
+      const answerKey = answer ? answer.toUpperCase().trim() : '';
+      const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
+      const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
+      
+      const resultObj = {
+        username: username,
+        answer: isValidAnswer ? answerKey : "?",
+        isCorrect: isCorrect,
+        correctAnswer: this.currentQuestion.correct
+      };
+      
+      this._broadcastToRoom(QUIZ_ROOM, ["quizAnswerResult", resultObj]);
+      this.quizAnswered.add(username);
+      
+      if (isCorrect && !this.quizHasWinner) {
+        this.quizHasWinner = true;
+        this.quizWinner = username;
+      }
+      
+    } catch(e) {
+      this._sendQuizErrorWithTime(ws, "ERROR", e.message);
     }
-    
-    const room = this._ensureRoomConsistency(ws);
-    if (room !== QUIZ_ROOM) {
-      this._sendQuizErrorWithTime(ws, "ERROR", "Quiz only available in Quiz room");
-      return;
-    }
-    
-    // ✅ HAPUS CEK INI - JADI USER BISA INPUT MESKIPUN JAM QUIZ
-    // if (this._isQuizTime()) {
-    //   this._safeSend(ws, ["quizError", "Quiz is currently running! Please wait until session ends."]);
-    //   return;
-    // }
-    
-    // ✅ CEK APAKAH ADA PERTANYAAN AKTIF
-    if (!this.currentQuestion) {
-      this._safeSend(ws, ["quizError", "No active question."]);
-      return;
-    }
-    
-    // ✅ CEK APAKAH QUIZ TIMEOUT MASIH AKTIF
-    if (!this._quizTimeout) {
-      this._safeSend(ws, ["quizError", "Question time is over!"]);
-      return;
-    }
-    
-    const clients = this.wsClients.get(QUIZ_ROOM);
-    if (!clients || clients.size === 0) {
-      this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
-      return;
-    }
-    
-    if (this.quizHasWinner) {
-      this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
-      return;
-    }
-    
-    if (this.quizAnswered.has(username)) {
-      this._safeSend(ws, ["quizError", "You already answered!"]);
-      return;
-    }
-    
-    const answerKey = answer ? answer.toUpperCase().trim() : '';
-    const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
-    const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
-    
-    const resultObj = {
-      username: username,
-      answer: isValidAnswer ? answerKey : "?",
-      isCorrect: isCorrect,
-      correctAnswer: this.currentQuestion.correct
-    };
-    
-    this._broadcastToRoom(QUIZ_ROOM, ["quizAnswerResult", resultObj]);
-    this.quizAnswered.add(username);
-    
-    if (isCorrect && !this.quizHasWinner) {
-      this.quizHasWinner = true;
-      this.quizWinner = username;
-    }
-    
-  } catch(e) {
-    this._sendQuizErrorWithTime(ws, "ERROR", e.message);
   }
-}
   
   _startQuizLoop() {
     if (this.quizTimer) {
@@ -887,16 +833,6 @@ async submitQuizAnswer(ws, username, answer) {
         return;
       }
       
-      if (evt === "getQuizLastWeekWinner") {
-        const winner = await this._getLastWeekWinner();
-        if (winner) {
-          this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
-        } else {
-          this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
-        }
-        return;
-      }
-      
       if (evt === "getQuizLeaderboard") {
         let limit = 10;
         if (data.length > 1 && typeof data[1] === 'number') {
@@ -924,6 +860,20 @@ async submitQuizAnswer(ws, username, answer) {
         const points = await this._getQuizPoints();
         const userPoints = points[username] || 0;
         this._safeSend(ws, ["quizUserPoints", username, userPoints]);
+        return;
+      }
+      
+      if (evt === "deleteQuizLastWeekWinner") {
+        try {
+          if (this.env && this.env.QUESTIONS) {
+            await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
+          } else {
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
+        }
         return;
       }
       
@@ -1365,9 +1315,7 @@ async submitQuizAnswer(ws, username, answer) {
           try {
             finalQuestion = await this._translateText(question, lang);
             finalOptions = await this._translateOptions(options, lang);
-          } catch(e) {
-            // FALLBACK: PAKAI BAHASA INGGRIS
-          }
+          } catch(e) {}
         }
         
         const questionObj = {
