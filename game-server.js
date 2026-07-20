@@ -724,73 +724,78 @@ export class GameServer {
     }
   }
   
-  async submitQuizAnswer(ws, username, answer) {
-    try {
-      if (!ws || !username) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
-        return;
-      }
-      
-      const room = this._ensureRoomConsistency(ws);
-      if (room !== QUIZ_ROOM) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Quiz only available in Quiz room");
-        return;
-      }
-      
-      if (this._isQuizTime()) {
-        this._safeSend(ws, ["quizError", "Quiz is currently running! Please wait until session ends."]);
-        return;
-      }
-      
-      if (!this.currentQuestion) {
-        this._safeSend(ws, ["quizError", "No active question."]);
-        return;
-      }
-      
-      if (!this._quizTimeout) {
-        this._safeSend(ws, ["quizError", "Question time is over!"]);
-        return;
-      }
-      
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients || clients.size === 0) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
-        return;
-      }
-      
-      if (this.quizHasWinner) {
-        this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
-        return;
-      }
-      
-      if (this.quizAnswered.has(username)) {
-        this._safeSend(ws, ["quizError", "You already answered!"]);
-        return;
-      }
-      
-      const answerKey = answer ? answer.toUpperCase().trim() : '';
-      const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
-      const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
-      
-      const resultObj = {
-        username: username,
-        answer: isValidAnswer ? answerKey : "?",
-        isCorrect: isCorrect,
-        correctAnswer: this.currentQuestion.correct
-      };
-      
-      this._broadcastToRoom(QUIZ_ROOM, ["quizAnswerResult", resultObj]);
-      this.quizAnswered.add(username);
-      
-      if (isCorrect && !this.quizHasWinner) {
-        this.quizHasWinner = true;
-        this.quizWinner = username;
-      }
-      
-    } catch(e) {
-      this._sendQuizErrorWithTime(ws, "ERROR", e.message);
+ // ==================== PERUBAHAN DI submitQuizAnswer() ====================
+
+async submitQuizAnswer(ws, username, answer) {
+  try {
+    if (!ws || !username) {
+      this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
+      return;
     }
+    
+    const room = this._ensureRoomConsistency(ws);
+    if (room !== QUIZ_ROOM) {
+      this._sendQuizErrorWithTime(ws, "ERROR", "Quiz only available in Quiz room");
+      return;
+    }
+    
+    // ✅ HAPUS CEK INI - JADI USER BISA INPUT MESKIPUN JAM QUIZ
+    // if (this._isQuizTime()) {
+    //   this._safeSend(ws, ["quizError", "Quiz is currently running! Please wait until session ends."]);
+    //   return;
+    // }
+    
+    // ✅ CEK APAKAH ADA PERTANYAAN AKTIF
+    if (!this.currentQuestion) {
+      this._safeSend(ws, ["quizError", "No active question."]);
+      return;
+    }
+    
+    // ✅ CEK APAKAH QUIZ TIMEOUT MASIH AKTIF
+    if (!this._quizTimeout) {
+      this._safeSend(ws, ["quizError", "Question time is over!"]);
+      return;
+    }
+    
+    const clients = this.wsClients.get(QUIZ_ROOM);
+    if (!clients || clients.size === 0) {
+      this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
+      return;
+    }
+    
+    if (this.quizHasWinner) {
+      this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
+      return;
+    }
+    
+    if (this.quizAnswered.has(username)) {
+      this._safeSend(ws, ["quizError", "You already answered!"]);
+      return;
+    }
+    
+    const answerKey = answer ? answer.toUpperCase().trim() : '';
+    const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
+    const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
+    
+    const resultObj = {
+      username: username,
+      answer: isValidAnswer ? answerKey : "?",
+      isCorrect: isCorrect,
+      correctAnswer: this.currentQuestion.correct
+    };
+    
+    this._broadcastToRoom(QUIZ_ROOM, ["quizAnswerResult", resultObj]);
+    this.quizAnswered.add(username);
+    
+    if (isCorrect && !this.quizHasWinner) {
+      this.quizHasWinner = true;
+      this.quizWinner = username;
+    }
+    
+  } catch(e) {
+    this._sendQuizErrorWithTime(ws, "ERROR", e.message);
   }
+}
   
   _startQuizLoop() {
     if (this.quizTimer) {
