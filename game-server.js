@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL WITH DEEPLX TRANSLATE) ====================
+// ==================== GAME-SERVER.JS (FULL - TRANSLATE ALL QUESTIONS TO USER LANGUAGE) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -41,9 +41,13 @@ const CONSTANTS = {
   QUIZ_BATCH_THRESHOLD: 20,          // Load batch baru jika sisa < 20
   MAX_QUESTIONS: 10000,              // Total soal di KV
   // ✅ KONFIGURASI DEEPLX
-  DEEPLX_URL: 'https://your-worker.workers.dev/translate', // Ganti dengan URL Worker Anda
-  DEEPLX_TIMEOUT: 3000,
-  SUPPORTED_LANGUAGES: ['id', 'ja', 'ko', 'th', 'vi', 'ar', 'ru', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'tr', 'hi'],
+  DEEPLX_URL: 'https://your-worker.workers.dev/translate', // Ganti dengan URL DeepLX Anda
+  DEEPLX_TIMEOUT: 5000,
+  // ✅ BAHASA YANG DIDUKUNG
+  SUPPORTED_LANGUAGES: [
+    'id', 'ms', 'ja', 'ko', 'th', 'vi', 'zh', 'hi', 
+    'ar', 'ru', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'tr'
+  ],
 };
 
 const QUIZ_SCHEDULE = {
@@ -111,8 +115,8 @@ export class GameServer {
       this.translateCount = 0;
       this.translateDate = new Date().toUTCString();
       this.translateLimitReached = false;
-      this.userLanguage = new Map();
-      this.userCountry = new Map();
+      this.userLanguage = new Map();        // ✅ MAP: wsId → language code
+      this.userCountry = new Map();         // ✅ MAP: wsId → country code
       
       // TIMERS
       this._quizTimeout = null;
@@ -782,7 +786,7 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
 
-      // ✅ KIRIM PERTANYAAN KE CLIENT (dengan translate)
+      // ✅ KIRIM PERTANYAAN KE CLIENT (DENGAN TRANSLATE PER USER)
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1059,6 +1063,25 @@ export class GameServer {
       if (evt === "getQuizStatus") {
         const status = this._getQuizStatus();
         this._safeSend(ws, ["quizStatus", status]);
+        return;
+      }
+      
+      // ✅ USER SET LANGUAGE MANUAL
+      if (evt === "setLanguage") {
+        const [_, lang] = data;
+        const wsId = this._getWsId(ws);
+        if (wsId && lang) {
+          this.userLanguage.set(wsId, lang);
+          this._safeSend(ws, ["languageSet", lang, true]);
+        }
+        return;
+      }
+      
+      // ✅ GET USER LANGUAGE
+      if (evt === "getUserLanguage") {
+        const wsId = this._getWsId(ws);
+        const lang = wsId ? this.userLanguage.get(wsId) || 'en' : 'en';
+        this._safeSend(ws, ["userLanguage", lang]);
         return;
       }
       
@@ -1351,7 +1374,160 @@ export class GameServer {
     return conn ? conn.wsId : null;
   }
   
-  // ==================== ✅ TRANSLATE DENGAN DEEPLX (GRATIS SELAMANYA) ====================
+  // ==================== ✅ COUNTRY TO LANGUAGE (LENGKAP) ====================
+  
+  _countryToLanguage(countryCode) {
+    if (!countryCode) return 'en';
+    
+    const map = {
+      // ===== ASIA =====
+      'ID': 'id',    // Indonesia
+      'MY': 'ms',    // Malaysia
+      'SG': 'zh',    // Singapore
+      'PH': 'tl',    // Philippines
+      'JP': 'ja',    // Japan
+      'CN': 'zh',    // China
+      'TW': 'zh',    // Taiwan
+      'HK': 'zh',    // Hong Kong
+      'KR': 'ko',    // Korea
+      'IN': 'hi',    // India
+      'TH': 'th',    // Thailand
+      'VN': 'vi',    // Vietnam
+      'MM': 'my',    // Myanmar
+      'KH': 'km',    // Cambodia
+      'LA': 'lo',    // Laos
+      'BD': 'bn',    // Bangladesh
+      'PK': 'ur',    // Pakistan
+      'LK': 'si',    // Sri Lanka
+      'NP': 'ne',    // Nepal
+      
+      // ===== EUROPE =====
+      'GB': 'en',    // UK
+      'US': 'en',    // USA
+      'AU': 'en',    // Australia
+      'CA': 'en',    // Canada
+      'NZ': 'en',    // New Zealand
+      'FR': 'fr',    // France
+      'DE': 'de',    // Germany
+      'ES': 'es',    // Spain
+      'IT': 'it',    // Italy
+      'PT': 'pt',    // Portugal
+      'NL': 'nl',    // Netherlands
+      'RU': 'ru',    // Russia
+      'UA': 'uk',    // Ukraine
+      'PL': 'pl',    // Poland
+      'TR': 'tr',    // Turkey
+      'GR': 'el',    // Greece
+      'SE': 'sv',    // Sweden
+      'NO': 'no',    // Norway
+      'DK': 'da',    // Denmark
+      'FI': 'fi',    // Finland
+      'IE': 'en',    // Ireland
+      'CH': 'de',    // Switzerland
+      'AT': 'de',    // Austria
+      'BE': 'nl',    // Belgium
+      'HU': 'hu',    // Hungary
+      'CZ': 'cs',    // Czech
+      'SK': 'sk',    // Slovakia
+      'RO': 'ro',    // Romania
+      'BG': 'bg',    // Bulgaria
+      'HR': 'hr',    // Croatia
+      'RS': 'sr',    // Serbia
+      'SI': 'sl',    // Slovenia
+      'LT': 'lt',    // Lithuania
+      'LV': 'lv',    // Latvia
+      'EE': 'et',    // Estonia
+      'IS': 'is',    // Iceland
+      'MT': 'mt',    // Malta
+      'AL': 'sq',    // Albania
+      'MK': 'mk',    // North Macedonia
+      'BA': 'bs',    // Bosnia
+      
+      // ===== MIDDLE EAST =====
+      'SA': 'ar',    // Saudi Arabia
+      'AE': 'ar',    // UAE
+      'QA': 'ar',    // Qatar
+      'KW': 'ar',    // Kuwait
+      'BH': 'ar',    // Bahrain
+      'OM': 'ar',    // Oman
+      'YE': 'ar',    // Yemen
+      'SY': 'ar',    // Syria
+      'LB': 'ar',    // Lebanon
+      'JO': 'ar',    // Jordan
+      'IQ': 'ar',    // Iraq
+      'EG': 'ar',    // Egypt
+      'LY': 'ar',    // Libya
+      'TN': 'ar',    // Tunisia
+      'DZ': 'ar',    // Algeria
+      'MA': 'ar',    // Morocco
+      'MR': 'ar',    // Mauritania
+      'SD': 'ar',    // Sudan
+      'PS': 'ar',    // Palestine
+      'IL': 'he',    // Israel
+      'IR': 'fa',    // Iran
+      'AF': 'ps',    // Afghanistan
+      'AM': 'hy',    // Armenia
+      
+      // ===== AMERICAS =====
+      'MX': 'es',    // Mexico
+      'BR': 'pt',    // Brazil
+      'AR': 'es',    // Argentina
+      'CO': 'es',    // Colombia
+      'CL': 'es',    // Chile
+      'PE': 'es',    // Peru
+      'VE': 'es',    // Venezuela
+      'EC': 'es',    // Ecuador
+      'BO': 'es',    // Bolivia
+      'PY': 'es',    // Paraguay
+      'UY': 'es',    // Uruguay
+      'GT': 'es',    // Guatemala
+      'HN': 'es',    // Honduras
+      'NI': 'es',    // Nicaragua
+      'CR': 'es',    // Costa Rica
+      'PA': 'es',    // Panama
+      'SV': 'es',    // El Salvador
+      'DO': 'es',    // Dominican Republic
+      'CU': 'es',    // Cuba
+      
+      // ===== AFRICA =====
+      'ZA': 'en',    // South Africa
+      'NG': 'en',    // Nigeria
+      'KE': 'en',    // Kenya
+      'GH': 'en',    // Ghana
+      'TZ': 'en',    // Tanzania
+      'UG': 'en',    // Uganda
+      'ZM': 'en',    // Zambia
+      'ZW': 'en',    // Zimbabwe
+      'MW': 'en',    // Malawi
+      'SL': 'en',    // Sierra Leone
+      'LR': 'en',    // Liberia
+      'GM': 'en',    // Gambia
+      'BW': 'en',    // Botswana
+      'NA': 'en',    // Namibia
+      'MG': 'mg',    // Madagascar
+      'MU': 'en',    // Mauritius
+      'SC': 'en',    // Seychelles
+      
+      // ===== OCEANIA =====
+      'FJ': 'en',    // Fiji
+      'PG': 'en',    // Papua New Guinea
+      'SB': 'en',    // Solomon Islands
+      'VU': 'en',    // Vanuatu
+      'WS': 'en',    // Samoa
+      'TO': 'en',    // Tonga
+      'KI': 'en',    // Kiribati
+      'TV': 'en',    // Tuvalu
+      'NR': 'en',    // Nauru
+      'PW': 'en',    // Palau
+      'FM': 'en',    // Micronesia
+      'MH': 'en',    // Marshall Islands
+    };
+    
+    const lang = map[countryCode.toUpperCase()];
+    return lang || 'en';
+  }
+  
+  // ==================== TRANSLATE DENGAN DEEPLX ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1376,27 +1552,6 @@ export class GameServer {
         }
       } catch(e) {}
     }, 60000);
-  }
-  
-  _countryToLanguage(countryCode) {
-    if (!countryCode) return 'en';
-    const map = {
-      'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id',
-      'JP': 'ja', 'CN': 'zh', 'TW': 'zh', 'HK': 'zh',
-      'KR': 'ko', 'IN': 'hi', 'TH': 'th', 'VN': 'vi',
-      'GB': 'en', 'US': 'en', 'AU': 'en', 'CA': 'en',
-      'NZ': 'en', 'FR': 'fr', 'DE': 'de', 'ES': 'es',
-      'IT': 'it', 'PT': 'pt', 'NL': 'nl', 'RU': 'ru',
-      'UA': 'ru', 'PL': 'pl', 'TR': 'tr',
-      'QA': 'ar', 'SA': 'ar', 'AE': 'ar', 'KW': 'ar', 'BH': 'ar',
-      'OM': 'ar', 'YE': 'ar', 'SY': 'ar', 'LB': 'ar', 'PS': 'ar',
-      'SD': 'ar', 'LY': 'ar', 'TN': 'ar', 'DZ': 'ar', 'MA': 'ar',
-      'MR': 'ar', 'IQ': 'ar', 'JO': 'ar', 'EG': 'ar',
-      'MX': 'es', 'BR': 'pt', 'AR': 'es', 'CO': 'es',
-      'CL': 'es', 'PE': 'es',
-      'ZA': 'en', 'NG': 'en', 'KE': 'en',
-    };
-    return map[countryCode.toUpperCase()] || 'en';
   }
   
   _getUserLanguage(ws) {
@@ -1812,7 +1967,9 @@ export class GameServer {
         };
         
         this._safeSend(ws, ["quizQuestion", questionObj]);
-      } catch(e) {}
+      } catch(e) {
+        console.error("Broadcast quiz error:", e);
+      }
     }
   }
   
@@ -3116,6 +3273,7 @@ export class GameServer {
           translateCount: this.translateCount,
           translateLimit: CONSTANTS.TRANSLATE_LIMIT,
           usingDeepLX: true,
+          supportedLanguages: CONSTANTS.SUPPORTED_LANGUAGES,
           quizProgress: this._getQuizStatus(),
           timestamp: Date.now()
         }), { 
@@ -3141,15 +3299,20 @@ export class GameServer {
           server._createdAt = Date.now();
           server.username = null;
           
+          // ✅ DETEKSI NEGARA DARI CLOUDFLARE
           const cf = req.cf;
           let country = 'US';
           if (cf && cf.country) {
             country = cf.country;
           }
           server._country = country;
+          
+          // ✅ DETEKSI BAHASA DARI NEGARA
           const lang = this._countryToLanguage(country);
           this.userLanguage.set(wsId, lang);
           this.userCountry.set(wsId, country);
+          
+          console.log(`🌍 User connected from: ${country}, language: ${lang}`);
           
           try { 
             this.state.acceptWebSocket(server);
