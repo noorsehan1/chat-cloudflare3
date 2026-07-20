@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FIXED - NO CHAT, QUIZ + GAME ONLY) ====================
+// ==================== GAME-SERVER.JS (FIX DEEPLX TRANSLATE) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -39,8 +39,15 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   QUIZ_BATCH_THRESHOLD: 20,
   MAX_QUESTIONS: 10000,
-  DEEPLX_API_URL: 'https://api.deeplx.org/translate',
-  DEEPLX_TIMEOUT_MS: 3000,
+  // ✅ DEEPLX CONFIG - BANYAK PILIHAN API
+  DEEPLX_API_URLS: [
+    'https://api.deeplx.org/translate',
+    'https://deeplx.vercel.app/translate',
+    'https://deeplx.deno.dev/translate',
+    'https://deeplx.mingming.dev/translate',
+  ],
+  DEEPLX_TIMEOUT_MS: 5000,
+  DEEPLX_MAX_RETRIES: 3,
 };
 
 const QUIZ_SCHEDULE = {
@@ -56,7 +63,6 @@ const QUIZ_ROOM = "Quiz";
 
 export class GameServer {
   constructor(state, env) {
-    // ✅ JANGAN GUNAKAN TRY-CATCH DI CONSTRUCTOR
     this.state = state;
     this.env = env;
     this.closing = false;
@@ -126,17 +132,15 @@ export class GameServer {
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
     
-    // ✅ PASTIKAN INIT BERJALAN
     this._initAsync();
   }
   
-  // ==================== ASYNC INIT - TANPA TRY-CATCH BERLEBIH ====================
+  // ==================== ASYNC INIT ====================
   
   async _initAsync() {
     if (this._initialized) return;
     this._initialized = true;
     
-    // ✅ JANGAN PAKAI TRY-CATCH YANG MENUTUPI ERROR
     await this._initQuiz();
     this._startQuizScheduler();
     await this._checkAndResetWeeklyPoints();
@@ -732,6 +736,7 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
 
+      // ✅ KIRIM PERTANYAAN (AKAN DI-TRANSLATE DI DALAM FUNGSI)
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1176,7 +1181,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== DEEPLX TRANSLATE (HANYA UNTUK QUIZ) ====================
+  // ==================== ✅ DEEPLX TRANSLATE - FIXED ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1229,11 +1234,19 @@ export class GameServer {
     return this.userLanguage.get(wsId) || 'en';
   }
   
+  // ✅ DEEPLX TRANSLATE - DENGAN RETRY DAN FALLBACK
   async _translateText(text, targetLang) {
     if (targetLang === 'en') return text;
     if (this.translateLimitReached) return text;
     if (!text || typeof text !== 'string') return text;
     
+    // Cek cache
+    const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
+    if (this.questionTranslations.has(cacheKey)) {
+      return this.questionTranslations.get(cacheKey);
+    }
+    
+    // Circuit breaker
     if (this._translationCircuitBreaker.isOpen) {
       const now = Date.now();
       if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
@@ -1244,76 +1257,106 @@ export class GameServer {
       }
     }
     
-    const cacheKey = `${text.substring(0, 30)}_${targetLang}`;
-    if (this.questionTranslations.has(cacheKey)) {
-      return this.questionTranslations.get(cacheKey);
-    }
-    
     if (this.translateCount >= CONSTANTS.TRANSLATE_LIMIT) {
       this.translateLimitReached = true;
       return text;
     }
     
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS || 3000);
-      
-      const response = await fetch(CONSTANTS.DEEPLX_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          text: text,
-          source_lang: 'EN',
-          target_lang: targetLang.toUpperCase()
-        }),
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        throw new Error(`DeepLX HTTP ${response.status}`);
+    // ✅ COBA SEMUA API URL
+    const apiUrls = CONSTANTS.DEEPLX_API_URLS || [
+      'https://api.deeplx.org/translate',
+      'https://deeplx.vercel.app/translate',
+      'https://deeplx.deno.dev/translate',
+    ];
+    
+    let lastError = null;
+    
+    for (const apiUrl of apiUrls) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS || 5000);
+        
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: text,
+            source_lang: 'EN',
+            target_lang: targetLang.toUpperCase()
+          }),
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        
+        // ✅ CEK RESPONSE FORMAT YANG BERBEDA
+        let translated = null;
+        
+        // Format 1: { data: "translated text" }
+        if (data && data.data && typeof data.data === 'string') {
+          translated = data.data;
+        }
+        // Format 2: { translations: [{ text: "translated text" }] }
+        else if (data && data.translations && Array.isArray(data.translations) && data.translations.length > 0) {
+          translated = data.translations[0].text;
+        }
+        // Format 3: { result: "translated text" }
+        else if (data && data.result && typeof data.result === 'string') {
+          translated = data.result;
+        }
+        // Format 4: { text: "translated text" }
+        else if (data && data.text && typeof data.text === 'string') {
+          translated = data.text;
+        }
+        // Format 5: { code: 200, data: "translated text" }
+        else if (data && data.code === 200 && data.data && typeof data.data === 'string') {
+          translated = data.data;
+        }
+        
+        if (translated) {
+          this.questionTranslations.set(cacheKey, translated);
+          this.translateCount++;
+          this._translationCircuitBreaker.failures = 0;
+          console.log(`✅ DeepLX translated: ${text.substring(0, 20)}... -> ${translated.substring(0, 20)}...`);
+          return translated;
+        }
+        
+        throw new Error('Invalid DeepLX response format');
+        
+      } catch(e) {
+        console.warn(`DeepLX API ${apiUrl} failed:`, e.message);
+        lastError = e;
+        // Lanjut ke API berikutnya
       }
-      
-      const data = await response.json();
-      
-      if (data && data.data && typeof data.data === 'string') {
-        const translated = data.data;
-        this.questionTranslations.set(cacheKey, translated);
-        this.translateCount++;
-        this._translationCircuitBreaker.failures = 0;
-        return translated;
-      }
-      
-      if (data && data.translations && data.translations[0] && data.translations[0].text) {
-        const translated = data.translations[0].text;
-        this.questionTranslations.set(cacheKey, translated);
-        this.translateCount++;
-        this._translationCircuitBreaker.failures = 0;
-        return translated;
-      }
-      
-      throw new Error('Invalid DeepLX response format');
-      
-    } catch(e) {
-      console.error(`DeepLX translate error for ${targetLang}:`, e.message);
-      this._translationCircuitBreaker.failures++;
-      this._translationCircuitBreaker.lastFailureTime = Date.now();
-      if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
-        this._translationCircuitBreaker.isOpen = true;
-      }
-      return text;
     }
+    
+    // ❌ SEMUA API GAGAL
+    console.error(`DeepLX translate error for ${targetLang}:`, lastError?.message);
+    this._translationCircuitBreaker.failures++;
+    this._translationCircuitBreaker.lastFailureTime = Date.now();
+    if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
+      this._translationCircuitBreaker.isOpen = true;
+    }
+    
+    return text; // Return original text
   }
   
   async _translateOptions(options, targetLang) {
     if (targetLang === 'en' || this.translateLimitReached || !options) {
       return options;
     }
+    
     const translatedOptions = {};
     const keys = ['A', 'B', 'C', 'D'];
+    
     for (const key of keys) {
       if (options[key] && typeof options[key] === 'string') {
         try {
@@ -1325,6 +1368,7 @@ export class GameServer {
         translatedOptions[key] = options[key] || '';
       }
     }
+    
     return translatedOptions;
   }
   
@@ -1347,7 +1391,9 @@ export class GameServer {
           try {
             finalQuestion = await this._translateText(question, lang);
             finalOptions = await this._translateOptions(options, lang);
-          } catch(e) {}
+          } catch(e) {
+            console.error(`Translate error for ${lang}:`, e.message);
+          }
         }
         
         const questionObj = {
@@ -1356,7 +1402,9 @@ export class GameServer {
         };
         
         this._safeSend(ws, ["quizQuestion", questionObj]);
-      } catch(e) {}
+      } catch(e) {
+        console.error("Broadcast question error:", e);
+      }
     }
   }
   
