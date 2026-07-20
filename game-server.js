@@ -39,12 +39,12 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   QUIZ_BATCH_THRESHOLD: 20,
   MAX_QUESTIONS: 10000,
-  // ✅ GAME SCHEDULE - JAM MAIN GAME
+  // GAME SCHEDULE - JAM MAIN GAME
   GAME_SCHEDULE: {
-    START_HOUR: 0,  // Jam mulai (UTC)
-    END_HOUR: 23,   // Jam selesai (UTC)
+    START_HOUR: 0,
+    END_HOUR: 23,
   },
-  // ✅ DEEPLX CONFIG - DENGAN PROTEKSI LIMIT
+  // DEEPLX CONFIG - DENGAN PROTEKSI LIMIT
   DEEPLX_API_URLS: [
     'https://api.deeplx.org/translate',
     'https://deeplx.vercel.app/translate',
@@ -53,14 +53,14 @@ const CONSTANTS = {
     'https://deeplx.azurewebsites.net/translate',
   ],
   DEEPLX_TIMEOUT_MS: 8000,
-  DEEPLX_DELAY_MS: 1500,              // ✅ DITINGKATKAN DARI 500 JADI 1500
-  DEEPLX_BATCH_SIZE: 5,               // ✅ DITURUNKAN DARI 10 JADI 5
-  DEEPLX_BATCH_DELAY_MS: 3000,        // ✅ DITINGKATKAN DARI 2000 JADI 3000
+  DEEPLX_DELAY_MS: 1500,
+  DEEPLX_BATCH_SIZE: 5,
+  DEEPLX_BATCH_DELAY_MS: 3000,
   DEEPLX_MAX_RETRIES: 3,
-  // ✅ CF LIMIT PROTECTION
-  CF_SUBREQUEST_LIMIT: 50,            // Maksimal subrequest per request
-  CF_CPU_TIME_LIMIT_MS: 9000,         // 90% dari 10ms CPU time
-  CF_MEMORY_LIMIT_MB: 128,            // Memory limit
+  // CF LIMIT PROTECTION
+  CF_SUBREQUEST_LIMIT: 50,
+  CF_CPU_TIME_LIMIT_MS: 9000,
+  CF_MEMORY_LIMIT_MB: 128,
 };
 
 const QUIZ_SCHEDULE = {
@@ -122,7 +122,7 @@ export class GameServer {
     this._isAllQuestionsLoaded = false;
     this._questionPointer = 0;
     
-    // ✅ DEEPLX TRANSLATION - DENGAN PROTEKSI
+    // DEEPLX TRANSLATION - DENGAN PROTEKSI
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -131,9 +131,9 @@ export class GameServer {
     this._translationQueue = [];
     this._isProcessingQueue = false;
     
-    // ✅ CF PROTECTION
+    // CF PROTECTION
     this._requestCount = 0;
-    this._requestResetTime = Date.now() + 60000; // Reset per menit
+    this._requestResetTime = Date.now() + 60000;
     this._cpuTimeUsed = 0;
     this._subRequestCount = 0;
     
@@ -143,7 +143,7 @@ export class GameServer {
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
     
-    // ✅ CIRCUIT BREAKER
+    // CIRCUIT BREAKER
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
@@ -172,12 +172,11 @@ export class GameServer {
     }, 2000);
   }
   
-  // ==================== ✅ CF PROTECTION METHODS ====================
+  // ==================== CF PROTECTION METHODS ====================
   
   _checkCFLimits() {
     const now = Date.now();
     
-    // Reset counter per menit
     if (now > this._requestResetTime) {
       this._requestCount = 0;
       this._requestResetTime = now + 60000;
@@ -185,9 +184,7 @@ export class GameServer {
       this._cpuTimeUsed = 0;
     }
     
-    // Cek limit subrequest (max 50 per menit untuk free plan)
     if (this._subRequestCount > CONSTANTS.CF_SUBREQUEST_LIMIT) {
-      console.warn(`⚠️ CF subrequest limit reached: ${this._subRequestCount}`);
       return false;
     }
     
@@ -200,17 +197,14 @@ export class GameServer {
   }
   
   _canTranslate() {
-    // Cek CF limits
     if (!this._checkCFLimits()) {
       return false;
     }
     
-    // Cek translate limit
     if (this.translateLimitReached) {
       return false;
     }
     
-    // Cek circuit breaker
     if (this._translationCircuitBreaker.isOpen) {
       const now = Date.now();
       if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
@@ -234,7 +228,7 @@ export class GameServer {
     return new Date().getUTCHours();
   }
   
-  // ==================== ✅ GAME TIME CHECK ====================
+  // ==================== GAME TIME CHECK ====================
   
   _isGameTime() {
     const hour = this._getCurrentUTCHours();
@@ -250,12 +244,10 @@ export class GameServer {
   _getGameType(room) {
     const isInGameTime = this._isGameTime();
     
-    // Jika diluar jam main game -> true (tidak bisa main)
     if (!isInGameTime) {
       return true;
     }
     
-    // Jika dalam jam main game -> false (bisa main)
     return false;
   }
   
@@ -435,7 +427,7 @@ export class GameServer {
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
             "⏳ Quiz will start soon!",
-            true
+            false
           ]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
         } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
@@ -453,7 +445,7 @@ export class GameServer {
         }
       }
     } catch(e) {
-      console.error("Check quiz auto status error:", e);
+      // Silent
     }
   }
   
@@ -696,14 +688,11 @@ export class GameServer {
         
         this._loadNextBatch();
         
-        console.log(`✅ Loaded ${this._allQuestions.length} questions from KV`);
         return true;
       }
       
-      console.log("❌ No questions found in KV");
       return false;
     } catch(e) {
-      console.error("Load all questions error:", e);
       return false;
     }
   }
@@ -717,7 +706,6 @@ export class GameServer {
     let startIndex = this._currentBatchEnd;
     
     if (startIndex >= totalQuestions) {
-      console.log("🔄 All 10,000 questions have been used! Resetting to question 1...");
       startIndex = 0;
       this._currentBatchStart = 0;
       this._questionPointer = 0;
@@ -741,8 +729,6 @@ export class GameServer {
     const startNum = startIndex + 1;
     const endNum = endIndex;
     
-    console.log(`📚 Loaded questions ${startNum} to ${endNum} (${batch.length} questions)`);
-    
     this._broadcastToRoom(QUIZ_ROOM, [
       "quizBatchLoaded",
       {
@@ -762,13 +748,11 @@ export class GameServer {
     const currentQuestions = this.quizQuestionCache['en'] || [];
     
     if (currentQuestions.length < CONSTANTS.QUIZ_BATCH_THRESHOLD) {
-      console.log(`⚠️ ${currentQuestions.length} questions remaining, loading next batch...`);
       this._loadNextBatch();
       return true;
     }
     
     if (this._currentBatchEnd >= this._allQuestions.length && this._isAllQuestionsLoaded) {
-      console.log("🔄 Reached end of all questions! Resetting...");
       this._loadNextBatch();
       return true;
     }
@@ -925,7 +909,6 @@ export class GameServer {
       }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
 
     } catch(e) {
-      console.error("Show question error:", e);
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
@@ -1300,7 +1283,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== ✅ DEEPLX TRANSLATE - DENGAN PROTEKSI CF ====================
+  // ==================== DEEPLX TRANSLATE - DENGAN PROTEKSI CF ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1361,9 +1344,8 @@ export class GameServer {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
   
-  // ✅ TRANSLATE SATU TEKS - DENGAN PROTEKSI CF
+  // TRANSLATE SATU TEKS - DENGAN PROTEKSI CF
   async _translateSingleText(text, targetLang, retryCount = 0) {
-    // ✅ CEK APAKAH BOLEH TRANSLATE
     if (!this._canTranslate()) {
       return text;
     }
@@ -1372,25 +1354,21 @@ export class GameServer {
     if (this.translateLimitReached) return text;
     if (!text || typeof text !== 'string') return text;
     
-    // ✅ CEK LIMIT
     if (this.translateCount >= CONSTANTS.TRANSLATE_LIMIT) {
       this.translateLimitReached = true;
       return text;
     }
     
-    // ✅ CIRCUIT BREAKER
     if (this._translationCircuitBreaker.isOpen) {
       const now = Date.now();
       if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
         this._translationCircuitBreaker.isOpen = false;
         this._translationCircuitBreaker.failures = 0;
-        console.log("🔄 Circuit breaker auto-reset");
       } else {
         return text;
       }
     }
     
-    // ✅ COBA SEMUA API URL
     const apiUrls = CONSTANTS.DEEPLX_API_URLS || [
       'https://api.deeplx.org/translate',
       'https://deeplx.vercel.app/translate',
@@ -1400,9 +1378,7 @@ export class GameServer {
     
     for (const apiUrl of apiUrls) {
       try {
-        // ✅ CEK SUBREQUEST LIMIT
         if (!this._checkCFLimits()) {
-          console.warn("⚠️ CF subrequest limit reached, skipping translate");
           return text;
         }
         
@@ -1449,19 +1425,15 @@ export class GameServer {
         throw new Error('Invalid response format');
         
       } catch(e) {
-        console.warn(`DeepLX API ${apiUrl} failed:`, e.message);
         lastError = e;
       }
     }
     
-    // ❌ SEMUA API GAGAL
-    console.error(`DeepLX translate error for ${targetLang}:`, lastError?.message);
     this._translationCircuitBreaker.failures++;
     this._translationCircuitBreaker.lastFailureTime = Date.now();
     
     if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
       this._translationCircuitBreaker.isOpen = true;
-      console.log(`🔴 Circuit breaker OPEN (${this._translationCircuitBreaker.failures} failures)`);
       
       if (this._translationCircuitBreaker.resetTimer) {
         clearTimeout(this._translationCircuitBreaker.resetTimer);
@@ -1470,22 +1442,19 @@ export class GameServer {
         this._translationCircuitBreaker.isOpen = false;
         this._translationCircuitBreaker.failures = 0;
         this._translationCircuitBreaker.resetTimer = null;
-        console.log("🔄 Circuit breaker reset by timer");
       }, CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS);
     }
     
     return text;
   }
   
-  // ✅ TRANSLATE BATCH - DENGAN PROTEKSI CF
+  // TRANSLATE BATCH - DENGAN PROTEKSI CF
   async _translateBatch(texts, targetLang) {
     if (!texts || texts.length === 0) return [];
     if (targetLang === 'en') return texts;
     if (this.translateLimitReached) return texts;
     
-    // ✅ CEK CF LIMIT SEBELUM MULAI
     if (!this._checkCFLimits()) {
-      console.warn("⚠️ CF limit reached, skipping batch translate");
       return texts;
     }
     
@@ -1494,13 +1463,8 @@ export class GameServer {
     const delayMs = CONSTANTS.DEEPLX_DELAY_MS || 1500;
     const batchSize = CONSTANTS.DEEPLX_BATCH_SIZE || 5;
     
-    console.log(`🔄 Translating ${total} texts to ${targetLang} (delay: ${delayMs}ms, batch: ${batchSize})`);
-    
     for (let i = 0; i < total; i++) {
-      // ✅ CEK LIMIT SETIAP ITERASI
       if (!this._checkCFLimits()) {
-        console.warn(`⚠️ CF limit reached at ${i}/${total}, returning partial results`);
-        // Isi sisa dengan text asli
         for (let j = i; j < total; j++) {
           results.push(texts[j]);
         }
@@ -1513,12 +1477,7 @@ export class GameServer {
       try {
         let translated = await this._translateSingleText(text, targetLang);
         results.push(translated);
-        
-        const elapsed = Date.now() - startTime;
-        console.log(`✅ [${i+1}/${total}] Done (${elapsed}ms)`);
-        
       } catch(e) {
-        console.error(`❌ [${i+1}/${total}] Failed:`, e.message);
         results.push(text);
       }
       
@@ -1527,12 +1486,10 @@ export class GameServer {
       }
       
       if ((i + 1) % batchSize === 0 && i < total - 1) {
-        console.log(`⏳ Batch complete, waiting ${CONSTANTS.DEEPLX_BATCH_DELAY_MS}ms...`);
         await this._delay(CONSTANTS.DEEPLX_BATCH_DELAY_MS || 3000);
       }
     }
     
-    console.log(`✅ Completed ${results.length}/${total} translations to ${targetLang}`);
     return results;
   }
   
@@ -1599,16 +1556,11 @@ export class GameServer {
         
         if (lang !== 'en' && !this.translateLimitReached) {
           try {
-            // ✅ CEK CF LIMIT SEBELUM TRANSLATE
             if (this._canTranslate()) {
               finalQuestion = await this._translateSingleText(question, lang);
               finalOptions = await this._translateOptions(options, lang);
-              console.log(`✅ Translated to ${lang} for ${users.length} users`);
-            } else {
-              console.warn(`⚠️ Skipping translate to ${lang} due to CF limits`);
             }
           } catch(e) {
-            console.error(`Translate error for ${lang}:`, e.message);
             finalQuestion = question;
             finalOptions = options;
           }
@@ -1624,8 +1576,6 @@ export class GameServer {
         }
         
       } catch(e) {
-        console.error(`Error broadcasting to lang ${lang}:`, e);
-        
         const fallbackObj = {
           question: question || '',
           options: options || { A: '', B: '', C: '', D: '' }
@@ -3193,7 +3143,7 @@ export class GameServer {
       }
       this._startQuizIfNeeded();
     } catch(e) {
-      console.error("Ensure quiz running error:", e);
+      // Silent
     }
   }
   
@@ -3213,7 +3163,7 @@ export class GameServer {
         this._showQuestion();
       }
     } catch(e) {
-      console.error("Start quiz if needed error:", e);
+      // Silent
     }
   }
   
