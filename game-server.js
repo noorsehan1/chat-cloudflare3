@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (OPTIMIZED - NO ALARM, TRANSLATE WORK, DELAY 5s) ====================
+// ==================== GAME-SERVER.JS (FULLY MATCHED WITH JAVA CLIENT) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -113,15 +113,9 @@ export class GameServer {
       this.quizAutoEnabled = false;
       this.quizAutoTimer = null;
       
-      // ✅ INIT VIA SETTIMEOUT (TIDAK BLOCKING)
       setTimeout(() => {
         this._initAsync();
       }, 0);
-      
-      // ❌ ALARM DINONAKTIFKAN UNTUK FREE TIER
-      // if (this.state && this.state.storage) {
-      //   this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
-      // }
       
     } catch(e) {
       console.error("Constructor error:", e);
@@ -224,11 +218,9 @@ export class GameServer {
           
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizLastWeekWinner",
-            {
-              username: winner,
-              score: highestScore,
-              week: savedWeek || currentWeek
-            }
+            winner,
+            highestScore,
+            savedWeek || currentWeek
           ]);
         }
         
@@ -337,7 +329,6 @@ export class GameServer {
       
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
-          console.log("🔥 Scheduler: Enabling quiz...");
           this.quizAutoEnabled = true;
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
@@ -346,12 +337,10 @@ export class GameServer {
           ]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
         } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-          console.log("🔥 Scheduler: No question, starting...");
           await this._showQuestion();
         }
       } else {
         if (this.quizAutoEnabled) {
-          console.log("🔥 Scheduler: Disabling quiz...");
           this.quizAutoEnabled = false;
           await this.resetQuiz();
           this._broadcastToRoom(QUIZ_ROOM, [
@@ -376,7 +365,6 @@ export class GameServer {
       if (this.isQuizWaiting) return;
       if (this._quizStartTimeout) return;
       
-      console.log("🔥 Force starting quiz...");
       this.quizAutoEnabled = true;
       this._showQuestion();
     } catch(e) {
@@ -483,7 +471,7 @@ export class GameServer {
     }
   }
   
-  // ==================== SWITCH ROOM (DENGAN DELAY 5 DETIK - HANYA 1 EVENT) ====================
+  // ==================== SWITCH ROOM ====================
   
   async switchRoom(ws, room, username = null) {
     if (this.isDestroyed) {
@@ -522,7 +510,6 @@ export class GameServer {
             }
           }
           
-          // ✅ HANYA 1 EVENT SETELAH DELAY 5 DETIK
           setTimeout(() => {
             try {
               if (this.closing || this.isDestroyed) return;
@@ -558,7 +545,6 @@ export class GameServer {
           }
         }
         
-        // ✅ HANYA 1 EVENT SETELAH DELAY 5 DETIK
         setTimeout(() => {
           try {
             if (this.closing || this.isDestroyed) return;
@@ -802,12 +788,8 @@ export class GameServer {
           return;
         }
         
-        // ✅ CEK APAKAH SUDAH JAM QUIZ
         if (this._isQuizTime()) {
-          
-          // ✅ JIKA QUIZ BELUM ENABLED, AKTIFKAN
           if (!this.quizAutoEnabled) {
-            console.log("🔥 Quiz time detected! Enabling quiz...");
             this.quizAutoEnabled = true;
             this._broadcastToRoom(QUIZ_ROOM, [
               "quizTimeLeft",
@@ -816,16 +798,12 @@ export class GameServer {
             ]);
           }
           
-          // ✅ JIKA TIDAK ADA PERTANYAAN, MULAI
           if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-            console.log("🔥 Starting quiz question...");
             this._showQuestion();
           }
           
         } else {
-          // ❌ JAM HABIS - MATIKAN QUIZ
           if (this.quizAutoEnabled) {
-            console.log("🔥 Quiz time ended! Disabling quiz...");
             this.quizAutoEnabled = false;
             this.resetQuiz();
             this._broadcastToRoom(QUIZ_ROOM, [
@@ -849,6 +827,7 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
       
+      // ===== QUIZ EVENTS =====
       if (evt === "switchRoom") {
         const [_, room, username] = data;
         await this.switchRoom(ws, room, username);
@@ -884,6 +863,7 @@ export class GameServer {
           .sort((a, b) => b.score - a.score)
           .slice(0, limit);
         
+        // Format for Java client: ["username|score", ...]
         const result = sorted.map(item => `${item.username}|${item.score}`);
         this._safeSend(ws, ["quizLeaderboard", result]);
         return;
@@ -901,13 +881,182 @@ export class GameServer {
         return;
       }
       
+      if (evt === "deleteQuizLastWeekWinner") {
+        try {
+          if (this.env && this.env.QUESTIONS) {
+            await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
+          } else {
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
+        }
+        return;
+      }
+      
       if (evt === "getRoomUsers") {
         return;
       }
       
+      // ===== CHAT EVENTS =====
+      if (evt === "setIdTarget") {
+        const [_, id, roomname] = data;
+        this.myIdTarget = id || "";
+        this.roomnama = roomname || "";
+        return;
+      }
+      
+      if (evt === "setIdTarget2") {
+        const [_, id, baru] = data;
+        this.myIdTarget = id || "";
+        if (id && this.roomnama) {
+          this._broadcastToRoom(this.roomnama, ["joinRoom", this.roomnama]);
+        }
+        return;
+      }
+      
+      if (evt === "joinRoom") {
+        const [_, roomname] = data;
+        if (roomname) {
+          this.roomnama = roomname;
+          this._broadcastToRoom(roomname, ["rooMasuk", this._getSeatNumber(ws), roomname]);
+          this._safeSend(ws, ["numberKursiSaya", this._getSeatNumber(ws)]);
+        }
+        return;
+      }
+      
+      if (evt === "chat") {
+        const [_, roomname, noImageURL, username, message, usernameColor, chatTextColor] = data;
+        this._broadcastToRoom(roomname, [
+          "chat",
+          roomname || "",
+          noImageURL || "",
+          username || "",
+          message || "",
+          usernameColor || "",
+          chatTextColor || ""
+        ]);
+        return;
+      }
+      
+      if (evt === "private") {
+        const [_, idtarget, noimageUrl, message, sender] = data;
+        this._sendPrivate(idtarget, noimageUrl, message, sender);
+        return;
+      }
+      
+      if (evt === "sendnotif") {
+        const [_, idtarget, noimageUrl, username, deskripsi] = data;
+        this._sendNotif(idtarget, noimageUrl, username, deskripsi);
+        return;
+      }
+      
+      if (evt === "removeKursiAndPoint") {
+        const [_, roomName, seatNumber] = data;
+        this._broadcastToRoom(roomName, ["removeKursi", roomName, seatNumber]);
+        return;
+      }
+      
+      if (evt === "resetRoom") {
+        const [_, roomName] = data;
+        this._broadcastToRoom(roomName, ["resetRoom", roomName]);
+        return;
+      }
+      
+      if (evt === "updatePoint") {
+        const [_, roomname, seat, x, y, fast] = data;
+        this._broadcastToRoom(roomname, ["pointUpdated", roomname, seat, x, y, fast]);
+        return;
+      }
+      
+      if (evt === "updateKursi") {
+        const [_, roomname, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda] = data;
+        this._broadcastToRoom(roomname, [
+          "kursiUpdated",
+          roomname, seat, noimageUrl, namauser, color, itembawah, itematas, vip, viptanda
+        ]);
+        return;
+      }
+      
+      if (evt === "modwarning") {
+        const [_, roomName] = data;
+        this._broadcastToRoom(roomName, ["modwarning", roomName]);
+        return;
+      }
+      
+      if (evt === "getOnlineUsers") {
+        const users = this._getOnlineUsers();
+        this._safeSend(ws, ["allOnlineUsers", users]);
+        return;
+      }
+      
+      if (evt === "isUserOnline") {
+        const [_, userId, tanda] = data;
+        const isOnline = this._isUserOnline(userId);
+        this._safeSend(ws, ["userOnlineStatus", userId, isOnline, tanda || ""]);
+        return;
+      }
+      
+      if (evt === "getAllRoomsUserCount") {
+        const roomCounts = this._getAllRoomsUserCount();
+        this._safeSend(ws, ["allRoomsUserCount", roomCounts]);
+        return;
+      }
+      
+      if (evt === "getCurrentNumber") {
+        const number = Math.floor(Math.random() * 12) + 1;
+        this._safeSend(ws, ["currentNumber", number]);
+        return;
+      }
+      
+      if (evt === "gift") {
+        const [_, roomname, sender, receiver, giftName] = data;
+        this._broadcastToRoom(roomname, ["gift", roomname, sender, receiver, giftName, Date.now()]);
+        return;
+      }
+      
+      if (evt === "rollangak") {
+        const [_, roomname, username, angka] = data;
+        this._broadcastToRoom(roomname, ["rollangakBroadcast", roomname, username, angka]);
+        return;
+      }
+      
+      if (evt === "setMuteType") {
+        const [_, isMuted, roomname] = data;
+        this._broadcastToRoom(roomname, ["muteStatusChanged", isMuted, roomname]);
+        return;
+      }
+      
+      if (evt === "getMuteType") {
+        const [_, roomname] = data;
+        this._safeSend(ws, ["muteTypeResponse", false, roomname]);
+        return;
+      }
+      
+      if (evt === "isInRoom") {
+        const isInRoom = this.roomnama && this.roomnama.length > 0;
+        this._safeSend(ws, ["inRoomStatus", isInRoom]);
+        return;
+      }
+      
+      if (evt === "onDestroy") {
+        const room = this.roomnama;
+        if (room) {
+          this._broadcastToRoom(room, ["removeKursi", room, this._getSeatNumber(ws)]);
+        }
+        return;
+      }
+      
+      // ===== GAME EVENTS =====
       const room = this._ensureRoomConsistency(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
+        return;
+      }
+      
+      if (room === QUIZ_ROOM) {
+        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
         return;
       }
       
@@ -936,11 +1085,82 @@ export class GameServer {
     }
   }
   
-  // ==================== ALARM DINONAKTIFKAN ====================
-  // ❌ ALARM DIHAPUS UNTUK FREE TIER
-  // async alarm() { ... }
+  // ==================== CHAT HELPER METHODS ====================
   
-  // ==================== TRANSLATION (TETAP WORK) ====================
+  _getSeatNumber(ws) {
+    if (!ws) return -1;
+    const wsId = this._getWsId(ws);
+    if (!wsId) return -1;
+    // Simple mapping: use wsId as seat number (1-45)
+    return (wsId % 45) + 1;
+  }
+  
+  _getOnlineUsers() {
+    const users = [];
+    for (const [username, conn] of this.userConnections) {
+      if (conn && conn.ws && conn.ws.readyState === 1) {
+        users.push(username);
+      }
+    }
+    return users;
+  }
+  
+  _isUserOnline(userId) {
+    if (!userId) return false;
+    const conn = this.userConnections.get(userId);
+    return conn && conn.ws && conn.ws.readyState === 1;
+  }
+  
+  _getAllRoomsUserCount() {
+    const result = [];
+    for (const [room, wsIds] of this.wsClients) {
+      if (room === QUIZ_ROOM) continue;
+      result.push({
+        roomName: room,
+        userCount: wsIds ? wsIds.size : 0
+      });
+    }
+    return result;
+  }
+  
+  _sendPrivate(idtarget, noimageUrl, message, sender) {
+    const wsId = this._getWsIdByUsername(idtarget);
+    if (wsId) {
+      const ws = this.wsMap.get(wsId);
+      if (ws && ws.readyState === 1) {
+        this._safeSend(ws, ["private", idtarget, noimageUrl, message, Date.now(), sender]);
+        return;
+      }
+    }
+    // Send failure to sender
+    const senderWsId = this._getWsIdByUsername(sender);
+    if (senderWsId) {
+      const senderWs = this.wsMap.get(senderWsId);
+      if (senderWs) {
+        this._safeSend(senderWs, ["privateFailed", idtarget, "User offline"]);
+      }
+    }
+  }
+  
+  _sendNotif(idtarget, noimageUrl, username, deskripsi) {
+    const wsId = this._getWsIdByUsername(idtarget);
+    if (wsId) {
+      const ws = this.wsMap.get(wsId);
+      if (ws && ws.readyState === 1) {
+        this._safeSend(ws, ["notif", idtarget, noimageUrl, username, Date.now()]);
+      }
+    }
+  }
+  
+  _getWsIdByUsername(username) {
+    if (!username) return null;
+    const conn = this.userConnections.get(username);
+    return conn ? conn.wsId : null;
+  }
+  
+  // ==================== ALARM DINONAKTIFKAN ====================
+  
+  // ==================== TRANSLATION ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1115,7 +1335,6 @@ export class GameServer {
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients || clients.size === 0) return;
       
-      // ✅ FORCE START JIKA SUDAH WAKTUNYA
       this._forceStartQuizIfTime();
       
       if (!this.quizQuestionCache['en'] || this.quizQuestionCache['en'].length === 0) {
@@ -1250,7 +1469,7 @@ export class GameServer {
     }
   }
   
-  // ==================== OPTIMIZED BROADCAST ====================
+  // ==================== BROADCAST ====================
   
   _broadcastToRoom(room, message) {
     if (this.closing || this.isDestroyed || !room || !message) return;
@@ -1340,8 +1559,6 @@ export class GameServer {
       correct: newCorrect || 'A'
     };
   }
-  
-  // ==================== BROADCAST QUIZ QUESTION (DENGAN TRANSLATE) ====================
   
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
