@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL CLEAN - NO LOGS) ====================
+// ==================== GAME-SERVER.JS (REMOVE NEXT SESSION SCHEDULER) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -247,86 +247,6 @@ export class GameServer {
     return false;
   }
   
-  _getNextQuizStartTime() {
-    const now = this._getCurrentUTCTime();
-    const schedules = [
-      QUIZ_SCHEDULE.SESSION1,
-      QUIZ_SCHEDULE.SESSION2,
-      QUIZ_SCHEDULE.SESSION3,
-      QUIZ_SCHEDULE.SESSION4,
-      QUIZ_SCHEDULE.SESSION5,
-      QUIZ_SCHEDULE.SESSION6
-    ];
-    for (const schedule of schedules) {
-      const startTime = new Date(now);
-      startTime.setUTCHours(schedule.start, 0, 0, 0);
-      if (startTime > now) {
-        return startTime;
-      }
-    }
-    const tomorrow = new Date(now);
-    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-    tomorrow.setUTCHours(QUIZ_SCHEDULE.SESSION1.start, 0, 0, 0);
-    return tomorrow;
-  }
-  
-  _getTimeLeftUntilNextEvent() {
-    const now = Date.now();
-    const nextStart = this._getNextQuizStartTime();
-    const timeLeft = nextStart.getTime() - now;
-    
-    if (timeLeft <= 0) {
-      return { minutes: 0, seconds: 0, isRunning: this._isQuizTime() };
-    }
-    
-    const totalSeconds = Math.floor(timeLeft / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    
-    return { minutes, seconds, isRunning: false };
-  }
-  
-  _getQuizSessionEndTime() {
-    const now = this._getCurrentUTCTime();
-    const hour = now.getUTCHours();
-    
-    const schedules = [
-      QUIZ_SCHEDULE.SESSION1,
-      QUIZ_SCHEDULE.SESSION2,
-      QUIZ_SCHEDULE.SESSION3,
-      QUIZ_SCHEDULE.SESSION4,
-      QUIZ_SCHEDULE.SESSION5,
-      QUIZ_SCHEDULE.SESSION6
-    ];
-    
-    for (const schedule of schedules) {
-      if (hour >= schedule.start && hour < schedule.end) {
-        const endTime = new Date(now);
-        endTime.setUTCHours(schedule.end, 0, 0, 0);
-        return endTime;
-      }
-    }
-    return null;
-  }
-  
-  _getTimeRemainingInSession() {
-    const endTime = this._getQuizSessionEndTime();
-    if (!endTime) return "0m";
-    
-    const now = Date.now();
-    const diff = endTime.getTime() - now;
-    
-    if (diff <= 0) return "0m";
-    
-    const minutes = Math.floor(diff / 60000);
-    const seconds = Math.floor((diff % 60000) / 1000);
-    
-    if (minutes > 0) {
-      return `${minutes}m ${seconds}s`;
-    }
-    return `${seconds}s`;
-  }
-  
   _startQuizScheduler() {
     if (this.quizAutoTimer) {
       clearInterval(this.quizAutoTimer);
@@ -401,18 +321,19 @@ export class GameServer {
     } catch(e) {}
   }
   
+  // ==================== HAPUS: _getNextQuizStartTime, _getTimeLeftUntilNextEvent, _getQuizSessionEndTime, _getTimeRemainingInSession ====================
+  // Tidak digunakan lagi karena notifikasi sudah dihandle saat masuk room
+  
   _sendQuizTimeLeftToUser(ws) {
     if (!ws || ws.readyState !== 1) return false;
     
     try {
       const isQuizTime = this._isQuizTime();
-      const timeLeft = this._getTimeLeftUntilNextEvent();
       const isQuizActive = this.currentQuestion !== null && this._quizTimeout !== null;
       const isQuizWaiting = this.isQuizWaiting || this._quizStartTimeout !== null;
       
       let message = "";
       let canType = true;
-      let notification = "";
       
       if (isQuizTime) {
         canType = false;
@@ -432,46 +353,18 @@ export class GameServer {
             }
           }
           message = `⏰ Quiz is running! ${remaining}`;
-          notification = "📢 Quiz has started! Answer the questions now!";
+          this._safeSend(ws, ["quizNotification", "📢 Quiz has started! Answer the questions now!", "info"]);
         } else if (isQuizWaiting) {
           message = `⏳ Quiz will start soon!`;
-          notification = "⏳ Quiz is about to start! Get ready!";
+          this._safeSend(ws, ["quizNotification", "⏳ Quiz is about to start! Get ready!", "info"]);
         } else {
-          const timeRemaining = this._getTimeRemainingInSession();
-          message = `⏳ Quiz will start soon! (${timeRemaining})`;
-          notification = `📢 Quiz session is active for ${timeRemaining}!`;
+          message = `⏳ Quiz will start soon!`;
+          this._safeSend(ws, ["quizNotification", "📢 Quiz session is active! Get ready!", "info"]);
         }
-        
-        this._safeSend(ws, ["quizNotification", notification, "info"]);
-        
       } else {
-        const totalSeconds = timeLeft.minutes * 60 + timeLeft.seconds;
-        
-        let countdown = "";
-        if (totalSeconds <= 0) {
-          countdown = "Now!";
-        } else {
-          const days = Math.floor(totalSeconds / 86400);
-          const hours = Math.floor((totalSeconds % 86400) / 3600);
-          const minutes = Math.floor((totalSeconds % 3600) / 60);
-          const seconds = Math.floor(totalSeconds % 60);
-          
-          let parts = [];
-          if (days > 0) parts.push(`${days}d`);
-          if (hours > 0) parts.push(`${hours}h`);
-          if (minutes > 0) parts.push(`${minutes}m`);
-          if (seconds > 0 && parts.length === 0) parts.push(`${seconds}s`);
-          
-          countdown = parts.join(" ");
-        }
-        
-        message = `⏸️ Quiz is offline. Starts in ${countdown}`;
+        message = `⏸️ Quiz is offline.`;
         canType = true;
-        
-        if (totalSeconds > 0) {
-          notification = `📢 Quiz will start in ${countdown}. Stay tuned!`;
-          this._safeSend(ws, ["quizNotification", notification, "info"]);
-        }
+        this._safeSend(ws, ["quizNotification", "📢 Quiz is offline. Check schedule for next session.", "info"]);
       }
       
       this._safeSend(ws, ["quizTimeLeft", message, canType]);
@@ -485,7 +378,6 @@ export class GameServer {
     if (!ws || ws.readyState !== 1) return false;
     
     try {
-      const timeLeft = this._getTimeLeftUntilNextEvent();
       let message = "";
       
       switch(errorType) {
@@ -499,10 +391,7 @@ export class GameServer {
           message = "Quiz session has ended";
           break;
         case "QUIZ_NOT_STARTED":
-          const timeStr = timeLeft.minutes > 0 ? 
-            `${timeLeft.minutes}m ${timeLeft.seconds}s` : 
-            `${timeLeft.seconds}s`;
-          message = `Quiz hasn't started yet. Starting in: ${timeStr}`;
+          message = "Quiz hasn't started yet.";
           break;
         default:
           message = customMessage || "Quiz error occurred";
@@ -582,8 +471,8 @@ export class GameServer {
         }
         
         const welcomeMessage = this._isQuizTime() 
-          ? "📢 Welcome to Quiz Room! Session is active. Answer questions to earn points!"
-          : "📢 Welcome to Quiz Room! Next session will start soon. Stay tuned!";
+          ? "📢 Welcome to Quiz Room! Session is active."
+          : "📢 Welcome to Quiz Room!";
         
         this._safeSend(ws, ["quizNotification", welcomeMessage, "info"]);
         
@@ -613,7 +502,7 @@ export class GameServer {
         if (clients && clients.size > 0) {
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz is offline. Check schedule for next session.",
+            "⏸️ Quiz is offline.",
             true
           ]);
         }
@@ -882,7 +771,7 @@ export class GameServer {
             
             this._broadcastToRoom(QUIZ_ROOM, [
               "quizTimeLeft",
-              "⏸️ Quiz is offline. Check schedule for next session.",
+              "⏸️ Quiz is offline.",
               true
             ]);
           }
