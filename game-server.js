@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FIX TRANSLATE TIDAK WORK) ====================
+// ==================== GAME-SERVER.JS (FULL CLASS WITH BATCH SYSTEM) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -39,12 +39,18 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   QUIZ_BATCH_THRESHOLD: 20,
   MAX_QUESTIONS: 10000,
-  // GAME SCHEDULE - JAM MAIN GAME
+  
+  // BATCH SYSTEM UNTUK 10.000 SOAL
+  QUIZ_BATCH_PREFIX: 'quiz_batch_',
+  QUIZ_METADATA_KEY: 'quiz_metadata',
+  QUIZ_TOTAL_KEY: 'quiz_total',
+  QUIZ_BATCH_CACHE_SIZE: 1,
+  
   GAME_SCHEDULE: {
     START_HOUR: 0,
     END_HOUR: 23,
   },
-  // DEEPLX CONFIG - DENGAN PROTEKSI LIMIT
+  
   DEEPLX_API_URLS: [
     'https://api.deeplx.org/translate',
     'https://deeplx.vercel.app/translate',
@@ -57,7 +63,7 @@ const CONSTANTS = {
   DEEPLX_BATCH_SIZE: 5,
   DEEPLX_BATCH_DELAY_MS: 3000,
   DEEPLX_MAX_RETRIES: 3,
-  // CF LIMIT PROTECTION
+  
   CF_SUBREQUEST_LIMIT: 50,
   CF_CPU_TIME_LIMIT_MS: 9000,
   CF_MEMORY_LIMIT_MB: 128,
@@ -114,7 +120,7 @@ export class GameServer {
     this.quizQuestionCache = {};
     this._quizStartTime = null;
     
-    // TRACKING UNTUK 10.000 SOAL
+    // ==================== BATCH SYSTEM UNTUK 10.000 SOAL ====================
     this._allQuestions = [];
     this._currentQuestions = [];
     this._currentBatchStart = 0;
@@ -122,7 +128,18 @@ export class GameServer {
     this._isAllQuestionsLoaded = false;
     this._questionPointer = 0;
     
-    // DEEPLX TRANSLATION - DENGAN PROTEKSI
+    // BATCH SYSTEM BARU
+    this._totalQuestions = 0;
+    this._totalBatches = 0;
+    this._currentBatchIndex = -1;
+    this._currentBatchQuestions = [];
+    this._isAllBatchesLoaded = false;
+    this._batchLoadCount = 0;
+    this._questionCounter = 0;
+    this._lastBatchLoaded = -1;
+    this._nextBatchCache = [];
+    
+    // DEEPLX TRANSLATION
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -671,7 +688,6 @@ export class GameServer {
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
       
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
-        
         this._allQuestions = cached.questions.map((q, index) => ({
           id: index + 1,
           question: q.question || '',
@@ -797,33 +813,16 @@ export class GameServer {
         return;
       }
 
-      this._checkAndLoadNextBatch();
-
-      let questions = this.quizQuestionCache['en'];
-      if (!questions || questions.length === 0) {
-        const loaded = this._loadNextBatch();
-        if (!loaded) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizError",
-            "No questions available! Please add questions to KV."
-          ]);
-          return;
-        }
-        questions = this.quizQuestionCache['en'];
-        if (!questions || questions.length === 0) return;
-      }
-
-      if (this._questionPointer >= questions.length) {
-        this._loadNextBatch();
-        questions = this.quizQuestionCache['en'];
-        if (!questions || questions.length === 0) return;
-        this._questionPointer = 0;
-      }
+      // Ambil soal berikutnya dari batch system
+      const q = await this._getNextQuestion();
       
-      const q = questions[this._questionPointer];
-      this._questionPointer++;
-      
-      if (!q || !q.options) return;
+      if (!q) {
+        this._broadcastToRoom(QUIZ_ROOM, [
+          "quizError",
+          "No questions available! Please add questions to KV."
+        ]);
+        return;
+      }
 
       const shuffled = this._shuffleQuestionOptions(q);
       
@@ -1283,7 +1282,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== DEEPLX TRANSLATE - DENGAN PROTEKSI CF ====================
+  // ==================== DEEPLX TRANSLATE ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1344,7 +1343,6 @@ export class GameServer {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
   
-  // TRANSLATE SATU TEKS - DENGAN PROTEKSI CF
   async _translateSingleText(text, targetLang, retryCount = 0) {
     if (!this._canTranslate()) {
       return text;
@@ -1448,7 +1446,6 @@ export class GameServer {
     return text;
   }
   
-  // TRANSLATE BATCH - DENGAN PROTEKSI CF
   async _translateBatch(texts, targetLang) {
     if (!texts || texts.length === 0) return [];
     if (targetLang === 'en') return texts;
@@ -1472,7 +1469,6 @@ export class GameServer {
       }
       
       const text = texts[i];
-      const startTime = Date.now();
       
       try {
         let translated = await this._translateSingleText(text, targetLang);
@@ -3185,5 +3181,248 @@ export class GameServer {
       }
       return false;
     }
+  }
+  
+  // ==================== BATCH SYSTEM METHODS (BARU) ====================
+  
+  async _loadQuizMetadata() {
+    if (!this.env || !this.env.QUESTIONS) return false;
+    
+    try {
+      this._incrementSubRequest();
+      const metadata = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_METADATA_KEY, 'json');
+      
+      if (metadata && metadata.totalQuestions) {
+        this._totalQuestions = metadata.totalQuestions;
+        this._totalBatches = Math.ceil(this._totalQuestions / CONSTANTS.QUIZ_BATCH_SIZE);
+        this._currentBatchIndex = -1;
+        this._questionPointer = 0;
+        this._isAllBatchesLoaded = false;
+        this._batchLoadCount = 0;
+        this._questionCounter = 0;
+        this._lastBatchLoaded = -1;
+        this._currentBatchQuestions = [];
+        this._nextBatchCache = [];
+        
+        console.log(`📊 Metadata loaded: ${this._totalQuestions} questions, ${this._totalBatches} batches`);
+        return true;
+      }
+      
+      return false;
+    } catch(e) {
+      console.error('Failed to load quiz metadata:', e);
+      return false;
+    }
+  }
+  
+  async _loadBatchFromKV(batchIndex) {
+    if (!this.env || !this.env.QUESTIONS) return false;
+    
+    try {
+      if (batchIndex < 0 || batchIndex >= this._totalBatches) {
+        console.error(`❌ Invalid batch index: ${batchIndex}`);
+        return false;
+      }
+      
+      // HAPUS BATCH LAMA
+      if (this._currentBatchQuestions.length > 0) {
+        console.log(`🗑️  Hapus batch ${this._currentBatchIndex} dari memory`);
+        this._currentBatchQuestions = [];
+      }
+      
+      // AMBIL BATCH BARU DARI KV
+      this._incrementSubRequest();
+      const batchKey = `${CONSTANTS.QUIZ_BATCH_PREFIX}${batchIndex}`;
+      const batch = await this.env.QUESTIONS.get(batchKey, 'json');
+      
+      if (batch && Array.isArray(batch) && batch.length > 0) {
+        this._currentBatchQuestions = batch;
+        this._currentBatchIndex = batchIndex;
+        this._questionPointer = 0;
+        this._lastBatchLoaded = batchIndex;
+        this._batchLoadCount++;
+        this._questionCounter = batchIndex * CONSTANTS.QUIZ_BATCH_SIZE;
+        
+        const startNum = batchIndex * CONSTANTS.QUIZ_BATCH_SIZE + 1;
+        const endNum = Math.min(
+          (batchIndex + 1) * CONSTANTS.QUIZ_BATCH_SIZE,
+          this._totalQuestions
+        );
+        
+        console.log(`✅ Load batch ${batchIndex}: questions ${startNum}-${endNum} (${batch.length} questions)`);
+        console.log(`📊 Memory: ${this._currentBatchQuestions.length} questions (${(this._currentBatchQuestions.length * 300 / 1024).toFixed(2)} KB)`);
+        
+        this._isAllBatchesLoaded = (batchIndex >= this._totalBatches - 1);
+        
+        this._broadcastToRoom(QUIZ_ROOM, [
+          "quizBatchLoaded",
+          {
+            start: startNum,
+            end: endNum,
+            total: this._totalQuestions,
+            remaining: this._totalQuestions - endNum,
+            batch: batchIndex + 1,
+            totalBatches: this._totalBatches,
+            progress: Math.round((endNum / this._totalQuestions) * 100)
+          }
+        ]);
+        
+        return true;
+      }
+      
+      return false;
+    } catch(e) {
+      console.error(`Failed to load batch ${batchIndex}:`, e);
+      return false;
+    }
+  }
+  
+  async _loadNextBatch() {
+    if (this._totalQuestions === 0 || this._totalBatches === 0) {
+      return false;
+    }
+    
+    let nextBatchIndex = this._currentBatchIndex + 1;
+    
+    if (nextBatchIndex >= this._totalBatches) {
+      nextBatchIndex = 0;
+      this._questionCounter = 0;
+      
+      console.log('🔄 All batches completed! Starting from batch 0 again');
+      
+      this._broadcastToRoom(QUIZ_ROOM, [
+        "quizNotification",
+        "📢 All 10,000 questions have been answered! Starting from question 1 again!",
+        "info"
+      ]);
+    }
+    
+    if (nextBatchIndex === this._lastBatchLoaded && this._currentBatchQuestions.length > 0) {
+      console.log(`⚠️ Batch ${nextBatchIndex} already loaded, skip`);
+      return true;
+    }
+    
+    // CEK CACHE DULU
+    if (this._nextBatchCache && this._nextBatchCache.length > 0 && this._nextBatchCache._batchIndex === nextBatchIndex) {
+      console.log(`📦 Using cached batch ${nextBatchIndex}`);
+      this._currentBatchQuestions = this._nextBatchCache;
+      this._currentBatchIndex = nextBatchIndex;
+      this._questionPointer = 0;
+      this._lastBatchLoaded = nextBatchIndex;
+      this._questionCounter = nextBatchIndex * CONSTANTS.QUIZ_BATCH_SIZE;
+      this._nextBatchCache = [];
+      return true;
+    }
+    
+    return await this._loadBatchFromKV(nextBatchIndex);
+  }
+  
+  async _getNextQuestion() {
+    if (this._currentBatchQuestions.length === 0) {
+      const loaded = await this._loadBatchFromKV(0);
+      if (!loaded) return null;
+    }
+    
+    if (this._questionPointer >= this._currentBatchQuestions.length) {
+      const loaded = await this._loadNextBatch();
+      if (!loaded) return null;
+    }
+    
+    const question = this._currentBatchQuestions[this._questionPointer];
+    this._questionPointer++;
+    this._questionCounter++;
+    
+    // Preload batch berikutnya jika sisa 5 soal
+    if (this._currentBatchQuestions.length - this._questionPointer <= 5 && !this._isAllBatchesLoaded) {
+      const nextIndex = this._currentBatchIndex + 1;
+      if (nextIndex < this._totalBatches) {
+        this._preloadBatch(nextIndex);
+      }
+    }
+    
+    return question;
+  }
+  
+  async _preloadBatch(batchIndex) {
+    if (!this.env || !this.env.QUESTIONS) return;
+    try {
+      const batchKey = `${CONSTANTS.QUIZ_BATCH_PREFIX}${batchIndex}`;
+      const batch = await this.env.QUESTIONS.get(batchKey, 'json');
+      if (batch && Array.isArray(batch) && batch.length > 0) {
+        batch._batchIndex = batchIndex;
+        this._nextBatchCache = batch;
+        console.log(`📦 Pre-loaded batch ${batchIndex}`);
+      }
+    } catch(e) {
+      // Silent
+    }
+  }
+  
+  async resetQuiz() {
+    try {
+      this.currentQuestion = null;
+      this.quizHasWinner = false;
+      this.quizWinner = null;
+      this.quizAnswered = new Set();
+      this.isQuizWaiting = false;
+      this.quizAutoEnabled = false;
+      
+      if (this._quizTimeout) {
+        clearTimeout(this._quizTimeout);
+        this._quizTimeout = null;
+      }
+      if (this._quizBreakTimeout) {
+        clearTimeout(this._quizBreakTimeout);
+        this._quizBreakTimeout = null;
+      }
+      if (this._quizStartTimeout) {
+        clearTimeout(this._quizStartTimeout);
+        this._quizStartTimeout = null;
+      }
+      
+      // Reset batch
+      this._currentBatchQuestions = [];
+      this._currentBatchIndex = -1;
+      this._questionPointer = 0;
+      this._questionCounter = 0;
+      this._nextBatchCache = [];
+      
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+  
+  async startQuizWithDelay(delayMs) {
+    if (this._quizStartTimeout) {
+      clearTimeout(this._quizStartTimeout);
+      this._quizStartTimeout = null;
+    }
+    
+    this._quizStartTimeout = setTimeout(() => {
+      if (this.closing || this.isDestroyed) return;
+      this._quizStartTimeout = null;
+      if (this._isQuizTime() && this.quizAutoEnabled) {
+        this._showQuestion();
+      }
+    }, delayMs);
+  }
+  
+  _ensureSingleConnection(room, username, newWs, newWsId) {
+    const game = this.activeGames.get(room);
+    if (!game) return newWsId;
+    
+    const existingWsId = game.playerWsId?.get(username);
+    if (existingWsId && existingWsId !== newWsId) {
+      const existingWs = this.wsMap.get(existingWsId);
+      if (existingWs && existingWs.readyState === 1) {
+        try {
+          existingWs.close(1000, "Duplicate connection");
+        } catch(e) {}
+      }
+      game.playerWsId.set(username, newWsId);
+    }
+    
+    return newWsId;
   }
 }
