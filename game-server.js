@@ -1,4 +1,7 @@
 // ==================== GAME-SERVER.JS (QUIZ 23:00-04:00 WIB) ====================
+// ==================== DENGAN CPU MONITOR & AUTO RESUME ====================
+// ==================== TANPA AUTO-KICK / CLEANUP SAAT SWITCH ROOM ====================
+// ==================== TANPA ICU TRANSLATE ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -40,6 +43,13 @@ const CONSTANTS = {
   TRANSLATE_TIMEOUT_MS: 10000,
   QUIZ_KEEP_ALIVE_INTERVAL_MS: 5000,
   QUIZ_NEXT_QUESTION_DELAY_MS: 5000,
+  // CPU CONFIG
+  MAX_CPU_MS: 7,
+  CPU_CHECK_INTERVAL_MS: 50,
+  MAX_BATCH_SIZE: 5,
+  RATE_LIMIT_PER_USER: 3,
+  CPU_EMERGENCY_THRESHOLD: 6,
+  CPU_THROTTLE_THRESHOLD: 4,
 };
 
 const QUIZ_SCHEDULE = {
@@ -48,6 +58,325 @@ const QUIZ_SCHEDULE = {
 };
 
 const QUIZ_ROOM = "Quiz";
+
+// ==================== CPU MONITOR ====================
+
+class CPUMonitor {
+  constructor(maxCpuMs = CONSTANTS.MAX_CPU_MS) {
+    this.maxCpuMs = maxCpuMs;
+    this.startTime = 0;
+    this.currentCpu = 0;
+    this.shouldStop = false;
+    this.reason = '';
+    this.operations = [];
+    this.isHeavyOperation = false;
+    this.lastCheckTime = 0;
+    this.isPaused = false;
+    this.resumeQueue = [];
+    this.isResuming = false;
+  }
+
+  start() {
+    this.startTime = performance.now();
+    this.currentCpu = 0;
+    this.shouldStop = false;
+    this.reason = '';
+    this.operations = [];
+    this.isHeavyOperation = false;
+    this.lastCheckTime = this.startTime;
+    this.isPaused = false;
+  }
+
+  check(operation = '') {
+    if (this.isPaused) return false;
+    if (this.shouldStop) return false;
+    
+    const now = performance.now();
+    this.currentCpu = now - this.startTime;
+    
+    if (now - this.lastCheckTime < 50 && operation !== 'force_check') {
+      return true;
+    }
+    this.lastCheckTime = now;
+    
+    if (this.currentCpu > this.maxCpuMs) {
+      this.shouldStop = true;
+      this.reason = `CPU exceeded: ${this.currentCpu.toFixed(2)}ms > ${this.maxCpuMs}ms${operation ? ` (${operation})` : ''}`;
+      return false;
+    }
+    
+    if (operation) {
+      this.operations.push({
+        op: operation,
+        time: this.currentCpu.toFixed(2)
+      });
+      if (this.operations.length > 20) {
+        this.operations.shift();
+      }
+    }
+    
+    return true;
+  }
+
+  checkHeavy(operation = '') {
+    if (this.isPaused) return false;
+    
+    const heavyThreshold = Math.min(this.maxCpuMs * 0.7, 5);
+    if (this.currentCpu > heavyThreshold) {
+      this.shouldStop = true;
+      this.reason = `Heavy operation stopped: ${this.currentCpu.toFixed(2)}ms > ${heavyThreshold.toFixed(2)}ms${operation ? ` (${operation})` : ''}`;
+      return false;
+    }
+    this.isHeavyOperation = true;
+    return this.check(operation);
+  }
+
+  pause(reason = 'CPU high') {
+    this.isPaused = true;
+    this.reason = reason;
+    console.log(`[CPU] Paused: ${reason}`);
+  }
+
+  resume() {
+    this.isPaused = false;
+    this.shouldStop = false;
+    this.reason = '';
+    this.startTime = performance.now();
+    this.currentCpu = 0;
+    console.log('[CPU] Resumed');
+    this._processResumeQueue();
+  }
+
+  async _processResumeQueue() {
+    if (this.isResuming || this.resumeQueue.length === 0) return;
+    this.isResuming = true;
+    
+    console.log(`[CPU] Processing ${this.resumeQueue.length} queued tasks`);
+    
+    for (const task of this.resumeQueue) {
+      if (this.isPaused) {
+        console.log('[CPU] Paused again, stopping queue');
+        break;
+      }
+      try {
+        await task();
+      } catch(e) {
+        console.error('[CPU] Queue task error:', e);
+      }
+    }
+    
+    this.resumeQueue = [];
+    this.isResuming = false;
+    console.log('[CPU] Queue processing complete');
+  }
+
+  addToResumeQueue(task) {
+    this.resumeQueue.push(task);
+    console.log(`[CPU] Added to queue (${this.resumeQueue.length} tasks)`);
+  }
+
+  getStatus() {
+    return {
+      cpuMs: this.currentCpu,
+      maxAllowed: this.maxCpuMs,
+      shouldStop: this.shouldStop,
+      isPaused: this.isPaused,
+      reason: this.reason,
+      operations: this.operations.slice(-10),
+      remainingMs: Math.max(0, this.maxCpuMs - this.currentCpu),
+      queueLength: this.resumeQueue.length
+    };
+  }
+
+  reset() {
+    this.startTime = performance.now();
+    this.currentCpu = 0;
+    this.shouldStop = false;
+    this.reason = '';
+    this.operations = [];
+    this.isHeavyOperation = false;
+    this.lastCheckTime = this.startTime;
+    this.isPaused = false;
+  }
+
+  forceStop(reason = 'Manual stop') {
+    this.shouldStop = true;
+    this.reason = reason;
+  }
+
+  isSafe() {
+    return !this.shouldStop && !this.isPaused;
+  }
+
+  getCpuMs() {
+    return this.currentCpu;
+  }
+
+  getRemainingMs() {
+    return Math.max(0, this.maxCpuMs - this.currentCpu);
+  }
+
+  canContinueHeavy() {
+    return this.currentCpu < this.maxCpuMs * 0.5;
+  }
+}
+
+// ==================== AUTO RESUME MANAGER ====================
+
+class AutoResumeManager {
+  constructor(cpuMonitor, checkInterval = 1000) {
+    this.cpuMonitor = cpuMonitor;
+    this.checkInterval = checkInterval;
+    this.isRunning = false;
+    this.intervalId = null;
+    this.callbacks = [];
+    this.isPaused = false;
+  }
+
+  start() {
+    if (this.isRunning) return;
+    this.isRunning = true;
+    this.isPaused = false;
+    
+    this.intervalId = setInterval(() => {
+      this._checkAndResume();
+    }, this.checkInterval);
+    
+    console.log('[AutoResume] Started');
+  }
+
+  stop() {
+    this.isRunning = false;
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+    console.log('[AutoResume] Stopped');
+  }
+
+  _checkAndResume() {
+    if (!this.cpuMonitor.isPaused) return;
+    
+    const status = this.cpuMonitor.getStatus();
+    
+    if (status.cpuMs < this.cpuMonitor.maxCpuMs * 0.5) {
+      console.log(`[AutoResume] CPU dropped to ${status.cpuMs.toFixed(2)}ms, resuming...`);
+      this.cpuMonitor.resume();
+      this._triggerCallbacks('resume');
+    } else {
+      console.log(`[AutoResume] CPU still high: ${status.cpuMs.toFixed(2)}ms`);
+    }
+  }
+
+  onResume(callback) {
+    this.callbacks.push(callback);
+  }
+
+  _triggerCallbacks(event) {
+    for (const callback of this.callbacks) {
+      try {
+        callback(event);
+      } catch(e) {}
+    }
+  }
+
+  getStatus() {
+    return {
+      isRunning: this.isRunning,
+      isPaused: this.isPaused,
+      checkInterval: this.checkInterval,
+      cpuStatus: this.cpuMonitor.getStatus()
+    };
+  }
+
+  pause() {
+    this.isPaused = true;
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+  }
+
+  resume() {
+    this.isPaused = false;
+    if (this.isRunning && !this.intervalId) {
+      this.intervalId = setInterval(() => {
+        this._checkAndResume();
+      }, this.checkInterval);
+    }
+  }
+}
+
+// ==================== CPU DASHBOARD ====================
+
+class CPUDashboard {
+  constructor() {
+    this.history = [];
+    this.maxHistory = 100;
+    this.alerts = [];
+    this.requestCount = 0;
+    this.requestLimit = 50;
+    this.resetTime = Date.now() + 60000;
+  }
+
+  log(status) {
+    this.history.push({
+      timestamp: Date.now(),
+      cpuMs: status.cpuMs,
+      maxAllowed: status.maxAllowed,
+      shouldStop: status.shouldStop,
+      isPaused: status.isPaused,
+      reason: status.reason,
+      operations: status.operations
+    });
+    
+    if (this.history.length > this.maxHistory) {
+      this.history.shift();
+    }
+    
+    if (status.cpuMs > 5 && status.shouldStop) {
+      this.alerts.push({
+        timestamp: Date.now(),
+        level: 'WARNING',
+        message: `CPU critical: ${status.cpuMs.toFixed(2)}ms - ${status.reason}`
+      });
+      if (this.alerts.length > 20) {
+        this.alerts.shift();
+      }
+    }
+  }
+
+  checkRateLimit() {
+    const now = Date.now();
+    if (now > this.resetTime) {
+      this.requestCount = 0;
+      this.resetTime = now + 60000;
+    }
+    this.requestCount++;
+    return this.requestCount <= this.requestLimit;
+  }
+
+  getStats() {
+    const recent = this.history.slice(-20);
+    const avgCpu = recent.length > 0 ? recent.reduce((a,b) => a + b.cpuMs, 0) / recent.length : 0;
+    const maxCpu = recent.length > 0 ? Math.max(...recent.map(h => h.cpuMs)) : 0;
+    const stopCount = recent.filter(h => h.shouldStop).length;
+    const pauseCount = recent.filter(h => h.isPaused).length;
+    
+    return {
+      averageCpuMs: avgCpu.toFixed(2),
+      maxCpuMs: maxCpu.toFixed(2),
+      totalRequests: this.history.length,
+      stopEvents: stopCount,
+      pauseEvents: pauseCount,
+      alertCount: this.alerts.length,
+      requestCount: this.requestCount,
+      requestLimit: this.requestLimit,
+      recentAlerts: this.alerts.slice(-5),
+      health: avgCpu < 3 ? 'GOOD' : avgCpu < 5 ? 'WARNING' : 'CRITICAL'
+    };
+  }
+}
 
 // ==================== TRANSLATION MANAGER ====================
 
@@ -59,29 +388,84 @@ class TranslationManager {
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
+    this.cpuMonitor = new CPUMonitor(CONSTANTS.MAX_CPU_MS * 0.7);
+    this.translationQueue = [];
+    this.isProcessing = false;
+    this.maxCacheSize = 500;
+    this.pendingTranslations = [];
+    this.isPaused = false;
+    
+    this.autoResume = new AutoResumeManager(this.cpuMonitor, 1000);
+    this.autoResume.onResume(() => {
+      this._processPendingTranslations();
+    });
+    this.autoResume.start();
   }
 
   resetQuestionCache() {
-    if (this.questionCache.size > 0) {
-      this.questionCache.clear();
+    if (this.questionCache.size > this.maxCacheSize) {
+      const entries = Array.from(this.questionCache.entries());
+      const toDelete = entries.slice(0, this.questionCache.size - this.maxCacheSize);
+      for (const [key] of toDelete) {
+        this.questionCache.delete(key);
+      }
     }
     this.translateCount = 0;
     this.translateLimitReached = false;
   }
 
   async translateForUsers(question, options, usersByLang) {
+    this.cpuMonitor.start();
+    this.resetQuestionCache();
+    
+    if (this.cpuMonitor.isPaused) {
+      console.log('[CPU] Translation paused, adding to queue');
+      return new Promise((resolve) => {
+        this.pendingTranslations.push({
+          question,
+          options,
+          usersByLang,
+          resolve
+        });
+      });
+    }
+    
     const results = new Map();
     
-    this.resetQuestionCache();
+    if (!this.cpuMonitor.check('translate_start')) {
+      console.warn(`[CPU] Early exit: ${this.cpuMonitor.reason}`);
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached during translation');
+        this.pendingTranslations.push({
+          question,
+          options,
+          usersByLang,
+          resolve: () => {}
+        });
+      }
+      return this._fallbackToEnglish(question, options, usersByLang);
+    }
     
     const needTranslate = [];
     
     for (const [lang, users] of usersByLang) {
+      if (!this.cpuMonitor.check('iterate_lang')) {
+        console.warn(`[CPU] Stopping at language: ${lang}, reason: ${this.cpuMonitor.reason}`);
+        results.set(lang, {
+          question,
+          options,
+          users,
+          isFallback: true,
+          fromCache: false
+        });
+        continue;
+      }
+      
       if (lang === 'en') {
-        results.set(lang, { 
-          question, 
-          options, 
-          users, 
+        results.set(lang, {
+          question,
+          options,
+          users,
           isFallback: false,
           fromCache: false
         });
@@ -92,27 +476,81 @@ class TranslationManager {
       const cached = this.questionCache.get(cacheKey);
       
       if (cached) {
-        results.set(lang, { 
-          ...cached, 
-          users, 
-          fromCache: true 
+        results.set(lang, {
+          ...cached,
+          users,
+          fromCache: true
         });
-      } else {
-        needTranslate.push({ lang, users });
+        continue;
       }
+      
+      if (!this.cpuMonitor.checkHeavy('translate_prep')) {
+        console.warn(`[CPU] CPU too high for translation: ${this.cpuMonitor.reason}`);
+        results.set(lang, {
+          question,
+          options,
+          users,
+          isFallback: true,
+          fromCache: false
+        });
+        continue;
+      }
+      
+      needTranslate.push({ lang, users });
     }
     
-    if (needTranslate.length === 0) {
-      this._sendResults(results);
-      return;
+    if (!this.cpuMonitor.check('before_translate')) {
+      console.warn(`[CPU] Stopping before translation: ${this.cpuMonitor.reason}`);
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached before translation');
+        this.pendingTranslations.push({
+          question,
+          options,
+          usersByLang,
+          resolve: () => {}
+        });
+      }
+      return this._fallbackToEnglish(question, options, usersByLang);
     }
     
     for (const { lang, users } of needTranslate) {
+      if (!this.cpuMonitor.check(`translate_${lang}`)) {
+        console.warn(`[CPU] Stopped translation for ${lang}: ${this.cpuMonitor.reason}`);
+        results.set(lang, {
+          question,
+          options,
+          users,
+          isFallback: true,
+          fromCache: false
+        });
+        if (this.cpuMonitor.shouldStop) {
+          this.cpuMonitor.pause(`CPU limit reached during ${lang} translation`);
+          break;
+        }
+        continue;
+      }
+      
       try {
         const [translatedQuestion, translatedOptions] = await Promise.all([
           this._translateText(question, lang),
           this._translateOptions(options, lang)
         ]);
+        
+        if (!this.cpuMonitor.check(`translate_done_${lang}`)) {
+          console.warn(`[CPU] CPU exceeded after translation ${lang}: ${this.cpuMonitor.reason}`);
+          results.set(lang, {
+            question,
+            options,
+            users,
+            isFallback: true,
+            fromCache: false
+          });
+          if (this.cpuMonitor.shouldStop) {
+            this.cpuMonitor.pause(`CPU limit reached after ${lang} translation`);
+            break;
+          }
+          continue;
+        }
         
         const cacheKey = this._getCacheKey(question, options, lang);
         this.questionCache.set(cacheKey, {
@@ -130,34 +568,97 @@ class TranslationManager {
         });
         
       } catch(e) {
-        try {
-          const retryResult = await this._translateWithRetry(question, options, lang);
-          results.set(lang, {
-            question: retryResult.question,
-            options: retryResult.options,
-            users,
-            isFallback: false,
-            fromCache: false
-          });
-        } catch(e2) {
-          results.set(lang, {
-            question: question,
-            options: options,
-            users,
-            isFallback: true,
-            fromCache: false
-          });
+        if (!this.cpuMonitor.check('translate_error')) {
+          console.warn(`[CPU] CPU exceeded after error: ${this.cpuMonitor.reason}`);
         }
+        results.set(lang, {
+          question,
+          options,
+          users,
+          isFallback: true,
+          fromCache: false
+        });
+      }
+      
+      if (!this.cpuMonitor.check(`translate_complete_${lang}`)) {
+        console.warn(`[CPU] Stopping after ${lang}: ${this.cpuMonitor.reason}`);
+        if (this.cpuMonitor.shouldStop) {
+          this.cpuMonitor.pause(`CPU limit reached after ${lang}`);
+        }
+        break;
       }
     }
     
+    if (!this.cpuMonitor.check('before_broadcast')) {
+      console.warn(`[CPU] CPU too high for broadcast: ${this.cpuMonitor.reason}`);
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached before broadcast');
+        this.pendingTranslations.push({
+          question,
+          options,
+          usersByLang,
+          resolve: () => {}
+        });
+      }
+      return this._fallbackToEnglish(question, options, usersByLang);
+    }
+    
+    this._sendResults(results);
+    
+    const status = this.cpuMonitor.getStatus();
+    console.log(`[CPU] Translation complete: ${status.cpuMs.toFixed(2)}ms, paused: ${status.isPaused}, languages: ${results.size}`);
+    this.gameServer.cpuDashboard.log(status);
+  }
+
+  async _processPendingTranslations() {
+    if (this.pendingTranslations.length === 0) return;
+    
+    console.log(`[CPU] Processing ${this.pendingTranslations.length} pending translations`);
+    
+    const pending = [...this.pendingTranslations];
+    this.pendingTranslations = [];
+    
+    for (const item of pending) {
+      try {
+        await this.translateForUsers(item.question, item.options, item.usersByLang);
+        if (item.resolve) item.resolve();
+      } catch(e) {
+        console.error('[CPU] Pending translation error:', e);
+        if (item.resolve) item.resolve();
+      }
+    }
+    
+    console.log('[CPU] Pending translations processed');
+  }
+
+  _fallbackToEnglish(question, options, usersByLang) {
+    console.warn('[CPU] Using English fallback for all users');
+    const results = new Map();
+    for (const [lang, users] of usersByLang) {
+      results.set(lang, {
+        question,
+        options,
+        users,
+        isFallback: true,
+        fromCache: false
+      });
+    }
     this._sendResults(results);
   }
-  
+
   async _translateWithRetry(question, options, lang) {
     let lastError = null;
     
+    if (!this.cpuMonitor.check('retry_start')) {
+      throw new Error('CPU limit reached before retry');
+    }
+    
     for (let i = 0; i < 5; i++) {
+      if (!this.cpuMonitor.check(`retry_${i}`)) {
+        console.warn(`[CPU] Stopping retry ${i}: ${this.cpuMonitor.reason}`);
+        break;
+      }
+      
       try {
         const translatedQuestion = await this._translateText(question, lang);
         const translatedOptions = await this._translateOptions(options, lang);
@@ -174,16 +675,20 @@ class TranslationManager {
     
     throw lastError || new Error('All retries failed');
   }
-  
+
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (!text || typeof text !== 'string') return text;
+    
+    if (!this.cpuMonitor.check(`translate_text_${targetLang}`)) {
+      console.warn(`[CPU] Stopping text translation: ${this.cpuMonitor.reason}`);
+      return text;
+    }
     
     try {
       const result = await this._callTranslateAPI(text, targetLang);
       this.translateCount++;
       return result;
-      
     } catch(e) {
       if (retryCount < 5) {
         await this._delay(1000 * (retryCount + 1));
@@ -192,7 +697,7 @@ class TranslationManager {
       throw e;
     }
   }
-  
+
   async _translateOptions(options, targetLang) {
     if (targetLang === 'en' || !options) return options;
     
@@ -200,6 +705,11 @@ class TranslationManager {
     const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
     
     if (texts.length === 0) return options;
+    
+    if (!this.cpuMonitor.check(`translate_options_${targetLang}`)) {
+      console.warn(`[CPU] Stopping options translation: ${this.cpuMonitor.reason}`);
+      return options;
+    }
     
     const translatedTexts = await Promise.all(
       texts.map(text => this._translateText(text, targetLang))
@@ -215,14 +725,24 @@ class TranslationManager {
     
     return result;
   }
-  
+
   _getCacheKey(question, options, lang) {
     const optionStr = Object.values(options).join('|');
     return `${question}|${optionStr}|${lang}`;
   }
-  
+
   _sendResults(results) {
+    if (!this.cpuMonitor.check('send_results')) {
+      console.warn(`[CPU] Stopping send results: ${this.cpuMonitor.reason}`);
+      return;
+    }
+    
     for (const [lang, data] of results) {
+      if (!this.cpuMonitor.check(`send_${lang}`)) {
+        console.warn(`[CPU] Stopping send for ${lang}: ${this.cpuMonitor.reason}`);
+        break;
+      }
+      
       const { question, options, users, isFallback, fromCache } = data;
       
       const message = [
@@ -230,7 +750,8 @@ class TranslationManager {
         {
           question: question || '',
           options: options || { A: '', B: '', C: '', D: '' },
-          isFallback: isFallback || false
+          isFallback: isFallback || false,
+          fromCache: fromCache || false
         }
       ];
       
@@ -245,8 +766,12 @@ class TranslationManager {
       }
     }
   }
-  
+
   async _callTranslateAPI(text, targetLang) {
+    if (!this.cpuMonitor.check('api_call_start')) {
+      throw new Error('CPU limit reached before API call');
+    }
+    
     const apiUrls = [
       'https://deeplx.1stg.me/translate',
       'https://deeplx.pages.dev/translate',
@@ -256,6 +781,11 @@ class TranslationManager {
     let lastError = null;
     
     for (const apiUrl of apiUrls) {
+      if (!this.cpuMonitor.check(`api_${apiUrl.substring(0, 20)}`)) {
+        console.warn(`[CPU] Stopping API call: ${this.cpuMonitor.reason}`);
+        break;
+      }
+      
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS);
@@ -291,55 +821,37 @@ class TranslationManager {
       }
     }
     
+    // FALLBACK: Google Translate
     try {
-      const googleResult = await this._callGoogleTranslate(text, targetLang);
-      if (googleResult) {
-        return googleResult;
+      if (this.cpuMonitor.check('google_fallback')) {
+        const googleResult = await this._callGoogleTranslate(text, targetLang);
+        if (googleResult) {
+          return googleResult;
+        }
       }
     } catch(e) {
       lastError = e;
     }
     
+    // FALLBACK: MyMemory
     try {
-      const libreResult = await this._callLibreTranslate(text, targetLang);
-      if (libreResult) {
-        return libreResult;
+      if (this.cpuMonitor.check('mymemory_fallback')) {
+        const myMemoryResult = await this._callMyMemory(text, targetLang);
+        if (myMemoryResult) {
+          return myMemoryResult;
+        }
       }
     } catch(e) {
       lastError = e;
     }
     
+    // FALLBACK: LibreTranslate
     try {
-      const myMemoryResult = await this._callMyMemory(text, targetLang);
-      if (myMemoryResult) {
-        return myMemoryResult;
-      }
-    } catch(e) {
-      lastError = e;
-    }
-    
-    try {
-      const lingvaResult = await this._callLingva(text, targetLang);
-      if (lingvaResult) {
-        return lingvaResult;
-      }
-    } catch(e) {
-      lastError = e;
-    }
-    
-    try {
-      const yandexResult = await this._callYandexTranslate(text, targetLang);
-      if (yandexResult) {
-        return yandexResult;
-      }
-    } catch(e) {
-      lastError = e;
-    }
-    
-    try {
-      const icuResult = await this._callICUTranslate(text, targetLang);
-      if (icuResult) {
-        return icuResult;
+      if (this.cpuMonitor.check('libre_fallback')) {
+        const libreResult = await this._callLibreTranslate(text, targetLang);
+        if (libreResult) {
+          return libreResult;
+        }
       }
     } catch(e) {
       lastError = e;
@@ -347,7 +859,7 @@ class TranslationManager {
     
     throw lastError || new Error('All translation APIs failed');
   }
-  
+
   async _callGoogleTranslate(text, targetLang) {
     const langMap = {
       'id': 'id', 'th': 'th', 'vi': 'vi', 'zh': 'zh-CN',
@@ -389,7 +901,31 @@ class TranslationManager {
     
     throw new Error('Invalid response');
   }
-  
+
+  async _callMyMemory(text, targetLang) {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|${targetLang}&de=demo@example.com`;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(url, {
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    if (data && data.responseData && data.responseData.translatedText) {
+      return data.responseData.translatedText;
+    }
+    
+    throw new Error('Invalid response');
+  }
+
   async _callLibreTranslate(text, targetLang) {
     const instances = [
       'https://libretranslate.com/translate',
@@ -436,230 +972,7 @@ class TranslationManager {
     
     throw lastError || new Error('All LibreTranslate instances failed');
   }
-  
-  async _callMyMemory(text, targetLang) {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|${targetLang}&de=demo@example.com`;
-    
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    
-    const response = await fetch(url, {
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    
-    const data = await response.json();
-    if (data && data.responseData && data.responseData.translatedText) {
-      return data.responseData.translatedText;
-    }
-    
-    throw new Error('Invalid response');
-  }
-  
-  async _callLingva(text, targetLang) {
-    const instances = [
-      'https://lingva.ml/api/v1/en',
-      'https://lingva.zerody.one/api/v1/en',
-      'https://lingva.pussthecat.org/api/v1/en'
-    ];
-    
-    let lastError = null;
-    
-    for (const instance of instances) {
-      try {
-        const url = `${instance}/${targetLang}/${encodeURIComponent(text)}`;
-        
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000);
-        
-        const response = await fetch(url, {
-          signal: controller.signal
-        });
-        
-        clearTimeout(timeoutId);
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        
-        const data = await response.json();
-        if (data && data.translation) {
-          return data.translation;
-        }
-        
-        throw new Error('Invalid response');
-        
-      } catch(e) {
-        lastError = e;
-      }
-    }
-    
-    throw lastError || new Error('All Lingva instances failed');
-  }
-  
-  async _callYandexTranslate(text, targetLang) {
-    const yandexLangMap = {
-      'id': 'id', 'th': 'th', 'vi': 'vi', 'zh': 'zh',
-      'ja': 'ja', 'ko': 'ko', 'ar': 'ar', 'es': 'es',
-      'fr': 'fr', 'de': 'de', 'pt': 'pt', 'ru': 'ru',
-      'hi': 'hi', 'it': 'it', 'nl': 'nl', 'pl': 'pl',
-      'tr': 'tr', 'uk': 'uk', 'sv': 'sv', 'no': 'no'
-    };
-    
-    const target = yandexLangMap[targetLang] || 'en';
-    const url = `https://translate.yandex.net/api/v1/tr.json/translate?id=&srv=tr-text&lang=en-${target}&text=${encodeURIComponent(text)}`;
-    
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Origin': 'https://translate.yandex.com',
-        'Referer': 'https://translate.yandex.com/'
-      }
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    
-    const data = await response.json();
-    if (data && data.text && data.text.length > 0) {
-      return data.text.join(' ');
-    }
-    
-    throw new Error('Invalid response');
-  }
-  
-  async _callICUTranslate(text, targetLang) {
-    const commonTranslations = {
-      'id': {
-        'What': 'Apa', 'Who': 'Siapa', 'Where': 'Di mana', 'When': 'Kapan',
-        'Why': 'Mengapa', 'How': 'Bagaimana', 'Which': 'Yang mana',
-        'is': 'adalah', 'are': 'adalah', 'the': 'itu', 'this': 'ini', 'that': 'itu',
-        'of': 'dari', 'and': 'dan', 'or': 'atau', 'but': 'tetapi', 'for': 'untuk',
-        'with': 'dengan', 'without': 'tanpa', 'capital': 'ibukota', 'city': 'kota',
-        'country': 'negara', 'president': 'presiden', 'first': 'pertama',
-        'second': 'kedua', 'third': 'ketiga', 'fourth': 'keempat', 'fifth': 'kelima',
-        'largest': 'terbesar', 'smallest': 'terkecil', 'highest': 'tertinggi',
-        'lowest': 'terendah', 'longest': 'terpanjang', 'shortest': 'terpendek',
-        'oldest': 'tertua', 'youngest': 'termuda', 'most': 'paling', 'least': 'paling sedikit'
-      },
-      'th': {
-        'What': 'อะไร', 'Who': 'ใคร', 'Where': 'ที่ไหน', 'When': 'เมื่อไหร่',
-        'Why': 'ทำไม', 'How': 'อย่างไร', 'Which': 'อันไหน',
-        'is': 'คือ', 'are': 'คือ', 'the': 'ที่', 'this': 'นี้', 'that': 'นั้น',
-        'of': 'ของ', 'and': 'และ', 'or': 'หรือ', 'but': 'แต่',
-        'capital': 'เมืองหลวง', 'city': 'เมือง', 'country': 'ประเทศ',
-        'president': 'ประธานาธิบดี', 'first': 'แรก', 'second': 'ที่สอง', 'third': 'ที่สาม'
-      },
-      'vi': {
-        'What': 'Cái gì', 'Who': 'Ai', 'Where': 'Ở đâu', 'When': 'Khi nào',
-        'Why': 'Tại sao', 'How': 'Thế nào', 'Which': 'Cái nào',
-        'is': 'là', 'are': 'là', 'the': 'cái', 'this': 'này', 'that': 'đó',
-        'capital': 'thủ đô', 'city': 'thành phố', 'country': 'quốc gia',
-        'president': 'tổng thống', 'first': 'đầu tiên', 'second': 'thứ hai', 'third': 'thứ ba'
-      },
-      'zh': {
-        'What': '什么', 'Who': '谁', 'Where': '哪里', 'When': '什么时候',
-        'Why': '为什么', 'How': '如何', 'Which': '哪个',
-        'is': '是', 'are': '是', 'the': '的', 'this': '这', 'that': '那',
-        'capital': '首都', 'city': '城市', 'country': '国家',
-        'president': '总统', 'first': '第一', 'second': '第二', 'third': '第三'
-      },
-      'ja': {
-        'What': '何', 'Who': '誰', 'Where': 'どこ', 'When': 'いつ',
-        'Why': 'なぜ', 'How': 'どうやって', 'Which': 'どれ',
-        'is': 'です', 'are': 'です', 'the': 'その', 'this': 'これ', 'that': 'それ',
-        'capital': '首都', 'city': '都市', 'country': '国',
-        'president': '大統領', 'first': '最初', 'second': '第二', 'third': '第三'
-      },
-      'ko': {
-        'What': '무엇', 'Who': '누구', 'Where': '어디', 'When': '언제',
-        'Why': '왜', 'How': '어떻게', 'Which': '어느',
-        'is': '입니다', 'are': '입니다', 'the': '그', 'this': '이', 'that': '저',
-        'capital': '수도', 'city': '도시', 'country': '국가',
-        'president': '대통령', 'first': '첫 번째', 'second': '두 번째', 'third': '세 번째'
-      },
-      'ar': {
-        'What': 'ماذا', 'Who': 'من', 'Where': 'أين', 'When': 'متى',
-        'Why': 'لماذا', 'How': 'كيف', 'Which': 'أي',
-        'is': 'هو', 'are': 'هم', 'the': 'ال', 'this': 'هذا', 'that': 'ذلك',
-        'capital': 'العاصمة', 'city': 'مدينة', 'country': 'دولة',
-        'president': 'رئيس', 'first': 'الأول', 'second': 'الثاني', 'third': 'الثالث'
-      },
-      'es': {
-        'What': 'Qué', 'Who': 'Quién', 'Where': 'Dónde', 'When': 'Cuándo',
-        'Why': 'Por qué', 'How': 'Cómo', 'Which': 'Cuál',
-        'is': 'es', 'are': 'son', 'the': 'el/la', 'this': 'esto', 'that': 'eso',
-        'capital': 'capital', 'city': 'ciudad', 'country': 'país',
-        'president': 'presidente', 'first': 'primero', 'second': 'segundo', 'third': 'tercero'
-      },
-      'fr': {
-        'What': 'Quoi', 'Who': 'Qui', 'Where': 'Où', 'When': 'Quand',
-        'Why': 'Pourquoi', 'How': 'Comment', 'Which': 'Lequel',
-        'is': 'est', 'are': 'sont', 'the': 'le/la', 'this': 'ceci', 'that': 'cela',
-        'capital': 'capitale', 'city': 'ville', 'country': 'pays',
-        'president': 'président', 'first': 'premier', 'second': 'deuxième', 'third': 'troisième'
-      },
-      'de': {
-        'What': 'Was', 'Who': 'Wer', 'Where': 'Wo', 'When': 'Wann',
-        'Why': 'Warum', 'How': 'Wie', 'Which': 'Welcher',
-        'is': 'ist', 'are': 'sind', 'the': 'der/die/das', 'this': 'dies', 'that': 'das',
-        'capital': 'Hauptstadt', 'city': 'Stadt', 'country': 'Land',
-        'president': 'Präsident', 'first': 'erste', 'second': 'zweite', 'third': 'dritte'
-      },
-      'pt': {
-        'What': 'O que', 'Who': 'Quem', 'Where': 'Onde', 'When': 'Quando',
-        'Why': 'Por que', 'How': 'Como', 'Which': 'Qual',
-        'is': 'é', 'are': 'são', 'the': 'o/a', 'this': 'isto', 'that': 'isso',
-        'capital': 'capital', 'city': 'cidade', 'country': 'país',
-        'president': 'presidente', 'first': 'primeiro', 'second': 'segundo', 'third': 'terceiro'
-      },
-      'ru': {
-        'What': 'Что', 'Who': 'Кто', 'Where': 'Где', 'When': 'Когда',
-        'Why': 'Почему', 'How': 'Как', 'Which': 'Который',
-        'is': 'является', 'are': 'являются', 'the': '', 'this': 'это', 'that': 'то',
-        'capital': 'столица', 'city': 'город', 'country': 'страна',
-        'president': 'президент', 'first': 'первый', 'second': 'второй', 'third': 'третий'
-      }
-    };
-    
-    const dict = commonTranslations[targetLang];
-    if (!dict) {
-      throw new Error('ICU translations not available for this language');
-    }
-    
-    const words = text.split(' ');
-    const translatedWords = words.map(word => {
-      const cleanWord = word.replace(/[^a-zA-Z]/g, '');
-      const punct = word.replace(/[a-zA-Z]/g, '');
-      const lowerWord = cleanWord.toLowerCase();
-      for (const [key, value] of Object.entries(dict)) {
-        if (key.toLowerCase() === lowerWord) {
-          return value + punct;
-        }
-      }
-      return word;
-    });
-    
-    const result = translatedWords.join(' ');
-    if (result === text) {
-      throw new Error('No translation found in ICU dictionary');
-    }
-    
-    return result;
-  }
-  
+
   resetDailyCounter() {
     const now = new Date().toUTCString();
     if (now !== this.translateDate) {
@@ -668,7 +981,7 @@ class TranslationManager {
       this.translateLimitReached = false;
     }
   }
-  
+
   _delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -736,6 +1049,21 @@ export class GameServer {
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
     
+    // CPU Monitor
+    this.cpuMonitor = new CPUMonitor(CONSTANTS.MAX_CPU_MS);
+    this.cpuDashboard = new CPUDashboard();
+    this.gameCpuMonitor = new CPUMonitor(CONSTANTS.MAX_CPU_MS * 0.8);
+    
+    // Auto Resume Manager
+    this.autoResume = new AutoResumeManager(this.cpuMonitor, 1000);
+    this.autoResume.onResume(() => {
+      this._onCpuResume();
+    });
+    this.autoResume.start();
+    
+    this.pendingOperations = [];
+    this.isProcessingPending = false;
+    
     this.translationManager = new TranslationManager(this);
     
     this._quizKeepAliveInterval = null;
@@ -748,7 +1076,72 @@ export class GameServer {
       this.forceStartQuiz();
     }, 3000);
   }
+
+  // ==================== CPU RESUME HANDLER ====================
   
+  _onCpuResume() {
+    console.log('[GameServer] CPU resumed, processing pending operations');
+    this._processPendingOperations();
+    
+    if (this._isQuizTime() && !this.currentQuestion) {
+      this.forceStartQuiz();
+    }
+    
+    this._broadcastToRoom(QUIZ_ROOM, [
+      "quizStatus",
+      "Server is back to normal"
+    ]);
+  }
+
+  async _processPendingOperations() {
+    if (this.isProcessingPending || this.pendingOperations.length === 0) return;
+    
+    this.isProcessingPending = true;
+    console.log(`[GameServer] Processing ${this.pendingOperations.length} pending ops`);
+    
+    const pending = [...this.pendingOperations];
+    this.pendingOperations = [];
+    
+    for (const op of pending) {
+      try {
+        await op();
+      } catch(e) {
+        console.error('[GameServer] Pending op error:', e);
+      }
+    }
+    
+    this.isProcessingPending = false;
+    console.log('[GameServer] Pending ops processed');
+  }
+
+  async _executeWithCpuCheck(operation, fallback = null) {
+    if (!this.cpuMonitor.check('execute')) {
+      console.warn(`[CPU] Cannot execute: ${this.cpuMonitor.reason}`);
+      
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached during execution');
+        return new Promise((resolve) => {
+          this.pendingOperations.push(async () => {
+            try {
+              const result = await operation();
+              resolve(result);
+            } catch(e) {
+              resolve(fallback);
+            }
+          });
+        });
+      }
+      
+      return fallback;
+    }
+    
+    try {
+      return await operation();
+    } catch(e) {
+      return fallback;
+    }
+  }
+
   async _initAsync() {
     if (this._initialized) return;
     this._initialized = true;
@@ -761,21 +1154,21 @@ export class GameServer {
       this.ensureQuizRunning();
     }, 2000);
   }
-  
+
   _incrementSubRequest() {
     this._subRequestCount++;
     this._requestCount++;
   }
-  
+
   _getCurrentUTCHours() {
     return new Date().getUTCHours();
   }
-  
+
   _isQuizTime() {
     const hour = this._getCurrentUTCHours();
     return hour >= QUIZ_SCHEDULE.START_HOUR && hour < QUIZ_SCHEDULE.END_HOUR;
   }
-  
+
   _getNextQuizStartTime() {
     const now = new Date();
     const startTime = new Date(now);
@@ -786,7 +1179,7 @@ export class GameServer {
     }
     return startTime;
   }
-  
+
   _getTimeLeftUntilNextEvent() {
     const now = Date.now();
     const nextStart = this._getNextQuizStartTime();
@@ -802,7 +1195,7 @@ export class GameServer {
     
     return { minutes, seconds, isRunning: false };
   }
-  
+
   _getCurrentWeek() {
     const now = new Date();
     const year = now.getUTCFullYear();
@@ -811,7 +1204,7 @@ export class GameServer {
     const week = Math.ceil((diff / 86400000 + startOfYear.getUTCDay() + 1) / 7);
     return `${year}-W${String(week).padStart(2, '0')}`;
   }
-  
+
   async _getQuizPoints() {
     if (!this.env || !this.env.QUESTIONS) return {};
     try {
@@ -821,7 +1214,7 @@ export class GameServer {
       return {};
     }
   }
-  
+
   async _getLastWeekWinner() {
     if (!this.env || !this.env.QUESTIONS) return null;
     try {
@@ -831,7 +1224,7 @@ export class GameServer {
       return null;
     }
   }
-  
+
   async _checkAndResetWeeklyPoints() {
     if (!this.env || !this.env.QUESTIONS) return false;
     
@@ -882,7 +1275,7 @@ export class GameServer {
       return false;
     }
   }
-  
+
   _startQuizScheduler() {
     if (this.quizAutoTimer) {
       clearInterval(this.quizAutoTimer);
@@ -903,7 +1296,7 @@ export class GameServer {
       } catch(e) {}
     }, CONSTANTS.SCHEDULER_INTERVAL_MS);
   }
-  
+
   async _checkQuizAutoStatus() {
     try {
       const isQuizTime = this._isQuizTime();
@@ -942,8 +1335,17 @@ export class GameServer {
       return true;
     }
   }
-  
+
   forceStartQuiz() {
+    if (!this.cpuMonitor.check('force_start_quiz')) {
+      console.warn(`[CPU] Cannot force start quiz: ${this.cpuMonitor.reason}`);
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached during force start');
+        this.pendingOperations.push(() => this.forceStartQuiz());
+      }
+      return false;
+    }
+    
     if (!this._isQuizTime()) {
       return false;
     }
@@ -967,7 +1369,7 @@ export class GameServer {
     this._showQuestion();
     return true;
   }
-  
+
   _checkAndRestartQuiz() {
     try {
       if (!this._isQuizTime()) {
@@ -985,7 +1387,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   ensureQuizStarted() {
     if (this._quizTimeout) {
       clearTimeout(this._quizTimeout);
@@ -1002,7 +1404,7 @@ export class GameServer {
     
     this.forceStartQuiz();
   }
-  
+
   ensureQuizRunning() {
     try {
       this._forceStartQuizIfTime();
@@ -1026,7 +1428,7 @@ export class GameServer {
       
     } catch(e) {}
   }
-  
+
   _forceStartQuizIfTime() {
     if (!this._isQuizTime()) {
       return;
@@ -1051,7 +1453,7 @@ export class GameServer {
     this.quizAutoEnabled = true;
     this._showQuestion();
   }
-  
+
   _sendQuizTimeLeftToUser(ws) {
     if (!ws || ws.readyState !== 1) return false;
     
@@ -1114,7 +1516,7 @@ export class GameServer {
       return true;
     }
   }
-  
+
   _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
     if (!ws || ws.readyState !== 1) return false;
     
@@ -1148,7 +1550,7 @@ export class GameServer {
       return false;
     }
   }
-  
+
   _setUserLanguage(ws, countryCode) {
     if (!ws) return 'en';
     const wsId = this._getWsId(ws);
@@ -1161,6 +1563,8 @@ export class GameServer {
     
     return lang;
   }
+
+  // ==================== SWITCH ROOM (TANPA AUTO-CLEANUP) ====================
   
   async switchRoom(ws, room, username = null) {
     if (this.isDestroyed) {
@@ -1187,6 +1591,7 @@ export class GameServer {
     try {
       const oldRoom = this.clientRooms.get(wsId);
       
+      // Jika sama, tidak usah pindah
       if (oldRoom === roomName) {
         if (roomName === QUIZ_ROOM) {
           let lang = this.userLanguage.get(wsId);
@@ -1214,10 +1619,12 @@ export class GameServer {
         return;
       }
       
+      // HAPUS dari room lama (tanpa cleanup otomatis)
       if (oldRoom) {
         this._removeClientFromRoom(oldRoom, wsId);
       }
       
+      // TAMBAHKAN ke room baru
       this._addClient(roomName, ws, username, false);
       ws.room = roomName;
       ws.roomname = roomName;
@@ -1228,6 +1635,7 @@ export class GameServer {
         if (conn) conn.room = roomName;
       }
       
+      // KALAU ROOM QUIZ
       if (roomName === QUIZ_ROOM) {
         let country = this.userCountry.get(wsId);
         if (!country) {
@@ -1259,15 +1667,26 @@ export class GameServer {
       this._switchLocks.delete(lockKey);
     }
   }
+
+  // ==================== LOAD QUESTIONS ====================
   
   async _loadAllQuestionsFromKV() {
     if (!this.env || !this.env.QUESTIONS) return false;
+    
+    if (!this.cpuMonitor.check('load_questions')) {
+      console.warn(`[CPU] Cannot load questions: ${this.cpuMonitor.reason}`);
+      return false;
+    }
     
     try {
       this._incrementSubRequest();
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
       
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
+        if (!this.cpuMonitor.check('process_questions')) {
+          console.warn(`[CPU] Cannot process questions: ${this.cpuMonitor.reason}`);
+          return false;
+        }
         
         this._allQuestions = cached.questions.map((q, index) => ({
           id: index + 1,
@@ -1295,9 +1714,14 @@ export class GameServer {
       return false;
     }
   }
-  
+
   _loadNextBatch() {
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+      return false;
+    }
+    
+    if (!this.cpuMonitor.check('load_batch')) {
+      console.warn(`[CPU] Cannot load batch: ${this.cpuMonitor.reason}`);
       return false;
     }
     
@@ -1325,7 +1749,7 @@ export class GameServer {
     
     return true;
   }
-  
+
   _checkAndLoadNextBatch() {
     const questions = this.quizQuestionCache['en'] || [];
     
@@ -1342,14 +1766,24 @@ export class GameServer {
     
     return false;
   }
-  
+
   async _broadcastQuizQuestion(question, options) {
+    if (!this.cpuMonitor.check('broadcast_quiz_start')) {
+      console.warn(`[CPU] Cannot broadcast quiz: ${this.cpuMonitor.reason}`);
+      return;
+    }
+    
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds || wsIds.size === 0) return;
     
     const usersByLang = new Map();
     
     for (const wsId of wsIds) {
+      if (!this.cpuMonitor.check('broadcast_user')) {
+        console.warn(`[CPU] Stopping user broadcast: ${this.cpuMonitor.reason}`);
+        break;
+      }
+      
       try {
         const ws = this.wsMap.get(wsId);
         if (!ws || ws.readyState !== 1) continue;
@@ -1367,7 +1801,7 @@ export class GameServer {
     
     await this.translationManager.translateForUsers(question, options, usersByLang);
   }
-  
+
   _broadcastQuizResult(type, data) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds || wsIds.size === 0) return;
@@ -1383,7 +1817,7 @@ export class GameServer {
       } catch(e) {}
     }
   }
-  
+
   _startQuizKeepAlive() {
     if (this._quizKeepAliveInterval) {
       clearInterval(this._quizKeepAliveInterval);
@@ -1423,10 +1857,15 @@ export class GameServer {
       }
     }, CONSTANTS.QUIZ_KEEP_ALIVE_INTERVAL_MS);
   }
-  
+
   async _forceEvaluateQuiz() {
     if (!this.currentQuestion) return;
     if (this._quizTimeout) return;
+    
+    if (!this.cpuMonitor.check('force_evaluate')) {
+      console.warn(`[CPU] Cannot force evaluate: ${this.cpuMonitor.reason}`);
+      return;
+    }
     
     try {
       const currentClients = this.wsClients.get(QUIZ_ROOM);
@@ -1493,8 +1932,21 @@ export class GameServer {
       this.isQuizWaiting = false;
     }
   }
-  
+
   async _showQuestion() {
+    if (!this.cpuMonitor.check('show_question_start')) {
+      console.warn(`[CPU] Cannot show question: ${this.cpuMonitor.reason}`);
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached before showing question');
+        this.pendingOperations.push(() => this._showQuestion());
+      }
+      this._broadcastToRoom(QUIZ_ROOM, [
+        "quizError",
+        "Server is busy, please wait"
+      ]);
+      return;
+    }
+    
     try {
       this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
@@ -1543,6 +1995,11 @@ export class GameServer {
         }
       }
       
+      if (!this.cpuMonitor.check('show_question_loaded')) {
+        console.warn(`[CPU] Stopping after load: ${this.cpuMonitor.reason}`);
+        return;
+      }
+      
       const q = questions[this._questionPointer];
       
       if (!q || !q.options) {
@@ -1566,6 +2023,11 @@ export class GameServer {
       
       this._questionPointer++;
       this._totalQuestionsAnswered++;
+
+      if (!this.cpuMonitor.check('show_question_broadcast')) {
+        console.warn(`[CPU] Stopping before broadcast: ${this.cpuMonitor.reason}`);
+        return;
+      }
 
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
@@ -1644,7 +2106,6 @@ export class GameServer {
             this._quizBreakTimeout = null;
             this.currentQuestion = null;
             
-            // Broadcast 5 detik sebelum soal berikutnya
             this._broadcastToRoom(QUIZ_ROOM, [
               "quizNextQuestionIn",
               "5"
@@ -1682,8 +2143,17 @@ export class GameServer {
       this._quizTimeout = null;
     }
   }
-  
+
   async submitQuizAnswer(ws, username, answer) {
+    if (!this.cpuMonitor.check('submit_answer_start')) {
+      this._safeSend(ws, ["quizError", "Server is busy, please wait"]);
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached during answer submission');
+        this.pendingOperations.push(() => this.submitQuizAnswer(ws, username, answer));
+      }
+      return;
+    }
+    
     try {
       if (!ws || !username) {
         this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
@@ -1753,7 +2223,7 @@ export class GameServer {
       this._safeSend(ws, ["quizError", e.message]);
     }
   }
-  
+
   _startQuizLoop() {
     if (this.quizTimer) {
       clearInterval(this.quizTimer);
@@ -1794,7 +2264,7 @@ export class GameServer {
       }
     }, CONSTANTS.QUIZ_INTERVAL_MS);
   }
-  
+
   async resetQuiz() {
     try {
       if (this._quizTimeout) {
@@ -1823,7 +2293,7 @@ export class GameServer {
       
     } catch(e) {}
   }
-  
+
   async startQuizWithDelay(delayMs) {
     if (this._quizStartTimeout) return;
     
@@ -1839,7 +2309,7 @@ export class GameServer {
       }
     }, delayMs);
   }
-  
+
   _startQuizIfNeeded() {
     try {
       const clients = this.wsClients.get(QUIZ_ROOM);
@@ -1857,7 +2327,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   async _initQuiz(retryCount = 0) {
     try {
       const loaded = await this._loadAllQuestionsFromKV();
@@ -1878,7 +2348,7 @@ export class GameServer {
       return false;
     }
   }
-  
+
   _startTranslateResetCounter() {
     if (this._translateResetInterval) {
       clearInterval(this._translateResetInterval);
@@ -1893,9 +2363,19 @@ export class GameServer {
       this.translationManager.resetDailyCounter();
     }, 60000);
   }
-  
+
   async handleEvent(ws, data) {
     if (this.isDestroyed || !ws || !data || !data[0]) return;
+    
+    if (!this.cpuMonitor.check('handle_event_start')) {
+      this._safeSend(ws, ["gameLowCardError", "Server is busy, please try again"]);
+      if (this.cpuMonitor.shouldStop) {
+        this.cpuMonitor.pause('CPU limit reached during event handling');
+        this.pendingOperations.push(() => this.handleEvent(ws, data));
+      }
+      return;
+    }
+    
     const evt = data[0];
     
     if (evt === "switchRoom") {
@@ -1984,23 +2464,23 @@ export class GameServer {
         break;
     }
   }
-  
+
   _getWIBTime() {
     const now = new Date();
     const hours = (now.getUTCHours() + 7) % 24;
     const minutes = String(now.getUTCMinutes()).padStart(2, '0');
     return `${String(hours).padStart(2, '0')}:${minutes}`;
   }
-  
+
   _getWsId(ws) {
     return ws ? ws._wsId : null;
   }
-  
+
   _getRoomForWs(ws) {
     if (!ws) return null;
     return ws.room || ws.roomname || null;
   }
-  
+
   _ensureRoomConsistency(ws) {
     if (!ws) return null;
     const wsId = this._getWsId(ws);
@@ -2022,7 +2502,7 @@ export class GameServer {
     }
     return room;
   }
-  
+
   _addClient(room, ws, username = null, isNewConnection = false) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
@@ -2070,7 +2550,7 @@ export class GameServer {
       this.roomViewers.get(room).add(username);
     }
   }
-  
+
   _removeClientFromRoom(room, wsId) {
     if (!room || !wsId) return;
     const clients = this.wsClients.get(room);
@@ -2079,7 +2559,7 @@ export class GameServer {
       if (clients.size === 0) this.wsClients.delete(room);
     }
   }
-  
+
   _removeClient(room, ws) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
@@ -2106,7 +2586,7 @@ export class GameServer {
     ws._wsId = null;
     ws.username = null;
   }
-  
+
   _countryToLanguage(countryCode) {
     if (!countryCode) return 'en';
     
@@ -2140,7 +2620,7 @@ export class GameServer {
     
     return map[countryCode.toUpperCase()] || 'en';
   }
-  
+
   _shuffleQuestionOptions(question) {
     if (!question || !question.options) {
       return { options: { A: '', B: '', C: '', D: '' }, correct: 'A' };
@@ -2166,7 +2646,7 @@ export class GameServer {
       correct: newCorrect || 'A'
     };
   }
-  
+
   _shuffleArray(array) {
     if (!array || !Array.isArray(array) || array.length === 0) return array || [];
     const arr = array.length > CONSTANTS.MAX_ARRAY_SIZE ? array.slice(0, CONSTANTS.MAX_ARRAY_SIZE) : [...array];
@@ -2176,7 +2656,7 @@ export class GameServer {
     }
     return arr;
   }
-  
+
   _broadcastToRoom(room, message) {
     if (this.closing || this.isDestroyed || !room || !message) return;
     const wsIds = this.wsClients.get(room);
@@ -2194,7 +2674,7 @@ export class GameServer {
       }
     }
   }
-  
+
   _safeSend(ws, message) {
     if (!ws || ws.readyState !== 1) return false;
     try {
@@ -2204,37 +2684,37 @@ export class GameServer {
       return false;
     }
   }
-  
+
   _isGameActuallyRunning(game) {
     if (!game) return false;
     return game._isActive === true && !game._gameEnded;
   }
-  
+
   _isGameValid(game) {
     if (!game) return false;
     return game._isActive === true && !game._gameEnded && game.players && game.players.size > 0;
   }
-  
+
   _getActivePlayers(game) {
     if (!game || !game._isActive || game._gameEnded || !game.players) return [];
     return Array.from(game.players.entries())
       .filter(([id]) => !game.eliminated?.has(id))
       .map(([, p]) => p);
   }
-  
+
   _getActivePlayerIds(game) {
     if (!game || !game._isActive || game._gameEnded || !game.players) return [];
     return Array.from(game.players.keys()).filter(id => !game.eliminated?.has(id));
   }
-  
+
   _getRandomCardTanda() {
     return ["C1", "C2", "C3", "C4"][Math.floor(Math.random() * 4)];
   }
-  
+
   _getRandomDrawDelay() {
     return (Math.floor(Math.random() * 14) + 2) * 1000;
   }
-  
+
   _getBotNumberByRound(round) {
     if (round <= 2) {
       return Math.floor(Math.random() * 12) + 1;
@@ -2244,7 +2724,7 @@ export class GameServer {
         [1, 2, 3, 4, 5, 6, 7][Math.floor(Math.random() * 7)];
     }
   }
-  
+
   _safeGetGame(room) {
     if (this.isDestroyed || !room) return null;
     const game = this.activeGames.get(room);
@@ -2253,7 +2733,7 @@ export class GameServer {
     }
     return null;
   }
-  
+
   _scheduleGameCleanup(room, game) {
     if (!room || !game) return;
     if (this._cleanupTimers.has(room)) {
@@ -2276,7 +2756,7 @@ export class GameServer {
     }, CONSTANTS.GAME_CLEANUP_DELAY_MS);
     this._cleanupTimers.set(room, timer);
   }
-  
+
   _cleanupGame(game) {
     if (!game) return;
     if (game._isActive === true && !game._gameEnded) return;
@@ -2302,7 +2782,7 @@ export class GameServer {
     game._gameEnded = true;
     game._isEvaluating = false;
   }
-  
+
   _deleteGame(room, game) {
     if (!room || !game) return;
     if (game && game._isActive === true && !game._gameEnded) return;
@@ -2324,7 +2804,7 @@ export class GameServer {
     this._gameStartFlags.delete(room);
     this._broadcastToRoom(room, ["gameLowCardEnd", "Game has ended"]);
   }
-  
+
   _removePlayerFromGame(username, room) {
     try {
       const game = this.activeGames.get(room);
@@ -2350,7 +2830,7 @@ export class GameServer {
       return false;
     }
   }
-  
+
   _checkGameCanContinue(room, game) {
     try {
       if (!game || game._gameEnded || !game.players || !game._isActive) return;
@@ -2387,7 +2867,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _findAllGamesByUsername(username) {
     if (!username) return [];
     const result = [];
@@ -2398,7 +2878,7 @@ export class GameServer {
     }
     return result;
   }
-  
+
   _addBots(room, count) {
     try {
       const game = this.activeGames.get(room);
@@ -2421,7 +2901,7 @@ export class GameServer {
       game.useBots = true;
     } catch(e) {}
   }
-  
+
   _startBotDraws(room, game) {
     try {
       if (!this._isGameActuallyRunning(game) || !game.botPlayers) return;
@@ -2448,7 +2928,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _handleBotDraw(room, botId, game) {
     try {
       if (!this._isGameActuallyRunning(game) || game.numbers?.has(botId) || game.drawTimeExpired || game.evaluationLocked) return;
@@ -2469,7 +2949,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _forceBotDraw(room, botId, game) {
     try {
       if (!this._isGameActuallyRunning(game) || game.numbers?.has(botId)) return;
@@ -2482,7 +2962,7 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
     } catch(e) {}
   }
-  
+
   _startRegistration(room, game) {
     if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
     if (game._registrationTimer) {
@@ -2514,7 +2994,7 @@ export class GameServer {
     }, 1000);
     game._registrationTimer = timer;
   }
-  
+
   _closeRegistration(room, game) {
     try {
       if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
@@ -2548,7 +3028,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _startDrawPhase(room, game) {
     try {
       if (!this._isGameActuallyRunning(game)) return;
@@ -2607,7 +3087,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _startDrawCountdown(room, game) {
     if (!this._isGameActuallyRunning(game)) return;
     if (game._drawTimer) {
@@ -2639,7 +3119,7 @@ export class GameServer {
     }, 1000);
     game._drawTimer = timer;
   }
-  
+
   _closeDrawPhase(room, game) {
     if (!this._isGameActuallyRunning(game) || game.drawTimeExpired || game.evaluationLocked) return;
     game.drawTimeExpired = true;
@@ -2669,14 +3149,33 @@ export class GameServer {
       } catch(e) {}
     }, CONSTANTS.EVALUATION_DELAY_MS);
   }
-  
+
   _evaluateRound(room, game) {
+    if (!this.gameCpuMonitor.check('evaluate_start')) {
+      console.warn(`[CPU] Cannot evaluate: ${this.gameCpuMonitor.reason}`);
+      if (this.gameCpuMonitor.shouldStop) {
+        this.gameCpuMonitor.pause('CPU limit reached during evaluation');
+        this.pendingOperations.push(() => this._evaluateRound(room, game));
+      }
+      this._broadcastToRoom(room, ["gameLowCardError", "Server busy, please try again"]);
+      return;
+    }
+    
     try {
       if (this.isDestroyed || !game || game._gameEnded || !game._isActive || game._isEvaluating) return;
       if (!game.players) return;
+      
       const currentGame = this.activeGames.get(room);
       if (currentGame !== game) return;
+      
       game._isEvaluating = true;
+      
+      if (!this.gameCpuMonitor.check('evaluate_setup')) {
+        console.warn(`[CPU] Stopped during setup: ${this.gameCpuMonitor.reason}`);
+        game._isEvaluating = false;
+        return;
+      }
+      
       game._safetyTimer = setTimeout(() => {
         try {
           if (game && game._isEvaluating) {
@@ -2685,6 +3184,7 @@ export class GameServer {
           }
         } catch(e) {}
       }, CONSTANTS.EVALUATION_TIMEOUT_MS);
+      
       if (game._evalTimer) {
         clearTimeout(game._evalTimer);
         game._evalTimer = null;
@@ -2693,16 +3193,32 @@ export class GameServer {
         for (const id of game._botTimeouts) clearTimeout(id);
         game._botTimeouts.clear();
       }
+      
       const numbers = game.numbers || new Map();
       const players = game.players || new Map();
       const eliminated = game.eliminated || new Set();
       const tanda = game.tanda || new Map();
+      
+      if (!this.gameCpuMonitor.check('evaluate_data')) {
+        console.warn(`[CPU] Stopped after data fetch: ${this.gameCpuMonitor.reason}`);
+        game._isEvaluating = false;
+        return;
+      }
+      
       const entries = Array.from(numbers.entries());
-      const submittedIds = new Set(numbers.keys());
       const activeIds = this._getActivePlayerIds(game);
+      
+      if (!this.gameCpuMonitor.check('evaluate_map')) {
+        console.warn(`[CPU] Stopped after mapping: ${this.gameCpuMonitor.reason}`);
+        game._isEvaluating = false;
+        return;
+      }
+      
+      const submittedIds = new Set(numbers.keys());
       for (const id of activeIds) {
         if (!submittedIds.has(id)) eliminated.add(id);
       }
+      
       if (entries.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) {
@@ -2716,6 +3232,7 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
+      
       if (entries.length === 1 && eliminated.size === activeIds.length - 1) {
         const winnerId = entries[0][0];
         const winnerName = players.get(winnerId)?.name || winnerId;
@@ -2732,15 +3249,44 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
-      const values = entries.map(([, n]) => n);
-      const allSame = values.every(v => v === values[0]);
+      
+      const batchSize = CONSTANTS.MAX_BATCH_SIZE;
+      let allValues = [];
+      
+      for (let i = 0; i < entries.length; i += batchSize) {
+        if (!this.gameCpuMonitor.check(`evaluate_batch_${i}`)) {
+          console.warn(`[CPU] Stopped at batch ${i}: ${this.gameCpuMonitor.reason}`);
+          game._isEvaluating = false;
+          if (game._safetyTimer) {
+            clearTimeout(game._safetyTimer);
+            game._safetyTimer = null;
+          }
+          this._broadcastToRoom(room, ["gameLowCardError", "Processing interrupted, please start new game"]);
+          return;
+        }
+        
+        const batch = entries.slice(i, i + batchSize);
+        allValues = allValues.concat(batch.map(([, n]) => n));
+      }
+      
+      const values = allValues;
+      const allSame = values.length > 0 && values.every(v => v === values[0]);
       let losers = [];
+      
       if (!allSame && values.length > 0) {
         const lowest = Math.min(...values);
         losers = entries.filter(([, n]) => n === lowest).map(([id]) => id);
         for (const id of losers) eliminated.add(id);
       }
+      
       const remaining = Array.from(players.keys()).filter(id => !eliminated.has(id));
+      
+      if (!this.gameCpuMonitor.check('evaluate_broadcast')) {
+        console.warn(`[CPU] Stopped before broadcast: ${this.gameCpuMonitor.reason}`);
+        game._isEvaluating = false;
+        return;
+      }
+      
       if (allSame && remaining.length >= 2) {
         game._isEvaluating = false;
         if (game._safetyTimer) {
@@ -2774,6 +3320,7 @@ export class GameServer {
         }
         return;
       }
+      
       if (remaining.length === 1 && !game._gameEnded) {
         const winnerId = remaining[0];
         const winnerName = players.get(winnerId)?.name || winnerId;
@@ -2790,6 +3337,7 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
+      
       if (remaining.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) {
@@ -2803,6 +3351,7 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
+      
       const numbersArr = entries.map(([id, n]) => {
         const name = players.get(id)?.name || id;
         const t = tanda.get(id) || "";
@@ -2813,6 +3362,7 @@ export class GameServer {
       this._broadcastToRoom(room, [
         "gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames
       ]);
+      
       numbers.clear();
       tanda.clear();
       game.round++;
@@ -2841,7 +3391,7 @@ export class GameServer {
       this._scheduleGameCleanup(room, game);
     }
   }
-  
+
   async startGame(ws, bet, username) {
     try {
       if (this.isDestroyed) {
@@ -2953,7 +3503,7 @@ export class GameServer {
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
     }
   }
-  
+
   async _forceCleanupGame(room, game) {
     if (!game) return;
     try {
@@ -2983,7 +3533,7 @@ export class GameServer {
       this._gameStartFlags.delete(`start_${room}`);
     } catch(e) {}
   }
-  
+
   async joinGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -3046,7 +3596,7 @@ export class GameServer {
       this._safeSend(ws, ["gameLowCardError", "Failed to join game"]);
     }
   }
-  
+
   async submitNumber(ws, number, tanda, username) {
     try {
       if (this.isDestroyed) {
@@ -3126,7 +3676,7 @@ export class GameServer {
       this._safeSend(ws, ["gameLowCardError", "Failed to submit number"]);
     }
   }
-  
+
   async leaveGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -3157,7 +3707,7 @@ export class GameServer {
       this._safeSend(ws, ["gameLowCardError", "Failed to leave game"]);
     }
   }
-  
+
   async checkGameRunning(ws, roomname) {
     try {
       if (this.isDestroyed) {
@@ -3177,11 +3727,11 @@ export class GameServer {
       this._safeSend(ws, ["gameStatus", { running: "false" }]);
     }
   }
-  
+
   getGame(room) {
     return this.activeGames.get(room);
   }
-  
+
   isGameRunning(room) {
     try {
       if (this.isDestroyed || !room) {
@@ -3197,7 +3747,7 @@ export class GameServer {
       return { running: false, message: "Error checking game" };
     }
   }
-  
+
   _checkStuckGames() {
     try {
       const now = Date.now();
@@ -3228,7 +3778,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _cleanupStaleGames() {
     try {
       const now = Date.now();
@@ -3252,7 +3802,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _cleanupStaleBroadcastCounters() {
     try {
       const now = Date.now();
@@ -3264,7 +3814,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _cleanupStaleSwitchLocks() {
     try {
       const now = Date.now();
@@ -3273,7 +3823,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
@@ -3299,7 +3849,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   _ensureSingleConnection(room, username, newWs, newWsId) {
     try {
       const game = this.activeGames.get(room);
@@ -3324,7 +3874,7 @@ export class GameServer {
       return newWsId;
     }
   }
-  
+
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -3438,19 +3988,28 @@ export class GameServer {
       return new Response("Internal Server Error: " + e.message, { status: 500 });
     }
   }
-  
+
   async webSocketMessage(ws, msg) {
     try {
       if (!ws || ws._closing || this.closing || this.isDestroyed) return;
       if (!ws._wsId) return;
       const data = JSON.parse(msg);
       if (!Array.isArray(data) || data.length === 0) return;
+      
+      if (!this.cpuMonitor.check('websocket_message')) {
+        if (this.cpuMonitor.shouldStop) {
+          this.cpuMonitor.pause('CPU limit reached during websocket message');
+          this.pendingOperations.push(() => this.webSocketMessage(ws, msg));
+        }
+        return;
+      }
+      
       await this.handleEvent(ws, data);
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", e.message || "Error"]);
     }
   }
-  
+
   async webSocketClose(ws) {
     try {
       if (!ws) return;
@@ -3482,7 +4041,7 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
+
   async webSocketError(ws) {
     try {
       if (!ws) return;
