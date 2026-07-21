@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (QUIZ DENGAN TERJEMAHAN) ====================
+// ==================== GAME-SERVER.JS (QUIZ 23:00-04:00 WIB) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -45,6 +45,8 @@ const CONSTANTS = {
   DEEPLX_TIMEOUT_MS: 5000,
   DEEPLX_MAX_RETRIES: 3,
   TRANSLATE_TIMEOUT_MS: 5000,
+  CIRCUIT_BREAKER_THRESHOLD: 5,
+  CIRCUIT_BREAKER_TIMEOUT_MS: 60000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -54,14 +56,14 @@ const QUIZ_SCHEDULE = {
 
 const QUIZ_ROOM = "Quiz";
 
-// ==================== TRANSLATION MANAGER (UNTUK QUIZ SAJA) ====================
+// ==================== TRANSLATION MANAGER ====================
 
 class TranslationManager {
   constructor(gameServer) {
     this.gameServer = gameServer;
-    this.questionCache = new Map();
+    this.languageCache = new Map();
     this.globalCache = new Map();
-    this.MAX_GLOBAL_CACHE = 10000;
+    this.MAX_GLOBAL_CACHE = 50000;
     this.GLOBAL_CACHE_TTL = 86400000;
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
     this.translateCount = 0;
@@ -77,8 +79,8 @@ class TranslationManager {
   }
 
   resetQuestionCache() {
-    if (this.questionCache.size > 0) {
-      this.questionCache.clear();
+    if (this.languageCache.size > 0) {
+      this.languageCache.clear();
     }
   }
 
@@ -103,7 +105,7 @@ class TranslationManager {
       }
       
       const cacheKey = this._getCacheKey(question, options, lang);
-      const cached = this.questionCache.get(cacheKey);
+      const cached = this.languageCache.get(cacheKey);
       
       if (cached) {
         cacheHits++;
@@ -133,7 +135,7 @@ class TranslationManager {
         const { lang, translatedQuestion, translatedOptions, users } = result;
         
         const cacheKey = this._getCacheKey(question, options, lang);
-        this.questionCache.set(cacheKey, {
+        this.languageCache.set(cacheKey, {
           question: translatedQuestion,
           options: translatedOptions,
           isFallback: false
@@ -447,7 +449,6 @@ export class GameServer {
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
     
-    // Translation Manager untuk quiz saja
     this.translationManager = new TranslationManager(this);
     
     this._initAsync();
@@ -1051,7 +1052,6 @@ export class GameServer {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds || wsIds.size === 0) return;
     
-    // Group users by language
     const usersByLang = new Map();
     
     for (const wsId of wsIds) {
@@ -1070,7 +1070,6 @@ export class GameServer {
     
     if (usersByLang.size === 0) return;
     
-    // Translate and send to all users
     await this.translationManager.translateForUsers(question, options, usersByLang);
   }
   
@@ -1160,7 +1159,6 @@ export class GameServer {
       this._questionPointer++;
       this._totalQuestionsAnswered++;
 
-      // Broadcast question with translation
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1472,8 +1470,6 @@ export class GameServer {
     }, 60000);
   }
   
-  // ==================== HANDLE EVENT ====================
-  
   async handleEvent(ws, data) {
     if (this.isDestroyed || !ws || !data || !data[0]) return;
     const evt = data[0];
@@ -1784,8 +1780,6 @@ export class GameServer {
       return false;
     }
   }
-  
-  // ==================== GAME LOWCARD METHODS ====================
   
   _isGameActuallyRunning(game) {
     if (!game) return false;
@@ -2906,8 +2900,6 @@ export class GameServer {
       return newWsId;
     }
   }
-  
-  // ==================== FETCH ====================
   
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
