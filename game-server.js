@@ -62,6 +62,7 @@ const CONSTANTS = {
   TRANSLATE_TIMEOUT_MS: 5000,
   CACHE_TTL_MS: 86400000,
   MAX_CACHE_SIZE: 50000,
+  MAX_USER_LANGUAGE_CACHE: 1000,
 };
 
 // ==================== QUIZ SCHEDULE - MALAM (18:00 - 23:00 WIB) ====================
@@ -467,7 +468,6 @@ class TranslationManager {
   // ==================== LOAD COMMON WORDS ====================
   
   _loadCommonWords() {
-    // ✅ KATA-KATA UMUM YANG SERING MUNCUL DI SOAL
     return {
       'id': {
         'Jakarta': 'Jakarta',
@@ -493,7 +493,6 @@ class TranslationManager {
         'Megawati': 'Megawati',
         'Susilo': 'Susilo',
         'Jokowi': 'Jokowi',
-        'Jakarta': 'Jakarta',
         'What': 'Apa',
         'Who': 'Siapa',
         'Where': 'Di mana',
@@ -823,7 +822,6 @@ export class GameServer {
     this.quizQuestionCache = {};
     this._quizStartTime = null;
     
-    // TRACKING SOAL
     this._allQuestions = [];
     this._currentQuestions = [];
     this._currentBatchStart = 0;
@@ -834,31 +832,25 @@ export class GameServer {
     this._currentBatchIndex = 0;
     this._lastLoadedBatch = 0;
     
-    // DEEPLX TRANSLATION
-    this.translateCount = 0;
-    this.translateDate = new Date().toUTCString();
-    this.translateLimitReached = false;
-    this.userLanguage = new Map();
-    this.userCountry = new Map();
+    // ✅ USER LANGUAGE MAP (disimpan saat masuk Quiz)
+    this.userLanguage = new Map(); // wsId → language (id, en, th, dll)
+    this.userCountry = new Map(); // wsId → country code (ID, US, TH, dll)
     this._translationQueue = [];
     this._isProcessingQueue = false;
     
     // Translation Manager
     this.translationManager = new TranslationManager(this);
     
-    // CF PROTECTION
     this._requestCount = 0;
     this._requestResetTime = Date.now() + 60000;
     this._cpuTimeUsed = 0;
     this._subRequestCount = 0;
     
-    // TIMERS
     this._quizTimeout = null;
     this._translateResetInterval = null;
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
     
-    // CIRCUIT BREAKER
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
@@ -869,7 +861,6 @@ export class GameServer {
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
     
-    // LOG STARTUP
     console.log('🚀 GameServer starting...');
     console.log(`🕐 Current UTC time: ${new Date().toUTCString()}`);
     console.log(`📅 Quiz Schedule: 18:00 - 23:00 WIB (${QUIZ_SCHEDULE.EVENING.start}:00 - ${QUIZ_SCHEDULE.EVENING.end}:00 UTC)`);
@@ -1365,6 +1356,24 @@ export class GameServer {
     }
   }
   
+  // ==================== SET USER LANGUAGE ====================
+  
+  _setUserLanguage(ws, countryCode) {
+    if (!ws) return 'en';
+    const wsId = this._getWsId(ws);
+    if (!wsId) return 'en';
+    
+    // Simpan country
+    this.userCountry.set(wsId, countryCode);
+    
+    // Convert country ke language
+    const lang = this._countryToLanguage(countryCode);
+    this.userLanguage.set(wsId, lang);
+    
+    console.log(`🌍 User ${wsId} language set to: ${lang} (${countryCode})`);
+    return lang;
+  }
+  
   // ==================== SWITCH ROOM ====================
   
   async switchRoom(ws, room, username = null) {
@@ -1394,6 +1403,14 @@ export class GameServer {
       
       if (oldRoom === roomName) {
         if (roomName === QUIZ_ROOM) {
+          // ✅ CEK APAKAH USER SUDAH PUNYA LANGUAGE
+          let lang = this.userLanguage.get(wsId);
+          if (!lang) {
+            const country = this.userCountry.get(wsId) || 'US';
+            lang = this._setUserLanguage(ws, country);
+          }
+          console.log(`🌍 User already in Quiz room, language: ${lang}`);
+          
           if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
             await this._initQuiz();
           }
@@ -1409,12 +1426,6 @@ export class GameServer {
             if (this.closing || this.isDestroyed) return;
             this._sendQuizTimeLeftToUser(ws);
           }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
-        } else {
-          const game = this.activeGames.get(roomName);
-          const isRunning = game && game._isActive && !game._gameEnded;
-          if (isRunning) {
-            this._safeSend(ws, ["gameLowCardError", "Game is already running"]);
-          }
         }
         return;
       }
@@ -1433,7 +1444,18 @@ export class GameServer {
         if (conn) conn.room = roomName;
       }
       
+      // ✅ JIKA MASUK QUIZ ROOM → SET LANGUAGE
       if (roomName === QUIZ_ROOM) {
+        let country = this.userCountry.get(wsId);
+        if (!country) {
+          const cf = ws._cf || {};
+          country = cf.country || 'US';
+          this.userCountry.set(wsId, country);
+        }
+        
+        const lang = this._setUserLanguage(ws, country);
+        console.log(`🌍 User ${username || wsId} entered Quiz room, language: ${lang} (${country})`);
+        
         if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           await this._initQuiz();
         }
@@ -1449,12 +1471,6 @@ export class GameServer {
           if (this.closing || this.isDestroyed) return;
           this._sendQuizTimeLeftToUser(ws);
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
-      } else {
-        const game = this.activeGames.get(roomName);
-        const isRunning = game && game._isActive && !game._gameEnded;
-        if (isRunning) {
-          this._safeSend(ws, ["gameLowCardError", "Game is already running"]);
-        }
       }
       
     } finally {
@@ -1652,13 +1668,12 @@ export class GameServer {
       const globalIndex = this._currentBatchStart + this._questionPointer;
       console.log(`📖 Showing question ${globalIndex}/${this._allQuestions.length} (Batch ${this._currentBatchIndex + 1})`);
 
-      // ========== BROADCAST KE SEMUA USER DENGAN BAHASA MASING-MASING ==========
+      // ========== BROADCAST KE SEMUA USER ==========
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
       );
 
-      // Kirim quizTimeLeft
       this._broadcastToRoom(QUIZ_ROOM, [
         "quizTimeLeft",
         `📝 Question ${this._questionPointer}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
@@ -1755,7 +1770,7 @@ export class GameServer {
     
     console.log(`🌍 Broadcasting question to ${wsIds.size} users`);
     
-    // ✅ Kumpulkan user berdasarkan bahasa
+    // ✅ KUMPULKAN USER BERDASARKAN BAHASA (LANGSUNG DARI MAP)
     const usersByLang = new Map();
     
     for (const wsId of wsIds) {
@@ -1763,7 +1778,9 @@ export class GameServer {
         const ws = this.wsMap.get(wsId);
         if (!ws || ws.readyState !== 1) continue;
         
-        const lang = this._getUserLanguage(ws);
+        // ✅ AMBIL DARI MAP (TIDAK PERLU CEK CF LAGI)
+        const lang = this.userLanguage.get(wsId) || 'en';
+        
         if (!usersByLang.has(lang)) {
           usersByLang.set(lang, []);
         }
@@ -1778,57 +1795,10 @@ export class GameServer {
       return;
     }
     
-    // ✅ Gunakan TranslationManager untuk translate per bahasa
+    // ✅ GUNakan TranslationManager
     await this.translationManager.translateForUsers(question, options, usersByLang);
     
     console.log(`✅ Broadcast complete to ${wsIds.size} users`);
-  }
-  
-  // ==================== TRANSLATE QUESTION FOR SPECIFIC LANGUAGE ====================
-  
-  async _translateQuestionForLanguage(question, options, targetLang) {
-    if (targetLang === 'en') {
-      return { question, options };
-    }
-    
-    try {
-      const translatedQuestion = await this.translationManager._translateText(question, targetLang);
-      const translatedOptions = await this._translateOptionsForLanguage(options, targetLang);
-      
-      return {
-        question: translatedQuestion || question,
-        options: translatedOptions || options
-      };
-      
-    } catch(e) {
-      console.error(`❌ Error translating to ${targetLang}:`, e.message);
-      return null;
-    }
-  }
-  
-  // ==================== TRANSLATE OPTIONS FOR LANGUAGE ====================
-  
-  async _translateOptionsForLanguage(options, targetLang) {
-    if (targetLang === 'en' || !options) return options;
-    
-    const keys = ['A', 'B', 'C', 'D'];
-    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
-    
-    if (texts.length === 0) return options;
-    
-    const translatedTexts = await Promise.all(
-      texts.map(text => this.translationManager._translateText(text, targetLang))
-    );
-    
-    const result = { ...options };
-    let idx = 0;
-    for (const key of keys) {
-      if (options[key] && typeof options[key] === 'string') {
-        result[key] = translatedTexts[idx++] || options[key];
-      }
-    }
-    
-    return result;
   }
   
   // ==================== SUBMIT QUIZ ANSWER ====================
@@ -2196,11 +2166,15 @@ export class GameServer {
     const wsId = this._getWsId(ws);
     if (!wsId) return;
     const username = ws.username;
+    
     this._removeClientFromRoom(room, wsId);
     this.clientRooms.delete(wsId);
     this.wsMap.delete(wsId);
+    
+    // ✅ HAPUS LANGUAGE DAN COUNTRY DARI MAP
     this.userLanguage.delete(wsId);
     this.userCountry.delete(wsId);
+    
     if (username) {
       const conn = this.userConnections.get(username);
       if (conn && conn.wsId === wsId) this.userConnections.delete(username);
@@ -2259,15 +2233,21 @@ export class GameServer {
     const wsId = this._getWsId(ws);
     if (!wsId) return 'en';
     
-    let lang = this.userLanguage.get(wsId);
-    if (lang) return lang;
+    // ✅ AMBIL LANGSUNG DARI MAP (TIDAK PERLU CEK ULANG)
+    const lang = this.userLanguage.get(wsId);
+    if (lang) {
+      return lang;
+    }
     
+    // ⚠️ FALLBACK: jika tidak ada di Map
     const country = this.userCountry.get(wsId);
-    lang = this._countryToLanguage(country);
+    if (country) {
+      const newLang = this._countryToLanguage(country);
+      this.userLanguage.set(wsId, newLang);
+      return newLang;
+    }
     
-    this.userLanguage.set(wsId, lang);
-    
-    return lang;
+    return 'en';
   }
   
   // ==================== SHUFFLE HELPERS ====================
@@ -3508,18 +3488,26 @@ export class GameServer {
           server._createdAt = Date.now();
           server.username = null;
           
-          const cf = req.cf;
+          // ✅ AMBIL COUNTRY DARI CF
+          const cf = req.cf || {};
           let country = 'US';
           if (cf && cf.country) {
             country = cf.country;
           }
-          server._country = country;
           
-          const lang = this._countryToLanguage(country);
-          this.userLanguage.set(wsId, lang);
+          // ✅ SIMPAN COUNTRY KE MAP (langsung dari awal)
           this.userCountry.set(wsId, country);
           
-          console.log(`🔗 New connection from ${country}, language: ${lang}`);
+          // ✅ CONVERT KE LANGUAGE DAN SIMPAN
+          const lang = this._countryToLanguage(country);
+          this.userLanguage.set(wsId, lang);
+          
+          // ✅ SIMPAN CF DI SERVER (untuk berjaga-jaga)
+          server._cf = cf;
+          server._country = country;
+          server._language = lang;
+          
+          console.log(`🔗 New connection ${wsId}: ${country} → ${lang}`);
           
           try { 
             this.state.acceptWebSocket(server);
