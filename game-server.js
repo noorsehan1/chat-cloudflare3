@@ -35,18 +35,9 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   MAX_QUESTIONS: 10000,
   CF_SUBREQUEST_LIMIT: 50,
-  DEEPLX_API_URLS: [
-    'https://api.deeplx.org/translate',
-    'https://deeplx.vercel.app/translate',
-    'https://deeplx.deno.dev/translate',
-    'https://deeplx.mingming.dev/translate',
-    'https://deeplx.azurewebsites.net/translate',
-  ],
-  DEEPLX_TIMEOUT_MS: 5000,
-  DEEPLX_MAX_RETRIES: 3,
-  TRANSLATE_TIMEOUT_MS: 5000,
-  CIRCUIT_BREAKER_THRESHOLD: 5,
-  CIRCUIT_BREAKER_TIMEOUT_MS: 60000,
+  DEEPLX_TIMEOUT_MS: 8000,
+  DEEPLX_MAX_RETRIES: 5,
+  TRANSLATE_TIMEOUT_MS: 10000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -66,13 +57,6 @@ class TranslationManager {
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
-    
-    this._translationCircuitBreaker = {
-      failures: 0,
-      lastFailureTime: 0,
-      isOpen: false,
-      resetTimer: null
-    };
   }
 
   resetQuestionCache() {
@@ -89,7 +73,6 @@ class TranslationManager {
     this.resetQuestionCache();
     
     const needTranslate = [];
-    let cacheHits = 0;
     
     for (const [lang, users] of usersByLang) {
       if (lang === 'en') {
@@ -107,7 +90,6 @@ class TranslationManager {
       const cached = this.questionCache.get(cacheKey);
       
       if (cached) {
-        cacheHits++;
         results.set(lang, { 
           ...cached, 
           users, 
@@ -123,82 +105,77 @@ class TranslationManager {
       return;
     }
     
-    const translatePromises = needTranslate.map(({ lang, users }) => 
-      this._translateWithTimeout(question, options, lang, users)
-    );
-    
-    const translatedResults = await Promise.all(translatePromises);
-    
-    for (const result of translatedResults) {
-      if (result.success) {
-        const { lang, translatedQuestion, translatedOptions, users } = result;
+    for (const { lang, users } of needTranslate) {
+      try {
+        const [translatedQuestion, translatedOptions] = await Promise.all([
+          this._translateText(question, lang),
+          this._translateOptions(options, lang)
+        ]);
         
         const cacheKey = this._getCacheKey(question, options, lang);
         this.questionCache.set(cacheKey, {
-          question: translatedQuestion,
-          options: translatedOptions,
+          question: translatedQuestion || question,
+          options: translatedOptions || options,
           isFallback: false
         });
         
         results.set(lang, {
-          question: translatedQuestion,
-          options: translatedOptions,
+          question: translatedQuestion || question,
+          options: translatedOptions || options,
           users,
           isFallback: false,
           fromCache: false
         });
-      } else {
-        const { lang, users } = result;
-        results.set(lang, {
-          question: question,
-          options: options,
-          users,
-          isFallback: true,
-          fromCache: false
-        });
+        
+      } catch(e) {
+        try {
+          const retryResult = await this._translateWithRetry(question, options, lang);
+          results.set(lang, {
+            question: retryResult.question,
+            options: retryResult.options,
+            users,
+            isFallback: false,
+            fromCache: false
+          });
+        } catch(e2) {
+          results.set(lang, {
+            question: question,
+            options: options,
+            users,
+            isFallback: true,
+            fromCache: false
+          });
+        }
       }
     }
     
     this._sendResults(results);
   }
   
-  async _translateWithTimeout(question, options, lang, users) {
-    try {
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Translate timeout')), this.TRANSLATE_TIMEOUT);
-      });
-      
-      const translatePromise = (async () => {
-        const [translatedQuestion, translatedOptions] = await Promise.all([
-          this._translateText(question, lang),
-          this._translateOptions(options, lang)
-        ]);
+  async _translateWithRetry(question, options, lang) {
+    let lastError = null;
+    
+    for (let i = 0; i < 5; i++) {
+      try {
+        const translatedQuestion = await this._translateText(question, lang);
+        const translatedOptions = await this._translateOptions(options, lang);
         
         return {
-          success: true,
-          lang,
-          users,
-          translatedQuestion,
-          translatedOptions
+          question: translatedQuestion || question,
+          options: translatedOptions || options
         };
-      })();
-      
-      return await Promise.race([translatePromise, timeoutPromise]);
-      
-    } catch(e) {
-      return {
-        success: false,
-        lang,
-        users,
-        error: e.message
-      };
+      } catch(e) {
+        lastError = e;
+        await this._delay(1000 * (i + 1));
+      }
     }
+    
+    throw lastError || new Error('All retries failed');
   }
   
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (!text || typeof text !== 'string') return text;
-    if (this.translateLimitReached) return text;
     
     try {
       const result = await this._callTranslateAPI(text, targetLang);
@@ -206,11 +183,11 @@ class TranslationManager {
       return result;
       
     } catch(e) {
-      if (retryCount < CONSTANTS.DEEPLX_MAX_RETRIES) {
-        await this._delay(500 * (retryCount + 1));
+      if (retryCount < 5) {
+        await this._delay(1000 * (retryCount + 1));
         return this._translateText(text, targetLang, retryCount + 1);
       }
-      return text;
+      throw e;
     }
   }
   
@@ -268,17 +245,18 @@ class TranslationManager {
   }
   
   async _callTranslateAPI(text, targetLang) {
-    if (this._translationCircuitBreaker.isOpen) {
-      const now = Date.now();
-      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
-        this._translationCircuitBreaker.isOpen = false;
-        this._translationCircuitBreaker.failures = 0;
-      } else {
-        throw new Error('Circuit breaker is open');
-      }
-    }
+    const apiUrls = [
+      'https://deeplx.pages.dev/translate',
+      'https://api.deeplx.org/translate',
+      'https://deeplx.vercel.app/translate',
+      'https://deeplx.deno.dev/translate',
+      'https://deeplx.mingming.dev/translate',
+      'https://deeplx.azurewebsites.net/translate',
+      'https://deeplx.quickso.com/translate',
+      'https://deeplx.zhile.io/translate',
+      'https://deeplx-api.vercel.app/translate',
+    ];
     
-    const apiUrls = CONSTANTS.DEEPLX_API_URLS;
     let lastError = null;
     
     for (const apiUrl of apiUrls) {
@@ -307,7 +285,6 @@ class TranslationManager {
         const translated = data.data || data.text || data.result || data.translations?.[0]?.text;
         
         if (translated) {
-          this._translationCircuitBreaker.failures = 0;
           return translated;
         }
         
@@ -316,22 +293,6 @@ class TranslationManager {
       } catch(e) {
         lastError = e;
       }
-    }
-    
-    this._translationCircuitBreaker.failures++;
-    this._translationCircuitBreaker.lastFailureTime = Date.now();
-    
-    if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
-      this._translationCircuitBreaker.isOpen = true;
-      
-      if (this._translationCircuitBreaker.resetTimer) {
-        clearTimeout(this._translationCircuitBreaker.resetTimer);
-      }
-      this._translationCircuitBreaker.resetTimer = setTimeout(() => {
-        this._translationCircuitBreaker.isOpen = false;
-        this._translationCircuitBreaker.failures = 0;
-        this._translationCircuitBreaker.resetTimer = null;
-      }, CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS);
     }
     
     throw lastError || new Error('All APIs failed');
@@ -343,13 +304,6 @@ class TranslationManager {
       this.translateDate = now;
       this.translateCount = 0;
       this.translateLimitReached = false;
-      
-      this._translationCircuitBreaker.isOpen = false;
-      this._translationCircuitBreaker.failures = 0;
-      if (this._translationCircuitBreaker.resetTimer) {
-        clearTimeout(this._translationCircuitBreaker.resetTimer);
-        this._translationCircuitBreaker.resetTimer = null;
-      }
     }
   }
   
