@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL CLEAN CLASS - NO LOGS) ====================
+// ==================== GAME-SERVER.JS (FULL FIXED - AUTO START QUIZ) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -151,6 +151,7 @@ export class GameServer {
     
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
+    this._quizCheckInterval = null;
     
     this._initAsync();
     
@@ -168,6 +169,19 @@ export class GameServer {
     await this._initQuiz();
     this._startQuizScheduler();
     await this._checkAndResetWeeklyPoints();
+    
+    this._quizCheckInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._quizCheckInterval);
+        this._quizCheckInterval = null;
+        return;
+      }
+      
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      if (clients && clients.size > 0 && this._isQuizTime() && !this.currentQuestion) {
+        this._showQuestion();
+      }
+    }, 3000);
     
     setTimeout(() => {
       this.ensureQuizRunning();
@@ -457,6 +471,7 @@ export class GameServer {
   
   forceStartQuiz() {
     if (!this._isQuizTime()) return false;
+    if (this.currentQuestion) return true;
     if (this._quizTimeout || this.isQuizWaiting) return false;
     
     if (this._quizStartTimeout) {
@@ -505,6 +520,12 @@ export class GameServer {
       
       if (this._isQuizTime()) {
         this.forceStartQuiz();
+        
+        if (!this.currentQuestion) {
+          setTimeout(() => {
+            this.forceStartQuiz();
+          }, 1000);
+        }
       }
     } catch(e) {
       // Silent
@@ -655,6 +676,9 @@ export class GameServer {
           
           if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
             await this._initQuiz();
+            if (isQuizTime) {
+              this._showQuestion();
+            }
           }
           
           setTimeout(() => {
@@ -702,6 +726,9 @@ export class GameServer {
         
         if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           await this._initQuiz();
+          if (isQuizTime) {
+            this._showQuestion();
+          }
         }
         
         setTimeout(() => {
@@ -829,15 +856,14 @@ export class GameServer {
   async _showQuestion() {
     try {
       if (!this._isQuizTime()) {
-        const clients = this.wsClients.get(QUIZ_ROOM);
-        if (clients && clients.size > 0) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏸️ Quiz is offline. Check schedule for next session.",
-            true,
-            true
-          ]);
-        }
+        return;
+      }
+      
+      if (this.currentQuestion) {
+        return;
+      }
+      
+      if (this._quizTimeout || this.isQuizWaiting) {
         return;
       }
       
@@ -845,7 +871,7 @@ export class GameServer {
         this.quizAutoEnabled = true;
       }
       
-      if (this.isDestroyed || this.isQuizWaiting) {
+      if (this.isDestroyed) {
         return;
       }
 
@@ -854,31 +880,33 @@ export class GameServer {
         this._quizStartTimeout = null;
       }
 
-      this._checkAndLoadNextBatch();
-      
-      const questions = this.quizQuestionCache['en'] || [];
-      
-      if (questions.length === 0) {
-        const loaded = this._loadNextBatch();
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        const loaded = await this._loadAllQuestionsFromKV();
         if (!loaded) {
           setTimeout(() => {
-            this._loadNextBatch();
             this._showQuestion();
           }, 1000);
           return;
         }
       }
+
+      this._checkAndLoadNextBatch();
       
-      const questions2 = this.quizQuestionCache['en'] || [];
-      if (questions2.length === 0) {
+      const questions = this.quizQuestionCache['en'] || [];
+      
+      if (questions.length === 0) {
+        this._loadNextBatch();
+        setTimeout(() => {
+          this._showQuestion();
+        }, 500);
         return;
       }
       
-      if (this._questionPointer >= questions2.length) {
+      if (this._questionPointer >= questions.length) {
         this._questionPointer = 0;
       }
       
-      const q = questions2[this._questionPointer];
+      const q = questions[this._questionPointer];
       
       if (!q || !q.options) {
         this._questionPointer++;
@@ -964,7 +992,7 @@ export class GameServer {
             if (!this.closing && !this.isDestroyed) {
               const clients = this.wsClients.get(QUIZ_ROOM);
               if (clients && clients.size > 0) {
-                this.forceStartQuiz();
+                this._showQuestion();
               }
             }
           }, CONSTANTS.QUIZ_BREAK_MS);
@@ -980,6 +1008,9 @@ export class GameServer {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
+      setTimeout(() => {
+        this._showQuestion();
+      }, 2000);
     }
   }
   
@@ -1595,6 +1626,22 @@ export class GameServer {
         isQuizTime: isQuizTime,
         gameType: !isQuizTime,
         currentHour: new Date().getUTCHours()
+      }]);
+      return;
+    }
+    
+    if (evt === "quizDebug") {
+      this._safeSend(ws, ["quizDebug", {
+        isQuizTime: this._isQuizTime(),
+        hasQuestion: !!this.currentQuestion,
+        hasTimeout: !!this._quizTimeout,
+        isWaiting: this.isQuizWaiting,
+        questionsLoaded: this._isAllQuestionsLoaded,
+        totalQuestions: this._allQuestions.length,
+        pointer: this._questionPointer,
+        usersInRoom: this.wsClients.get(QUIZ_ROOM)?.size || 0,
+        currentHour: new Date().getUTCHours(),
+        quizAutoEnabled: this.quizAutoEnabled
       }]);
       return;
     }
@@ -3375,6 +3422,10 @@ export class GameServer {
       if (this._translateResetInterval) {
         clearInterval(this._translateResetInterval);
         this._translateResetInterval = null;
+      }
+      if (this._quizCheckInterval) {
+        clearInterval(this._quizCheckInterval);
+        this._quizCheckInterval = null;
       }
       if (this._quizTimeout) {
         clearTimeout(this._quizTimeout);
