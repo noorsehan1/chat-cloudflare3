@@ -39,6 +39,7 @@ const CONSTANTS = {
   DEEPLX_MAX_RETRIES: 5,
   TRANSLATE_TIMEOUT_MS: 10000,
   QUIZ_KEEP_ALIVE_INTERVAL_MS: 5000,
+  QUIZ_NEXT_QUESTION_DELAY_MS: 5000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -737,7 +738,6 @@ export class GameServer {
     
     this.translationManager = new TranslationManager(this);
     
-    // QUIZ KEEP ALIVE
     this._quizKeepAliveInterval = null;
     this._lastActivityTime = Date.now();
     this._isQuizIdle = false;
@@ -944,7 +944,7 @@ export class GameServer {
   }
   
   forceStartQuiz() {
-    if (this._isQuizTime()) {
+    if (!this._isQuizTime()) {
       return false;
     }
     
@@ -1384,8 +1384,6 @@ export class GameServer {
     }
   }
   
-  // ==================== QUIZ KEEP ALIVE ====================
-  
   _startQuizKeepAlive() {
     if (this._quizKeepAliveInterval) {
       clearInterval(this._quizKeepAliveInterval);
@@ -1645,6 +1643,26 @@ export class GameServer {
             this.isQuizWaiting = false;
             this._quizBreakTimeout = null;
             this.currentQuestion = null;
+            
+            // Broadcast 5 detik sebelum soal berikutnya
+            this._broadcastToRoom(QUIZ_ROOM, [
+              "quizNextQuestionIn",
+              "5"
+            ]);
+            
+            setTimeout(() => {
+              this._broadcastToRoom(QUIZ_ROOM, [
+                "quizNextQuestionIn",
+                "3"
+              ]);
+            }, 2000);
+            
+            setTimeout(() => {
+              this._broadcastToRoom(QUIZ_ROOM, [
+                "quizNextQuestionIn",
+                "1"
+              ]);
+            }, 4000);
             
             if (!this.closing && !this.isDestroyed) {
               this.ensureQuizRunning();
