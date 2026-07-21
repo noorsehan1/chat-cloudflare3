@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FIXED QUIZ LOGIC) ====================
+// ==================== GAME-SERVER.JS (FIXED QUIZ LOGIC - ALL QUESTIONS) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -39,12 +39,10 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   QUIZ_BATCH_THRESHOLD: 20,
   MAX_QUESTIONS: 10000,
-  // GAME SCHEDULE - JAM MAIN GAME
   GAME_SCHEDULE: {
     START_HOUR: 0,
     END_HOUR: 23,
   },
-  // DEEPLX CONFIG - DENGAN PROTEKSI LIMIT
   DEEPLX_API_URLS: [
     'https://api.deeplx.org/translate',
     'https://deeplx.vercel.app/translate',
@@ -57,7 +55,6 @@ const CONSTANTS = {
   DEEPLX_BATCH_SIZE: 5,
   DEEPLX_BATCH_DELAY_MS: 3000,
   DEEPLX_MAX_RETRIES: 3,
-  // CF LIMIT PROTECTION
   CF_SUBREQUEST_LIMIT: 50,
   CF_CPU_TIME_LIMIT_MS: 9000,
   CF_MEMORY_LIMIT_MB: 128,
@@ -82,14 +79,12 @@ export class GameServer {
     this.isDestroyed = false;
     this._initialized = false;
     
-    // GAME MAPS
     this.activeGames = new Map();
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._gameLocks = new Map();
     this._joinLocks = new Map();
     this._switchLocks = new Map();
     
-    // WEBSOCKET MAPS
     this._wsIdCounter = 0;
     this.wsClients = new Map();
     this.clientRooms = new Map();
@@ -103,7 +98,7 @@ export class GameServer {
     this._tikCounter = 0;
     this._gameStartFlags = new Map();
     
-    // QUIZ
+    // QUIZ - FIXED
     this.quizAnswered = new Set();
     this.quizHasWinner = false;
     this.quizWinner = null;
@@ -121,10 +116,11 @@ export class GameServer {
     this._currentBatchEnd = 0;
     this._isAllQuestionsLoaded = false;
     this._questionPointer = 0;
-    this._totalQuestionsLoaded = 0;
+    this._totalQuestionsAnswered = 0;
     this._currentBatchIndex = 0;
+    this._lastLoadedBatch = 0;
     
-    // DEEPLX TRANSLATION - DENGAN PROTEKSI
+    // DEEPLX TRANSLATION
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -687,17 +683,22 @@ export class GameServer {
         this._currentBatchStart = 0;
         this._currentBatchEnd = 0;
         this._questionPointer = 0;
-        this._totalQuestionsLoaded = 0;
+        this._totalQuestionsAnswered = 0;
         this._currentBatchIndex = 0;
         
         // Load batch pertama
         this._loadNextBatch();
+        
+        // Log untuk debugging
+        console.log(`✅ Loaded ${this._allQuestions.length} questions from KV`);
+        console.log(`📦 First batch: ${this._currentBatchStart + 1} - ${this._currentBatchEnd}`);
         
         return true;
       }
       
       return false;
     } catch(e) {
+      console.error('❌ Failed to load questions:', e);
       return false;
     }
   }
@@ -717,7 +718,8 @@ export class GameServer {
       startIndex = 0;
       this._currentBatchStart = 0;
       this._currentBatchEnd = 0;
-      this._questionPointer = 0;
+      this._questionPointer = 0; // HANYA RESET KETIKA RESET TOTAL
+      this._totalQuestionsAnswered = 0;
       this._currentBatchIndex = 0;
       
       this._broadcastToRoom(QUIZ_ROOM, [
@@ -725,25 +727,26 @@ export class GameServer {
         "📢 All 10,000 questions have been answered! Starting from question 1 again!",
         "info"
       ]);
+      
+      console.log('🔄 All questions completed! Resetting to start...');
     }
+    // ❌ JANGAN RESET POINTER DI SINI!
+    // Pointer tetap di posisi sebelumnya
     
-    // Ambil batch berikutnya
     let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
     const batch = this._allQuestions.slice(startIndex, endIndex);
     
-    // Simpan batch
     this.quizQuestionCache['en'] = batch;
     this._currentQuestions = batch;
     this._currentBatchStart = startIndex;
     this._currentBatchEnd = endIndex;
     this._currentBatchIndex = Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE);
+    this._lastLoadedBatch = this._currentBatchIndex;
     
-    // HAPUS: this._questionPointer = 0; // <-- BUG FIXED: Jangan reset pointer di sini!
-    // Pointer hanya di-reset ketika batch baru benar-benar dimulai dari awal
-    
-    // Kirim notifikasi batch loaded
     const startNum = startIndex + 1;
     const endNum = endIndex;
+    
+    console.log(`📦 Loaded batch ${this._currentBatchIndex + 1}: questions ${startNum} - ${endNum} (${batch.length} questions)`);
     
     this._broadcastToRoom(QUIZ_ROOM, [
       "quizBatchLoaded",
@@ -765,32 +768,26 @@ export class GameServer {
   _checkAndLoadNextBatch() {
     const questions = this.quizQuestionCache['en'] || [];
     
-    // Jika pointer sudah mencapai akhir batch, load batch berikutnya
+    // HANYA LOAD BATCH BARU JIKA POINTER SUDAH MENCAPAI AKHIR BATCH
     if (this._questionPointer >= questions.length) {
-      // Load batch berikutnya
+      // Simpan posisi pointer saat ini sebelum load
+      const currentPointer = this._questionPointer;
+      
+      console.log(`📖 Reached end of batch (pointer: ${currentPointer}/${questions.length}), loading next batch...`);
+      
       this._loadNextBatch();
-      // Reset pointer untuk batch baru (kecuali jika batch baru adalah reset ke awal)
+      
+      // Jika batch baru dimulai dari awal (reset total), pointer = 0
+      // Jika tidak, pointer tetap di posisi yang sama (relative terhadap batch baru)
       const newQuestions = this.quizQuestionCache['en'] || [];
-      if (this._questionPointer >= newQuestions.length) {
+      if (this._currentBatchStart === 0 && newQuestions.length > 0) {
+        // Reset total, pointer = 0
         this._questionPointer = 0;
+        console.log('🔄 Reset to beginning of all questions');
       }
+      // Jika tidak reset total, pointer sudah benar (tidak perlu diubah)
+      
       return true;
-    }
-    
-    // Jika batch hampir habis (kurang dari threshold), pre-load batch berikutnya
-    // TAPI jangan load sekarang, biarkan pointer mencapai akhir dulu
-    const remaining = questions.length - this._questionPointer;
-    if (remaining <= CONSTANTS.QUIZ_BATCH_THRESHOLD && this._currentBatchEnd < this._allQuestions.length) {
-      // Tandai bahwa kita perlu load batch berikutnya, tapi jangan load sekarang
-      // Kita akan load ketika pointer mencapai akhir
-      // Ini untuk mencegah load batch di tengah-tengah
-      return false;
-    }
-    
-    // Jika ini adalah batch terakhir dan sudah mencapai akhir
-    if (this._questionPointer >= questions.length - 1 && this._currentBatchEnd >= this._allQuestions.length) {
-      // Akan di-handle di _showQuestion() dengan reset ke awal
-      return false;
     }
     
     return false;
@@ -856,7 +853,9 @@ export class GameServer {
         return;
       }
 
-      // Cek dan load batch berikutnya jika diperlukan
+      // Cek dan load batch berikutnya jika pointer sudah mencapai akhir
+      this._checkAndLoadNextBatch();
+      
       const questions = this.quizQuestionCache['en'] || [];
       
       // Jika tidak ada soal, load batch
@@ -871,23 +870,13 @@ export class GameServer {
         }
       }
       
-      // Jika pointer sudah mencapai akhir batch, load batch berikutnya
-      if (this._questionPointer >= questions.length) {
-        this._loadNextBatch();
-        const newQuestions = this.quizQuestionCache['en'] || [];
-        if (newQuestions.length === 0) {
-          return;
-        }
-        this._questionPointer = 0;
-      }
-      
-      // Ambil soal dari batch berdasarkan pointer
+      // Ambil soal berdasarkan pointer
       const q = questions[this._questionPointer];
       
       if (!q || !q.options) {
         // Skip soal yang tidak valid
         this._questionPointer++;
-        this._showQuestion(); // Rekursif untuk skip
+        this._showQuestion();
         return;
       }
 
@@ -904,8 +893,13 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
       
-      // Increment pointer setelah mengambil soal
+      // Increment pointer untuk soal berikutnya
       this._questionPointer++;
+      this._totalQuestionsAnswered++;
+      
+      // Log untuk debugging
+      const globalIndex = this._currentBatchStart + this._questionPointer;
+      console.log(`📖 Question ${globalIndex}/${this._allQuestions.length} (Batch ${this._currentBatchIndex + 1}, Pointer: ${this._questionPointer}/${questions.length})`);
 
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
@@ -978,6 +972,7 @@ export class GameServer {
       }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
 
     } catch(e) {
+      console.error('❌ Error in _showQuestion:', e);
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
@@ -1221,6 +1216,12 @@ export class GameServer {
       return;
     }
     
+    if (evt === "getQuizProgress") {
+      const progress = this._getQuizProgress();
+      this._safeSend(ws, ["quizProgress", progress]);
+      return;
+    }
+    
     // ===== GAME EVENTS =====
     const room = this._ensureRoomConsistency(ws);
     if (!room) {
@@ -1264,8 +1265,14 @@ export class GameServer {
       const currentBatchEnd = this._currentBatchEnd;
       const pointer = this._questionPointer;
       const questions = this.quizQuestionCache['en'] || [];
+      
+      // Perbaiki perhitungan remaining
       const remainingInBatch = Math.max(0, questions.length - pointer);
       const nextBatchStart = currentBatchEnd + 1;
+      
+      // Hitung total progress yang sebenarnya
+      const totalAnswered = this._currentBatchStart + pointer;
+      const progress = total > 0 ? Math.round((totalAnswered / total) * 100) : 0;
       
       return {
         total: total,
@@ -1276,10 +1283,39 @@ export class GameServer {
         nextBatchStart: nextBatchStart,
         currentBatch: Math.floor(this._currentBatchStart / CONSTANTS.QUIZ_BATCH_SIZE) + 1,
         totalBatches: Math.ceil(total / CONSTANTS.QUIZ_BATCH_SIZE),
-        isComplete: this._currentBatchEnd >= total,
-        progress: total > 0 ? Math.round((this._currentBatchEnd / total) * 100) : 0,
-        currentQuestionIndex: this._questionPointer,
-        batchSize: questions.length
+        isComplete: this._currentBatchEnd >= total && pointer >= questions.length,
+        progress: progress,
+        questionsInBatch: questions.length,
+        totalAnswered: totalAnswered,
+        currentBatchRange: `${this._currentBatchStart + 1} - ${this._currentBatchEnd}`,
+        nextQuestionIndex: this._currentBatchStart + pointer + 1,
+        batchSize: CONSTANTS.QUIZ_BATCH_SIZE,
+        isAllQuestionsLoaded: this._isAllQuestionsLoaded
+      };
+    } catch(e) {
+      return { error: e.message };
+    }
+  }
+  
+  // ==================== GET QUIZ PROGRESS - NEW ====================
+  
+  _getQuizProgress() {
+    try {
+      const total = this._allQuestions.length || 0;
+      const totalAnswered = this._currentBatchStart + this._questionPointer;
+      const progress = total > 0 ? Math.round((totalAnswered / total) * 100) : 0;
+      
+      return {
+        totalQuestions: total,
+        answered: totalAnswered,
+        remaining: Math.max(0, total - totalAnswered),
+        progress: progress,
+        currentBatch: Math.floor(this._currentBatchStart / CONSTANTS.QUIZ_BATCH_SIZE) + 1,
+        totalBatches: Math.ceil(total / CONSTANTS.QUIZ_BATCH_SIZE),
+        currentQuestionInBatch: this._questionPointer + 1,
+        questionsInBatch: this.quizQuestionCache['en']?.length || 0,
+        isComplete: this._currentBatchEnd >= total && this._questionPointer >= (this.quizQuestionCache['en']?.length || 0),
+        lastLoadedBatch: this._lastLoadedBatch + 1
       };
     } catch(e) {
       return { error: e.message };
@@ -1400,7 +1436,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== DEEPLX TRANSLATE - DENGAN PROTEKSI CF ====================
+  // ==================== DEEPLX TRANSLATE ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1461,7 +1497,6 @@ export class GameServer {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
   
-  // TRANSLATE SATU TEKS - DENGAN PROTEKSI CF
   async _translateSingleText(text, targetLang, retryCount = 0) {
     if (!this._canTranslate()) {
       return text;
@@ -1565,7 +1600,6 @@ export class GameServer {
     return text;
   }
   
-  // TRANSLATE BATCH - DENGAN PROTEKSI CF
   async _translateBatch(texts, targetLang) {
     if (!texts || texts.length === 0) return [];
     if (targetLang === 'en') return texts;
