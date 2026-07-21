@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (QUIZ MALAM 18:00-23:00 WIB) ====================
+// ==================== GAME-SERVER.JS (QUIZ 23:00-04:00 WIB) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -65,13 +65,14 @@ const CONSTANTS = {
   MAX_USER_LANGUAGE_CACHE: 1000,
 };
 
-// ==================== QUIZ SCHEDULE - MALAM (18:00 - 23:00 WIB) ====================
-// WIB = UTC+7, jadi:
-// 18:00 WIB = 11:00 UTC
+// ==================== QUIZ SCHEDULE ====================
+// WIB = UTC+7
 // 23:00 WIB = 16:00 UTC
+// 04:00 WIB = 21:00 UTC
 
 const QUIZ_SCHEDULE = {
-    EVENING: { start: 16, end: 21 }, // 23:00-04:00 WIB
+  START_HOUR: 16, // 23:00 WIB
+  END_HOUR: 21,   // 04:00 WIB
 };
 
 const QUIZ_ROOM = "Quiz";
@@ -82,13 +83,13 @@ class TranslationManager {
   constructor(gameServer) {
     this.gameServer = gameServer;
     
-    // ✅ CACHE PER SOAL (di-reset setiap soal)
+    // Cache per question (reset each question)
     this.questionCache = new Map();
     
-    // ✅ GLOBAL CACHE (untuk teks yang sama di banyak soal)
+    // Global cache (for same text across many questions)
     this.globalCache = new Map();
     this.MAX_GLOBAL_CACHE = 50000;
-    this.GLOBAL_CACHE_TTL = 86400000; // 24 jam
+    this.GLOBAL_CACHE_TTL = 86400000; // 24 hours
     
     this.MAX_PARALLEL = CONSTANTS.MAX_PARALLEL_TRANSLATE;
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
@@ -103,12 +104,10 @@ class TranslationManager {
       resetTimer: null
     };
     
-    // ✅ PRE-TRANSLATE COMMON WORDS
+    // Pre-translate common words
     this.commonWords = this._loadCommonWords();
   }
 
-  // ==================== RESET CACHE PER SOAL ====================
-  
   resetQuestionCache() {
     if (this.questionCache.size > 0) {
       console.log(`🔄 Resetting question cache (${this.questionCache.size} entries)`);
@@ -116,8 +115,6 @@ class TranslationManager {
     }
   }
 
-  // ==================== TRANSLATE FOR USERS BY LANGUAGE ====================
-  
   async translateForUsers(question, options, usersByLang) {
     const startTime = Date.now();
     const results = new Map();
@@ -125,7 +122,6 @@ class TranslationManager {
     console.log(`🌍 Translating for ${usersByLang.size} languages...`);
     console.log(`📊 Languages: ${Array.from(usersByLang.keys()).join(', ')}`);
     
-    // ✅ RESET CACHE PER SOAL
     this.resetQuestionCache();
     
     const needTranslate = [];
@@ -143,7 +139,6 @@ class TranslationManager {
         continue;
       }
       
-      // ✅ CEK CACHE PER BAHASA (dalam soal yang sama)
       const cacheKey = this._getCacheKey(question, options, lang);
       const cached = this.questionCache.get(cacheKey);
       
@@ -168,7 +163,6 @@ class TranslationManager {
       return;
     }
     
-    // ✅ TRANSLATE PER BAHASA
     const translatePromises = needTranslate.map(({ lang, users }) => 
       this._translateWithTimeout(question, options, lang, users)
     );
@@ -182,7 +176,6 @@ class TranslationManager {
       if (result.success) {
         const { lang, translatedQuestion, translatedOptions, users } = result;
         
-        // ✅ SIMPAN DI CACHE PER SOAL
         const cacheKey = this._getCacheKey(question, options, lang);
         this.questionCache.set(cacheKey, {
           question: translatedQuestion,
@@ -217,8 +210,6 @@ class TranslationManager {
     console.log(`✅ Broadcast complete! ${Date.now() - startTime}ms`);
   }
   
-  // ==================== EXECUTE WITH CONCURRENCY LIMIT ====================
-  
   async _executeWithConcurrencyLimit(promiseFactories, limit) {
     const results = [];
     const executing = [];
@@ -238,8 +229,6 @@ class TranslationManager {
     
     return Promise.all(results);
   }
-  
-  // ==================== TRANSLATE WITH TIMEOUT ====================
   
   async _translateWithTimeout(question, options, lang, users) {
     try {
@@ -274,19 +263,15 @@ class TranslationManager {
     }
   }
   
-  // ==================== TRANSLATE TEXT ====================
-  
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (!text || typeof text !== 'string') return text;
     if (this.translateLimitReached) return text;
     
-    // ✅ CEK PRE-TRANSLATE COMMON WORDS
     if (this.commonWords[targetLang] && this.commonWords[targetLang][text]) {
       return this.commonWords[targetLang][text];
     }
     
-    // ✅ CEK GLOBAL CACHE (untuk teks yang sama di banyak soal)
     const globalCacheKey = `global_${text}|${targetLang}`;
     const globalCached = this._getGlobalCache(globalCacheKey);
     if (globalCached) {
@@ -296,7 +281,6 @@ class TranslationManager {
     try {
       const result = await this._callTranslateAPI(text, targetLang);
       
-      // ✅ SIMPAN DI GLOBAL CACHE
       this._setGlobalCache(globalCacheKey, result);
       this.translateCount++;
       
@@ -310,8 +294,6 @@ class TranslationManager {
       return text;
     }
   }
-  
-  // ==================== TRANSLATE OPTIONS ====================
   
   async _translateOptions(options, targetLang) {
     if (targetLang === 'en' || !options) return options;
@@ -335,8 +317,6 @@ class TranslationManager {
     
     return result;
   }
-  
-  // ==================== CACHE METHODS ====================
   
   _getCacheKey(question, options, lang) {
     const optionStr = Object.values(options).join('|');
@@ -364,8 +344,6 @@ class TranslationManager {
     });
   }
   
-  // ==================== SEND RESULTS ====================
-  
   _sendResults(results) {
     for (const [lang, data] of results) {
       const { question, options, users, isFallback, fromCache } = data;
@@ -392,8 +370,6 @@ class TranslationManager {
       }
     }
   }
-  
-  // ==================== CALL TRANSLATE API ====================
   
   async _callTranslateAPI(text, targetLang) {
     if (this._translationCircuitBreaker.isOpen) {
@@ -464,8 +440,6 @@ class TranslationManager {
     
     throw lastError || new Error('All APIs failed');
   }
-  
-  // ==================== LOAD COMMON WORDS ====================
   
   _loadCommonWords() {
     return {
@@ -759,8 +733,6 @@ class TranslationManager {
     };
   }
   
-  // ==================== RESET DAILY COUNTER ====================
-  
   resetDailyCounter() {
     const now = new Date().toUTCString();
     if (now !== this.translateDate) {
@@ -832,9 +804,9 @@ export class GameServer {
     this._currentBatchIndex = 0;
     this._lastLoadedBatch = 0;
     
-    // ✅ USER LANGUAGE MAP (disimpan saat masuk Quiz)
-    this.userLanguage = new Map(); // wsId → language (id, en, th, dll)
-    this.userCountry = new Map(); // wsId → country code (ID, US, TH, dll)
+    // User language map
+    this.userLanguage = new Map();
+    this.userCountry = new Map();
     this._translationQueue = [];
     this._isProcessingQueue = false;
     
@@ -863,7 +835,7 @@ export class GameServer {
     
     console.log('🚀 GameServer starting...');
     console.log(`🕐 Current UTC time: ${new Date().toUTCString()}`);
-    console.log(`📅 Quiz Schedule: 18:00 - 23:00 WIB (${QUIZ_SCHEDULE.EVENING.start}:00 - ${QUIZ_SCHEDULE.EVENING.end}:00 UTC)`);
+    console.log(`📅 Quiz Schedule: ${QUIZ_SCHEDULE.START_HOUR}:00 - ${QUIZ_SCHEDULE.END_HOUR}:00 UTC (${(QUIZ_SCHEDULE.START_HOUR+7)%24}:00 - ${(QUIZ_SCHEDULE.END_HOUR+7)%24}:00 WIB)`);
     
     this._initAsync();
     
@@ -872,8 +844,6 @@ export class GameServer {
       this.forceStartQuiz();
     }, 3000);
   }
-  
-  // ==================== ASYNC INIT ====================
   
   async _initAsync() {
     if (this._initialized) return;
@@ -887,8 +857,6 @@ export class GameServer {
       this.ensureQuizRunning();
     }, 2000);
   }
-  
-  // ==================== CF PROTECTION METHODS ====================
   
   _checkCFLimits() {
     const now = Date.now();
@@ -934,8 +902,6 @@ export class GameServer {
     return true;
   }
   
-  // ==================== UTC TIME HELPERS ====================
-  
   _getCurrentUTCTime() {
     return new Date();
   }
@@ -944,21 +910,42 @@ export class GameServer {
     return new Date().getUTCHours();
   }
   
-  // ==================== GAME TIME CHECK ====================
+  // ==================== QUIZ SCHEDULE METHODS ====================
   
-  _isGameTime() {
+  _isQuizTime() {
     const hour = this._getCurrentUTCHours();
-    const schedule = CONSTANTS.GAME_SCHEDULE || { START_HOUR: 0, END_HOUR: 23 };
+    return hour >= QUIZ_SCHEDULE.START_HOUR && hour < QUIZ_SCHEDULE.END_HOUR;
+  }
+  
+  _getNextQuizStartTime() {
+    const now = this._getCurrentUTCTime();
+    const startTime = new Date(now);
+    startTime.setUTCHours(QUIZ_SCHEDULE.START_HOUR, 0, 0, 0);
     
-    if (schedule.START_HOUR > schedule.END_HOUR) {
-      return hour >= schedule.START_HOUR || hour < schedule.END_HOUR;
+    if (startTime <= now) {
+      startTime.setUTCDate(startTime.getUTCDate() + 1);
+    }
+    return startTime;
+  }
+  
+  _getTimeLeftUntilNextEvent() {
+    const now = Date.now();
+    const nextStart = this._getNextQuizStartTime();
+    const timeLeft = nextStart.getTime() - now;
+    
+    if (timeLeft <= 0) {
+      return { minutes: 0, seconds: 0, isRunning: this._isQuizTime() };
     }
     
-    return hour >= schedule.START_HOUR && hour < schedule.END_HOUR;
+    const totalSeconds = Math.floor(timeLeft / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    
+    return { minutes, seconds, isRunning: false };
   }
   
   _getGameType(room) {
-    const isInGameTime = this._isGameTime();
+    const isInGameTime = this._isQuizTime();
     
     if (!isInGameTime) {
       return true;
@@ -1049,59 +1036,6 @@ export class GameServer {
     }
   }
   
-  // ==================== QUIZ SCHEDULE ====================
-  
-  _isQuizTime() {
-    const hour = this._getCurrentUTCHours();
-    
-    const schedules = [
-      QUIZ_SCHEDULE.EVENING,
-    ];
-    
-    for (const schedule of schedules) {
-      if (hour >= schedule.start && hour < schedule.end) {
-        return true;
-      }
-    }
-    return false;
-  }
-  
-  _getNextQuizStartTime() {
-    const now = this._getCurrentUTCTime();
-    const schedules = [
-      QUIZ_SCHEDULE.EVENING,
-    ];
-    
-    for (const schedule of schedules) {
-      const startTime = new Date(now);
-      startTime.setUTCHours(schedule.start, 0, 0, 0);
-      if (startTime > now) {
-        return startTime;
-      }
-    }
-    
-    const tomorrow = new Date(now);
-    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-    tomorrow.setUTCHours(QUIZ_SCHEDULE.EVENING.start, 0, 0, 0);
-    return tomorrow;
-  }
-  
-  _getTimeLeftUntilNextEvent() {
-    const now = Date.now();
-    const nextStart = this._getNextQuizStartTime();
-    const timeLeft = nextStart.getTime() - now;
-    
-    if (timeLeft <= 0) {
-      return { minutes: 0, seconds: 0, isRunning: this._isQuizTime() };
-    }
-    
-    const totalSeconds = Math.floor(timeLeft / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    
-    return { minutes, seconds, isRunning: false };
-  }
-  
   // ==================== QUIZ AUTO SCHEDULER ====================
   
   _startQuizScheduler() {
@@ -1139,11 +1073,11 @@ export class GameServer {
       
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
-          console.log('✅ Quiz Malam detected! Enabling quiz...');
+          console.log('✅ Quiz detected! Enabling quiz...');
           this.quizAutoEnabled = true;
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "🌙 Quiz Malam (18:00-23:00 WIB) akan segera dimulai!",
+            "⏳ Quiz will start soon!",
             false
           ]);
           
@@ -1155,39 +1089,38 @@ export class GameServer {
         } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
           console.log('📝 Showing next question...');
           await this._showQuestion();
-        } else {
-          console.log(`⏳ Quiz state: question=${!!this.currentQuestion}, timeout=${!!this._quizTimeout}, waiting=${this.isQuizWaiting}`);
         }
+        return false;
       } else {
         if (this.quizAutoEnabled) {
-          console.log('⏸️ Quiz Malam selesai, disabling quiz...');
+          console.log('⏸️ Quiz ended, disabling...');
           this.quizAutoEnabled = false;
           await this.resetQuiz();
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz Malam (18:00-23:00 WIB) telah berakhir. Sampai jumpa besok! 🌙",
+            "⏸️ Quiz has ended. See you tomorrow!",
             true
           ]);
         }
+        return true;
       }
     } catch(e) {
       console.error('❌ Error checking quiz status:', e);
+      return true;
     }
   }
-  
-  // ==================== FORCE START QUIZ ====================
   
   forceStartQuiz() {
     console.log('🔍 Force start quiz check...');
     
-    if (!this._isQuizTime()) {
-      console.log('⏰ Not quiz time yet (18:00-23:00 WIB)');
+    if (this._isQuizTime()) {
+      console.log('⏰ Inside quiz time, cannot force start');
       return false;
     }
     
     if (this.currentQuestion) {
       console.log('✅ Quiz already running');
-      return true;
+      return false;
     }
     
     if (this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
@@ -1212,8 +1145,6 @@ export class GameServer {
     return true;
   }
   
-  // ==================== CHECK AND RESTART QUIZ ====================
-  
   _checkAndRestartQuiz() {
     try {
       if (!this._isQuizTime()) {
@@ -1235,8 +1166,6 @@ export class GameServer {
     }
   }
   
-  // ==================== ENSURE QUIZ STARTED ====================
-  
   ensureQuizStarted() {
     console.log('🔄 Ensuring quiz started...');
     
@@ -1256,6 +1185,71 @@ export class GameServer {
     this.forceStartQuiz();
   }
   
+  ensureQuizRunning() {
+    try {
+      console.log('🔍 ensureQuizRunning called');
+      
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      console.log(`👥 Users in quiz room: ${clients ? clients.size : 0}`);
+      
+      this._forceStartQuizIfTime();
+      
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        console.log('📚 Questions not loaded, initializing...');
+        this._initQuiz().then(() => {
+          if (!this.closing && !this.isDestroyed) {
+            console.log('✅ Questions loaded, starting quiz...');
+            this.forceStartQuiz();
+          }
+        });
+        return;
+      }
+      
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+        console.log('🚀 Quiz not running, starting...');
+        this.forceStartQuiz();
+      } else {
+        console.log(`⏳ Quiz state: question=${!!this.currentQuestion}, timeout=${!!this._quizTimeout}, waiting=${this.isQuizWaiting}, startTimeout=${!!this._quizStartTimeout}`);
+      }
+      
+    } catch(e) {
+      console.error('❌ Error in ensureQuizRunning:', e);
+    }
+  }
+  
+  _forceStartQuizIfTime() {
+    console.log('🔍 _forceStartQuizIfTime called');
+    
+    if (!this._isQuizTime()) {
+      console.log('⏰ Not quiz time');
+      return;
+    }
+    
+    if (this.currentQuestion) {
+      console.log('✅ Quiz already has question');
+      return;
+    }
+    
+    if (this._quizTimeout) {
+      console.log('⏳ Quiz is in timeout');
+      return;
+    }
+    
+    if (this.isQuizWaiting) {
+      console.log('⏳ Quiz is waiting');
+      return;
+    }
+    
+    if (this._quizStartTimeout) {
+      console.log('⏳ Quiz start timeout active');
+      return;
+    }
+    
+    console.log('🚀 Force starting quiz from _forceStartQuizIfTime!');
+    this.quizAutoEnabled = true;
+    this._showQuestion();
+  }
+  
   // ==================== SEND TO USER ====================
   
   _sendQuizTimeLeftToUser(ws) {
@@ -1265,10 +1259,6 @@ export class GameServer {
       const isQuizTime = this._isQuizTime();
       const timeLeft = this._getTimeLeftUntilNextEvent();
       const isQuizActive = this.currentQuestion !== null || this._quizTimeout !== null;
-      
-      const now = new Date();
-      const hoursWIB = (now.getUTCHours() + 7) % 24;
-      const minutesWIB = now.getUTCMinutes();
       
       let message = "";
       let canType = true;
@@ -1287,38 +1277,41 @@ export class GameServer {
             remaining = `${seconds}s remaining`;
           }
         }
-        message = `🌙 Quiz Malam sedang berjalan! ${remaining}`;
+        message = `📝 Quiz is running! ${remaining}`;
         canType = false;
+        this._safeSend(ws, ["quizTimeLeft", message, canType]);
+        return false;
       } else if (isQuizTime && !isQuizActive) {
-        message = `⏳ Quiz Malam (18:00-23:00 WIB) akan segera dimulai!`;
+        message = `⏳ Quiz will start soon!`;
         canType = true;
+        this._safeSend(ws, ["quizTimeLeft", message, canType]);
+        return false;
       } else {
         const totalSeconds = timeLeft.minutes * 60 + timeLeft.seconds;
         
         let countdown = "";
         if (totalSeconds <= 0) {
-          countdown = "Sekarang!";
+          countdown = "Now!";
         } else {
           const hours = Math.floor(totalSeconds / 3600);
           const minutes = Math.floor((totalSeconds % 3600) / 60);
           const seconds = Math.floor(totalSeconds % 60);
           
           let parts = [];
-          if (hours > 0) parts.push(`${hours} jam`);
-          if (minutes > 0) parts.push(`${minutes} menit`);
-          if (seconds > 0 && parts.length === 0) parts.push(`${seconds} detik`);
+          if (hours > 0) parts.push(`${hours} hour${hours > 1 ? 's' : ''}`);
+          if (minutes > 0) parts.push(`${minutes} minute${minutes > 1 ? 's' : ''}`);
+          if (seconds > 0 && parts.length === 0) parts.push(`${seconds} second${seconds > 1 ? 's' : ''}`);
           
           countdown = parts.join(" ");
         }
         
-        message = `⏸️ Quiz Malam (18:00-23:00 WIB) dimulai dalam ${countdown}`;
+        message = `⏸️ Quiz starts in ${countdown}`;
         canType = true;
+        this._safeSend(ws, ["quizTimeLeft", message, canType]);
+        return true;
       }
-      
-      this._safeSend(ws, ["quizTimeLeft", message, canType]);
-      return true;
     } catch(e) {
-      return false;
+      return true;
     }
   }
   
@@ -1331,19 +1324,19 @@ export class GameServer {
       
       switch(errorType) {
         case "NOT_QUIZ_TIME":
-          message = "Quiz Malam (18:00-23:00 WIB) sedang offline";
+          message = "Quiz is offline";
           break;
         case "QUIZ_DISABLED":
-          message = "Quiz tidak tersedia saat ini";
+          message = "Quiz is currently unavailable";
           break;
         case "QUIZ_ENDED":
-          message = "Quiz Malam telah berakhir";
+          message = "Quiz has ended";
           break;
         case "QUIZ_NOT_STARTED":
           const timeStr = timeLeft.minutes > 0 ? 
             `${timeLeft.minutes}m ${timeLeft.seconds}s` : 
             `${timeLeft.seconds}s`;
-          message = `Quiz Malam dimulai dalam: ${timeStr}`;
+          message = `Quiz starts in: ${timeStr}`;
           break;
         default:
           message = customMessage || "Quiz error occurred";
@@ -1363,10 +1356,8 @@ export class GameServer {
     const wsId = this._getWsId(ws);
     if (!wsId) return 'en';
     
-    // Simpan country
     this.userCountry.set(wsId, countryCode);
     
-    // Convert country ke language
     const lang = this._countryToLanguage(countryCode);
     this.userLanguage.set(wsId, lang);
     
@@ -1403,7 +1394,6 @@ export class GameServer {
       
       if (oldRoom === roomName) {
         if (roomName === QUIZ_ROOM) {
-          // ✅ CEK APAKAH USER SUDAH PUNYA LANGUAGE
           let lang = this.userLanguage.get(wsId);
           if (!lang) {
             const country = this.userCountry.get(wsId) || 'US';
@@ -1444,7 +1434,6 @@ export class GameServer {
         if (conn) conn.room = roomName;
       }
       
-      // ✅ JIKA MASUK QUIZ ROOM → SET LANGUAGE
       if (roomName === QUIZ_ROOM) {
         let country = this.userCountry.get(wsId);
         if (!country) {
@@ -1520,8 +1509,6 @@ export class GameServer {
     }
   }
   
-  // ==================== LOAD NEXT BATCH ====================
-  
   _loadNextBatch() {
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
       return false;
@@ -1559,8 +1546,6 @@ export class GameServer {
     return true;
   }
   
-  // ==================== CHECK AND LOAD NEXT BATCH ====================
-  
   _checkAndLoadNextBatch() {
     const questions = this.quizQuestionCache['en'] || [];
     
@@ -1587,12 +1572,12 @@ export class GameServer {
       console.log('📝 _showQuestion called');
       
       if (!this._isQuizTime()) {
-        console.log('⏰ Not quiz time (18:00-23:00 WIB), skipping');
+        console.log('⏰ Not quiz time, skipping');
         const clients = this.wsClients.get(QUIZ_ROOM);
         if (clients && clients.size > 0) {
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz Malam (18:00-23:00 WIB) sedang offline.",
+            "⏸️ Quiz is offline.",
             true
           ]);
         }
@@ -1606,7 +1591,7 @@ export class GameServer {
         if (clients && clients.size > 0) {
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "🌙 Quiz Malam akan segera dimulai!",
+            "⏳ Quiz will start soon!",
             true
           ]);
         }
@@ -1668,7 +1653,6 @@ export class GameServer {
       const globalIndex = this._currentBatchStart + this._questionPointer;
       console.log(`📖 Showing question ${globalIndex}/${this._allQuestions.length} (Batch ${this._currentBatchIndex + 1})`);
 
-      // ========== BROADCAST KE SEMUA USER ==========
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1759,8 +1743,6 @@ export class GameServer {
     }
   }
   
-  // ==================== BROADCAST QUIZ QUESTION ====================
-  
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds || wsIds.size === 0) {
@@ -1770,7 +1752,6 @@ export class GameServer {
     
     console.log(`🌍 Broadcasting question to ${wsIds.size} users`);
     
-    // ✅ KUMPULKAN USER BERDASARKAN BAHASA (LANGSUNG DARI MAP)
     const usersByLang = new Map();
     
     for (const wsId of wsIds) {
@@ -1778,7 +1759,6 @@ export class GameServer {
         const ws = this.wsMap.get(wsId);
         if (!ws || ws.readyState !== 1) continue;
         
-        // ✅ AMBIL DARI MAP (TIDAK PERLU CEK CF LAGI)
         const lang = this.userLanguage.get(wsId) || 'en';
         
         if (!usersByLang.has(lang)) {
@@ -1795,13 +1775,10 @@ export class GameServer {
       return;
     }
     
-    // ✅ GUNakan TranslationManager
     await this.translationManager.translateForUsers(question, options, usersByLang);
     
     console.log(`✅ Broadcast complete to ${wsIds.size} users`);
   }
-  
-  // ==================== SUBMIT QUIZ ANSWER ====================
   
   async submitQuizAnswer(ws, username, answer) {
     try {
@@ -1892,7 +1869,7 @@ export class GameServer {
           this.quizAutoEnabled = true;
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "🌙 Quiz Malam akan segera dimulai!",
+            "⏳ Quiz will start soon!",
             true
           ]);
         }
@@ -1907,15 +1884,13 @@ export class GameServer {
           this.resetQuiz();
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz Malam (18:00-23:00 WIB) telah berakhir. Sampai jumpa besok! 🌙",
+            "⏸️ Quiz has ended. See you tomorrow!",
             true
           ]);
         }
       }
     }, CONSTANTS.QUIZ_INTERVAL_MS);
   }
-  
-  // ==================== RESET QUIZ ====================
   
   async resetQuiz() {
     try {
@@ -1967,13 +1942,65 @@ export class GameServer {
     }, delayMs);
   }
   
+  _startQuizIfNeeded() {
+    try {
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      if (!clients || clients.size === 0) return;
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+          this._initQuiz().then(() => {
+            if (!this.closing && !this.isDestroyed) {
+              this._showQuestion();
+            }
+          });
+          return;
+        }
+        this._showQuestion();
+      }
+    } catch(e) {}
+  }
+  
+  async _initQuiz(retryCount = 0) {
+    try {
+      const loaded = await this._loadAllQuestionsFromKV();
+      if (loaded) {
+        this._startQuizLoop();
+        this._startTranslateResetCounter();
+        return true;
+      }
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+      }
+      return false;
+    } catch(e) {
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+      }
+      return false;
+    }
+  }
+  
+  _startTranslateResetCounter() {
+    if (this._translateResetInterval) {
+      clearInterval(this._translateResetInterval);
+      this._translateResetInterval = null;
+    }
+    this._translateResetInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._translateResetInterval);
+        this._translateResetInterval = null;
+        return;
+      }
+      this.translationManager.resetDailyCounter();
+    }, 60000);
+  }
+  
   // ==================== HANDLE EVENT ====================
   
   async handleEvent(ws, data) {
     if (this.isDestroyed || !ws || !data || !data[0]) return;
     const evt = data[0];
     
-    // ===== QUIZ EVENTS =====
     if (evt === "switchRoom") {
       const [_, room, username] = data;
       await this.switchRoom(ws, room, username);
@@ -2028,7 +2055,6 @@ export class GameServer {
       return;
     }
     
-    // ===== GAME EVENTS =====
     const room = this._ensureRoomConsistency(ws);
     if (!room) {
       this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -2171,7 +2197,6 @@ export class GameServer {
     this.clientRooms.delete(wsId);
     this.wsMap.delete(wsId);
     
-    // ✅ HAPUS LANGUAGE DAN COUNTRY DARI MAP
     this.userLanguage.delete(wsId);
     this.userCountry.delete(wsId);
     
@@ -2225,21 +2250,17 @@ export class GameServer {
     return map[countryCode.toUpperCase()] || 'en';
   }
   
-  // ==================== GET USER LANGUAGE ====================
-  
   _getUserLanguage(ws) {
     if (!ws) return 'en';
     
     const wsId = this._getWsId(ws);
     if (!wsId) return 'en';
     
-    // ✅ AMBIL LANGSUNG DARI MAP (TIDAK PERLU CEK ULANG)
     const lang = this.userLanguage.get(wsId);
     if (lang) {
       return lang;
     }
     
-    // ⚠️ FALLBACK: jika tidak ada di Map
     const country = this.userCountry.get(wsId);
     if (country) {
       const newLang = this._countryToLanguage(country);
@@ -2368,8 +2389,6 @@ export class GameServer {
     }
     return null;
   }
-  
-  // ==================== GAME CLEANUP ====================
   
   _scheduleGameCleanup(room, game) {
     if (!room || !game) return;
@@ -3458,7 +3477,7 @@ export class GameServer {
           circuitBreakerOpen: this.translationManager._translationCircuitBreaker.isOpen || false,
           subRequestCount: this._subRequestCount,
           cfLimitRemaining: Math.max(0, CONSTANTS.CF_SUBREQUEST_LIMIT - this._subRequestCount),
-          schedule: "18:00 - 23:00 WIB",
+          schedule: `${QUIZ_SCHEDULE.START_HOUR}:00-${QUIZ_SCHEDULE.END_HOUR}:00 UTC (${(QUIZ_SCHEDULE.START_HOUR+7)%24}:00-${(QUIZ_SCHEDULE.END_HOUR+7)%24}:00 WIB)`,
           currentTimeWIB: this._getWIBTime(),
           timestamp: Date.now()
         }), { 
@@ -3488,21 +3507,17 @@ export class GameServer {
           server._createdAt = Date.now();
           server.username = null;
           
-          // ✅ AMBIL COUNTRY DARI CF
           const cf = req.cf || {};
           let country = 'US';
           if (cf && cf.country) {
             country = cf.country;
           }
           
-          // ✅ SIMPAN COUNTRY KE MAP (langsung dari awal)
           this.userCountry.set(wsId, country);
           
-          // ✅ CONVERT KE LANGUAGE DAN SIMPAN
           const lang = this._countryToLanguage(country);
           this.userLanguage.set(wsId, lang);
           
-          // ✅ SIMPAN CF DI SERVER (untuk berjaga-jaga)
           server._cf = cf;
           server._country = country;
           server._language = lang;
@@ -3581,8 +3596,6 @@ export class GameServer {
     }
   }
   
-  // ==================== WEBSOCKET EVENTS ====================
-  
   async webSocketMessage(ws, msg) {
     try {
       if (!ws || ws._closing || this.closing || this.isDestroyed) return;
@@ -3655,8 +3668,6 @@ export class GameServer {
     } catch(e) {}
   }
   
-  // ==================== ENSURE SINGLE CONNECTION ====================
-  
   _ensureSingleConnection(room, username, newWs, newWsId) {
     try {
       const game = this.activeGames.get(room);
@@ -3680,127 +3691,5 @@ export class GameServer {
     } catch(e) {
       return newWsId;
     }
-  }
-  
-  // ==================== ENSURE QUIZ RUNNING ====================
-  
-  ensureQuizRunning() {
-    try {
-      console.log('🔍 ensureQuizRunning called');
-      
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      console.log(`👥 Users in quiz room: ${clients ? clients.size : 0}`);
-      
-      this._forceStartQuizIfTime();
-      
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        console.log('📚 Questions not loaded, initializing...');
-        this._initQuiz().then(() => {
-          if (!this.closing && !this.isDestroyed) {
-            console.log('✅ Questions loaded, starting quiz...');
-            this.forceStartQuiz();
-          }
-        });
-        return;
-      }
-      
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-        console.log('🚀 Quiz not running, starting...');
-        this.forceStartQuiz();
-      } else {
-        console.log(`⏳ Quiz state: question=${!!this.currentQuestion}, timeout=${!!this._quizTimeout}, waiting=${this.isQuizWaiting}, startTimeout=${!!this._quizStartTimeout}`);
-      }
-      
-    } catch(e) {
-      console.error('❌ Error in ensureQuizRunning:', e);
-    }
-  }
-  
-  _startQuizIfNeeded() {
-    try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients || clients.size === 0) return;
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-          this._initQuiz().then(() => {
-            if (!this.closing && !this.isDestroyed) {
-              this._showQuestion();
-            }
-          });
-          return;
-        }
-        this._showQuestion();
-      }
-    } catch(e) {}
-  }
-  
-  _forceStartQuizIfTime() {
-    console.log('🔍 _forceStartQuizIfTime called');
-    
-    if (!this._isQuizTime()) {
-      console.log('⏰ Not quiz time (18:00-23:00 WIB)');
-      return;
-    }
-    
-    if (this.currentQuestion) {
-      console.log('✅ Quiz already has question');
-      return;
-    }
-    
-    if (this._quizTimeout) {
-      console.log('⏳ Quiz is in timeout');
-      return;
-    }
-    
-    if (this.isQuizWaiting) {
-      console.log('⏳ Quiz is waiting');
-      return;
-    }
-    
-    if (this._quizStartTimeout) {
-      console.log('⏳ Quiz start timeout active');
-      return;
-    }
-    
-    console.log('🚀 Force starting quiz from _forceStartQuizIfTime!');
-    this.quizAutoEnabled = true;
-    this._showQuestion();
-  }
-  
-  async _initQuiz(retryCount = 0) {
-    try {
-      const loaded = await this._loadAllQuestionsFromKV();
-      if (loaded) {
-        this._startQuizLoop();
-        this._startTranslateResetCounter();
-        return true;
-      }
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    } catch(e) {
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    }
-  }
-  
-  // ==================== TRANSLATE RESET COUNTER ====================
-  
-  _startTranslateResetCounter() {
-    if (this._translateResetInterval) {
-      clearInterval(this._translateResetInterval);
-      this._translateResetInterval = null;
-    }
-    this._translateResetInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this._translateResetInterval);
-        this._translateResetInterval = null;
-        return;
-      }
-      this.translationManager.resetDailyCounter();
-    }, 60000);
   }
 }
