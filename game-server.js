@@ -70,13 +70,7 @@ const CONSTANTS = {
 // 23:00 WIB = 16:00 UTC
 
 const QUIZ_SCHEDULE = {
-  // Sesi malam: 18:00 - 23:00 WIB (tanpa henti)
   EVENING: { start: 11, end: 16 }, // 11:00 - 16:00 UTC
-  
-  // Opsi: Multi sesi dengan break
-  // SESSION1: { start: 11, end: 13 }, // 18:00 - 20:00 WIB
-  // SESSION2: { start: 13, end: 15 }, // 20:00 - 22:00 WIB
-  // SESSION3: { start: 15, end: 16 }, // 22:00 - 23:00 WIB
 };
 
 const QUIZ_ROOM = "Quiz";
@@ -104,6 +98,8 @@ class TranslationManager {
     };
   }
 
+  // ==================== TRANSLATE FOR USERS BY LANGUAGE ====================
+  
   async translateForUsers(question, options, usersByLang) {
     const startTime = Date.now();
     const results = new Map();
@@ -138,6 +134,7 @@ class TranslationManager {
       return;
     }
     
+    // Translate per bahasa (1x per bahasa, bukan per user)
     const translatePromises = needTranslate.map(({ lang, users }) => 
       this._translateWithTimeout(question, options, lang, users)
     );
@@ -394,6 +391,7 @@ class TranslationManager {
       
       const msgStr = JSON.stringify(message);
       
+      // Kirim ke SEMUA user dalam bahasa ini (soal SAMA per bahasa)
       for (const ws of users) {
         if (ws && ws.readyState === 1) {
           try {
@@ -716,7 +714,6 @@ export class GameServer {
   _isQuizTime() {
     const hour = this._getCurrentUTCHours();
     
-    // JADWAL MALAM: 18:00 - 23:00 WIB = 11:00 - 16:00 UTC
     const schedules = [
       QUIZ_SCHEDULE.EVENING,
     ];
@@ -743,7 +740,6 @@ export class GameServer {
       }
     }
     
-    // Jika sudah lewat, kembali ke besok
     const tomorrow = new Date(now);
     tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
     tomorrow.setUTCHours(QUIZ_SCHEDULE.EVENING.start, 0, 0, 0);
@@ -798,7 +794,6 @@ export class GameServer {
       const hours = now.getUTCHours();
       const minutes = now.getUTCMinutes();
       
-      // Konversi ke WIB untuk log
       const hoursWIB = (hours + 7) % 24;
       console.log(`🕐 Quiz check: ${hoursWIB}:${String(minutes).padStart(2, '0')} WIB, isQuizTime=${isQuizTime}`);
       
@@ -931,7 +926,6 @@ export class GameServer {
       const timeLeft = this._getTimeLeftUntilNextEvent();
       const isQuizActive = this.currentQuestion !== null || this._quizTimeout !== null;
       
-      // Konversi ke WIB untuk display
       const now = new Date();
       const hoursWIB = (now.getUTCHours() + 7) % 24;
       const minutesWIB = now.getUTCMinutes();
@@ -1336,6 +1330,7 @@ export class GameServer {
       const globalIndex = this._currentBatchStart + this._questionPointer;
       console.log(`📖 Showing question ${globalIndex}/${this._allQuestions.length} (Batch ${this._currentBatchIndex + 1})`);
 
+      // ========== BROADCAST KE SEMUA USER DENGAN BAHASA MASING-MASING ==========
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1420,7 +1415,7 @@ export class GameServer {
     }
   }
   
-  // ==================== BROADCAST QUIZ WITH PARALLEL TRANSLATE ====================
+  // ==================== BROADCAST QUIZ QUESTION ====================
   
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
@@ -1429,6 +1424,9 @@ export class GameServer {
       return;
     }
     
+    console.log(`🌍 Broadcasting same question to ${wsIds.size} users in their languages`);
+    
+    // Kumpulkan user berdasarkan bahasa
     const usersByLang = new Map();
     
     for (const wsId of wsIds) {
@@ -1436,6 +1434,7 @@ export class GameServer {
         const ws = this.wsMap.get(wsId);
         if (!ws || ws.readyState !== 1) continue;
         
+        // Ambil bahasa user (dari country code)
         const lang = this._getUserLanguage(ws);
         if (!usersByLang.has(lang)) {
           usersByLang.set(lang, []);
@@ -1446,9 +1445,157 @@ export class GameServer {
       }
     }
     
-    console.log(`🌍 Broadcasting to ${wsIds.size} users in ${usersByLang.size} languages`);
+    console.log(`📊 Users by language:`, Array.from(usersByLang.keys()).map(l => `${l}: ${usersByLang.get(l).length}`).join(', '));
     
-    await this.translationManager.translateForUsers(question, options, usersByLang);
+    // Kirim soal yang SAMA ke semua user, ditranslate per bahasa
+    if (usersByLang.size === 0) {
+      console.log('⚠️ No valid users found');
+      return;
+    }
+    
+    // English langsung, lainnya translate
+    const results = new Map();
+    
+    for (const [lang, users] of usersByLang) {
+      if (lang === 'en') {
+        // User English dapat soal asli
+        results.set(lang, {
+          question: question,
+          options: options,
+          users: users,
+          isFallback: false
+        });
+        continue;
+      }
+      
+      // Translate untuk bahasa ini (1x per bahasa, bukan per user)
+      try {
+        const translated = await this._translateQuestionForLanguage(question, options, lang);
+        if (translated) {
+          results.set(lang, {
+            question: translated.question,
+            options: translated.options,
+            users: users,
+            isFallback: false
+          });
+          console.log(`✅ Translated to ${lang}`);
+        } else {
+          // Fallback ke English
+          results.set(lang, {
+            question: question,
+            options: options,
+            users: users,
+            isFallback: true
+          });
+          console.log(`⚠️ Fallback to English for ${lang}`);
+        }
+      } catch(e) {
+        // Fallback ke English
+        results.set(lang, {
+          question: question,
+          options: options,
+          users: users,
+          isFallback: true
+        });
+        console.log(`❌ Error translating ${lang}: ${e.message}, using English`);
+      }
+    }
+    
+    // Kirim ke semua user
+    this._sendQuizResults(results);
+    console.log(`✅ Broadcast complete to ${wsIds.size} users`);
+  }
+  
+  // ==================== TRANSLATE QUESTION FOR SPECIFIC LANGUAGE ====================
+  
+  async _translateQuestionForLanguage(question, options, targetLang) {
+    if (targetLang === 'en') {
+      return { question, options };
+    }
+    
+    try {
+      // Cek cache dulu
+      const cacheKey = this.translationManager._getCacheKey(question, options, targetLang);
+      const cached = this.translationManager._getCache(cacheKey);
+      if (cached) {
+        return cached;
+      }
+      
+      // Translate question
+      const translatedQuestion = await this.translationManager._translateText(question, targetLang);
+      
+      // Translate options
+      const translatedOptions = await this._translateOptionsForLanguage(options, targetLang);
+      
+      const result = {
+        question: translatedQuestion || question,
+        options: translatedOptions || options
+      };
+      
+      // Simpan di cache
+      this.translationManager._setCache(cacheKey, result);
+      
+      return result;
+      
+    } catch(e) {
+      console.error(`❌ Error translating to ${targetLang}:`, e.message);
+      return null;
+    }
+  }
+  
+  // ==================== TRANSLATE OPTIONS FOR LANGUAGE ====================
+  
+  async _translateOptionsForLanguage(options, targetLang) {
+    if (targetLang === 'en' || !options) return options;
+    
+    const keys = ['A', 'B', 'C', 'D'];
+    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
+    
+    if (texts.length === 0) return options;
+    
+    const translatedTexts = await Promise.all(
+      texts.map(text => this.translationManager._translateText(text, targetLang))
+    );
+    
+    const result = { ...options };
+    let idx = 0;
+    for (const key of keys) {
+      if (options[key] && typeof options[key] === 'string') {
+        result[key] = translatedTexts[idx++] || options[key];
+      }
+    }
+    
+    return result;
+  }
+  
+  // ==================== SEND QUIZ RESULTS TO USERS ====================
+  
+  _sendQuizResults(results) {
+    for (const [lang, data] of results) {
+      const { question, options, users, isFallback } = data;
+      
+      const message = [
+        "quizQuestion",
+        {
+          question: question || '',
+          options: options || { A: '', B: '', C: '', D: '' },
+          isFallback: isFallback || false
+        }
+      ];
+      
+      const msgStr = JSON.stringify(message);
+      
+      // Kirim ke SEMUA user dalam bahasa ini (soal SAMA per bahasa)
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {
+            // Ignore
+          }
+        }
+      }
+    }
   }
   
   // ==================== SUBMIT QUIZ ANSWER ====================
@@ -1817,7 +1964,6 @@ export class GameServer {
         batchSize: CONSTANTS.QUIZ_BATCH_SIZE,
         isAllQuestionsLoaded: this._isAllQuestionsLoaded,
         
-        // Schedule info
         schedule: {
           isQuizTime: isQuizTime,
           timeLeftMinutes: timeLeft.minutes,
@@ -1970,37 +2116,75 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== LANGUAGE DETECTION ====================
+  // ==================== LANGUAGE MAPPING ====================
   
   _countryToLanguage(countryCode) {
     if (!countryCode) return 'en';
+    
+    // Mapping country ke bahasa yang lebih detail
     const map = {
+      // Asia Tenggara
       'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id',
-      'JP': 'ja', 'CN': 'zh', 'TW': 'zh', 'HK': 'zh',
-      'KR': 'ko', 'IN': 'hi', 'TH': 'th', 'VN': 'vi',
+      'TH': 'th', 'VN': 'vi', 'KH': 'km', 'LA': 'lo',
+      'MM': 'my', 'TL': 'pt',
+      
+      // Asia Timur
+      'CN': 'zh', 'TW': 'zh', 'HK': 'zh', 'MO': 'zh',
+      'JP': 'ja', 'KR': 'ko', 'MN': 'mn',
+      
+      // Asia Selatan
+      'IN': 'hi', 'PK': 'ur', 'BD': 'bn', 'LK': 'si',
+      'NP': 'ne', 'MV': 'dv', 'AF': 'ps',
+      
+      // Timur Tengah
+      'SA': 'ar', 'AE': 'ar', 'QA': 'ar', 'KW': 'ar',
+      'BH': 'ar', 'OM': 'ar', 'YE': 'ar', 'SY': 'ar',
+      'LB': 'ar', 'PS': 'ar', 'JO': 'ar', 'IQ': 'ar',
+      'EG': 'ar', 'DZ': 'ar', 'MA': 'ar', 'TN': 'ar',
+      'LY': 'ar', 'SD': 'ar', 'MR': 'ar', 'SO': 'ar',
+      'IR': 'fa', 'IL': 'he', 'TR': 'tr',
+      
+      // Eropa
       'GB': 'en', 'US': 'en', 'AU': 'en', 'CA': 'en',
-      'NZ': 'en', 'FR': 'fr', 'DE': 'de', 'ES': 'es',
-      'IT': 'it', 'PT': 'pt', 'NL': 'nl', 'RU': 'ru',
-      'UA': 'ru', 'PL': 'pl', 'TR': 'tr',
-      'QA': 'ar', 'SA': 'ar', 'AE': 'ar', 'KW': 'ar', 'BH': 'ar',
-      'OM': 'ar', 'YE': 'ar', 'SY': 'ar', 'LB': 'ar', 'PS': 'ar',
-      'SD': 'ar', 'LY': 'ar', 'TN': 'ar', 'DZ': 'ar', 'MA': 'ar',
-      'MR': 'ar', 'IQ': 'ar', 'JO': 'ar', 'EG': 'ar',
-      'MX': 'es', 'BR': 'pt', 'AR': 'es', 'CO': 'es',
-      'CL': 'es', 'PE': 'es',
-      'ZA': 'en', 'NG': 'en', 'KE': 'en',
+      'NZ': 'en', 'ZA': 'en', 'NG': 'en', 'KE': 'en',
+      'FR': 'fr', 'BE': 'fr', 'CH': 'fr', 'LU': 'fr',
+      'DE': 'de', 'AT': 'de', 'LI': 'de',
+      'ES': 'es', 'MX': 'es', 'AR': 'es', 'CO': 'es',
+      'CL': 'es', 'PE': 'es', 'VE': 'es', 'EC': 'es',
+      'GT': 'es', 'CU': 'es', 'DO': 'es',
+      'IT': 'it', 'PT': 'pt', 'BR': 'pt',
+      'NL': 'nl', 'RU': 'ru', 'UA': 'ru', 'PL': 'pl',
+      'SE': 'sv', 'NO': 'no', 'DK': 'da', 'FI': 'fi',
+      'GR': 'el', 'HU': 'hu', 'CS': 'cs', 'SK': 'sk',
+      'RO': 'ro', 'BG': 'bg', 'HR': 'hr', 'SI': 'sl',
+      
+      // Lainnya
+      'EG': 'ar', 'ZA': 'en', 'NG': 'en', 'KE': 'en',
     };
+    
     return map[countryCode.toUpperCase()] || 'en';
   }
   
+  // ==================== GET USER LANGUAGE ====================
+  
   _getUserLanguage(ws) {
     if (!ws) return 'en';
+    
     const wsId = this._getWsId(ws);
     if (!wsId) return 'en';
-    const lang = this.userLanguage.get(wsId);
+    
+    // Cek dari memory
+    let lang = this.userLanguage.get(wsId);
     if (lang) return lang;
+    
+    // Cek dari country
     const country = this.userCountry.get(wsId);
-    return this._countryToLanguage(country) || 'en';
+    lang = this._countryToLanguage(country);
+    
+    // Simpan di memory
+    this.userLanguage.set(wsId, lang);
+    
+    return lang;
   }
   
   // ==================== SHUFFLE HELPERS ====================
@@ -3289,15 +3473,20 @@ export class GameServer {
           server._createdAt = Date.now();
           server.username = null;
           
+          // ========== DETEKSI BAHASA DARI COUNTRY ==========
           const cf = req.cf;
           let country = 'US';
           if (cf && cf.country) {
             country = cf.country;
           }
           server._country = country;
+          
+          // Simpan bahasa berdasarkan country
           const lang = this._countryToLanguage(country);
           this.userLanguage.set(wsId, lang);
           this.userCountry.set(wsId, country);
+          
+          console.log(`🔗 New connection from ${country}, language: ${lang}`);
           
           try { 
             this.state.acceptWebSocket(server);
@@ -3445,101 +3634,31 @@ export class GameServer {
     } catch(e) {}
   }
   
-  // ==================== DESTROY ====================
+  // ==================== ENSURE SINGLE CONNECTION ====================
   
-  async destroy() {
+  _ensureSingleConnection(room, username, newWs, newWsId) {
     try {
-      if (this.isDestroyed) return;
-      this.closing = true;
-      this.isDestroyed = true;
+      const game = this.activeGames.get(room);
+      if (!game) return newWsId;
       
-      if (this.quizAutoTimer) {
-        clearInterval(this.quizAutoTimer);
-        this.quizAutoTimer = null;
-      }
-      if (this.quizTimer) {
-        clearInterval(this.quizTimer);
-        this.quizTimer = null;
-      }
-      if (this._translateResetInterval) {
-        clearInterval(this._translateResetInterval);
-        this._translateResetInterval = null;
-      }
-      if (this._quizTimeout) {
-        clearTimeout(this._quizTimeout);
-        this._quizTimeout = null;
-      }
-      if (this._quizBreakTimeout) {
-        clearTimeout(this._quizBreakTimeout);
-        this._quizBreakTimeout = null;
-      }
-      if (this._quizStartTimeout) {
-        clearTimeout(this._quizStartTimeout);
-        this._quizStartTimeout = null;
-      }
-      if (this._translationCircuitBreaker.resetTimer) {
-        clearTimeout(this._translationCircuitBreaker.resetTimer);
-        this._translationCircuitBreaker.resetTimer = null;
-      }
-      
-      for (const [room, game] of this.activeGames) {
-        if (game) {
-          const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
-          for (const key of timers) {
-            if (game[key]) {
-              clearTimeout(game[key]);
-              clearInterval(game[key]);
-              game[key] = null;
-            }
-          }
-          if (game._botTimeouts) {
-            for (const id of game._botTimeouts) clearTimeout(id);
-            game._botTimeouts.clear();
-            game._botTimeouts = null;
-          }
-          game.players = null;
-          game.botPlayers = null;
-          game.numbers = null;
-          game.tanda = null;
-          game.eliminated = null;
-          game.playerWsId = null;
+      const existingWsId = game.playerWsId?.get(username);
+      if (existingWsId && existingWsId !== newWsId) {
+        const oldWs = this.wsMap.get(existingWsId);
+        if (oldWs) {
+          try {
+            oldWs.close(1000, "Duplicate connection");
+          } catch(e) {}
+          this._removeClient(room, oldWs);
+        }
+        if (game.playerWsId) {
+          game.playerWsId.set(username, newWsId);
         }
       }
       
-      for (const [room, timer] of this._cleanupTimers) {
-        clearTimeout(timer);
-      }
-      this._cleanupTimers.clear();
-      
-      this.quizQuestionCache = {};
-      this.userLanguage.clear();
-      this.userCountry.clear();
-      this.wsClients.clear();
-      this.clientRooms.clear();
-      this.wsMap.clear();
-      this.roomViewers.clear();
-      this.userConnections.clear();
-      this.connectionLocks.clear();
-      this._gameLocks.clear();
-      this._joinLocks.clear();
-      this._switchLocks.clear();
-      this._gameStartFlags.clear();
-      this._roomBroadcastCount.clear();
-      this._roomBroadcastReset.clear();
-      this.quizAnswered.clear();
-      this.activeGames.clear();
-      
-      for (const [room, wsIds] of this.wsClients) {
-        for (const wsId of wsIds) {
-          const ws = this.wsMap.get(wsId);
-          if (ws) {
-            try {
-              ws.close(1000, "Game server shutting down");
-            } catch(e) {}
-          }
-        }
-      }
-    } catch(e) {}
+      return newWsId;
+    } catch(e) {
+      return newWsId;
+    }
   }
   
   // ==================== ENSURE QUIZ RUNNING ====================
@@ -3664,32 +3783,5 @@ export class GameServer {
       }
       this.translationManager.resetDailyCounter();
     }, 60000);
-  }
-  
-  // ==================== ENSURE SINGLE CONNECTION ====================
-  
-  _ensureSingleConnection(room, username, newWs, newWsId) {
-    try {
-      const game = this.activeGames.get(room);
-      if (!game) return newWsId;
-      
-      const existingWsId = game.playerWsId?.get(username);
-      if (existingWsId && existingWsId !== newWsId) {
-        const oldWs = this.wsMap.get(existingWsId);
-        if (oldWs) {
-          try {
-            oldWs.close(1000, "Duplicate connection");
-          } catch(e) {}
-          this._removeClient(room, oldWs);
-        }
-        if (game.playerWsId) {
-          game.playerWsId.set(username, newWsId);
-        }
-      }
-      
-      return newWsId;
-    } catch(e) {
-      return newWsId;
-    }
   }
 }
