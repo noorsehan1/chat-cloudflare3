@@ -40,12 +40,6 @@ const CONSTANTS = {
   TRANSLATE_TIMEOUT_MS: 10000,
   QUIZ_KEEP_ALIVE_INTERVAL_MS: 5000,
   QUIZ_NEXT_QUESTION_DELAY_MS: 5000,
-  // CPU Protection Constants
-  CPU_TIME_LIMIT_MS: 10,           // Maksimum 10ms per operasi
-  CPU_YIELD_DELAY_MS: 1,           // Delay minimal 1ms setelah 10ms
-  CPU_CHECK_INTERVAL_MS: 100,      // Cek CPU setiap 100ms
-  MAX_EVENTS_PER_TICK: 5,          // Maksimal event per tick
-  BROADCAST_BATCH_SIZE: 5,         // Batch size untuk broadcast
 };
 
 const QUIZ_SCHEDULE = {
@@ -56,203 +50,10 @@ const QUIZ_SCHEDULE = {
 
 const QUIZ_ROOM = "Quiz";
 
-// ==================== CPU PROTECTION MIXIN ====================
-
-class CPUProtection {
-  constructor() {
-    this._cpuStartTime = 0;
-    this._cpuTotalTime = 0;
-    this._cpuCheckCount = 0;
-    this._isThrottled = false;
-    this._pendingOperations = [];
-    this._isProcessingPending = false;
-    this._cpuHistory = [];
-    this._cpuAverage = 0;
-  }
-
-  // Mulai timer CPU
-  _startCPUTimer() {
-    this._cpuStartTime = performance.now ? performance.now() : Date.now();
-    return this._cpuStartTime;
-  }
-
-  // Cek apakah sudah melewati batas 10ms
-  _checkCPULimit() {
-    const now = performance.now ? performance.now() : Date.now();
-    const elapsed = now - this._cpuStartTime;
-    
-    if (elapsed >= CONSTANTS.CPU_TIME_LIMIT_MS) {
-      this._cpuTotalTime += elapsed;
-      this._cpuCheckCount++;
-      this._cpuHistory.push(elapsed);
-      
-      // Simpan history terakhir 10
-      if (this._cpuHistory.length > 10) {
-        this._cpuHistory.shift();
-      }
-      
-      // Hitung rata-rata
-      const sum = this._cpuHistory.reduce((a, b) => a + b, 0);
-      this._cpuAverage = sum / this._cpuHistory.length;
-      
-      return true; // Melewati batas
-    }
-    return false;
-  }
-
-  // Yield - beri jeda untuk mencegah CPU spike
-  async _cpuYield() {
-    if (this._isThrottled) {
-      // Jika sedang throttled, beri jeda lebih panjang
-      await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 2);
-      return;
-    }
-    
-    // Jika rata-rata CPU tinggi, throttle lebih agresif
-    if (this._cpuAverage > CONSTANTS.CPU_TIME_LIMIT_MS * 0.8) {
-      await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 3);
-      this._isThrottled = true;
-      // Reset throttle setelah 100ms
-      setTimeout(() => {
-        this._isThrottled = false;
-      }, 100);
-    } else {
-      await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS);
-    }
-  }
-
-  // Sleep helper
-  _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  // Proses operasi dengan proteksi CPU
-  async _processWithCPUProtection(operations) {
-    if (!operations || operations.length === 0) return;
-    
-    const batchSize = CONSTANTS.MAX_EVENTS_PER_TICK;
-    let index = 0;
-    
-    while (index < operations.length) {
-      this._startCPUTimer();
-      
-      // Proses maksimal batchSize per tick
-      const end = Math.min(index + batchSize, operations.length);
-      
-      for (let i = index; i < end; i++) {
-        try {
-          await operations[i]();
-        } catch(e) {
-          // Skip error
-        }
-        
-        // Cek CPU setelah setiap operasi
-        if (this._checkCPULimit()) {
-          await this._cpuYield();
-          this._startCPUTimer(); // Reset timer setelah yield
-        }
-      }
-      
-      index = end;
-      
-      // Cek CPU setelah batch
-      if (this._checkCPULimit()) {
-        await this._cpuYield();
-        this._startCPUTimer();
-      }
-    }
-  }
-
-  // Wrapper untuk function dengan proteksi CPU
-  async _safeExecute(fn, ...args) {
-    this._startCPUTimer();
-    
-    try {
-      const result = await fn(...args);
-      
-      if (this._checkCPULimit()) {
-        await this._cpuYield();
-      }
-      
-      return result;
-    } catch(e) {
-      if (this._checkCPULimit()) {
-        await this._cpuYield();
-      }
-      throw e;
-    }
-  }
-
-  // Broadcast dengan proteksi CPU
-  async _safeBroadcast(room, message) {
-    if (this.closing || this.isDestroyed || !room || !message) return;
-    
-    const wsIds = this.wsClients.get(room);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const msgStr = JSON.stringify(message);
-    const wsIdArray = Array.from(wsIds);
-    const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
-    
-    this._startCPUTimer();
-    
-    for (let i = 0; i < wsIdArray.length; i += batchSize) {
-      const batch = wsIdArray.slice(i, i + batchSize);
-      
-      for (const wsId of batch) {
-        const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1) {
-          try {
-            ws.send(msgStr);
-          } catch(e) {}
-        }
-      }
-      
-      // Cek CPU setelah setiap batch
-      if (this._checkCPULimit()) {
-        await this._cpuYield();
-        this._startCPUTimer();
-      }
-    }
-  }
-
-  // Safe send dengan proteksi CPU
-  async _safeSendAsync(ws, message) {
-    if (!ws || ws.readyState !== 1) return false;
-    
-    this._startCPUTimer();
-    
-    try {
-      ws.send(JSON.stringify(message));
-      
-      if (this._checkCPULimit()) {
-        await this._cpuYield();
-      }
-      
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  // Override _safeSend yang sudah ada
-  _safeSend(ws, message) {
-    if (!ws || ws.readyState !== 1) return false;
-    
-    try {
-      ws.send(JSON.stringify(message));
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-}
-
 // ==================== TRANSLATION MANAGER ====================
 
-class TranslationManager extends CPUProtection {
+class TranslationManager {
   constructor(gameServer) {
-    super();
     this.gameServer = gameServer;
     this.questionCache = new Map();
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
@@ -309,15 +110,10 @@ class TranslationManager extends CPUProtection {
     
     for (const { lang, users } of needTranslate) {
       try {
-        // Gunakan safeExecute untuk proteksi CPU
-        const [translatedQuestion, translatedOptions] = await this._safeExecute(
-          async () => {
-            return await Promise.all([
-              this._translateText(question, lang),
-              this._translateOptions(options, lang)
-            ]);
-          }
-        );
+        const [translatedQuestion, translatedOptions] = await Promise.all([
+          this._translateText(question, lang),
+          this._translateOptions(options, lang)
+        ]);
         
         const cacheKey = this._getCacheKey(question, options, lang);
         this.questionCache.set(cacheKey, {
@@ -364,14 +160,8 @@ class TranslationManager extends CPUProtection {
     
     for (let i = 0; i < 5; i++) {
       try {
-        const [translatedQuestion, translatedOptions] = await this._safeExecute(
-          async () => {
-            return await Promise.all([
-              this._translateText(question, lang),
-              this._translateOptions(options, lang)
-            ]);
-          }
-        );
+        const translatedQuestion = await this._translateText(question, lang);
+        const translatedOptions = await this._translateOptions(options, lang);
         
         return {
           question: translatedQuestion || question,
@@ -379,7 +169,7 @@ class TranslationManager extends CPUProtection {
         };
       } catch(e) {
         lastError = e;
-        await this._sleep(1000 * (i + 1));
+        await this._delay(1000 * (i + 1));
       }
     }
     
@@ -391,15 +181,13 @@ class TranslationManager extends CPUProtection {
     if (!text || typeof text !== 'string') return text;
     
     try {
-      const result = await this._safeExecute(async () => {
-        return await this._callTranslateAPI(text, targetLang);
-      });
+      const result = await this._callTranslateAPI(text, targetLang);
       this.translateCount++;
       return result;
       
     } catch(e) {
       if (retryCount < 5) {
-        await this._sleep(1000 * (retryCount + 1));
+        await this._delay(1000 * (retryCount + 1));
         return this._translateText(text, targetLang, retryCount + 1);
       }
       throw e;
@@ -414,11 +202,9 @@ class TranslationManager extends CPUProtection {
     
     if (texts.length === 0) return options;
     
-    const translatedTexts = await this._safeExecute(async () => {
-      return await Promise.all(
-        texts.map(text => this._translateText(text, targetLang))
-      );
-    });
+    const translatedTexts = await Promise.all(
+      texts.map(text => this._translateText(text, targetLang))
+    );
     
     const result = { ...options };
     let idx = 0;
@@ -755,16 +541,15 @@ class TranslationManager extends CPUProtection {
     }
   }
   
-  _sleep(ms) {
+  _delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
 
 // ==================== GAME SERVER CLASS ====================
 
-export class GameServer extends CPUProtection {
+export class GameServer {
   constructor(state, env) {
-    super();
     this.state = state;
     this.env = env;
     this.closing = false;
@@ -829,137 +614,1341 @@ export class GameServer extends CPUProtection {
     this._lastActivityTime = Date.now();
     this._isQuizIdle = false;
     
-    // CPU Protection: Event queue
-    this._eventQueue = [];
-    this._isProcessingQueue = false;
-    this._rateLimitMap = new Map();
-    this._cpuMonitorInterval = null;
-    
     this._initAsync();
     
     setTimeout(() => {
       this.forceStartQuiz();
     }, 3000);
-    
-    // Start CPU monitor
-    this._startCPUMonitor();
   }
   
-  // ==================== CPU MONITOR ====================
+  async _initAsync() {
+    if (this._initialized) return;
+    this._initialized = true;
+    
+    await this._initQuiz();
+    this._startQuizScheduler();
+    await this._checkAndResetWeeklyPoints();
+    
+    setTimeout(() => {
+      this.ensureQuizRunning();
+    }, 2000);
+  }
   
-  _startCPUMonitor() {
-    if (this._cpuMonitorInterval) {
-      clearInterval(this._cpuMonitorInterval);
+  _incrementSubRequest() {
+    this._subRequestCount++;
+    this._requestCount++;
+  }
+  
+  _getCurrentWIBHour() {
+    const now = new Date();
+    const wibHour = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
+    return wibHour;
+  }
+  
+  _getCurrentWIBMinutes() {
+    return new Date().getUTCMinutes();
+  }
+  
+  _getCurrentWIBTime() {
+    const now = new Date();
+    const hours = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
+    const minutes = String(now.getUTCMinutes()).padStart(2, '0');
+    return {
+        hours: hours,
+        minutes: now.getUTCMinutes(),
+        totalMinutes: (hours * 60) + now.getUTCMinutes(),
+        formatted: `${String(hours).padStart(2, '0')}:${minutes} WIB`
+    };
+  }
+  
+  _formatWIBTime(hours, minutes) {
+    const pad = (num) => String(num).padStart(2, '0');
+    return `${pad(hours)}:${pad(minutes)} WIB`;
+  }
+  
+  _isQuizTime() {
+    const wibHour = this._getCurrentWIBHour();
+    const wibMinutes = this._getCurrentWIBMinutes();
+    const currentTotalMinutes = (wibHour * 60) + wibMinutes;
+    const startTotalMinutes = (QUIZ_SCHEDULE.START_HOUR * 60);
+    const endTotalMinutes = (QUIZ_SCHEDULE.END_HOUR * 60);
+    
+    return currentTotalMinutes >= startTotalMinutes && currentTotalMinutes < endTotalMinutes;
+  }
+  
+  _getNextQuizStartTime() {
+    const now = new Date();
+    const wibTime = this._getCurrentWIBTime();
+    
+    const startTime = new Date(now);
+    startTime.setUTCHours(QUIZ_SCHEDULE.START_HOUR - QUIZ_SCHEDULE.TIMEZONE_OFFSET, 0, 0, 0);
+    
+    if (wibTime.totalMinutes >= (QUIZ_SCHEDULE.START_HOUR * 60)) {
+      startTime.setUTCDate(startTime.getUTCDate() + 1);
     }
     
-    this._cpuMonitorInterval = setInterval(() => {
-      try {
-        // Reset rate limits periodically
-        if (this._rateLimitMap.size > 0) {
-          const now = Date.now();
-          for (const [key, data] of this._rateLimitMap) {
-            if (now - data.resetTime > 1000) {
-              this._rateLimitMap.delete(key);
-            }
+    return startTime;
+  }
+  
+  _getTimeLeftUntilNextEvent() {
+    const wibTime = this._getCurrentWIBTime();
+    const currentTotalMinutes = wibTime.totalMinutes;
+    
+    const startTotalMinutes = (QUIZ_SCHEDULE.START_HOUR * 60);
+    const endTotalMinutes = (QUIZ_SCHEDULE.END_HOUR * 60);
+    
+    if (currentTotalMinutes >= startTotalMinutes && currentTotalMinutes < endTotalMinutes) {
+      return { 
+        minutes: 0, 
+        seconds: 0, 
+        isRunning: true,
+        hours: 0,
+        totalMinutes: 0,
+        status: 'running',
+        currentTime: wibTime.formatted,
+        startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
+        endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
+        startHour: QUIZ_SCHEDULE.START_HOUR,
+        endHour: QUIZ_SCHEDULE.END_HOUR
+      };
+    }
+    
+    let targetTotalMinutes;
+    let status;
+    let dayText = "";
+    
+    if (currentTotalMinutes < startTotalMinutes) {
+      targetTotalMinutes = startTotalMinutes;
+      status = 'before';
+      dayText = "hari ini";
+    } else {
+      targetTotalMinutes = startTotalMinutes + 1440;
+      status = 'after';
+      dayText = "besok";
+    }
+    
+    const diffMinutes = targetTotalMinutes - currentTotalMinutes;
+    const hours = Math.floor(diffMinutes / 60);
+    const minutes = Math.floor(diffMinutes % 60);
+    const totalSeconds = diffMinutes * 60;
+    
+    return {
+      hours: hours,
+      minutes: minutes,
+      seconds: 0,
+      totalMinutes: diffMinutes,
+      totalSeconds: totalSeconds,
+      isRunning: false,
+      status: status,
+      startHour: QUIZ_SCHEDULE.START_HOUR,
+      endHour: QUIZ_SCHEDULE.END_HOUR,
+      startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
+      endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
+      currentTime: wibTime.formatted,
+      dayText: dayText
+    };
+  }
+  
+  _getCurrentWeek() {
+    const now = new Date();
+    const year = now.getUTCFullYear();
+    const startOfYear = new Date(year, 0, 1);
+    const diff = now - startOfYear;
+    const week = Math.ceil((diff / 86400000 + startOfYear.getUTCDay() + 1) / 7);
+    return `${year}-W${String(week).padStart(2, '0')}`;
+  }
+  
+  async _getQuizPoints() {
+    if (!this.env || !this.env.QUESTIONS) return {};
+    try {
+      const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json');
+      return points || {};
+    } catch(e) {
+      return {};
+    }
+  }
+  
+  async _getLastWeekWinner() {
+    if (!this.env || !this.env.QUESTIONS) return null;
+    try {
+      const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
+      return winner || null;
+    } catch(e) {
+      return null;
+    }
+  }
+  
+  async _checkAndResetWeeklyPoints() {
+    if (!this.env || !this.env.QUESTIONS) return false;
+    
+    try {
+      const currentWeek = this._getCurrentWeek();
+      const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
+      
+      if (savedWeek !== currentWeek) {
+        const points = await this._getQuizPoints();
+        
+        let winner = null;
+        let highestScore = 0;
+        
+        for (const [username, score] of Object.entries(points)) {
+          if (score > highestScore) {
+            highestScore = score;
+            winner = username;
           }
         }
         
-        // Log CPU usage if needed
-        if (this._cpuHistory.length > 0) {
-          const avg = this._cpuHistory.reduce((a, b) => a + b, 0) / this._cpuHistory.length;
-          if (avg > CONSTANTS.CPU_TIME_LIMIT_MS * 0.9) {
-            // CPU tinggi, throttle lebih agresif
-            this._isThrottled = true;
-            setTimeout(() => {
-              this._isThrottled = false;
-            }, 500);
-          }
+        if (winner) {
+          const winnerData = {
+            username: winner,
+            score: highestScore,
+            week: savedWeek || currentWeek
+          };
+          
+          await this.env.QUESTIONS.put(
+            CONSTANTS.QUIZ_LAST_WEEK_WINNER,
+            JSON.stringify(winnerData)
+          );
+          
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizLastWeekWinner",
+            winner,
+            highestScore,
+            savedWeek || currentWeek
+          ]);
         }
+        
+        await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify({}));
+        await this.env.QUESTIONS.put(CONSTANTS.QUIZ_WEEK_KEY, currentWeek);
+        
+        return true;
+      }
+      return false;
+    } catch(e) {
+      return false;
+    }
+  }
+  
+  _startQuizScheduler() {
+    if (this.quizAutoTimer) {
+      clearInterval(this.quizAutoTimer);
+      this.quizAutoTimer = null;
+    }
+    
+    this.quizAutoTimer = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this.quizAutoTimer);
+        this.quizAutoTimer = null;
+        return;
+      }
+      
+      try {
+        this.translationManager.resetDailyCounter();
+        this._checkQuizAutoStatus();
+        this._checkAndRestartQuiz();
+        
+        const timeInfo = this._getTimeLeftUntilNextEvent();
+        if (!timeInfo.isRunning) {
+          this._broadcastQuizTimeLeft();
+        }
+        
       } catch(e) {}
-    }, CONSTANTS.CPU_CHECK_INTERVAL_MS);
+    }, CONSTANTS.SCHEDULER_INTERVAL_MS);
   }
   
-  // ==================== RATE LIMITING ====================
+  async _checkQuizAutoStatus() {
+    try {
+      const isQuizTime = this._isQuizTime();
+      const wibTime = this._getCurrentWIBTime();
+      
+      if (isQuizTime) {
+        if (!this.quizAutoEnabled) {
+          this.quizAutoEnabled = true;
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            `⏳ Quiz akan segera dimulai! (${wibTime.formatted})`,
+            false
+          ]);
+          
+          await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
+          
+          if (!this._quizStartTimeout) {
+            this.forceStartQuiz();
+          }
+        } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+          await this._showQuestion();
+        }
+        return false;
+      } else {
+        if (this.quizAutoEnabled) {
+          this.quizAutoEnabled = false;
+          await this.resetQuiz();
+          
+          const timeInfo = this._getTimeLeftUntilNextEvent();
+          let statusMsg = "";
+          if (timeInfo.status === 'before') {
+            statusMsg = `⏳ Quiz dimulai pukul ${timeInfo.startTime}\n🕐 Sekarang: ${timeInfo.currentTime}`;
+          } else {
+            statusMsg = `⏸️ Quiz telah berakhir. Kembali besok pukul ${timeInfo.startTime}`;
+          }
+          
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            statusMsg,
+            true
+          ]);
+        }
+        return true;
+      }
+    } catch(e) {
+      return true;
+    }
+  }
   
-  _isRateLimited(wsId, eventType) {
-    const now = Date.now();
-    const key = `${wsId}_${eventType}`;
-    const data = this._rateLimitMap.get(key);
-    
-    if (!data) {
-      this._rateLimitMap.set(key, { count: 1, resetTime: now + 1000 });
+  forceStartQuiz() {
+    if (!this._isQuizTime()) {
       return false;
     }
     
-    if (now > data.resetTime) {
-      data.count = 1;
-      data.resetTime = now + 1000;
+    if (this.currentQuestion) {
       return false;
     }
     
-    data.count++;
-    return data.count > 10; // Max 10 event per second per type
+    if (this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
+      return false;
+    }
+    
+    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+      this._initQuiz().then(() => {
+        this._showQuestion();
+      });
+      return false;
+    }
+    
+    this.quizAutoEnabled = true;
+    this._showQuestion();
+    return true;
   }
   
-  // ==================== EVENT QUEUE WITH CPU PROTECTION ====================
+  _checkAndRestartQuiz() {
+    try {
+      if (!this._isQuizTime()) {
+        return;
+      }
+      
+      const isRunning = this.currentQuestion !== null;
+      const isWaiting = this.isQuizWaiting;
+      const hasTimeout = this._quizTimeout !== null;
+      const hasBreak = this._quizBreakTimeout !== null;
+      
+      if (!isRunning && !isWaiting && !hasTimeout && !hasBreak) {
+        this.quizAutoEnabled = true;
+        this._showQuestion();
+      }
+    } catch(e) {}
+  }
   
-  async _processEventQueue() {
-    if (this._isProcessingQueue || this._eventQueue.length === 0) {
+  ensureQuizStarted() {
+    if (this._quizTimeout) {
+      clearTimeout(this._quizTimeout);
+      this._quizTimeout = null;
+    }
+    if (this._quizBreakTimeout) {
+      clearTimeout(this._quizBreakTimeout);
+      this._quizBreakTimeout = null;
+    }
+    if (this._quizStartTimeout) {
+      clearTimeout(this._quizStartTimeout);
+      this._quizStartTimeout = null;
+    }
+    
+    this.forceStartQuiz();
+  }
+  
+  ensureQuizRunning() {
+    try {
+      this._forceStartQuizIfTime();
+      
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        this._initQuiz().then(() => {
+          if (!this.closing && !this.isDestroyed) {
+            this.forceStartQuiz();
+          }
+        });
+        return;
+      }
+      
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+        this.forceStartQuiz();
+      }
+      
+      if (!this._quizKeepAliveInterval) {
+        this._startQuizKeepAlive();
+      }
+      
+    } catch(e) {}
+  }
+  
+  _forceStartQuizIfTime() {
+    if (!this._isQuizTime()) {
       return;
     }
     
-    this._isProcessingQueue = true;
-    this._startCPUTimer();
+    if (this.currentQuestion) {
+      return;
+    }
+    
+    if (this._quizTimeout) {
+      return;
+    }
+    
+    if (this.isQuizWaiting) {
+      return;
+    }
+    
+    if (this._quizStartTimeout) {
+      return;
+    }
+    
+    this.quizAutoEnabled = true;
+    this._showQuestion();
+  }
+  
+  _sendQuizTimeLeftToUser(ws) {
+    if (!ws || ws.readyState !== 1) return false;
     
     try {
-      const batchSize = CONSTANTS.MAX_EVENTS_PER_TICK;
-      const batch = this._eventQueue.splice(0, batchSize);
+      const timeInfo = this._getTimeLeftUntilNextEvent();
       
-      for (const item of batch) {
-        try {
-          await this._processEventItem(item.ws, item.data);
-        } catch(e) {
-          // Skip error
+      let message = "";
+      let canType = true;
+      let isQuizTime = timeInfo.isRunning;
+      
+      if (isQuizTime) {
+        if (this.currentQuestion && this._quizStartTime) {
+          const elapsed = (Date.now() - this._quizStartTime) / 1000;
+          const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+          const left = Math.max(0, total - elapsed);
+          const minutes = Math.floor(left / 60);
+          const seconds = Math.floor(left % 60);
+          
+          if (minutes > 0) {
+            message = `📝 Quiz berjalan! ${minutes}m ${seconds}s tersisa`;
+          } else {
+            message = `📝 Quiz berjalan! ${seconds}s tersisa`;
+          }
+          canType = false;
+        } else {
+          message = `⏳ Quiz akan segera dimulai! (${timeInfo.currentTime})`;
+          canType = true;
         }
         
-        // Cek CPU limit
-        if (this._checkCPULimit()) {
-          await this._cpuYield();
-          this._startCPUTimer();
+        this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
+        return false;
+        
+      } else {
+        const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
+        
+        let countdownText = "";
+        const totalSeconds = (hours * 3600) + (minutes * 60);
+        
+        if (totalSeconds <= 0) {
+          countdownText = "Segera!";
+        } else if (hours > 0) {
+          if (minutes > 0) {
+            countdownText = `${hours} jam ${minutes} menit`;
+          } else {
+            countdownText = `${hours} jam`;
+          }
+        } else if (minutes > 0) {
+          countdownText = `${minutes} menit`;
+        } else {
+          countdownText = "Kurang dari 1 menit";
         }
+        
+        let statusText = "";
+        if (status === 'before') {
+          statusText = `⏳ Quiz dimulai ${dayText} pukul ${startTime} (WIB)`;
+        } else {
+          statusText = `⏸️ Quiz hari ini selesai. Kembali ${dayText} pukul ${startTime} (WIB)`;
+        }
+        
+        message = `${statusText}\n🕐 Waktu sekarang: ${currentTime}\n⏱️ Tersisa: ${countdownText}`;
+        canType = true;
+        
+        this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
+        return true;
+      }
+    } catch(e) {
+      return true;
+    }
+  }
+  
+  _broadcastQuizTimeLeft() {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    const timeInfo = this._getTimeLeftUntilNextEvent();
+    
+    let message = "";
+    let canType = true;
+    let isQuizTime = timeInfo.isRunning;
+    
+    if (isQuizTime) {
+      if (this.currentQuestion && this._quizStartTime) {
+        const elapsed = (Date.now() - this._quizStartTime) / 1000;
+        const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+        const left = Math.max(0, total - elapsed);
+        const minutes = Math.floor(left / 60);
+        const seconds = Math.floor(left % 60);
+        
+        if (minutes > 0) {
+          message = `📝 Quiz berjalan! ${minutes}m ${seconds}s tersisa`;
+        } else {
+          message = `📝 Quiz berjalan! ${seconds}s tersisa`;
+        }
+        canType = false;
+      } else {
+        message = `⏳ Quiz akan segera dimulai! (${timeInfo.currentTime})`;
+        canType = true;
+      }
+    } else {
+      const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
+      
+      let countdownText = "";
+      const totalSeconds = (hours * 3600) + (minutes * 60);
+      
+      if (totalSeconds <= 0) {
+        countdownText = "Segera!";
+      } else if (hours > 0) {
+        if (minutes > 0) {
+          countdownText = `${hours} jam ${minutes} menit`;
+        } else {
+          countdownText = `${hours} jam`;
+        }
+      } else if (minutes > 0) {
+        countdownText = `${minutes} menit`;
+      } else {
+        countdownText = "Kurang dari 1 menit";
       }
       
-      // Jika masih ada queue, proses lanjutan dengan delay
-      if (this._eventQueue.length > 0) {
+      if (status === 'before') {
+        message = `⏳ Quiz dimulai ${dayText} pukul ${startTime}\n⏱️ Tersisa: ${countdownText}`;
+      } else {
+        message = `⏸️ Quiz hari ini selesai. Kembali ${dayText} pukul ${startTime}\n⏱️ Tersisa: ${countdownText}`;
+      }
+      canType = true;
+    }
+    
+    this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, canType, isQuizTime]);
+  }
+  
+  _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
+    if (!ws || ws.readyState !== 1) return false;
+    
+    try {
+      const timeInfo = this._getTimeLeftUntilNextEvent();
+      let message = "";
+      
+      switch(errorType) {
+        case "NOT_QUIZ_TIME":
+          if (timeInfo.status === 'before') {
+            const { hours, minutes, startTime, currentTime } = timeInfo;
+            let timeStr = "";
+            if (hours > 0 && minutes > 0) {
+              timeStr = `${hours} jam ${minutes} menit`;
+            } else if (hours > 0) {
+              timeStr = `${hours} jam`;
+            } else if (minutes > 0) {
+              timeStr = `${minutes} menit`;
+            } else {
+              timeStr = "kurang dari 1 menit";
+            }
+            message = `⏳ Quiz dimulai pukul ${startTime} (WIB)\n🕐 Sekarang: ${currentTime}\n⏱️ Tersisa: ${timeStr}`;
+          } else {
+            const { startTime, currentTime } = timeInfo;
+            message = `⏸️ Quiz telah berakhir.\n🕐 Sekarang: ${currentTime}\n📅 Kembali besok pukul ${startTime} (WIB)`;
+          }
+          break;
+          
+        case "QUIZ_DISABLED":
+          message = "❌ Quiz sedang tidak tersedia";
+          break;
+          
+        case "QUIZ_ENDED":
+          const { hours, minutes, startTime, currentTime } = timeInfo;
+          let timeStr = "";
+          if (hours > 0 && minutes > 0) {
+            timeStr = `${hours} jam ${minutes} menit`;
+          } else if (hours > 0) {
+            timeStr = `${hours} jam`;
+          } else if (minutes > 0) {
+            timeStr = `${minutes} menit`;
+          } else {
+            timeStr = "kurang dari 1 menit";
+          }
+          message = `⏸️ Quiz telah berakhir.\n🕐 Sekarang: ${currentTime}\n📅 Lanjut besok pukul ${startTime} (WIB)\n⏱️ Tersisa: ${timeStr}`;
+          break;
+          
+        case "QUIZ_NOT_STARTED":
+          message = `⏳ Quiz akan dimulai pukul ${QUIZ_SCHEDULE.START_HOUR}:00 WIB`;
+          break;
+          
+        default:
+          message = customMessage || "❌ Terjadi kesalahan pada Quiz";
+      }
+      
+      this._safeSend(ws, ["quizError", message]);
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+  
+  _setUserLanguage(ws, countryCode) {
+    if (!ws) return 'en';
+    const wsId = this._getWsId(ws);
+    if (!wsId) return 'en';
+    
+    this.userCountry.set(wsId, countryCode);
+    
+    const lang = this._countryToLanguage(countryCode);
+    this.userLanguage.set(wsId, lang);
+    
+    return lang;
+  }
+  
+  async switchRoom(ws, room, username = null) {
+    if (this.isDestroyed) {
+      this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
+      return;
+    }
+    if (!room || room.trim() === "") {
+      this._safeSend(ws, ["gameLowCardError", "Invalid room name"]);
+      return;
+    }
+    
+    const roomName = room.trim();
+    const wsId = this._getWsId(ws);
+    
+    if (!wsId) {
+      this._safeSend(ws, ["gameLowCardError", "Connection error"]);
+      return;
+    }
+    
+    const lockKey = `switch_${wsId}`;
+    if (this._switchLocks.has(lockKey)) return;
+    this._switchLocks.set(lockKey, Date.now());
+    
+    try {
+      const oldRoom = this.clientRooms.get(wsId);
+      
+      if (oldRoom === roomName) {
+        if (roomName === QUIZ_ROOM) {
+          let lang = this.userLanguage.get(wsId);
+          if (!lang) {
+            const country = this.userCountry.get(wsId) || 'US';
+            lang = this._setUserLanguage(ws, country);
+          }
+          
+          if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+            await this._initQuiz();
+          }
+          
+          if (this._isQuizTime()) {
+            if (!this.quizAutoEnabled) {
+              this.quizAutoEnabled = true;
+            }
+            this.forceStartQuiz();
+          }
+          
+          setTimeout(() => {
+            if (this.closing || this.isDestroyed) return;
+            this._sendQuizTimeLeftToUser(ws);
+          }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
+        }
+        return;
+      }
+      
+      if (oldRoom) {
+        this._removeClientFromRoom(oldRoom, wsId);
+      }
+      
+      this._addClient(roomName, ws, username, false);
+      ws.room = roomName;
+      ws.roomname = roomName;
+      ws.username = username;
+      
+      if (username) {
+        const conn = this.userConnections.get(username);
+        if (conn) conn.room = roomName;
+      }
+      
+      if (roomName === QUIZ_ROOM) {
+        let country = this.userCountry.get(wsId);
+        if (!country) {
+          const cf = ws._cf || {};
+          country = cf.country || 'US';
+          this.userCountry.set(wsId, country);
+        }
+        
+        this._setUserLanguage(ws, country);
+        
+        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+          await this._initQuiz();
+        }
+        
+        if (this._isQuizTime()) {
+          if (!this.quizAutoEnabled) {
+            this.quizAutoEnabled = true;
+          }
+          this.forceStartQuiz();
+        }
+        
         setTimeout(() => {
-          this._processEventQueue();
-        }, CONSTANTS.CPU_YIELD_DELAY_MS);
+          if (this.closing || this.isDestroyed) return;
+          this._sendQuizTimeLeftToUser(ws);
+        }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
       }
       
     } finally {
-      this._isProcessingQueue = false;
+      this._switchLocks.delete(lockKey);
     }
   }
   
-  async _processEventItem(ws, data) {
+  async _loadAllQuestionsFromKV() {
+    if (!this.env || !this.env.QUESTIONS) return false;
+    
+    try {
+      this._incrementSubRequest();
+      const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
+      
+      if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
+        this._allQuestions = cached.questions.map((q, index) => ({
+          id: index + 1,
+          question: q.question || '',
+          options: q.options || { A: '', B: '', C: '', D: '' },
+          correct: q.correct || 'A',
+          category: q.category || 'General',
+          difficulty: q.difficulty || 'medium'
+        }));
+        
+        this._isAllQuestionsLoaded = true;
+        this._currentBatchStart = 0;
+        this._currentBatchEnd = 0;
+        this._questionPointer = 0;
+        this._totalQuestionsAnswered = 0;
+        this._currentBatchIndex = 0;
+        
+        this._loadNextBatch();
+        
+        return true;
+      }
+      
+      return false;
+    } catch(e) {
+      return false;
+    }
+  }
+  
+  _loadNextBatch() {
+    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+      return false;
+    }
+    
+    const totalQuestions = this._allQuestions.length;
+    let startIndex = this._currentBatchEnd;
+    
+    if (startIndex >= totalQuestions) {
+      startIndex = 0;
+      this._currentBatchStart = 0;
+      this._currentBatchEnd = 0;
+      this._questionPointer = 0;
+      this._totalQuestionsAnswered = 0;
+      this._currentBatchIndex = 0;
+    }
+    
+    let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
+    const batch = this._allQuestions.slice(startIndex, endIndex);
+    
+    this.quizQuestionCache['en'] = batch;
+    this._currentQuestions = batch;
+    this._currentBatchStart = startIndex;
+    this._currentBatchEnd = endIndex;
+    this._currentBatchIndex = Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE);
+    this._lastLoadedBatch = this._currentBatchIndex;
+    
+    return true;
+  }
+  
+  _checkAndLoadNextBatch() {
+    const questions = this.quizQuestionCache['en'] || [];
+    
+    if (this._questionPointer >= questions.length) {
+      this._loadNextBatch();
+      
+      const newQuestions = this.quizQuestionCache['en'] || [];
+      if (this._currentBatchStart === 0 && newQuestions.length > 0) {
+        this._questionPointer = 0;
+      }
+      
+      return true;
+    }
+    
+    return false;
+  }
+  
+  async _broadcastQuizQuestion(question, options) {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    const usersByLang = new Map();
+    
+    for (const wsId of wsIds) {
+      try {
+        const ws = this.wsMap.get(wsId);
+        if (!ws || ws.readyState !== 1) continue;
+        
+        const lang = this.userLanguage.get(wsId) || 'en';
+        
+        if (!usersByLang.has(lang)) {
+          usersByLang.set(lang, []);
+        }
+        usersByLang.get(lang).push(ws);
+      } catch(e) {}
+    }
+    
+    if (usersByLang.size === 0) return;
+    
+    await this.translationManager.translateForUsers(question, options, usersByLang);
+  }
+  
+  _broadcastQuizResult(type, data) {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    const msgStr = JSON.stringify([type, data]);
+    
+    for (const wsId of wsIds) {
+      try {
+        const ws = this.wsMap.get(wsId);
+        if (ws && ws.readyState === 1) {
+          ws.send(msgStr);
+        }
+      } catch(e) {}
+    }
+  }
+  
+  _startQuizKeepAlive() {
+    if (this._quizKeepAliveInterval) {
+      clearInterval(this._quizKeepAliveInterval);
+      this._quizKeepAliveInterval = null;
+    }
+    
+    this._quizKeepAliveInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._quizKeepAliveInterval);
+        this._quizKeepAliveInterval = null;
+        return;
+      }
+      
+      if (this._isQuizTime()) {
+        const now = Date.now();
+        
+        if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+          if (this.quizAutoEnabled) {
+            this._showQuestion();
+          } else {
+            this.quizAutoEnabled = true;
+            this._showQuestion();
+          }
+        }
+        
+        if (this.currentQuestion && this._quizStartTime) {
+          const elapsed = (now - this._quizStartTime) / 1000;
+          const maxTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+          
+          if (elapsed > maxTime - 2) {
+            if (!this._quizTimeout) {
+              this._forceEvaluateQuiz();
+            }
+          }
+        }
+      }
+    }, CONSTANTS.QUIZ_KEEP_ALIVE_INTERVAL_MS);
+  }
+  
+  async _forceEvaluateQuiz() {
+    if (!this.currentQuestion) return;
+    if (this._quizTimeout) return;
+    
+    try {
+      const currentClients = this.wsClients.get(QUIZ_ROOM);
+      if (!currentClients || currentClients.size === 0) {
+        this.currentQuestion = null;
+        return;
+      }
+
+      const correctAnswer = this.currentQuestion.correct;
+      const question = this.currentQuestion.question;
+      const options = this.currentQuestion.options;
+
+      if (this.quizHasWinner && this.quizWinner) {
+        const points = await this._getQuizPoints();
+        points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
+        
+        if (this.env && this.env.QUESTIONS) {
+          this._incrementSubRequest();
+          await this.env.QUESTIONS.put(
+            CONSTANTS.QUIZ_POINT_KEY,
+            JSON.stringify(points)
+          );
+        }
+        
+        const totalPoints = points[this.quizWinner] || 0;
+        
+        this._broadcastQuizResult("quizWinner", {
+          username: this.quizWinner,
+          totalPoints: totalPoints,
+          correctAnswer: correctAnswer
+        });
+        
+      } else {
+        this._broadcastQuizResult("quizNoWinner", {
+          message: "No one answered correctly!",
+          correctAnswer: correctAnswer
+        });
+      }
+      
+      this._broadcastQuizResult("quizCorrectAnswer", {
+        question: question,
+        options: options,
+        correctAnswer: correctAnswer
+      });
+
+      this.currentQuestion = null;
+      this.isQuizWaiting = true;
+
+      this._quizBreakTimeout = setTimeout(() => {
+        if (this.closing || this.isDestroyed) {
+          this._quizBreakTimeout = null;
+          return;
+        }
+        this.isQuizWaiting = false;
+        this._quizBreakTimeout = null;
+        
+        if (!this.closing && !this.isDestroyed) {
+          this.ensureQuizRunning();
+        }
+      }, CONSTANTS.QUIZ_BREAK_MS);
+
+    } catch(e) {
+      this.currentQuestion = null;
+      this.isQuizWaiting = false;
+    }
+  }
+  
+  async _showQuestion() {
+    try {
+      this._lastActivityTime = Date.now();
+      this._isQuizIdle = false;
+      
+      if (!this._isQuizTime()) {
+        const clients = this.wsClients.get(QUIZ_ROOM);
+        if (clients && clients.size > 0) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏸️ Quiz is offline.",
+            true
+          ]);
+        }
+        return;
+      }
+      
+      if (!this.quizAutoEnabled) {
+        this.quizAutoEnabled = true;
+        const clients = this.wsClients.get(QUIZ_ROOM);
+        if (clients && clients.size > 0) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏳ Quiz will start soon!",
+            true
+          ]);
+        }
+        return;
+      }
+      
+      if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) {
+        return;
+      }
+
+      this._checkAndLoadNextBatch();
+      
+      const questions = this.quizQuestionCache['en'] || [];
+      
+      if (questions.length === 0) {
+        const loaded = this._loadNextBatch();
+        if (!loaded) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizError",
+            "No questions available! Please add questions to KV."
+          ]);
+          return;
+        }
+      }
+      
+      const q = questions[this._questionPointer];
+      
+      if (!q || !q.options) {
+        this._questionPointer++;
+        this._showQuestion();
+        return;
+      }
+
+      const shuffled = this._shuffleQuestionOptions(q);
+      
+      this.currentQuestion = {
+        ...q,
+        options: shuffled.options,
+        correct: shuffled.correct
+      };
+      
+      this._quizStartTime = Date.now();
+      this.quizAnswered = new Set();
+      this.quizHasWinner = false;
+      this.quizWinner = null;
+      
+      this._questionPointer++;
+      this._totalQuestionsAnswered++;
+
+      await this._broadcastQuizQuestion(
+        this.currentQuestion.question,
+        this.currentQuestion.options
+      );
+
+      this._broadcastToRoom(QUIZ_ROOM, [
+        "quizTimeLeft",
+        `📝 Question ${this._questionPointer}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
+        false
+      ]);
+
+      if (this._quizTimeout) clearTimeout(this._quizTimeout);
+      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
+
+      this._quizTimeout = setTimeout(async () => {
+        try {
+          if (this.closing || this.isDestroyed) {
+            this._quizTimeout = null;
+            return;
+          }
+
+          const currentClients = this.wsClients.get(QUIZ_ROOM);
+          if (!currentClients || currentClients.size === 0) {
+            this._quizTimeout = null;
+            this.currentQuestion = null;
+            return;
+          }
+
+          const correctAnswer = this.currentQuestion.correct;
+          const question = this.currentQuestion.question;
+          const options = this.currentQuestion.options;
+
+          if (this.quizHasWinner && this.quizWinner) {
+            const points = await this._getQuizPoints();
+            points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
+            
+            if (this.env && this.env.QUESTIONS) {
+              this._incrementSubRequest();
+              await this.env.QUESTIONS.put(
+                CONSTANTS.QUIZ_POINT_KEY,
+                JSON.stringify(points)
+              );
+            }
+            
+            const totalPoints = points[this.quizWinner] || 0;
+            
+            this._broadcastQuizResult("quizWinner", {
+              username: this.quizWinner,
+              totalPoints: totalPoints,
+              correctAnswer: correctAnswer
+            });
+            
+          } else {
+            this._broadcastQuizResult("quizNoWinner", {
+              message: "No one answered correctly!",
+              correctAnswer: correctAnswer
+            });
+          }
+          
+          this._broadcastQuizResult("quizCorrectAnswer", {
+            question: question,
+            options: options,
+            correctAnswer: correctAnswer
+          });
+
+          this._quizTimeout = null;
+          this.isQuizWaiting = true;
+
+          this._quizBreakTimeout = setTimeout(() => {
+            if (this.closing || this.isDestroyed) {
+              this._quizBreakTimeout = null;
+              return;
+            }
+            this.isQuizWaiting = false;
+            this._quizBreakTimeout = null;
+            this.currentQuestion = null;
+            
+            this._broadcastToRoom(QUIZ_ROOM, [
+              "quizNextQuestionIn",
+              "5"
+            ]);
+            
+            setTimeout(() => {
+              this._broadcastToRoom(QUIZ_ROOM, [
+                "quizNextQuestionIn",
+                "3"
+              ]);
+            }, 2000);
+            
+            setTimeout(() => {
+              this._broadcastToRoom(QUIZ_ROOM, [
+                "quizNextQuestionIn",
+                "1"
+              ]);
+            }, 4000);
+            
+            if (!this.closing && !this.isDestroyed) {
+              this.ensureQuizRunning();
+            }
+          }, CONSTANTS.QUIZ_BREAK_MS);
+
+        } catch(e) {
+          this._quizTimeout = null;
+          this.currentQuestion = null;
+          this.isQuizWaiting = false;
+        }
+      }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
+
+    } catch(e) {
+      this.currentQuestion = null;
+      this.isQuizWaiting = false;
+      this._quizTimeout = null;
+    }
+  }
+  
+  async submitQuizAnswer(ws, username, answer) {
+    try {
+      if (!ws || !username) {
+        this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
+        return;
+      }
+      
+      const room = this._ensureRoomConsistency(ws);
+      if (room !== QUIZ_ROOM) {
+        this._safeSend(ws, ["quizError", "Quiz only available in Quiz room"]);
+        return;
+      }
+      
+      if (!this._isQuizTime()) {
+        this._sendQuizErrorWithTime(ws, "NOT_QUIZ_TIME");
+        return;
+      }
+      
+      if (!this.quizAutoEnabled) {
+        this._sendQuizErrorWithTime(ws, "QUIZ_DISABLED");
+        return;
+      }
+      
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      if (!clients || clients.size === 0) {
+        this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
+        return;
+      }
+      
+      if (!this.currentQuestion) {
+        this._startQuizIfNeeded();
+        if (!this.currentQuestion) {
+          this._sendQuizErrorWithTime(ws, "QUIZ_NOT_STARTED");
+          return;
+        }
+      }
+      
+      if (this.quizHasWinner) {
+        this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
+        return;
+      }
+      
+      if (this.quizAnswered.has(username)) {
+        this._safeSend(ws, ["quizError", "You already answered!"]);
+        return;
+      }
+      
+      const answerKey = answer ? answer.toUpperCase().trim() : '';
+      const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
+      const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
+      
+      const resultObj = {
+        username: username,
+        answer: isValidAnswer ? answerKey : "?",
+        isCorrect: isCorrect,
+        correctAnswer: this.currentQuestion.correct
+      };
+      
+      this._broadcastQuizResult("quizAnswerResult", resultObj);
+      this.quizAnswered.add(username);
+      
+      if (isCorrect && !this.quizHasWinner) {
+        this.quizHasWinner = true;
+        this.quizWinner = username;
+      }
+      
+    } catch(e) {
+      this._safeSend(ws, ["quizError", e.message]);
+    }
+  }
+  
+  _startQuizLoop() {
+    if (this.quizTimer) {
+      clearInterval(this.quizTimer);
+      this.quizTimer = null;
+    }
+    
+    this.quizTimer = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this.quizTimer);
+        this.quizTimer = null;
+        return;
+      }
+      
+      if (this._isQuizTime()) {
+        if (!this.quizAutoEnabled) {
+          this.quizAutoEnabled = true;
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏳ Quiz will start soon!",
+            true
+          ]);
+        }
+        
+        if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+          this._showQuestion();
+        }
+        
+      } else {
+        if (this.quizAutoEnabled) {
+          this.quizAutoEnabled = false;
+          this.resetQuiz();
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏸️ Quiz has ended. See you tomorrow!",
+            true
+          ]);
+        }
+      }
+    }, CONSTANTS.QUIZ_INTERVAL_MS);
+  }
+  
+  async resetQuiz() {
+    try {
+      if (this._quizTimeout) {
+        clearTimeout(this._quizTimeout);
+        this._quizTimeout = null;
+      }
+      if (this._quizBreakTimeout) {
+        clearTimeout(this._quizBreakTimeout);
+        this._quizBreakTimeout = null;
+      }
+      if (this._quizStartTimeout) {
+        clearTimeout(this._quizStartTimeout);
+        this._quizStartTimeout = null;
+      }
+      if (this._quizKeepAliveInterval) {
+        clearInterval(this._quizKeepAliveInterval);
+        this._quizKeepAliveInterval = null;
+      }
+      
+      this.currentQuestion = null;
+      this.isQuizWaiting = false;
+      this.quizHasWinner = false;
+      this.quizWinner = null;
+      this.quizAnswered = new Set();
+      this._quizStartTime = null;
+      
+    } catch(e) {}
+  }
+  
+  async startQuizWithDelay(delayMs) {
+    if (this._quizStartTimeout) return;
+    
+    this._quizStartTimeout = setTimeout(() => {
+      if (this.closing || this.isDestroyed) {
+        this._quizStartTimeout = null;
+        return;
+      }
+      this._quizStartTimeout = null;
+      
+      if (!this.currentQuestion && this.quizAutoEnabled) {
+        this.forceStartQuiz();
+      }
+    }, delayMs);
+  }
+  
+  _startQuizIfNeeded() {
+    try {
+      const clients = this.wsClients.get(QUIZ_ROOM);
+      if (!clients || clients.size === 0) return;
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+          this._initQuiz().then(() => {
+            if (!this.closing && !this.isDestroyed) {
+              this._showQuestion();
+            }
+          });
+          return;
+        }
+        this._showQuestion();
+      }
+    } catch(e) {}
+  }
+  
+  async _initQuiz(retryCount = 0) {
+    try {
+      const loaded = await this._loadAllQuestionsFromKV();
+      if (loaded) {
+        this._startQuizLoop();
+        this._startTranslateResetCounter();
+        this._startQuizKeepAlive();
+        return true;
+      }
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+      }
+      return false;
+    } catch(e) {
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+      }
+      return false;
+    }
+  }
+  
+  _startTranslateResetCounter() {
+    if (this._translateResetInterval) {
+      clearInterval(this._translateResetInterval);
+      this._translateResetInterval = null;
+    }
+    this._translateResetInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._translateResetInterval);
+        this._translateResetInterval = null;
+        return;
+      }
+      this.translationManager.resetDailyCounter();
+    }, 60000);
+  }
+  
+  async handleEvent(ws, data) {
     if (this.isDestroyed || !ws || !data || !data[0]) return;
-    
-    const evt = data[0];
-    const wsId = this._getWsId(ws);
-    
-    if (wsId && this._isRateLimited(wsId, evt)) {
-      this._safeSend(ws, ["gameLowCardError", "Too many requests"]);
-      return;
-    }
-    
-    // Handle event dengan proteksi CPU
-    await this._safeExecute(async () => {
-      await this._handleEventInternal(ws, data);
-    });
-  }
-  
-  async _handleEventInternal(ws, data) {
-    // Logika handleEvent yang asli
     const evt = data[0];
     
     if (evt === "switchRoom") {
@@ -1048,111 +2037,6 @@ export class GameServer extends CPUProtection {
         break;
     }
   }
-
-  // Override handleEvent untuk menggunakan queue
-  async handleEvent(ws, data) {
-    if (this.isDestroyed || !ws || !data || !data[0]) return;
-    
-    // Masukkan ke queue
-    this._eventQueue.push({ ws, data });
-    
-    if (!this._isProcessingQueue) {
-      this._processEventQueue();
-    }
-  }
-
-  // Override _broadcastToRoom dengan proteksi CPU
-  async _broadcastToRoom(room, message) {
-    if (this.closing || this.isDestroyed || !room || !message) return;
-    const wsIds = this.wsClients.get(room);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const msgStr = JSON.stringify(message);
-    const wsIdArray = Array.from(wsIds);
-    const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
-    
-    this._startCPUTimer();
-    
-    for (let i = 0; i < wsIdArray.length; i += batchSize) {
-      const batch = wsIdArray.slice(i, i + batchSize);
-      
-      for (const wsId of batch) {
-        const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1) {
-          try {
-            ws.send(msgStr);
-          } catch(e) {}
-        }
-      }
-      
-      // Cek CPU setelah setiap batch
-      if (this._checkCPULimit()) {
-        await this._cpuYield();
-        this._startCPUTimer();
-      }
-    }
-  }
-
-  // Override _broadcastQuizResult dengan proteksi CPU
-  async _broadcastQuizResult(type, data) {
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const msgStr = JSON.stringify([type, data]);
-    const wsIdArray = Array.from(wsIds);
-    const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
-    
-    this._startCPUTimer();
-    
-    for (let i = 0; i < wsIdArray.length; i += batchSize) {
-      const batch = wsIdArray.slice(i, i + batchSize);
-      
-      for (const wsId of batch) {
-        try {
-          const ws = this.wsMap.get(wsId);
-          if (ws && ws.readyState === 1) {
-            ws.send(msgStr);
-          }
-        } catch(e) {}
-      }
-      
-      if (this._checkCPULimit()) {
-        await this._cpuYield();
-        this._startCPUTimer();
-      }
-    }
-  }
-
-  // Override _broadcastQuizQuestion dengan proteksi CPU
-  async _broadcastQuizQuestion(question, options) {
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const usersByLang = new Map();
-    
-    for (const wsId of wsIds) {
-      try {
-        const ws = this.wsMap.get(wsId);
-        if (!ws || ws.readyState !== 1) continue;
-        
-        const lang = this.userLanguage.get(wsId) || 'en';
-        
-        if (!usersByLang.has(lang)) {
-          usersByLang.set(lang, []);
-        }
-        usersByLang.get(lang).push(ws);
-      } catch(e) {}
-    }
-    
-    if (usersByLang.size === 0) return;
-    
-    await this.translationManager.translateForUsers(question, options, usersByLang);
-  }
-
-  // ==================== YANG LAIN TETAP SAMA ====================
-  
-  // ... SEMUA METHOD LAINNYA TETAP SAMA SEPERTI KODE ASLI ...
-  // (Saya potong karena panjang, tapi semua method di bawah ini tetap sama)
   
   _getWIBTime() {
     const wibTime = this._getCurrentWIBTime();
@@ -1342,6 +2226,24 @@ export class GameServer extends CPUProtection {
       [arr[i], arr[j]] = [arr[j], arr[i]];
     }
     return arr;
+  }
+  
+  _broadcastToRoom(room, message) {
+    if (this.closing || this.isDestroyed || !room || !message) return;
+    const wsIds = this.wsClients.get(room);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    const msgStr = JSON.stringify(message);
+    const wsIdArray = Array.from(wsIds);
+    
+    for (const wsId of wsIdArray) {
+      const ws = this.wsMap.get(wsId);
+      if (ws && ws.readyState === 1) {
+        try {
+          ws.send(msgStr);
+        } catch(e) {}
+      }
+    }
   }
   
   _safeSend(ws, message) {
@@ -2473,1282 +3375,6 @@ export class GameServer extends CPUProtection {
       return newWsId;
     }
   }
-  
-  // ==================== QUIZ METHODS (TETAP SAMA) ====================
-  
-  _getCurrentWIBHour() {
-    const now = new Date();
-    const wibHour = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
-    return wibHour;
-  }
-  
-  _getCurrentWIBMinutes() {
-    return new Date().getUTCMinutes();
-  }
-  
-  _getCurrentWIBTime() {
-    const now = new Date();
-    const hours = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
-    const minutes = String(now.getUTCMinutes()).padStart(2, '0');
-    return {
-        hours: hours,
-        minutes: now.getUTCMinutes(),
-        totalMinutes: (hours * 60) + now.getUTCMinutes(),
-        formatted: `${String(hours).padStart(2, '0')}:${minutes} WIB`
-    };
-  }
-  
-  _formatWIBTime(hours, minutes) {
-    const pad = (num) => String(num).padStart(2, '0');
-    return `${pad(hours)}:${pad(minutes)} WIB`;
-  }
-  
-  _isQuizTime() {
-    const wibHour = this._getCurrentWIBHour();
-    const wibMinutes = this._getCurrentWIBMinutes();
-    const currentTotalMinutes = (wibHour * 60) + wibMinutes;
-    const startTotalMinutes = (QUIZ_SCHEDULE.START_HOUR * 60);
-    const endTotalMinutes = (QUIZ_SCHEDULE.END_HOUR * 60);
-    
-    return currentTotalMinutes >= startTotalMinutes && currentTotalMinutes < endTotalMinutes;
-  }
-  
-  _getNextQuizStartTime() {
-    const now = new Date();
-    const wibTime = this._getCurrentWIBTime();
-    
-    const startTime = new Date(now);
-    startTime.setUTCHours(QUIZ_SCHEDULE.START_HOUR - QUIZ_SCHEDULE.TIMEZONE_OFFSET, 0, 0, 0);
-    
-    if (wibTime.totalMinutes >= (QUIZ_SCHEDULE.START_HOUR * 60)) {
-      startTime.setUTCDate(startTime.getUTCDate() + 1);
-    }
-    
-    return startTime;
-  }
-  
-  _getTimeLeftUntilNextEvent() {
-    const wibTime = this._getCurrentWIBTime();
-    const currentTotalMinutes = wibTime.totalMinutes;
-    
-    const startTotalMinutes = (QUIZ_SCHEDULE.START_HOUR * 60);
-    const endTotalMinutes = (QUIZ_SCHEDULE.END_HOUR * 60);
-    
-    if (currentTotalMinutes >= startTotalMinutes && currentTotalMinutes < endTotalMinutes) {
-      return { 
-        minutes: 0, 
-        seconds: 0, 
-        isRunning: true,
-        hours: 0,
-        totalMinutes: 0,
-        status: 'running',
-        currentTime: wibTime.formatted,
-        startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
-        endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
-        startHour: QUIZ_SCHEDULE.START_HOUR,
-        endHour: QUIZ_SCHEDULE.END_HOUR
-      };
-    }
-    
-    let targetTotalMinutes;
-    let status;
-    let dayText = "";
-    
-    if (currentTotalMinutes < startTotalMinutes) {
-      targetTotalMinutes = startTotalMinutes;
-      status = 'before';
-      dayText = "hari ini";
-    } else {
-      targetTotalMinutes = startTotalMinutes + 1440;
-      status = 'after';
-      dayText = "besok";
-    }
-    
-    const diffMinutes = targetTotalMinutes - currentTotalMinutes;
-    const hours = Math.floor(diffMinutes / 60);
-    const minutes = Math.floor(diffMinutes % 60);
-    const totalSeconds = diffMinutes * 60;
-    
-    return {
-      hours: hours,
-      minutes: minutes,
-      seconds: 0,
-      totalMinutes: diffMinutes,
-      totalSeconds: totalSeconds,
-      isRunning: false,
-      status: status,
-      startHour: QUIZ_SCHEDULE.START_HOUR,
-      endHour: QUIZ_SCHEDULE.END_HOUR,
-      startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
-      endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
-      currentTime: wibTime.formatted,
-      dayText: dayText
-    };
-  }
-  
-  _getCurrentWeek() {
-    const now = new Date();
-    const year = now.getUTCFullYear();
-    const startOfYear = new Date(year, 0, 1);
-    const diff = now - startOfYear;
-    const week = Math.ceil((diff / 86400000 + startOfYear.getUTCDay() + 1) / 7);
-    return `${year}-W${String(week).padStart(2, '0')}`;
-  }
-  
-  async _getQuizPoints() {
-    if (!this.env || !this.env.QUESTIONS) return {};
-    try {
-      const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json');
-      return points || {};
-    } catch(e) {
-      return {};
-    }
-  }
-  
-  async _getLastWeekWinner() {
-    if (!this.env || !this.env.QUESTIONS) return null;
-    try {
-      const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
-      return winner || null;
-    } catch(e) {
-      return null;
-    }
-  }
-  
-  async _checkAndResetWeeklyPoints() {
-    if (!this.env || !this.env.QUESTIONS) return false;
-    
-    try {
-      const currentWeek = this._getCurrentWeek();
-      const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
-      
-      if (savedWeek !== currentWeek) {
-        const points = await this._getQuizPoints();
-        
-        let winner = null;
-        let highestScore = 0;
-        
-        for (const [username, score] of Object.entries(points)) {
-          if (score > highestScore) {
-            highestScore = score;
-            winner = username;
-          }
-        }
-        
-        if (winner) {
-          const winnerData = {
-            username: winner,
-            score: highestScore,
-            week: savedWeek || currentWeek
-          };
-          
-          await this.env.QUESTIONS.put(
-            CONSTANTS.QUIZ_LAST_WEEK_WINNER,
-            JSON.stringify(winnerData)
-          );
-          
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizLastWeekWinner",
-            winner,
-            highestScore,
-            savedWeek || currentWeek
-          ]);
-        }
-        
-        await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify({}));
-        await this.env.QUESTIONS.put(CONSTANTS.QUIZ_WEEK_KEY, currentWeek);
-        
-        return true;
-      }
-      return false;
-    } catch(e) {
-      return false;
-    }
-  }
-  
-  _startQuizScheduler() {
-    if (this.quizAutoTimer) {
-      clearInterval(this.quizAutoTimer);
-      this.quizAutoTimer = null;
-    }
-    
-    this.quizAutoTimer = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this.quizAutoTimer);
-        this.quizAutoTimer = null;
-        return;
-      }
-      
-      try {
-        this.translationManager.resetDailyCounter();
-        this._checkQuizAutoStatus();
-        this._checkAndRestartQuiz();
-        
-        const timeInfo = this._getTimeLeftUntilNextEvent();
-        if (!timeInfo.isRunning) {
-          this._broadcastQuizTimeLeft();
-        }
-        
-      } catch(e) {}
-    }, CONSTANTS.SCHEDULER_INTERVAL_MS);
-  }
-  
-  async _checkQuizAutoStatus() {
-    try {
-      const isQuizTime = this._isQuizTime();
-      const wibTime = this._getCurrentWIBTime();
-      
-      if (isQuizTime) {
-        if (!this.quizAutoEnabled) {
-          this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            `⏳ Quiz akan segera dimulai! (${wibTime.formatted})`,
-            false
-          ]);
-          
-          await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
-          
-          if (!this._quizStartTimeout) {
-            this.forceStartQuiz();
-          }
-        } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-          await this._showQuestion();
-        }
-        return false;
-      } else {
-        if (this.quizAutoEnabled) {
-          this.quizAutoEnabled = false;
-          await this.resetQuiz();
-          
-          const timeInfo = this._getTimeLeftUntilNextEvent();
-          let statusMsg = "";
-          if (timeInfo.status === 'before') {
-            statusMsg = `⏳ Quiz dimulai pukul ${timeInfo.startTime}\n🕐 Sekarang: ${timeInfo.currentTime}`;
-          } else {
-            statusMsg = `⏸️ Quiz telah berakhir. Kembali besok pukul ${timeInfo.startTime}`;
-          }
-          
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            statusMsg,
-            true
-          ]);
-        }
-        return true;
-      }
-    } catch(e) {
-      return true;
-    }
-  }
-  
-  forceStartQuiz() {
-    if (!this._isQuizTime()) {
-      return false;
-    }
-    
-    if (this.currentQuestion) {
-      return false;
-    }
-    
-    if (this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
-      return false;
-    }
-    
-    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-      this._initQuiz().then(() => {
-        this._showQuestion();
-      });
-      return false;
-    }
-    
-    this.quizAutoEnabled = true;
-    this._showQuestion();
-    return true;
-  }
-  
-  _checkAndRestartQuiz() {
-    try {
-      if (!this._isQuizTime()) {
-        return;
-      }
-      
-      const isRunning = this.currentQuestion !== null;
-      const isWaiting = this.isQuizWaiting;
-      const hasTimeout = this._quizTimeout !== null;
-      const hasBreak = this._quizBreakTimeout !== null;
-      
-      if (!isRunning && !isWaiting && !hasTimeout && !hasBreak) {
-        this.quizAutoEnabled = true;
-        this._showQuestion();
-      }
-    } catch(e) {}
-  }
-  
-  ensureQuizStarted() {
-    if (this._quizTimeout) {
-      clearTimeout(this._quizTimeout);
-      this._quizTimeout = null;
-    }
-    if (this._quizBreakTimeout) {
-      clearTimeout(this._quizBreakTimeout);
-      this._quizBreakTimeout = null;
-    }
-    if (this._quizStartTimeout) {
-      clearTimeout(this._quizStartTimeout);
-      this._quizStartTimeout = null;
-    }
-    
-    this.forceStartQuiz();
-  }
-  
-  ensureQuizRunning() {
-    try {
-      this._forceStartQuizIfTime();
-      
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        this._initQuiz().then(() => {
-          if (!this.closing && !this.isDestroyed) {
-            this.forceStartQuiz();
-          }
-        });
-        return;
-      }
-      
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-        this.forceStartQuiz();
-      }
-      
-      if (!this._quizKeepAliveInterval) {
-        this._startQuizKeepAlive();
-      }
-      
-    } catch(e) {}
-  }
-  
-  _forceStartQuizIfTime() {
-    if (!this._isQuizTime()) {
-      return;
-    }
-    
-    if (this.currentQuestion) {
-      return;
-    }
-    
-    if (this._quizTimeout) {
-      return;
-    }
-    
-    if (this.isQuizWaiting) {
-      return;
-    }
-    
-    if (this._quizStartTimeout) {
-      return;
-    }
-    
-    this.quizAutoEnabled = true;
-    this._showQuestion();
-  }
-  
-  _sendQuizTimeLeftToUser(ws) {
-    if (!ws || ws.readyState !== 1) return false;
-    
-    try {
-      const timeInfo = this._getTimeLeftUntilNextEvent();
-      
-      let message = "";
-      let canType = true;
-      let isQuizTime = timeInfo.isRunning;
-      
-      if (isQuizTime) {
-        if (this.currentQuestion && this._quizStartTime) {
-          const elapsed = (Date.now() - this._quizStartTime) / 1000;
-          const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
-          const left = Math.max(0, total - elapsed);
-          const minutes = Math.floor(left / 60);
-          const seconds = Math.floor(left % 60);
-          
-          if (minutes > 0) {
-            message = `📝 Quiz berjalan! ${minutes}m ${seconds}s tersisa`;
-          } else {
-            message = `📝 Quiz berjalan! ${seconds}s tersisa`;
-          }
-          canType = false;
-        } else {
-          message = `⏳ Quiz akan segera dimulai! (${timeInfo.currentTime})`;
-          canType = true;
-        }
-        
-        this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
-        return false;
-        
-      } else {
-        const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
-        
-        let countdownText = "";
-        const totalSeconds = (hours * 3600) + (minutes * 60);
-        
-        if (totalSeconds <= 0) {
-          countdownText = "Segera!";
-        } else if (hours > 0) {
-          if (minutes > 0) {
-            countdownText = `${hours} jam ${minutes} menit`;
-          } else {
-            countdownText = `${hours} jam`;
-          }
-        } else if (minutes > 0) {
-          countdownText = `${minutes} menit`;
-        } else {
-          countdownText = "Kurang dari 1 menit";
-        }
-        
-        let statusText = "";
-        if (status === 'before') {
-          statusText = `⏳ Quiz dimulai ${dayText} pukul ${startTime} (WIB)`;
-        } else {
-          statusText = `⏸️ Quiz hari ini selesai. Kembali ${dayText} pukul ${startTime} (WIB)`;
-        }
-        
-        message = `${statusText}\n🕐 Waktu sekarang: ${currentTime}\n⏱️ Tersisa: ${countdownText}`;
-        canType = true;
-        
-        this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
-        return true;
-      }
-    } catch(e) {
-      return true;
-    }
-  }
-  
-  _broadcastQuizTimeLeft() {
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const timeInfo = this._getTimeLeftUntilNextEvent();
-    
-    let message = "";
-    let canType = true;
-    let isQuizTime = timeInfo.isRunning;
-    
-    if (isQuizTime) {
-      if (this.currentQuestion && this._quizStartTime) {
-        const elapsed = (Date.now() - this._quizStartTime) / 1000;
-        const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
-        const left = Math.max(0, total - elapsed);
-        const minutes = Math.floor(left / 60);
-        const seconds = Math.floor(left % 60);
-        
-        if (minutes > 0) {
-          message = `📝 Quiz berjalan! ${minutes}m ${seconds}s tersisa`;
-        } else {
-          message = `📝 Quiz berjalan! ${seconds}s tersisa`;
-        }
-        canType = false;
-      } else {
-        message = `⏳ Quiz akan segera dimulai! (${timeInfo.currentTime})`;
-        canType = true;
-      }
-    } else {
-      const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
-      
-      let countdownText = "";
-      const totalSeconds = (hours * 3600) + (minutes * 60);
-      
-      if (totalSeconds <= 0) {
-        countdownText = "Segera!";
-      } else if (hours > 0) {
-        if (minutes > 0) {
-          countdownText = `${hours} jam ${minutes} menit`;
-        } else {
-          countdownText = `${hours} jam`;
-        }
-      } else if (minutes > 0) {
-        countdownText = `${minutes} menit`;
-      } else {
-        countdownText = "Kurang dari 1 menit";
-      }
-      
-      if (status === 'before') {
-        message = `⏳ Quiz dimulai ${dayText} pukul ${startTime}\n⏱️ Tersisa: ${countdownText}`;
-      } else {
-        message = `⏸️ Quiz hari ini selesai. Kembali ${dayText} pukul ${startTime}\n⏱️ Tersisa: ${countdownText}`;
-      }
-      canType = true;
-    }
-    
-    this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, canType, isQuizTime]);
-  }
-  
-  _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
-    if (!ws || ws.readyState !== 1) return false;
-    
-    try {
-      const timeInfo = this._getTimeLeftUntilNextEvent();
-      let message = "";
-      
-      switch(errorType) {
-        case "NOT_QUIZ_TIME":
-          if (timeInfo.status === 'before') {
-            const { hours, minutes, startTime, currentTime } = timeInfo;
-            let timeStr = "";
-            if (hours > 0 && minutes > 0) {
-              timeStr = `${hours} jam ${minutes} menit`;
-            } else if (hours > 0) {
-              timeStr = `${hours} jam`;
-            } else if (minutes > 0) {
-              timeStr = `${minutes} menit`;
-            } else {
-              timeStr = "kurang dari 1 menit";
-            }
-            message = `⏳ Quiz dimulai pukul ${startTime} (WIB)\n🕐 Sekarang: ${currentTime}\n⏱️ Tersisa: ${timeStr}`;
-          } else {
-            const { startTime, currentTime } = timeInfo;
-            message = `⏸️ Quiz telah berakhir.\n🕐 Sekarang: ${currentTime}\n📅 Kembali besok pukul ${startTime} (WIB)`;
-          }
-          break;
-          
-        case "QUIZ_DISABLED":
-          message = "❌ Quiz sedang tidak tersedia";
-          break;
-          
-        case "QUIZ_ENDED":
-          const { hours, minutes, startTime, currentTime } = timeInfo;
-          let timeStr = "";
-          if (hours > 0 && minutes > 0) {
-            timeStr = `${hours} jam ${minutes} menit`;
-          } else if (hours > 0) {
-            timeStr = `${hours} jam`;
-          } else if (minutes > 0) {
-            timeStr = `${minutes} menit`;
-          } else {
-            timeStr = "kurang dari 1 menit";
-          }
-          message = `⏸️ Quiz telah berakhir.\n🕐 Sekarang: ${currentTime}\n📅 Lanjut besok pukul ${startTime} (WIB)\n⏱️ Tersisa: ${timeStr}`;
-          break;
-          
-        case "QUIZ_NOT_STARTED":
-          message = `⏳ Quiz akan dimulai pukul ${QUIZ_SCHEDULE.START_HOUR}:00 WIB`;
-          break;
-          
-        default:
-          message = customMessage || "❌ Terjadi kesalahan pada Quiz";
-      }
-      
-      this._safeSend(ws, ["quizError", message]);
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-  
-  _setUserLanguage(ws, countryCode) {
-    if (!ws) return 'en';
-    const wsId = this._getWsId(ws);
-    if (!wsId) return 'en';
-    
-    this.userCountry.set(wsId, countryCode);
-    
-    const lang = this._countryToLanguage(countryCode);
-    this.userLanguage.set(wsId, lang);
-    
-    return lang;
-  }
-  
-  async switchRoom(ws, room, username = null) {
-    if (this.isDestroyed) {
-      this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
-      return;
-    }
-    if (!room || room.trim() === "") {
-      this._safeSend(ws, ["gameLowCardError", "Invalid room name"]);
-      return;
-    }
-    
-    const roomName = room.trim();
-    const wsId = this._getWsId(ws);
-    
-    if (!wsId) {
-      this._safeSend(ws, ["gameLowCardError", "Connection error"]);
-      return;
-    }
-    
-    const lockKey = `switch_${wsId}`;
-    if (this._switchLocks.has(lockKey)) return;
-    this._switchLocks.set(lockKey, Date.now());
-    
-    try {
-      const oldRoom = this.clientRooms.get(wsId);
-      
-      if (oldRoom === roomName) {
-        if (roomName === QUIZ_ROOM) {
-          let lang = this.userLanguage.get(wsId);
-          if (!lang) {
-            const country = this.userCountry.get(wsId) || 'US';
-            lang = this._setUserLanguage(ws, country);
-          }
-          
-          if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-            await this._initQuiz();
-          }
-          
-          if (this._isQuizTime()) {
-            if (!this.quizAutoEnabled) {
-              this.quizAutoEnabled = true;
-            }
-            this.forceStartQuiz();
-          }
-          
-          setTimeout(() => {
-            if (this.closing || this.isDestroyed) return;
-            this._sendQuizTimeLeftToUser(ws);
-          }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
-        }
-        return;
-      }
-      
-      if (oldRoom) {
-        this._removeClientFromRoom(oldRoom, wsId);
-      }
-      
-      this._addClient(roomName, ws, username, false);
-      ws.room = roomName;
-      ws.roomname = roomName;
-      ws.username = username;
-      
-      if (username) {
-        const conn = this.userConnections.get(username);
-        if (conn) conn.room = roomName;
-      }
-      
-      if (roomName === QUIZ_ROOM) {
-        let country = this.userCountry.get(wsId);
-        if (!country) {
-          const cf = ws._cf || {};
-          country = cf.country || 'US';
-          this.userCountry.set(wsId, country);
-        }
-        
-        this._setUserLanguage(ws, country);
-        
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-          await this._initQuiz();
-        }
-        
-        if (this._isQuizTime()) {
-          if (!this.quizAutoEnabled) {
-            this.quizAutoEnabled = true;
-          }
-          this.forceStartQuiz();
-        }
-        
-        setTimeout(() => {
-          if (this.closing || this.isDestroyed) return;
-          this._sendQuizTimeLeftToUser(ws);
-        }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
-      }
-      
-    } finally {
-      this._switchLocks.delete(lockKey);
-    }
-  }
-  
-  async _loadAllQuestionsFromKV() {
-    if (!this.env || !this.env.QUESTIONS) return false;
-    
-    try {
-      this._incrementSubRequest();
-      const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
-      
-      if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
-        this._allQuestions = cached.questions.map((q, index) => ({
-          id: index + 1,
-          question: q.question || '',
-          options: q.options || { A: '', B: '', C: '', D: '' },
-          correct: q.correct || 'A',
-          category: q.category || 'General',
-          difficulty: q.difficulty || 'medium'
-        }));
-        
-        this._isAllQuestionsLoaded = true;
-        this._currentBatchStart = 0;
-        this._currentBatchEnd = 0;
-        this._questionPointer = 0;
-        this._totalQuestionsAnswered = 0;
-        this._currentBatchIndex = 0;
-        
-        this._loadNextBatch();
-        
-        return true;
-      }
-      
-      return false;
-    } catch(e) {
-      return false;
-    }
-  }
-  
-  _loadNextBatch() {
-    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-      return false;
-    }
-    
-    const totalQuestions = this._allQuestions.length;
-    let startIndex = this._currentBatchEnd;
-    
-    if (startIndex >= totalQuestions) {
-      startIndex = 0;
-      this._currentBatchStart = 0;
-      this._currentBatchEnd = 0;
-      this._questionPointer = 0;
-      this._totalQuestionsAnswered = 0;
-      this._currentBatchIndex = 0;
-    }
-    
-    let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
-    const batch = this._allQuestions.slice(startIndex, endIndex);
-    
-    this.quizQuestionCache['en'] = batch;
-    this._currentQuestions = batch;
-    this._currentBatchStart = startIndex;
-    this._currentBatchEnd = endIndex;
-    this._currentBatchIndex = Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE);
-    this._lastLoadedBatch = this._currentBatchIndex;
-    
-    return true;
-  }
-  
-  _checkAndLoadNextBatch() {
-    const questions = this.quizQuestionCache['en'] || [];
-    
-    if (this._questionPointer >= questions.length) {
-      this._loadNextBatch();
-      
-      const newQuestions = this.quizQuestionCache['en'] || [];
-      if (this._currentBatchStart === 0 && newQuestions.length > 0) {
-        this._questionPointer = 0;
-      }
-      
-      return true;
-    }
-    
-    return false;
-  }
-  
-  async _showQuestion() {
-    try {
-      this._lastActivityTime = Date.now();
-      this._isQuizIdle = false;
-      
-      if (!this._isQuizTime()) {
-        const clients = this.wsClients.get(QUIZ_ROOM);
-        if (clients && clients.size > 0) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏸️ Quiz is offline.",
-            true
-          ]);
-        }
-        return;
-      }
-      
-      if (!this.quizAutoEnabled) {
-        this.quizAutoEnabled = true;
-        const clients = this.wsClients.get(QUIZ_ROOM);
-        if (clients && clients.size > 0) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏳ Quiz will start soon!",
-            true
-          ]);
-        }
-        return;
-      }
-      
-      if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) {
-        return;
-      }
-
-      this._checkAndLoadNextBatch();
-      
-      const questions = this.quizQuestionCache['en'] || [];
-      
-      if (questions.length === 0) {
-        const loaded = this._loadNextBatch();
-        if (!loaded) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizError",
-            "No questions available! Please add questions to KV."
-          ]);
-          return;
-        }
-      }
-      
-      const q = questions[this._questionPointer];
-      
-      if (!q || !q.options) {
-        this._questionPointer++;
-        this._showQuestion();
-        return;
-      }
-
-      const shuffled = this._shuffleQuestionOptions(q);
-      
-      this.currentQuestion = {
-        ...q,
-        options: shuffled.options,
-        correct: shuffled.correct
-      };
-      
-      this._quizStartTime = Date.now();
-      this.quizAnswered = new Set();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      
-      this._questionPointer++;
-      this._totalQuestionsAnswered++;
-
-      await this._broadcastQuizQuestion(
-        this.currentQuestion.question,
-        this.currentQuestion.options
-      );
-
-      this._broadcastToRoom(QUIZ_ROOM, [
-        "quizTimeLeft",
-        `📝 Question ${this._questionPointer}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
-        false
-      ]);
-
-      if (this._quizTimeout) clearTimeout(this._quizTimeout);
-      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
-
-      this._quizTimeout = setTimeout(async () => {
-        try {
-          if (this.closing || this.isDestroyed) {
-            this._quizTimeout = null;
-            return;
-          }
-
-          const currentClients = this.wsClients.get(QUIZ_ROOM);
-          if (!currentClients || currentClients.size === 0) {
-            this._quizTimeout = null;
-            this.currentQuestion = null;
-            return;
-          }
-
-          const correctAnswer = this.currentQuestion.correct;
-          const question = this.currentQuestion.question;
-          const options = this.currentQuestion.options;
-
-          if (this.quizHasWinner && this.quizWinner) {
-            const points = await this._getQuizPoints();
-            points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-            
-            if (this.env && this.env.QUESTIONS) {
-              this._incrementSubRequest();
-              await this.env.QUESTIONS.put(
-                CONSTANTS.QUIZ_POINT_KEY,
-                JSON.stringify(points)
-              );
-            }
-            
-            const totalPoints = points[this.quizWinner] || 0;
-            
-            this._broadcastQuizResult("quizWinner", {
-              username: this.quizWinner,
-              totalPoints: totalPoints,
-              correctAnswer: correctAnswer
-            });
-            
-          } else {
-            this._broadcastQuizResult("quizNoWinner", {
-              message: "No one answered correctly!",
-              correctAnswer: correctAnswer
-            });
-          }
-          
-          this._broadcastQuizResult("quizCorrectAnswer", {
-            question: question,
-            options: options,
-            correctAnswer: correctAnswer
-          });
-
-          this._quizTimeout = null;
-          this.isQuizWaiting = true;
-
-          this._quizBreakTimeout = setTimeout(() => {
-            if (this.closing || this.isDestroyed) {
-              this._quizBreakTimeout = null;
-              return;
-            }
-            this.isQuizWaiting = false;
-            this._quizBreakTimeout = null;
-            this.currentQuestion = null;
-            
-            this._broadcastToRoom(QUIZ_ROOM, [
-              "quizNextQuestionIn",
-              "5"
-            ]);
-            
-            setTimeout(() => {
-              this._broadcastToRoom(QUIZ_ROOM, [
-                "quizNextQuestionIn",
-                "3"
-              ]);
-            }, 2000);
-            
-            setTimeout(() => {
-              this._broadcastToRoom(QUIZ_ROOM, [
-                "quizNextQuestionIn",
-                "1"
-              ]);
-            }, 4000);
-            
-            if (!this.closing && !this.isDestroyed) {
-              this.ensureQuizRunning();
-            }
-          }, CONSTANTS.QUIZ_BREAK_MS);
-
-        } catch(e) {
-          this._quizTimeout = null;
-          this.currentQuestion = null;
-          this.isQuizWaiting = false;
-        }
-      }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
-
-    } catch(e) {
-      this.currentQuestion = null;
-      this.isQuizWaiting = false;
-      this._quizTimeout = null;
-    }
-  }
-  
-  async submitQuizAnswer(ws, username, answer) {
-    try {
-      if (!ws || !username) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
-        return;
-      }
-      
-      const room = this._ensureRoomConsistency(ws);
-      if (room !== QUIZ_ROOM) {
-        this._safeSend(ws, ["quizError", "Quiz only available in Quiz room"]);
-        return;
-      }
-      
-      if (!this._isQuizTime()) {
-        this._sendQuizErrorWithTime(ws, "NOT_QUIZ_TIME");
-        return;
-      }
-      
-      if (!this.quizAutoEnabled) {
-        this._sendQuizErrorWithTime(ws, "QUIZ_DISABLED");
-        return;
-      }
-      
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients || clients.size === 0) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
-        return;
-      }
-      
-      if (!this.currentQuestion) {
-        this._startQuizIfNeeded();
-        if (!this.currentQuestion) {
-          this._sendQuizErrorWithTime(ws, "QUIZ_NOT_STARTED");
-          return;
-        }
-      }
-      
-      if (this.quizHasWinner) {
-        this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
-        return;
-      }
-      
-      if (this.quizAnswered.has(username)) {
-        this._safeSend(ws, ["quizError", "You already answered!"]);
-        return;
-      }
-      
-      const answerKey = answer ? answer.toUpperCase().trim() : '';
-      const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
-      const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
-      
-      const resultObj = {
-        username: username,
-        answer: isValidAnswer ? answerKey : "?",
-        isCorrect: isCorrect,
-        correctAnswer: this.currentQuestion.correct
-      };
-      
-      this._broadcastQuizResult("quizAnswerResult", resultObj);
-      this.quizAnswered.add(username);
-      
-      if (isCorrect && !this.quizHasWinner) {
-        this.quizHasWinner = true;
-        this.quizWinner = username;
-      }
-      
-    } catch(e) {
-      this._safeSend(ws, ["quizError", e.message]);
-    }
-  }
-  
-  _startQuizLoop() {
-    if (this.quizTimer) {
-      clearInterval(this.quizTimer);
-      this.quizTimer = null;
-    }
-    
-    this.quizTimer = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this.quizTimer);
-        this.quizTimer = null;
-        return;
-      }
-      
-      if (this._isQuizTime()) {
-        if (!this.quizAutoEnabled) {
-          this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏳ Quiz will start soon!",
-            true
-          ]);
-        }
-        
-        if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-          this._showQuestion();
-        }
-        
-      } else {
-        if (this.quizAutoEnabled) {
-          this.quizAutoEnabled = false;
-          this.resetQuiz();
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏸️ Quiz has ended. See you tomorrow!",
-            true
-          ]);
-        }
-      }
-    }, CONSTANTS.QUIZ_INTERVAL_MS);
-  }
-  
-  async resetQuiz() {
-    try {
-      if (this._quizTimeout) {
-        clearTimeout(this._quizTimeout);
-        this._quizTimeout = null;
-      }
-      if (this._quizBreakTimeout) {
-        clearTimeout(this._quizBreakTimeout);
-        this._quizBreakTimeout = null;
-      }
-      if (this._quizStartTimeout) {
-        clearTimeout(this._quizStartTimeout);
-        this._quizStartTimeout = null;
-      }
-      if (this._quizKeepAliveInterval) {
-        clearInterval(this._quizKeepAliveInterval);
-        this._quizKeepAliveInterval = null;
-      }
-      
-      this.currentQuestion = null;
-      this.isQuizWaiting = false;
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this.quizAnswered = new Set();
-      this._quizStartTime = null;
-      
-    } catch(e) {}
-  }
-  
-  async startQuizWithDelay(delayMs) {
-    if (this._quizStartTimeout) return;
-    
-    this._quizStartTimeout = setTimeout(() => {
-      if (this.closing || this.isDestroyed) {
-        this._quizStartTimeout = null;
-        return;
-      }
-      this._quizStartTimeout = null;
-      
-      if (!this.currentQuestion && this.quizAutoEnabled) {
-        this.forceStartQuiz();
-      }
-    }, delayMs);
-  }
-  
-  _startQuizIfNeeded() {
-    try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients || clients.size === 0) return;
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-          this._initQuiz().then(() => {
-            if (!this.closing && !this.isDestroyed) {
-              this._showQuestion();
-            }
-          });
-          return;
-        }
-        this._showQuestion();
-      }
-    } catch(e) {}
-  }
-  
-  async _initQuiz(retryCount = 0) {
-    try {
-      const loaded = await this._loadAllQuestionsFromKV();
-      if (loaded) {
-        this._startQuizLoop();
-        this._startTranslateResetCounter();
-        this._startQuizKeepAlive();
-        return true;
-      }
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    } catch(e) {
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    }
-  }
-  
-  _startTranslateResetCounter() {
-    if (this._translateResetInterval) {
-      clearInterval(this._translateResetInterval);
-      this._translateResetInterval = null;
-    }
-    this._translateResetInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this._translateResetInterval);
-        this._translateResetInterval = null;
-        return;
-      }
-      this.translationManager.resetDailyCounter();
-    }, 60000);
-  }
-  
-  _startQuizKeepAlive() {
-    if (this._quizKeepAliveInterval) {
-      clearInterval(this._quizKeepAliveInterval);
-      this._quizKeepAliveInterval = null;
-    }
-    
-    this._quizKeepAliveInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this._quizKeepAliveInterval);
-        this._quizKeepAliveInterval = null;
-        return;
-      }
-      
-      if (this._isQuizTime()) {
-        const now = Date.now();
-        
-        if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-          if (this.quizAutoEnabled) {
-            this._showQuestion();
-          } else {
-            this.quizAutoEnabled = true;
-            this._showQuestion();
-          }
-        }
-        
-        if (this.currentQuestion && this._quizStartTime) {
-          const elapsed = (now - this._quizStartTime) / 1000;
-          const maxTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
-          
-          if (elapsed > maxTime - 2) {
-            if (!this._quizTimeout) {
-              this._forceEvaluateQuiz();
-            }
-          }
-        }
-      }
-    }, CONSTANTS.QUIZ_KEEP_ALIVE_INTERVAL_MS);
-  }
-  
-  async _forceEvaluateQuiz() {
-    if (!this.currentQuestion) return;
-    if (this._quizTimeout) return;
-    
-    try {
-      const currentClients = this.wsClients.get(QUIZ_ROOM);
-      if (!currentClients || currentClients.size === 0) {
-        this.currentQuestion = null;
-        return;
-      }
-
-      const correctAnswer = this.currentQuestion.correct;
-      const question = this.currentQuestion.question;
-      const options = this.currentQuestion.options;
-
-      if (this.quizHasWinner && this.quizWinner) {
-        const points = await this._getQuizPoints();
-        points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-        
-        if (this.env && this.env.QUESTIONS) {
-          this._incrementSubRequest();
-          await this.env.QUESTIONS.put(
-            CONSTANTS.QUIZ_POINT_KEY,
-            JSON.stringify(points)
-          );
-        }
-        
-        const totalPoints = points[this.quizWinner] || 0;
-        
-        this._broadcastQuizResult("quizWinner", {
-          username: this.quizWinner,
-          totalPoints: totalPoints,
-          correctAnswer: correctAnswer
-        });
-        
-      } else {
-        this._broadcastQuizResult("quizNoWinner", {
-          message: "No one answered correctly!",
-          correctAnswer: correctAnswer
-        });
-      }
-      
-      this._broadcastQuizResult("quizCorrectAnswer", {
-        question: question,
-        options: options,
-        correctAnswer: correctAnswer
-      });
-
-      this.currentQuestion = null;
-      this.isQuizWaiting = true;
-
-      this._quizBreakTimeout = setTimeout(() => {
-        if (this.closing || this.isDestroyed) {
-          this._quizBreakTimeout = null;
-          return;
-        }
-        this.isQuizWaiting = false;
-        this._quizBreakTimeout = null;
-        
-        if (!this.closing && !this.isDestroyed) {
-          this.ensureQuizRunning();
-        }
-      }, CONSTANTS.QUIZ_BREAK_MS);
-
-    } catch(e) {
-      this.currentQuestion = null;
-      this.isQuizWaiting = false;
-    }
-  }
-  
-  _incrementSubRequest() {
-    this._subRequestCount++;
-    this._requestCount++;
-  }
-  
-  // ==================== FETCH METHOD ====================
   
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
