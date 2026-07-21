@@ -71,7 +71,7 @@ const CONSTANTS = {
 // 23:00 WIB = 16:00 UTC
 
 const QUIZ_SCHEDULE = {
-  EVENING: { start: 11, end: 16 },
+    EVENING: { start: 16, end: 21 }, // 23:00-04:00 WIB
 };
 
 const QUIZ_ROOM = "Quiz";
