@@ -45,6 +45,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   START_HOUR: 16,
   END_HOUR: 21,
+  TIMEZONE_OFFSET: 7,
 };
 
 const QUIZ_ROOM = "Quiz";
@@ -336,15 +337,6 @@ class TranslationManager {
       lastError = e;
     }
     
-    try {
-      const icuResult = await this._callICUTranslate(text, targetLang);
-      if (icuResult) {
-        return icuResult;
-      }
-    } catch(e) {
-      lastError = e;
-    }
-    
     throw lastError || new Error('All translation APIs failed');
   }
   
@@ -540,126 +532,6 @@ class TranslationManager {
     throw new Error('Invalid response');
   }
   
-  async _callICUTranslate(text, targetLang) {
-    const commonTranslations = {
-      'id': {
-        'What': 'Apa', 'Who': 'Siapa', 'Where': 'Di mana', 'When': 'Kapan',
-        'Why': 'Mengapa', 'How': 'Bagaimana', 'Which': 'Yang mana',
-        'is': 'adalah', 'are': 'adalah', 'the': 'itu', 'this': 'ini', 'that': 'itu',
-        'of': 'dari', 'and': 'dan', 'or': 'atau', 'but': 'tetapi', 'for': 'untuk',
-        'with': 'dengan', 'without': 'tanpa', 'capital': 'ibukota', 'city': 'kota',
-        'country': 'negara', 'president': 'presiden', 'first': 'pertama',
-        'second': 'kedua', 'third': 'ketiga', 'fourth': 'keempat', 'fifth': 'kelima',
-        'largest': 'terbesar', 'smallest': 'terkecil', 'highest': 'tertinggi',
-        'lowest': 'terendah', 'longest': 'terpanjang', 'shortest': 'terpendek',
-        'oldest': 'tertua', 'youngest': 'termuda', 'most': 'paling', 'least': 'paling sedikit'
-      },
-      'th': {
-        'What': 'อะไร', 'Who': 'ใคร', 'Where': 'ที่ไหน', 'When': 'เมื่อไหร่',
-        'Why': 'ทำไม', 'How': 'อย่างไร', 'Which': 'อันไหน',
-        'is': 'คือ', 'are': 'คือ', 'the': 'ที่', 'this': 'นี้', 'that': 'นั้น',
-        'of': 'ของ', 'and': 'และ', 'or': 'หรือ', 'but': 'แต่',
-        'capital': 'เมืองหลวง', 'city': 'เมือง', 'country': 'ประเทศ',
-        'president': 'ประธานาธิบดี', 'first': 'แรก', 'second': 'ที่สอง', 'third': 'ที่สาม'
-      },
-      'vi': {
-        'What': 'Cái gì', 'Who': 'Ai', 'Where': 'Ở đâu', 'When': 'Khi nào',
-        'Why': 'Tại sao', 'How': 'Thế nào', 'Which': 'Cái nào',
-        'is': 'là', 'are': 'là', 'the': 'cái', 'this': 'này', 'that': 'đó',
-        'capital': 'thủ đô', 'city': 'thành phố', 'country': 'quốc gia',
-        'president': 'tổng thống', 'first': 'đầu tiên', 'second': 'thứ hai', 'third': 'thứ ba'
-      },
-      'zh': {
-        'What': '什么', 'Who': '谁', 'Where': '哪里', 'When': '什么时候',
-        'Why': '为什么', 'How': '如何', 'Which': '哪个',
-        'is': '是', 'are': '是', 'the': '的', 'this': '这', 'that': '那',
-        'capital': '首都', 'city': '城市', 'country': '国家',
-        'president': '总统', 'first': '第一', 'second': '第二', 'third': '第三'
-      },
-      'ja': {
-        'What': '何', 'Who': '誰', 'Where': 'どこ', 'When': 'いつ',
-        'Why': 'なぜ', 'How': 'どうやって', 'Which': 'どれ',
-        'is': 'です', 'are': 'です', 'the': 'その', 'this': 'これ', 'that': 'それ',
-        'capital': '首都', 'city': '都市', 'country': '国',
-        'president': '大統領', 'first': '最初', 'second': '第二', 'third': '第三'
-      },
-      'ko': {
-        'What': '무엇', 'Who': '누구', 'Where': '어디', 'When': '언제',
-        'Why': '왜', 'How': '어떻게', 'Which': '어느',
-        'is': '입니다', 'are': '입니다', 'the': '그', 'this': '이', 'that': '저',
-        'capital': '수도', 'city': '도시', 'country': '국가',
-        'president': '대통령', 'first': '첫 번째', 'second': '두 번째', 'third': '세 번째'
-      },
-      'ar': {
-        'What': 'ماذا', 'Who': 'من', 'Where': 'أين', 'When': 'متى',
-        'Why': 'لماذا', 'How': 'كيف', 'Which': 'أي',
-        'is': 'هو', 'are': 'هم', 'the': 'ال', 'this': 'هذا', 'that': 'ذلك',
-        'capital': 'العاصمة', 'city': 'مدينة', 'country': 'دولة',
-        'president': 'رئيس', 'first': 'الأول', 'second': 'الثاني', 'third': 'الثالث'
-      },
-      'es': {
-        'What': 'Qué', 'Who': 'Quién', 'Where': 'Dónde', 'When': 'Cuándo',
-        'Why': 'Por qué', 'How': 'Cómo', 'Which': 'Cuál',
-        'is': 'es', 'are': 'son', 'the': 'el/la', 'this': 'esto', 'that': 'eso',
-        'capital': 'capital', 'city': 'ciudad', 'country': 'país',
-        'president': 'presidente', 'first': 'primero', 'second': 'segundo', 'third': 'tercero'
-      },
-      'fr': {
-        'What': 'Quoi', 'Who': 'Qui', 'Where': 'Où', 'When': 'Quand',
-        'Why': 'Pourquoi', 'How': 'Comment', 'Which': 'Lequel',
-        'is': 'est', 'are': 'sont', 'the': 'le/la', 'this': 'ceci', 'that': 'cela',
-        'capital': 'capitale', 'city': 'ville', 'country': 'pays',
-        'president': 'président', 'first': 'premier', 'second': 'deuxième', 'third': 'troisième'
-      },
-      'de': {
-        'What': 'Was', 'Who': 'Wer', 'Where': 'Wo', 'When': 'Wann',
-        'Why': 'Warum', 'How': 'Wie', 'Which': 'Welcher',
-        'is': 'ist', 'are': 'sind', 'the': 'der/die/das', 'this': 'dies', 'that': 'das',
-        'capital': 'Hauptstadt', 'city': 'Stadt', 'country': 'Land',
-        'president': 'Präsident', 'first': 'erste', 'second': 'zweite', 'third': 'dritte'
-      },
-      'pt': {
-        'What': 'O que', 'Who': 'Quem', 'Where': 'Onde', 'When': 'Quando',
-        'Why': 'Por que', 'How': 'Como', 'Which': 'Qual',
-        'is': 'é', 'are': 'são', 'the': 'o/a', 'this': 'isto', 'that': 'isso',
-        'capital': 'capital', 'city': 'cidade', 'country': 'país',
-        'president': 'presidente', 'first': 'primeiro', 'second': 'segundo', 'third': 'terceiro'
-      },
-      'ru': {
-        'What': 'Что', 'Who': 'Кто', 'Where': 'Где', 'When': 'Когда',
-        'Why': 'Почему', 'How': 'Как', 'Which': 'Который',
-        'is': 'является', 'are': 'являются', 'the': '', 'this': 'это', 'that': 'то',
-        'capital': 'столица', 'city': 'город', 'country': 'страна',
-        'president': 'президент', 'first': 'первый', 'second': 'второй', 'third': 'третий'
-      }
-    };
-    
-    const dict = commonTranslations[targetLang];
-    if (!dict) {
-      throw new Error('ICU translations not available for this language');
-    }
-    
-    const words = text.split(' ');
-    const translatedWords = words.map(word => {
-      const cleanWord = word.replace(/[^a-zA-Z]/g, '');
-      const punct = word.replace(/[a-zA-Z]/g, '');
-      const lowerWord = cleanWord.toLowerCase();
-      for (const [key, value] of Object.entries(dict)) {
-        if (key.toLowerCase() === lowerWord) {
-          return value + punct;
-        }
-      }
-      return word;
-    });
-    
-    const result = translatedWords.join(' ');
-    if (result === text) {
-      throw new Error('No translation found in ICU dictionary');
-    }
-    
-    return result;
-  }
-  
   resetDailyCounter() {
     const now = new Date().toUTCString();
     if (now !== this.translateDate) {
@@ -767,40 +639,114 @@ export class GameServer {
     this._requestCount++;
   }
   
-  _getCurrentUTCHours() {
-    return new Date().getUTCHours();
+  _getCurrentWIBHour() {
+    const now = new Date();
+    const wibHour = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
+    return wibHour;
+  }
+  
+  _getCurrentWIBMinutes() {
+    return new Date().getUTCMinutes();
+  }
+  
+  _getCurrentWIBTime() {
+    const now = new Date();
+    const hours = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
+    const minutes = String(now.getUTCMinutes()).padStart(2, '0');
+    return {
+        hours: hours,
+        minutes: now.getUTCMinutes(),
+        totalMinutes: (hours * 60) + now.getUTCMinutes(),
+        formatted: `${String(hours).padStart(2, '0')}:${minutes} WIB`
+    };
+  }
+  
+  _formatWIBTime(hours, minutes) {
+    const pad = (num) => String(num).padStart(2, '0');
+    return `${pad(hours)}:${pad(minutes)} WIB`;
   }
   
   _isQuizTime() {
-    const hour = this._getCurrentUTCHours();
-    return hour >= QUIZ_SCHEDULE.START_HOUR && hour < QUIZ_SCHEDULE.END_HOUR;
+    const wibHour = this._getCurrentWIBHour();
+    const wibMinutes = this._getCurrentWIBMinutes();
+    const currentTotalMinutes = (wibHour * 60) + wibMinutes;
+    const startTotalMinutes = (QUIZ_SCHEDULE.START_HOUR * 60);
+    const endTotalMinutes = (QUIZ_SCHEDULE.END_HOUR * 60);
+    
+    return currentTotalMinutes >= startTotalMinutes && currentTotalMinutes < endTotalMinutes;
   }
   
   _getNextQuizStartTime() {
     const now = new Date();
-    const startTime = new Date(now);
-    startTime.setUTCHours(QUIZ_SCHEDULE.START_HOUR, 0, 0, 0);
+    const wibTime = this._getCurrentWIBTime();
     
-    if (startTime <= now) {
+    const startTime = new Date(now);
+    startTime.setUTCHours(QUIZ_SCHEDULE.START_HOUR - QUIZ_SCHEDULE.TIMEZONE_OFFSET, 0, 0, 0);
+    
+    if (wibTime.totalMinutes >= (QUIZ_SCHEDULE.START_HOUR * 60)) {
       startTime.setUTCDate(startTime.getUTCDate() + 1);
     }
+    
     return startTime;
   }
   
   _getTimeLeftUntilNextEvent() {
-    const now = Date.now();
-    const nextStart = this._getNextQuizStartTime();
-    const timeLeft = nextStart.getTime() - now;
+    const wibTime = this._getCurrentWIBTime();
+    const currentTotalMinutes = wibTime.totalMinutes;
     
-    if (timeLeft <= 0) {
-      return { minutes: 0, seconds: 0, isRunning: this._isQuizTime() };
+    const startTotalMinutes = (QUIZ_SCHEDULE.START_HOUR * 60);
+    const endTotalMinutes = (QUIZ_SCHEDULE.END_HOUR * 60);
+    
+    if (currentTotalMinutes >= startTotalMinutes && currentTotalMinutes < endTotalMinutes) {
+      return { 
+        minutes: 0, 
+        seconds: 0, 
+        isRunning: true,
+        hours: 0,
+        totalMinutes: 0,
+        status: 'running',
+        currentTime: wibTime.formatted,
+        startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
+        endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
+        startHour: QUIZ_SCHEDULE.START_HOUR,
+        endHour: QUIZ_SCHEDULE.END_HOUR
+      };
     }
     
-    const totalSeconds = Math.floor(timeLeft / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
+    let targetTotalMinutes;
+    let status;
+    let dayText = "";
     
-    return { minutes, seconds, isRunning: false };
+    if (currentTotalMinutes < startTotalMinutes) {
+      targetTotalMinutes = startTotalMinutes;
+      status = 'before';
+      dayText = "hari ini";
+    } else {
+      targetTotalMinutes = startTotalMinutes + 1440;
+      status = 'after';
+      dayText = "besok";
+    }
+    
+    const diffMinutes = targetTotalMinutes - currentTotalMinutes;
+    const hours = Math.floor(diffMinutes / 60);
+    const minutes = Math.floor(diffMinutes % 60);
+    const totalSeconds = diffMinutes * 60;
+    
+    return {
+      hours: hours,
+      minutes: minutes,
+      seconds: 0,
+      totalMinutes: diffMinutes,
+      totalSeconds: totalSeconds,
+      isRunning: false,
+      status: status,
+      startHour: QUIZ_SCHEDULE.START_HOUR,
+      endHour: QUIZ_SCHEDULE.END_HOUR,
+      startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
+      endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
+      currentTime: wibTime.formatted,
+      dayText: dayText
+    };
   }
   
   _getCurrentWeek() {
@@ -900,6 +846,12 @@ export class GameServer {
         this.translationManager.resetDailyCounter();
         this._checkQuizAutoStatus();
         this._checkAndRestartQuiz();
+        
+        const timeInfo = this._getTimeLeftUntilNextEvent();
+        if (!timeInfo.isRunning) {
+          this._broadcastQuizTimeLeft();
+        }
+        
       } catch(e) {}
     }, CONSTANTS.SCHEDULER_INTERVAL_MS);
   }
@@ -907,13 +859,14 @@ export class GameServer {
   async _checkQuizAutoStatus() {
     try {
       const isQuizTime = this._isQuizTime();
+      const wibTime = this._getCurrentWIBTime();
       
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏳ Quiz will start soon!",
+            `⏳ Quiz akan segera dimulai! (${wibTime.formatted})`,
             false
           ]);
           
@@ -930,9 +883,18 @@ export class GameServer {
         if (this.quizAutoEnabled) {
           this.quizAutoEnabled = false;
           await this.resetQuiz();
+          
+          const timeInfo = this._getTimeLeftUntilNextEvent();
+          let statusMsg = "";
+          if (timeInfo.status === 'before') {
+            statusMsg = `⏳ Quiz dimulai pukul ${timeInfo.startTime}\n🕐 Sekarang: ${timeInfo.currentTime}`;
+          } else {
+            statusMsg = `⏸️ Quiz telah berakhir. Kembali besok pukul ${timeInfo.startTime}`;
+          }
+          
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏸️ Quiz has ended. See you tomorrow!",
+            statusMsg,
             true
           ]);
         }
@@ -1056,58 +1018,65 @@ export class GameServer {
     if (!ws || ws.readyState !== 1) return false;
     
     try {
-      const isQuizTime = this._isQuizTime();
-      const timeLeft = this._getTimeLeftUntilNextEvent();
-      const isQuizActive = this.currentQuestion !== null || this._quizTimeout !== null;
+      const timeInfo = this._getTimeLeftUntilNextEvent();
       
       let message = "";
       let canType = true;
+      let isQuizTime = timeInfo.isRunning;
       
-      if (isQuizTime && isQuizActive) {
-        let remaining = "";
-        if (this._quizStartTime) {
+      if (isQuizTime) {
+        if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (Date.now() - this._quizStartTime) / 1000;
           const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
           const left = Math.max(0, total - elapsed);
           const minutes = Math.floor(left / 60);
           const seconds = Math.floor(left % 60);
+          
           if (minutes > 0) {
-            remaining = `${minutes}m ${seconds}s remaining`;
+            message = `📝 Quiz berjalan! ${minutes}m ${seconds}s tersisa`;
           } else {
-            remaining = `${seconds}s remaining`;
+            message = `📝 Quiz berjalan! ${seconds}s tersisa`;
           }
-        }
-        message = `📝 Quiz is running! ${remaining}`;
-        canType = false;
-        this._safeSend(ws, ["quizTimeLeft", message, canType]);
-        return false;
-      } else if (isQuizTime && !isQuizActive) {
-        message = `⏳ Quiz will start soon!`;
-        canType = true;
-        this._safeSend(ws, ["quizTimeLeft", message, canType]);
-        return false;
-      } else {
-        const totalSeconds = timeLeft.minutes * 60 + timeLeft.seconds;
-        
-        let countdown = "";
-        if (totalSeconds <= 0) {
-          countdown = "Now!";
+          canType = false;
         } else {
-          const hours = Math.floor(totalSeconds / 3600);
-          const minutes = Math.floor((totalSeconds % 3600) / 60);
-          const seconds = Math.floor(totalSeconds % 60);
-          
-          let parts = [];
-          if (hours > 0) parts.push(`${hours} hour${hours > 1 ? 's' : ''}`);
-          if (minutes > 0) parts.push(`${minutes} minute${minutes > 1 ? 's' : ''}`);
-          if (seconds > 0 && parts.length === 0) parts.push(`${seconds} second${seconds > 1 ? 's' : ''}`);
-          
-          countdown = parts.join(" ");
+          message = `⏳ Quiz akan segera dimulai! (${timeInfo.currentTime})`;
+          canType = true;
         }
         
-        message = `⏸️ Quiz starts in ${countdown}`;
+        this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
+        return false;
+        
+      } else {
+        const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
+        
+        let countdownText = "";
+        const totalSeconds = (hours * 3600) + (minutes * 60);
+        
+        if (totalSeconds <= 0) {
+          countdownText = "Segera!";
+        } else if (hours > 0) {
+          if (minutes > 0) {
+            countdownText = `${hours} jam ${minutes} menit`;
+          } else {
+            countdownText = `${hours} jam`;
+          }
+        } else if (minutes > 0) {
+          countdownText = `${minutes} menit`;
+        } else {
+          countdownText = "Kurang dari 1 menit";
+        }
+        
+        let statusText = "";
+        if (status === 'before') {
+          statusText = `⏳ Quiz dimulai ${dayText} pukul ${startTime} (WIB)`;
+        } else {
+          statusText = `⏸️ Quiz hari ini selesai. Kembali ${dayText} pukul ${startTime} (WIB)`;
+        }
+        
+        message = `${statusText}\n🕐 Waktu sekarang: ${currentTime}\n⏱️ Tersisa: ${countdownText}`;
         canType = true;
-        this._safeSend(ws, ["quizTimeLeft", message, canType]);
+        
+        this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
         return true;
       }
     } catch(e) {
@@ -1115,31 +1084,118 @@ export class GameServer {
     }
   }
   
+  _broadcastQuizTimeLeft() {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    const timeInfo = this._getTimeLeftUntilNextEvent();
+    
+    let message = "";
+    let canType = true;
+    let isQuizTime = timeInfo.isRunning;
+    
+    if (isQuizTime) {
+      if (this.currentQuestion && this._quizStartTime) {
+        const elapsed = (Date.now() - this._quizStartTime) / 1000;
+        const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+        const left = Math.max(0, total - elapsed);
+        const minutes = Math.floor(left / 60);
+        const seconds = Math.floor(left % 60);
+        
+        if (minutes > 0) {
+          message = `📝 Quiz berjalan! ${minutes}m ${seconds}s tersisa`;
+        } else {
+          message = `📝 Quiz berjalan! ${seconds}s tersisa`;
+        }
+        canType = false;
+      } else {
+        message = `⏳ Quiz akan segera dimulai! (${timeInfo.currentTime})`;
+        canType = true;
+      }
+    } else {
+      const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
+      
+      let countdownText = "";
+      const totalSeconds = (hours * 3600) + (minutes * 60);
+      
+      if (totalSeconds <= 0) {
+        countdownText = "Segera!";
+      } else if (hours > 0) {
+        if (minutes > 0) {
+          countdownText = `${hours} jam ${minutes} menit`;
+        } else {
+          countdownText = `${hours} jam`;
+        }
+      } else if (minutes > 0) {
+        countdownText = `${minutes} menit`;
+      } else {
+        countdownText = "Kurang dari 1 menit";
+      }
+      
+      if (status === 'before') {
+        message = `⏳ Quiz dimulai ${dayText} pukul ${startTime}\n⏱️ Tersisa: ${countdownText}`;
+      } else {
+        message = `⏸️ Quiz hari ini selesai. Kembali ${dayText} pukul ${startTime}\n⏱️ Tersisa: ${countdownText}`;
+      }
+      canType = true;
+    }
+    
+    this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, canType, isQuizTime]);
+  }
+  
   _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
     if (!ws || ws.readyState !== 1) return false;
     
     try {
-      const timeLeft = this._getTimeLeftUntilNextEvent();
+      const timeInfo = this._getTimeLeftUntilNextEvent();
       let message = "";
       
       switch(errorType) {
         case "NOT_QUIZ_TIME":
-          message = "Quiz is offline";
+          if (timeInfo.status === 'before') {
+            const { hours, minutes, startTime, currentTime } = timeInfo;
+            let timeStr = "";
+            if (hours > 0 && minutes > 0) {
+              timeStr = `${hours} jam ${minutes} menit`;
+            } else if (hours > 0) {
+              timeStr = `${hours} jam`;
+            } else if (minutes > 0) {
+              timeStr = `${minutes} menit`;
+            } else {
+              timeStr = "kurang dari 1 menit";
+            }
+            message = `⏳ Quiz dimulai pukul ${startTime} (WIB)\n🕐 Sekarang: ${currentTime}\n⏱️ Tersisa: ${timeStr}`;
+          } else {
+            const { startTime, currentTime } = timeInfo;
+            message = `⏸️ Quiz telah berakhir.\n🕐 Sekarang: ${currentTime}\n📅 Kembali besok pukul ${startTime} (WIB)`;
+          }
           break;
+          
         case "QUIZ_DISABLED":
-          message = "Quiz is currently unavailable";
+          message = "❌ Quiz sedang tidak tersedia";
           break;
+          
         case "QUIZ_ENDED":
-          message = "Quiz has ended";
+          const { hours, minutes, startTime, currentTime } = timeInfo;
+          let timeStr = "";
+          if (hours > 0 && minutes > 0) {
+            timeStr = `${hours} jam ${minutes} menit`;
+          } else if (hours > 0) {
+            timeStr = `${hours} jam`;
+          } else if (minutes > 0) {
+            timeStr = `${minutes} menit`;
+          } else {
+            timeStr = "kurang dari 1 menit";
+          }
+          message = `⏸️ Quiz telah berakhir.\n🕐 Sekarang: ${currentTime}\n📅 Lanjut besok pukul ${startTime} (WIB)\n⏱️ Tersisa: ${timeStr}`;
           break;
+          
         case "QUIZ_NOT_STARTED":
-          const timeStr = timeLeft.minutes > 0 ? 
-            `${timeLeft.minutes}m ${timeLeft.seconds}s` : 
-            `${timeLeft.seconds}s`;
-          message = `Quiz starts in: ${timeStr}`;
+          message = `⏳ Quiz akan dimulai pukul ${QUIZ_SCHEDULE.START_HOUR}:00 WIB`;
           break;
+          
         default:
-          message = customMessage || "Quiz error occurred";
+          message = customMessage || "❌ Terjadi kesalahan pada Quiz";
       }
       
       this._safeSend(ws, ["quizError", message]);
@@ -1268,7 +1324,6 @@ export class GameServer {
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
       
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
-        
         this._allQuestions = cached.questions.map((q, index) => ({
           id: index + 1,
           question: q.question || '',
@@ -1399,7 +1454,6 @@ export class GameServer {
       
       if (this._isQuizTime()) {
         const now = Date.now();
-        const idleTime = (now - this._lastActivityTime) / 1000;
         
         if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
           if (this.quizAutoEnabled) {
@@ -1644,7 +1698,6 @@ export class GameServer {
             this._quizBreakTimeout = null;
             this.currentQuestion = null;
             
-            // Broadcast 5 detik sebelum soal berikutnya
             this._broadcastToRoom(QUIZ_ROOM, [
               "quizNextQuestionIn",
               "5"
@@ -1986,10 +2039,8 @@ export class GameServer {
   }
   
   _getWIBTime() {
-    const now = new Date();
-    const hours = (now.getUTCHours() + 7) % 24;
-    const minutes = String(now.getUTCMinutes()).padStart(2, '0');
-    return `${String(hours).padStart(2, '0')}:${minutes}`;
+    const wibTime = this._getCurrentWIBTime();
+    return wibTime.formatted;
   }
   
   _getWsId(ws) {
