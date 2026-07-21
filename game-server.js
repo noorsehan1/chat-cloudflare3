@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (QUIZ 23:00-04:00 WIB) ====================
+// ==================== GAME-SERVER.JS (QUIZ DENGAN TERJEMAHAN) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -35,6 +35,16 @@ const CONSTANTS = {
   QUIZ_BATCH_SIZE: 100,
   MAX_QUESTIONS: 10000,
   CF_SUBREQUEST_LIMIT: 50,
+  DEEPLX_API_URLS: [
+    'https://api.deeplx.org/translate',
+    'https://deeplx.vercel.app/translate',
+    'https://deeplx.deno.dev/translate',
+    'https://deeplx.mingming.dev/translate',
+    'https://deeplx.azurewebsites.net/translate',
+  ],
+  DEEPLX_TIMEOUT_MS: 5000,
+  DEEPLX_MAX_RETRIES: 3,
+  TRANSLATE_TIMEOUT_MS: 5000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -43,6 +53,339 @@ const QUIZ_SCHEDULE = {
 };
 
 const QUIZ_ROOM = "Quiz";
+
+// ==================== TRANSLATION MANAGER (UNTUK QUIZ SAJA) ====================
+
+class TranslationManager {
+  constructor(gameServer) {
+    this.gameServer = gameServer;
+    this.questionCache = new Map();
+    this.globalCache = new Map();
+    this.MAX_GLOBAL_CACHE = 10000;
+    this.GLOBAL_CACHE_TTL = 86400000;
+    this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
+    this.translateCount = 0;
+    this.translateDate = new Date().toUTCString();
+    this.translateLimitReached = false;
+    
+    this._translationCircuitBreaker = {
+      failures: 0,
+      lastFailureTime: 0,
+      isOpen: false,
+      resetTimer: null
+    };
+  }
+
+  resetQuestionCache() {
+    if (this.questionCache.size > 0) {
+      this.questionCache.clear();
+    }
+  }
+
+  async translateForUsers(question, options, usersByLang) {
+    const results = new Map();
+    
+    this.resetQuestionCache();
+    
+    const needTranslate = [];
+    let cacheHits = 0;
+    
+    for (const [lang, users] of usersByLang) {
+      if (lang === 'en') {
+        results.set(lang, { 
+          question, 
+          options, 
+          users, 
+          isFallback: false,
+          fromCache: false
+        });
+        continue;
+      }
+      
+      const cacheKey = this._getCacheKey(question, options, lang);
+      const cached = this.questionCache.get(cacheKey);
+      
+      if (cached) {
+        cacheHits++;
+        results.set(lang, { 
+          ...cached, 
+          users, 
+          fromCache: true 
+        });
+      } else {
+        needTranslate.push({ lang, users });
+      }
+    }
+    
+    if (needTranslate.length === 0) {
+      this._sendResults(results);
+      return;
+    }
+    
+    const translatePromises = needTranslate.map(({ lang, users }) => 
+      this._translateWithTimeout(question, options, lang, users)
+    );
+    
+    const translatedResults = await Promise.all(translatePromises);
+    
+    for (const result of translatedResults) {
+      if (result.success) {
+        const { lang, translatedQuestion, translatedOptions, users } = result;
+        
+        const cacheKey = this._getCacheKey(question, options, lang);
+        this.questionCache.set(cacheKey, {
+          question: translatedQuestion,
+          options: translatedOptions,
+          isFallback: false
+        });
+        
+        results.set(lang, {
+          question: translatedQuestion,
+          options: translatedOptions,
+          users,
+          isFallback: false,
+          fromCache: false
+        });
+      } else {
+        const { lang, users } = result;
+        results.set(lang, {
+          question: question,
+          options: options,
+          users,
+          isFallback: true,
+          fromCache: false
+        });
+      }
+    }
+    
+    this._sendResults(results);
+  }
+  
+  async _translateWithTimeout(question, options, lang, users) {
+    try {
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Translate timeout')), this.TRANSLATE_TIMEOUT);
+      });
+      
+      const translatePromise = (async () => {
+        const [translatedQuestion, translatedOptions] = await Promise.all([
+          this._translateText(question, lang),
+          this._translateOptions(options, lang)
+        ]);
+        
+        return {
+          success: true,
+          lang,
+          users,
+          translatedQuestion,
+          translatedOptions
+        };
+      })();
+      
+      return await Promise.race([translatePromise, timeoutPromise]);
+      
+    } catch(e) {
+      return {
+        success: false,
+        lang,
+        users,
+        error: e.message
+      };
+    }
+  }
+  
+  async _translateText(text, targetLang, retryCount = 0) {
+    if (targetLang === 'en') return text;
+    if (!text || typeof text !== 'string') return text;
+    if (this.translateLimitReached) return text;
+    
+    const globalCacheKey = `global_${text}|${targetLang}`;
+    const globalCached = this._getGlobalCache(globalCacheKey);
+    if (globalCached) {
+      return globalCached;
+    }
+    
+    try {
+      const result = await this._callTranslateAPI(text, targetLang);
+      this._setGlobalCache(globalCacheKey, result);
+      this.translateCount++;
+      return result;
+      
+    } catch(e) {
+      if (retryCount < CONSTANTS.DEEPLX_MAX_RETRIES) {
+        await this._delay(500 * (retryCount + 1));
+        return this._translateText(text, targetLang, retryCount + 1);
+      }
+      return text;
+    }
+  }
+  
+  async _translateOptions(options, targetLang) {
+    if (targetLang === 'en' || !options) return options;
+    
+    const keys = ['A', 'B', 'C', 'D'];
+    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
+    
+    if (texts.length === 0) return options;
+    
+    const translatedTexts = await Promise.all(
+      texts.map(text => this._translateText(text, targetLang))
+    );
+    
+    const result = { ...options };
+    let idx = 0;
+    for (const key of keys) {
+      if (options[key] && typeof options[key] === 'string') {
+        result[key] = translatedTexts[idx++] || options[key];
+      }
+    }
+    
+    return result;
+  }
+  
+  _getCacheKey(question, options, lang) {
+    const optionStr = Object.values(options).join('|');
+    return `${question}|${optionStr}|${lang}`;
+  }
+  
+  _getGlobalCache(key) {
+    const entry = this.globalCache.get(key);
+    if (entry && Date.now() - entry.timestamp < this.GLOBAL_CACHE_TTL) {
+      return entry.value;
+    }
+    return null;
+  }
+  
+  _setGlobalCache(key, value) {
+    if (this.globalCache.size >= this.MAX_GLOBAL_CACHE) {
+      const keysToDelete = Array.from(this.globalCache.keys()).slice(0, this.MAX_GLOBAL_CACHE * 0.2);
+      for (const k of keysToDelete) {
+        this.globalCache.delete(k);
+      }
+    }
+    this.globalCache.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+  }
+  
+  _sendResults(results) {
+    for (const [lang, data] of results) {
+      const { question, options, users, isFallback, fromCache } = data;
+      
+      const message = [
+        "quizQuestion",
+        {
+          question: question || '',
+          options: options || { A: '', B: '', C: '', D: '' },
+          isFallback: isFallback || false
+        }
+      ];
+      
+      const msgStr = JSON.stringify(message);
+      
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {}
+        }
+      }
+    }
+  }
+  
+  async _callTranslateAPI(text, targetLang) {
+    if (this._translationCircuitBreaker.isOpen) {
+      const now = Date.now();
+      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+      } else {
+        throw new Error('Circuit breaker is open');
+      }
+    }
+    
+    const apiUrls = CONSTANTS.DEEPLX_API_URLS;
+    let lastError = null;
+    
+    for (const apiUrl of apiUrls) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS);
+        
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: text,
+            source_lang: 'EN',
+            target_lang: targetLang.toUpperCase()
+          }),
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        const translated = data.data || data.text || data.result || data.translations?.[0]?.text;
+        
+        if (translated) {
+          this._translationCircuitBreaker.failures = 0;
+          return translated;
+        }
+        
+        throw new Error('Invalid response');
+        
+      } catch(e) {
+        lastError = e;
+      }
+    }
+    
+    this._translationCircuitBreaker.failures++;
+    this._translationCircuitBreaker.lastFailureTime = Date.now();
+    
+    if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
+      this._translationCircuitBreaker.isOpen = true;
+      
+      if (this._translationCircuitBreaker.resetTimer) {
+        clearTimeout(this._translationCircuitBreaker.resetTimer);
+      }
+      this._translationCircuitBreaker.resetTimer = setTimeout(() => {
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+        this._translationCircuitBreaker.resetTimer = null;
+      }, CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS);
+    }
+    
+    throw lastError || new Error('All APIs failed');
+  }
+  
+  resetDailyCounter() {
+    const now = new Date().toUTCString();
+    if (now !== this.translateDate) {
+      this.translateDate = now;
+      this.translateCount = 0;
+      this.translateLimitReached = false;
+      
+      this._translationCircuitBreaker.isOpen = false;
+      this._translationCircuitBreaker.failures = 0;
+      if (this._translationCircuitBreaker.resetTimer) {
+        clearTimeout(this._translationCircuitBreaker.resetTimer);
+        this._translationCircuitBreaker.resetTimer = null;
+      }
+    }
+  }
+  
+  _delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// ==================== GAME SERVER CLASS ====================
 
 export class GameServer {
   constructor(state, env) {
@@ -103,6 +446,9 @@ export class GameServer {
     
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
+    
+    // Translation Manager untuk quiz saja
+    this.translationManager = new TranslationManager(this);
     
     this._initAsync();
     
@@ -259,6 +605,7 @@ export class GameServer {
       }
       
       try {
+        this.translationManager.resetDailyCounter();
         this._checkQuizAutoStatus();
         this._checkAndRestartQuiz();
       } catch(e) {}
@@ -700,29 +1047,31 @@ export class GameServer {
     return false;
   }
   
-  _broadcastQuizQuestion(question, options) {
+  async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds || wsIds.size === 0) return;
     
-    const message = [
-      "quizQuestion",
-      {
-        question: question || '',
-        options: options || { A: '', B: '', C: '', D: '' },
-        isFallback: false
-      }
-    ];
-    
-    const msgStr = JSON.stringify(message);
+    // Group users by language
+    const usersByLang = new Map();
     
     for (const wsId of wsIds) {
       try {
         const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1) {
-          ws.send(msgStr);
+        if (!ws || ws.readyState !== 1) continue;
+        
+        const lang = this.userLanguage.get(wsId) || 'en';
+        
+        if (!usersByLang.has(lang)) {
+          usersByLang.set(lang, []);
         }
+        usersByLang.get(lang).push(ws);
       } catch(e) {}
     }
+    
+    if (usersByLang.size === 0) return;
+    
+    // Translate and send to all users
+    await this.translationManager.translateForUsers(question, options, usersByLang);
   }
   
   _broadcastQuizResult(type, data) {
@@ -811,7 +1160,8 @@ export class GameServer {
       this._questionPointer++;
       this._totalQuestionsAnswered++;
 
-      this._broadcastQuizQuestion(
+      // Broadcast question with translation
+      await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
       );
@@ -1092,6 +1442,7 @@ export class GameServer {
       const loaded = await this._loadAllQuestionsFromKV();
       if (loaded) {
         this._startQuizLoop();
+        this._startTranslateResetCounter();
         return true;
       }
       if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
@@ -1104,6 +1455,21 @@ export class GameServer {
       }
       return false;
     }
+  }
+  
+  _startTranslateResetCounter() {
+    if (this._translateResetInterval) {
+      clearInterval(this._translateResetInterval);
+      this._translateResetInterval = null;
+    }
+    this._translateResetInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._translateResetInterval);
+        this._translateResetInterval = null;
+        return;
+      }
+      this.translationManager.resetDailyCounter();
+    }, 60000);
   }
   
   // ==================== HANDLE EVENT ====================
