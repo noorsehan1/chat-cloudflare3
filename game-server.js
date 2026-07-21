@@ -54,7 +54,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   START_HOUR: 16,
-  END_HOUR: 21,
+  END_HOUR: 23,
 };
 
 const QUIZ_ROOM = "Quiz";
