@@ -65,9 +65,30 @@ const CONSTANTS = {
 };
 
 const QUIZ_SCHEDULE = {
-  SESSION1: { start: 0, end: 7 },
-  SESSION2: { start: 8, end: 24 },
- 
+  SESSION1: { start: 0, end: 1 },
+  SESSION2: { start: 1, end: 2 },
+  SESSION3: { start: 2, end: 3 },
+  SESSION4: { start: 3, end: 4 },
+  SESSION5: { start: 4, end: 5 },
+  SESSION6: { start: 5, end: 6 },
+  SESSION7: { start: 6, end: 7 },
+  SESSION8: { start: 7, end: 8 },
+  SESSION9: { start: 8, end: 9 },
+  SESSION10: { start: 9, end: 10 },
+  SESSION11: { start: 10, end: 11 },
+  SESSION12: { start: 11, end: 12 },
+  SESSION13: { start: 12, end: 13 },
+  SESSION14: { start: 13, end: 14 },
+  SESSION15: { start: 14, end: 15 },
+  SESSION16: { start: 15, end: 16 },
+  SESSION17: { start: 16, end: 17 },
+  SESSION18: { start: 17, end: 18 },
+  SESSION19: { start: 18, end: 19 },
+  SESSION20: { start: 19, end: 20 },
+  SESSION21: { start: 20, end: 21 },
+  SESSION22: { start: 21, end: 22 },
+  SESSION23: { start: 22, end: 23 },
+  SESSION24: { start: 23, end: 24 },
 };
 
 const QUIZ_ROOM = "Quiz";
