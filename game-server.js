@@ -61,10 +61,7 @@ const QUIZ_ROOM = "Quiz";
 class TranslationManager {
   constructor(gameServer) {
     this.gameServer = gameServer;
-    this.languageCache = new Map();
-    this.globalCache = new Map();
-    this.MAX_GLOBAL_CACHE = 50000;
-    this.GLOBAL_CACHE_TTL = 86400000;
+    this.questionCache = new Map();
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
@@ -79,9 +76,11 @@ class TranslationManager {
   }
 
   resetQuestionCache() {
-    if (this.languageCache.size > 0) {
-      this.languageCache.clear();
+    if (this.questionCache.size > 0) {
+      this.questionCache.clear();
     }
+    this.translateCount = 0;
+    this.translateLimitReached = false;
   }
 
   async translateForUsers(question, options, usersByLang) {
@@ -105,7 +104,7 @@ class TranslationManager {
       }
       
       const cacheKey = this._getCacheKey(question, options, lang);
-      const cached = this.languageCache.get(cacheKey);
+      const cached = this.questionCache.get(cacheKey);
       
       if (cached) {
         cacheHits++;
@@ -135,7 +134,7 @@ class TranslationManager {
         const { lang, translatedQuestion, translatedOptions, users } = result;
         
         const cacheKey = this._getCacheKey(question, options, lang);
-        this.languageCache.set(cacheKey, {
+        this.questionCache.set(cacheKey, {
           question: translatedQuestion,
           options: translatedOptions,
           isFallback: false
@@ -201,15 +200,8 @@ class TranslationManager {
     if (!text || typeof text !== 'string') return text;
     if (this.translateLimitReached) return text;
     
-    const globalCacheKey = `global_${text}|${targetLang}`;
-    const globalCached = this._getGlobalCache(globalCacheKey);
-    if (globalCached) {
-      return globalCached;
-    }
-    
     try {
       const result = await this._callTranslateAPI(text, targetLang);
-      this._setGlobalCache(globalCacheKey, result);
       this.translateCount++;
       return result;
       
@@ -248,27 +240,6 @@ class TranslationManager {
   _getCacheKey(question, options, lang) {
     const optionStr = Object.values(options).join('|');
     return `${question}|${optionStr}|${lang}`;
-  }
-  
-  _getGlobalCache(key) {
-    const entry = this.globalCache.get(key);
-    if (entry && Date.now() - entry.timestamp < this.GLOBAL_CACHE_TTL) {
-      return entry.value;
-    }
-    return null;
-  }
-  
-  _setGlobalCache(key, value) {
-    if (this.globalCache.size >= this.MAX_GLOBAL_CACHE) {
-      const keysToDelete = Array.from(this.globalCache.keys()).slice(0, this.MAX_GLOBAL_CACHE * 0.2);
-      for (const k of keysToDelete) {
-        this.globalCache.delete(k);
-      }
-    }
-    this.globalCache.set(key, {
-      value,
-      timestamp: Date.now()
-    });
   }
   
   _sendResults(results) {
