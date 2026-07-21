@@ -38,6 +38,7 @@ const CONSTANTS = {
   DEEPLX_TIMEOUT_MS: 8000,
   DEEPLX_MAX_RETRIES: 5,
   TRANSLATE_TIMEOUT_MS: 10000,
+  QUIZ_KEEP_ALIVE_INTERVAL_MS: 5000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -736,6 +737,11 @@ export class GameServer {
     
     this.translationManager = new TranslationManager(this);
     
+    // QUIZ KEEP ALIVE
+    this._quizKeepAliveInterval = null;
+    this._lastActivityTime = Date.now();
+    this._isQuizIdle = false;
+    
     this._initAsync();
     
     setTimeout(() => {
@@ -1012,6 +1018,10 @@ export class GameServer {
       
       if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
         this.forceStartQuiz();
+      }
+      
+      if (!this._quizKeepAliveInterval) {
+        this._startQuizKeepAlive();
       }
       
     } catch(e) {}
@@ -1374,8 +1384,123 @@ export class GameServer {
     }
   }
   
+  // ==================== QUIZ KEEP ALIVE ====================
+  
+  _startQuizKeepAlive() {
+    if (this._quizKeepAliveInterval) {
+      clearInterval(this._quizKeepAliveInterval);
+      this._quizKeepAliveInterval = null;
+    }
+    
+    this._quizKeepAliveInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._quizKeepAliveInterval);
+        this._quizKeepAliveInterval = null;
+        return;
+      }
+      
+      if (this._isQuizTime()) {
+        const now = Date.now();
+        const idleTime = (now - this._lastActivityTime) / 1000;
+        
+        if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+          if (this.quizAutoEnabled) {
+            this._showQuestion();
+          } else {
+            this.quizAutoEnabled = true;
+            this._showQuestion();
+          }
+        }
+        
+        if (this.currentQuestion && this._quizStartTime) {
+          const elapsed = (now - this._quizStartTime) / 1000;
+          const maxTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+          
+          if (elapsed > maxTime - 2) {
+            if (!this._quizTimeout) {
+              this._forceEvaluateQuiz();
+            }
+          }
+        }
+      }
+    }, CONSTANTS.QUIZ_KEEP_ALIVE_INTERVAL_MS);
+  }
+  
+  async _forceEvaluateQuiz() {
+    if (!this.currentQuestion) return;
+    if (this._quizTimeout) return;
+    
+    try {
+      const currentClients = this.wsClients.get(QUIZ_ROOM);
+      if (!currentClients || currentClients.size === 0) {
+        this.currentQuestion = null;
+        return;
+      }
+
+      const correctAnswer = this.currentQuestion.correct;
+      const question = this.currentQuestion.question;
+      const options = this.currentQuestion.options;
+
+      if (this.quizHasWinner && this.quizWinner) {
+        const points = await this._getQuizPoints();
+        points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
+        
+        if (this.env && this.env.QUESTIONS) {
+          this._incrementSubRequest();
+          await this.env.QUESTIONS.put(
+            CONSTANTS.QUIZ_POINT_KEY,
+            JSON.stringify(points)
+          );
+        }
+        
+        const totalPoints = points[this.quizWinner] || 0;
+        
+        this._broadcastQuizResult("quizWinner", {
+          username: this.quizWinner,
+          totalPoints: totalPoints,
+          correctAnswer: correctAnswer
+        });
+        
+      } else {
+        this._broadcastQuizResult("quizNoWinner", {
+          message: "No one answered correctly!",
+          correctAnswer: correctAnswer
+        });
+      }
+      
+      this._broadcastQuizResult("quizCorrectAnswer", {
+        question: question,
+        options: options,
+        correctAnswer: correctAnswer
+      });
+
+      this.currentQuestion = null;
+      this.isQuizWaiting = true;
+
+      this._quizBreakTimeout = setTimeout(() => {
+        if (this.closing || this.isDestroyed) {
+          this._quizBreakTimeout = null;
+          return;
+        }
+        this.isQuizWaiting = false;
+        this._quizBreakTimeout = null;
+        
+        if (!this.closing && !this.isDestroyed) {
+          this.ensureQuizRunning();
+        }
+      }, CONSTANTS.QUIZ_BREAK_MS);
+
+    } catch(e) {
+      this.currentQuestion = null;
+      this.isQuizWaiting = false;
+    }
+  }
+  
   async _showQuestion() {
     try {
+      this._lastActivityTime = Date.now();
+      this._isQuizIdle = false;
+      
       if (!this._isQuizTime()) {
         const clients = this.wsClients.get(QUIZ_ROOM);
         if (clients && clients.size > 0) {
@@ -1666,6 +1791,10 @@ export class GameServer {
         clearTimeout(this._quizStartTimeout);
         this._quizStartTimeout = null;
       }
+      if (this._quizKeepAliveInterval) {
+        clearInterval(this._quizKeepAliveInterval);
+        this._quizKeepAliveInterval = null;
+      }
       
       this.currentQuestion = null;
       this.isQuizWaiting = false;
@@ -1717,6 +1846,7 @@ export class GameServer {
       if (loaded) {
         this._startQuizLoop();
         this._startTranslateResetCounter();
+        this._startQuizKeepAlive();
         return true;
       }
       if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
