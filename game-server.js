@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULLY OPTIMIZED WITH PARALLEL TRANSLATE) ====================
+// ==================== GAME-SERVER.JS (CLEAN VERSION - NO LOGS) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -58,7 +58,6 @@ const CONSTANTS = {
   CF_SUBREQUEST_LIMIT: 50,
   CF_CPU_TIME_LIMIT_MS: 9000,
   CF_MEMORY_LIMIT_MB: 128,
-  // TRANSLATION OPTIMIZATION
   MAX_PARALLEL_TRANSLATE: 10,
   TRANSLATE_TIMEOUT_MS: 3000,
   CACHE_TTL_MS: 3600000,
@@ -91,7 +90,6 @@ class TranslationManager {
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
     
-    // Circuit Breaker
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
@@ -100,21 +98,14 @@ class TranslationManager {
     };
   }
 
-  // ==================== CORE METHOD ====================
-  
   async translateForUsers(question, options, usersByLang) {
-    const startTime = Date.now();
     const results = new Map();
     
-    console.log(`🌍 Translating for ${usersByLang.size} languages...`);
-    
-    // 1️⃣ Cek cache untuk semua bahasa
     const cacheHits = new Map();
     const needTranslate = [];
     
     for (const [lang, users] of usersByLang) {
       if (lang === 'en') {
-        // English tidak perlu translate
         results.set(lang, { question, options, users, isFallback: false });
         continue;
       }
@@ -123,41 +114,31 @@ class TranslationManager {
       const cached = this._getCache(cacheKey);
       
       if (cached) {
-        // ✅ Cache hit!
         cacheHits.set(lang, { ...cached, users });
         results.set(lang, { ...cached, users, isFallback: false });
       } else {
-        // ❌ Cache miss, perlu translate
         needTranslate.push({ lang, users });
       }
     }
     
-    console.log(`📊 Cache: ${cacheHits.size} hit, ${needTranslate.length} miss`);
-    
-    // 2️⃣ Jika semua cache hit, langsung kirim
     if (needTranslate.length === 0) {
       this._sendResults(results);
-      console.log(`✅ All cached! ${Date.now() - startTime}ms`);
       return;
     }
     
-    // 3️⃣ Translate yang belum di-cache secara PARALLEL
     const translatePromises = needTranslate.map(({ lang, users }) => 
       this._translateWithTimeout(question, options, lang, users)
     );
     
-    // 4️⃣ Tunggu semua selesai (dengan batasan parallel)
     const translatedResults = await this._executeWithConcurrencyLimit(
       translatePromises,
       this.MAX_PARALLEL
     );
     
-    // 5️⃣ Simpan ke cache dan gabungkan hasil
     for (const result of translatedResults) {
       if (result.success) {
         const { lang, translatedQuestion, translatedOptions, users } = result;
         
-        // Simpan cache
         const cacheKey = this._getCacheKey(question, options, lang);
         this._setCache(cacheKey, {
           question: translatedQuestion,
@@ -171,7 +152,6 @@ class TranslationManager {
           isFallback: false
         });
       } else {
-        // ❌ Gagal, fallback ke English
         const { lang, users } = result;
         results.set(lang, {
           question: question,
@@ -179,16 +159,11 @@ class TranslationManager {
           users,
           isFallback: true
         });
-        console.log(`⚠️ Fallback to English for ${lang}`);
       }
     }
     
-    // 6️⃣ Kirim semua hasil
     this._sendResults(results);
-    console.log(`✅ All done! ${Date.now() - startTime}ms`);
   }
-  
-  // ==================== PARALLEL WITH CONCURRENCY LIMIT ====================
   
   async _executeWithConcurrencyLimit(promiseFactories, limit) {
     const results = [];
@@ -210,8 +185,6 @@ class TranslationManager {
     return Promise.all(results);
   }
   
-  // ==================== TRANSLATE WITH TIMEOUT ====================
-  
   async _translateWithTimeout(question, options, lang, users) {
     try {
       const timeoutPromise = new Promise((_, reject) => {
@@ -219,7 +192,6 @@ class TranslationManager {
       });
       
       const translatePromise = (async () => {
-        // ✅ Translate question dan options secara PARALLEL
         const [translatedQuestion, translatedOptions] = await Promise.all([
           this._translateText(question, lang),
           this._translateOptions(options, lang)
@@ -237,7 +209,6 @@ class TranslationManager {
       return await Promise.race([translatePromise, timeoutPromise]);
       
     } catch(e) {
-      // ❌ Timeout atau error, return fallback
       return {
         success: false,
         lang,
@@ -247,21 +218,17 @@ class TranslationManager {
     }
   }
   
-  // ==================== TRANSLATE TEXT (DENGAN RETRY) ====================
-  
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (!text || typeof text !== 'string') return text;
     if (this.translateLimitReached) return text;
     
     try {
-      // Cek pending request (deduplicate)
       const pendingKey = `${text}|${targetLang}`;
       if (this.pendingRequests.has(pendingKey)) {
         return await this.pendingRequests.get(pendingKey);
       }
       
-      // Buat promise translate
       const translatePromise = this._callTranslateAPI(text, targetLang);
       this.pendingRequests.set(pendingKey, translatePromise);
       
@@ -276,14 +243,11 @@ class TranslationManager {
         await this._delay(500 * (retryCount + 1));
         return this._translateText(text, targetLang, retryCount + 1);
       }
-      return text; // Fallback ke text asli
+      return text;
     }
   }
   
-  // ==================== CALL TRANSLATE API ====================
-  
   async _callTranslateAPI(text, targetLang) {
-    // Check circuit breaker
     if (this._translationCircuitBreaker.isOpen) {
       const now = Date.now();
       if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
@@ -323,7 +287,6 @@ class TranslationManager {
         const translated = data.data || data.text || data.result || data.translations?.[0]?.text;
         
         if (translated) {
-          // Reset circuit breaker on success
           this._translationCircuitBreaker.failures = 0;
           return translated;
         }
@@ -332,11 +295,9 @@ class TranslationManager {
         
       } catch(e) {
         lastError = e;
-        // Lanjut ke API berikutnya
       }
     }
     
-    // Update circuit breaker
     this._translationCircuitBreaker.failures++;
     this._translationCircuitBreaker.lastFailureTime = Date.now();
     
@@ -356,8 +317,6 @@ class TranslationManager {
     throw lastError || new Error('All APIs failed');
   }
   
-  // ==================== TRANSLATE OPTIONS ====================
-  
   async _translateOptions(options, targetLang) {
     if (targetLang === 'en' || !options) return options;
     
@@ -366,7 +325,6 @@ class TranslationManager {
     
     if (texts.length === 0) return options;
     
-    // ✅ Translate semua options secara PARALLEL
     const translatedTexts = await Promise.all(
       texts.map(text => this._translateText(text, targetLang))
     );
@@ -382,8 +340,6 @@ class TranslationManager {
     return result;
   }
   
-  // ==================== CACHE ====================
-  
   _getCacheKey(question, options, lang) {
     const optionStr = Object.values(options).join('|');
     return `${question}|${optionStr}|${lang}`;
@@ -398,7 +354,6 @@ class TranslationManager {
   }
   
   _setCache(key, value) {
-    // Limit cache size
     if (this.cache.size >= this.MAX_CACHE_SIZE) {
       const oldestKey = this.cache.keys().next().value;
       this.cache.delete(oldestKey);
@@ -409,8 +364,6 @@ class TranslationManager {
       timestamp: Date.now()
     });
   }
-  
-  // ==================== SEND RESULTS ====================
   
   _sendResults(results) {
     for (const [lang, data] of results) {
@@ -431,15 +384,11 @@ class TranslationManager {
         if (ws && ws.readyState === 1) {
           try {
             ws.send(msgStr);
-          } catch(e) {
-            // Ignore
-          }
+          } catch(e) {}
         }
       }
     }
   }
-  
-  // ==================== RESET COUNTER ====================
   
   resetDailyCounter() {
     const now = new Date().toUTCString();
@@ -456,8 +405,6 @@ class TranslationManager {
       }
     }
   }
-  
-  // ==================== UTILITY ====================
   
   _delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -493,7 +440,6 @@ export class GameServer {
     this._tikCounter = 0;
     this._gameStartFlags = new Map();
     
-    // QUIZ
     this.quizAnswered = new Set();
     this.quizHasWinner = false;
     this.quizWinner = null;
@@ -504,7 +450,6 @@ export class GameServer {
     this.quizQuestionCache = {};
     this._quizStartTime = null;
     
-    // TRACKING UNTUK SOAL
     this._allQuestions = [];
     this._currentQuestions = [];
     this._currentBatchStart = 0;
@@ -515,7 +460,6 @@ export class GameServer {
     this._currentBatchIndex = 0;
     this._lastLoadedBatch = 0;
     
-    // DEEPLX TRANSLATION - WITH OPTIMIZATION
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -524,22 +468,18 @@ export class GameServer {
     this._translationQueue = [];
     this._isProcessingQueue = false;
     
-    // ✅ Translation Manager
     this.translationManager = new TranslationManager(this);
     
-    // CF PROTECTION
     this._requestCount = 0;
     this._requestResetTime = Date.now() + 60000;
     this._cpuTimeUsed = 0;
     this._subRequestCount = 0;
     
-    // TIMERS
     this._quizTimeout = null;
     this._translateResetInterval = null;
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
     
-    // CIRCUIT BREAKER
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
@@ -553,8 +493,6 @@ export class GameServer {
     this._initAsync();
   }
   
-  // ==================== ASYNC INIT ====================
-  
   async _initAsync() {
     if (this._initialized) return;
     this._initialized = true;
@@ -567,8 +505,6 @@ export class GameServer {
       this.ensureQuizRunning();
     }, 2000);
   }
-  
-  // ==================== CF PROTECTION METHODS ====================
   
   _checkCFLimits() {
     const now = Date.now();
@@ -614,8 +550,6 @@ export class GameServer {
     return true;
   }
   
-  // ==================== UTC TIME HELPERS ====================
-  
   _getCurrentUTCTime() {
     return new Date();
   }
@@ -623,8 +557,6 @@ export class GameServer {
   _getCurrentUTCHours() {
     return new Date().getUTCHours();
   }
-  
-  // ==================== GAME TIME CHECK ====================
   
   _isGameTime() {
     const hour = this._getCurrentUTCHours();
@@ -646,8 +578,6 @@ export class GameServer {
     
     return false;
   }
-  
-  // ==================== WEEKLY HELPERS ====================
   
   _getCurrentWeek() {
     const now = new Date();
@@ -737,8 +667,6 @@ export class GameServer {
     }
   }
   
-  // ==================== QUIZ SCHEDULE ====================
-  
   _isQuizTime() {
     const hour = this._getCurrentUTCHours();
     const schedules = [
@@ -796,8 +724,6 @@ export class GameServer {
     return { minutes, seconds, isRunning: false };
   }
   
-  // ==================== QUIZ AUTO SCHEDULER ====================
-  
   _startQuizScheduler() {
     if (this.quizAutoTimer) {
       clearInterval(this.quizAutoTimer);
@@ -840,12 +766,8 @@ export class GameServer {
           ]);
         }
       }
-    } catch(e) {
-      // Silent
-    }
+    } catch(e) {}
   }
-  
-  // ==================== FORCE START QUIZ IF TIME ====================
   
   _forceStartQuizIfTime() {
     if (!this._isQuizTime()) return;
@@ -857,8 +779,6 @@ export class GameServer {
     this.quizAutoEnabled = true;
     this._showQuestion();
   }
-  
-  // ==================== SEND TO USER ====================
   
   _sendQuizTimeLeftToUser(ws) {
     if (!ws || ws.readyState !== 1) return false;
@@ -955,8 +875,6 @@ export class GameServer {
       return false;
     }
   }
-  
-  // ==================== SWITCH ROOM ====================
   
   async switchRoom(ws, room, username = null) {
     if (this.isDestroyed) {
@@ -1057,8 +975,6 @@ export class GameServer {
     }
   }
   
-  // ==================== LOAD SEMUA SOAL DARI KV ====================
-  
   async _loadAllQuestionsFromKV() {
     if (!this.env || !this.env.QUESTIONS) return false;
     
@@ -1067,7 +983,6 @@ export class GameServer {
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
       
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
-        
         this._allQuestions = cached.questions.map((q, index) => ({
           id: index + 1,
           question: q.question || '',
@@ -1084,23 +999,16 @@ export class GameServer {
         this._totalQuestionsAnswered = 0;
         this._currentBatchIndex = 0;
         
-        // Load batch pertama
         this._loadNextBatch();
-        
-        console.log(`✅ Loaded ${this._allQuestions.length} questions from KV`);
-        console.log(`📦 First batch: ${this._currentBatchStart + 1} - ${this._currentBatchEnd}`);
         
         return true;
       }
       
       return false;
     } catch(e) {
-      console.error('❌ Failed to load questions:', e);
       return false;
     }
   }
-  
-  // ==================== LOAD NEXT BATCH ====================
   
   _loadNextBatch() {
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
@@ -1110,7 +1018,6 @@ export class GameServer {
     const totalQuestions = this._allQuestions.length;
     let startIndex = this._currentBatchEnd;
     
-    // Jika sudah mencapai akhir, reset ke awal
     if (startIndex >= totalQuestions) {
       startIndex = 0;
       this._currentBatchStart = 0;
@@ -1124,8 +1031,6 @@ export class GameServer {
         "📢 All 10,000 questions have been answered! Starting from question 1 again!",
         "info"
       ]);
-      
-      console.log('🔄 All questions completed! Resetting to start...');
     }
     
     let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
@@ -1138,18 +1043,13 @@ export class GameServer {
     this._currentBatchIndex = Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE);
     this._lastLoadedBatch = this._currentBatchIndex;
     
-    const startNum = startIndex + 1;
-    const endNum = endIndex;
-    
-    console.log(`📦 Loaded batch ${this._currentBatchIndex + 1}: questions ${startNum} - ${endNum} (${batch.length} questions)`);
-    
     this._broadcastToRoom(QUIZ_ROOM, [
       "quizBatchLoaded",
       {
-        start: startNum,
-        end: endNum,
+        start: startIndex + 1,
+        end: endIndex,
         total: totalQuestions,
-        remaining: totalQuestions - endNum,
+        remaining: totalQuestions - endIndex,
         batch: Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE) + 1,
         totalBatches: Math.ceil(totalQuestions / CONSTANTS.QUIZ_BATCH_SIZE)
       }
@@ -1158,31 +1058,16 @@ export class GameServer {
     return true;
   }
   
-  // ==================== CHECK AND LOAD NEXT BATCH ====================
-  
   _checkAndLoadNextBatch() {
     const questions = this.quizQuestionCache['en'] || [];
     
     if (this._questionPointer >= questions.length) {
-      const currentPointer = this._questionPointer;
-      
-      console.log(`📖 Reached end of batch (pointer: ${currentPointer}/${questions.length}), loading next batch...`);
-      
       this._loadNextBatch();
-      
-      const newQuestions = this.quizQuestionCache['en'] || [];
-      if (this._currentBatchStart === 0 && newQuestions.length > 0) {
-        this._questionPointer = 0;
-        console.log('🔄 Reset to beginning of all questions');
-      }
-      
       return true;
     }
     
     return false;
   }
-  
-  // ==================== QUIZ CORE ====================
   
   async _showQuestion() {
     try {
@@ -1257,11 +1142,7 @@ export class GameServer {
       
       this._questionPointer++;
       this._totalQuestionsAnswered++;
-      
-      const globalIndex = this._currentBatchStart + this._questionPointer;
-      console.log(`📖 Question ${globalIndex}/${this._allQuestions.length} (Batch ${this._currentBatchIndex + 1})`);
 
-      // ✅ BROADCAST DENGAN PARALLEL TRANSLATE
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1333,20 +1214,16 @@ export class GameServer {
       }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
 
     } catch(e) {
-      console.error('❌ Error in _showQuestion:', e);
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
     }
   }
   
-  // ==================== BROADCAST QUIZ WITH PARALLEL TRANSLATE ====================
-  
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds || wsIds.size === 0) return;
     
-    // ✅ Group users by language
     const usersByLang = new Map();
     
     for (const wsId of wsIds) {
@@ -1359,18 +1236,11 @@ export class GameServer {
           usersByLang.set(lang, []);
         }
         usersByLang.get(lang).push(ws);
-      } catch(e) {
-        // Ignore
-      }
+      } catch(e) {}
     }
     
-    console.log(`🌍 Broadcasting to ${wsIds.size} users in ${usersByLang.size} languages`);
-    
-    // ✅ Gunakan Translation Manager untuk parallel translate
     await this.translationManager.translateForUsers(question, options, usersByLang);
   }
-  
-  // ==================== SUBMIT QUIZ ANSWER ====================
   
   async submitQuizAnswer(ws, username, answer) {
     try {
@@ -1484,8 +1354,6 @@ export class GameServer {
     }, CONSTANTS.QUIZ_INTERVAL_MS);
   }
   
-  // ==================== RESET QUIZ ====================
-  
   async resetQuiz() {
     try {
       if (this._quizTimeout) {
@@ -1509,9 +1377,7 @@ export class GameServer {
       this._quizStartTime = null;
       
       this._broadcastToRoom(QUIZ_ROOM, ["quizReset", "Quiz has been reset"]);
-    } catch(e) {
-      // Silent
-    }
+    } catch(e) {}
   }
   
   async startQuizWithDelay(delayMs) {
@@ -1529,13 +1395,10 @@ export class GameServer {
     }, delayMs);
   }
   
-  // ==================== HANDLE EVENT ====================
-  
   async handleEvent(ws, data) {
     if (this.isDestroyed || !ws || !data || !data[0]) return;
     const evt = data[0];
     
-    // ===== QUIZ EVENTS =====
     if (evt === "switchRoom") {
       const [_, room, username] = data;
       await this.switchRoom(ws, room, username);
@@ -1615,7 +1478,6 @@ export class GameServer {
       return;
     }
     
-    // ===== GAME EVENTS =====
     const room = this._ensureRoomConsistency(ws);
     if (!room) {
       this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1648,8 +1510,6 @@ export class GameServer {
         break;
     }
   }
-  
-  // ==================== GET QUIZ STATUS ====================
   
   _getQuizStatus() {
     try {
@@ -1710,8 +1570,6 @@ export class GameServer {
       return { error: e.message };
     }
   }
-  
-  // ==================== WEBSOCKET HELPERS ====================
   
   _getWsId(ws) {
     return ws ? ws._wsId : null;
@@ -1825,8 +1683,6 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== LANGUAGE DETECTION ====================
-  
   _countryToLanguage(countryCode) {
     if (!countryCode) return 'en';
     const map = {
@@ -1857,8 +1713,6 @@ export class GameServer {
     const country = this.userCountry.get(wsId);
     return this._countryToLanguage(country) || 'en';
   }
-  
-  // ==================== SHUFFLE HELPERS ====================
   
   _shuffleQuestionOptions(question) {
     if (!question || !question.options) {
@@ -1895,8 +1749,6 @@ export class GameServer {
     }
     return arr;
   }
-  
-  // ==================== BROADCAST ====================
   
   _broadcastToRoom(room, message) {
     if (this.closing || this.isDestroyed || !room || !message) return;
@@ -1959,8 +1811,6 @@ export class GameServer {
     }
   }
   
-  // ==================== GAME LOWCARD METHODS ====================
-  
   _isGameActuallyRunning(game) {
     if (!game) return false;
     return game._isActive === true && !game._gameEnded;
@@ -2009,8 +1859,6 @@ export class GameServer {
     }
     return null;
   }
-  
-  // ==================== GAME CLEANUP ====================
   
   _scheduleGameCleanup(room, game) {
     if (!room || !game) return;
@@ -2157,8 +2005,6 @@ export class GameServer {
     return result;
   }
   
-  // ==================== BOT METHODS ====================
-  
   _addBots(room, count) {
     try {
       const game = this.activeGames.get(room);
@@ -2242,8 +2088,6 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
     } catch(e) {}
   }
-  
-  // ==================== GAME PHASE METHODS ====================
   
   _startRegistration(room, game) {
     if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
@@ -2604,8 +2448,6 @@ export class GameServer {
     }
   }
   
-  // ==================== START GAME ====================
-  
   async startGame(ws, bet, username) {
     try {
       if (this.isDestroyed) {
@@ -2755,8 +2597,6 @@ export class GameServer {
     } catch(e) {}
   }
   
-  // ==================== JOIN GAME ====================
-  
   async joinGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -2826,8 +2666,6 @@ export class GameServer {
       this._safeSend(ws, ["gameLowCardError", "Failed to join game"]);
     }
   }
-  
-  // ==================== SUBMIT NUMBER ====================
   
   async submitNumber(ws, number, tanda, username) {
     try {
@@ -2909,8 +2747,6 @@ export class GameServer {
     }
   }
   
-  // ==================== LEAVE GAME ====================
-  
   async leaveGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -2942,8 +2778,6 @@ export class GameServer {
     }
   }
   
-  // ==================== CHECK GAME ====================
-  
   async checkGameRunning(ws, roomname) {
     try {
       if (this.isDestroyed) {
@@ -2964,8 +2798,6 @@ export class GameServer {
     }
   }
   
-  // ==================== GETTERS ====================
-  
   getGame(room) {
     return this.activeGames.get(room);
   }
@@ -2985,8 +2817,6 @@ export class GameServer {
       return { running: false, message: "Error checking game" };
     }
   }
-  
-  // ==================== CLEANUP ====================
   
   _checkStuckGames() {
     try {
@@ -3089,8 +2919,6 @@ export class GameServer {
       }
     } catch(e) {}
   }
-  
-  // ==================== FETCH ====================
   
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
@@ -3224,8 +3052,6 @@ export class GameServer {
     }
   }
   
-  // ==================== WEBSOCKET EVENTS ====================
-  
   async webSocketMessage(ws, msg) {
     try {
       if (!ws || ws._closing || this.closing || this.isDestroyed) return;
@@ -3297,8 +3123,6 @@ export class GameServer {
       ws.username = null;
     } catch(e) {}
   }
-  
-  // ==================== DESTROY ====================
   
   async destroy() {
     try {
@@ -3395,8 +3219,6 @@ export class GameServer {
     } catch(e) {}
   }
   
-  // ==================== ENSURE QUIZ RUNNING ====================
-  
   ensureQuizRunning() {
     try {
       const clients = this.wsClients.get(QUIZ_ROOM);
@@ -3413,9 +3235,7 @@ export class GameServer {
         return;
       }
       this._startQuizIfNeeded();
-    } catch(e) {
-      // Silent
-    }
+    } catch(e) {}
   }
   
   _startQuizIfNeeded() {
@@ -3433,9 +3253,7 @@ export class GameServer {
         }
         this._showQuestion();
       }
-    } catch(e) {
-      // Silent
-    }
+    } catch(e) {}
   }
   
   async _initQuiz(retryCount = 0) {
@@ -3458,8 +3276,6 @@ export class GameServer {
     }
   }
   
-  // ==================== TRANSLATE RESET COUNTER ====================
-  
   _startTranslateResetCounter() {
     if (this._translateResetInterval) {
       clearInterval(this._translateResetInterval);
@@ -3474,8 +3290,6 @@ export class GameServer {
       this.translationManager.resetDailyCounter();
     }, 60000);
   }
-  
-  // ==================== ENSURE SINGLE CONNECTION ====================
   
   _ensureSingleConnection(room, username, newWs, newWsId) {
     try {
