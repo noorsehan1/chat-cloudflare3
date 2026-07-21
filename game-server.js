@@ -246,15 +246,9 @@ class TranslationManager {
   
   async _callTranslateAPI(text, targetLang) {
     const apiUrls = [
+      'https://deeplx.1stg.me/translate',
       'https://deeplx.pages.dev/translate',
       'https://api.deeplx.org/translate',
-      'https://deeplx.vercel.app/translate',
-      'https://deeplx.deno.dev/translate',
-      'https://deeplx.mingming.dev/translate',
-      'https://deeplx.azurewebsites.net/translate',
-      'https://deeplx.quickso.com/translate',
-      'https://deeplx.zhile.io/translate',
-      'https://deeplx-api.vercel.app/translate',
     ];
     
     let lastError = null;
@@ -295,7 +289,373 @@ class TranslationManager {
       }
     }
     
-    throw lastError || new Error('All APIs failed');
+    try {
+      const googleResult = await this._callGoogleTranslate(text, targetLang);
+      if (googleResult) {
+        return googleResult;
+      }
+    } catch(e) {
+      lastError = e;
+    }
+    
+    try {
+      const libreResult = await this._callLibreTranslate(text, targetLang);
+      if (libreResult) {
+        return libreResult;
+      }
+    } catch(e) {
+      lastError = e;
+    }
+    
+    try {
+      const myMemoryResult = await this._callMyMemory(text, targetLang);
+      if (myMemoryResult) {
+        return myMemoryResult;
+      }
+    } catch(e) {
+      lastError = e;
+    }
+    
+    try {
+      const lingvaResult = await this._callLingva(text, targetLang);
+      if (lingvaResult) {
+        return lingvaResult;
+      }
+    } catch(e) {
+      lastError = e;
+    }
+    
+    try {
+      const yandexResult = await this._callYandexTranslate(text, targetLang);
+      if (yandexResult) {
+        return yandexResult;
+      }
+    } catch(e) {
+      lastError = e;
+    }
+    
+    try {
+      const icuResult = await this._callICUTranslate(text, targetLang);
+      if (icuResult) {
+        return icuResult;
+      }
+    } catch(e) {
+      lastError = e;
+    }
+    
+    throw lastError || new Error('All translation APIs failed');
+  }
+  
+  async _callGoogleTranslate(text, targetLang) {
+    const langMap = {
+      'id': 'id', 'th': 'th', 'vi': 'vi', 'zh': 'zh-CN',
+      'ja': 'ja', 'ko': 'ko', 'ar': 'ar', 'es': 'es',
+      'fr': 'fr', 'de': 'de', 'pt': 'pt', 'ru': 'ru',
+      'hi': 'hi', 'it': 'it', 'nl': 'nl', 'pl': 'pl',
+      'tr': 'tr', 'uk': 'uk', 'sv': 'sv', 'no': 'no',
+      'da': 'da', 'fi': 'fi', 'el': 'el', 'cs': 'cs',
+      'hu': 'hu', 'ro': 'ro', 'bg': 'bg', 'hr': 'hr',
+      'sk': 'sk', 'sl': 'sl', 'et': 'et', 'lv': 'lv',
+      'lt': 'lt', 'ms': 'ms', 'tl': 'tl', 'km': 'km',
+      'lo': 'lo', 'my': 'my', 'mn': 'mn', 'ne': 'ne',
+      'si': 'si', 'ur': 'ur', 'fa': 'fa', 'he': 'he'
+    };
+    
+    const target = langMap[targetLang] || 'en';
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${target}&dt=t&q=${encodeURIComponent(text)}`;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    if (data && data[0] && data[0][0] && data[0][0][0]) {
+      return data[0][0][0];
+    }
+    
+    throw new Error('Invalid response');
+  }
+  
+  async _callLibreTranslate(text, targetLang) {
+    const instances = [
+      'https://libretranslate.com/translate',
+      'https://translate.argonauta.dev/translate',
+      'https://translate.mentality.rip/translate'
+    ];
+    
+    let lastError = null;
+    
+    for (const instance of instances) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        
+        const response = await fetch(instance, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            q: text,
+            source: 'en',
+            target: targetLang,
+            format: 'text'
+          }),
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        if (data && data.translatedText) {
+          return data.translatedText;
+        }
+        
+        throw new Error('Invalid response');
+        
+      } catch(e) {
+        lastError = e;
+      }
+    }
+    
+    throw lastError || new Error('All LibreTranslate instances failed');
+  }
+  
+  async _callMyMemory(text, targetLang) {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|${targetLang}&de=demo@example.com`;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(url, {
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    if (data && data.responseData && data.responseData.translatedText) {
+      return data.responseData.translatedText;
+    }
+    
+    throw new Error('Invalid response');
+  }
+  
+  async _callLingva(text, targetLang) {
+    const instances = [
+      'https://lingva.ml/api/v1/en',
+      'https://lingva.zerody.one/api/v1/en',
+      'https://lingva.pussthecat.org/api/v1/en'
+    ];
+    
+    let lastError = null;
+    
+    for (const instance of instances) {
+      try {
+        const url = `${instance}/${targetLang}/${encodeURIComponent(text)}`;
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
+        const response = await fetch(url, {
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        if (data && data.translation) {
+          return data.translation;
+        }
+        
+        throw new Error('Invalid response');
+        
+      } catch(e) {
+        lastError = e;
+      }
+    }
+    
+    throw lastError || new Error('All Lingva instances failed');
+  }
+  
+  async _callYandexTranslate(text, targetLang) {
+    const yandexLangMap = {
+      'id': 'id', 'th': 'th', 'vi': 'vi', 'zh': 'zh',
+      'ja': 'ja', 'ko': 'ko', 'ar': 'ar', 'es': 'es',
+      'fr': 'fr', 'de': 'de', 'pt': 'pt', 'ru': 'ru',
+      'hi': 'hi', 'it': 'it', 'nl': 'nl', 'pl': 'pl',
+      'tr': 'tr', 'uk': 'uk', 'sv': 'sv', 'no': 'no'
+    };
+    
+    const target = yandexLangMap[targetLang] || 'en';
+    const url = `https://translate.yandex.net/api/v1/tr.json/translate?id=&srv=tr-text&lang=en-${target}&text=${encodeURIComponent(text)}`;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Origin': 'https://translate.yandex.com',
+        'Referer': 'https://translate.yandex.com/'
+      }
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    if (data && data.text && data.text.length > 0) {
+      return data.text.join(' ');
+    }
+    
+    throw new Error('Invalid response');
+  }
+  
+  async _callICUTranslate(text, targetLang) {
+    const commonTranslations = {
+      'id': {
+        'What': 'Apa', 'Who': 'Siapa', 'Where': 'Di mana', 'When': 'Kapan',
+        'Why': 'Mengapa', 'How': 'Bagaimana', 'Which': 'Yang mana',
+        'is': 'adalah', 'are': 'adalah', 'the': 'itu', 'this': 'ini', 'that': 'itu',
+        'of': 'dari', 'and': 'dan', 'or': 'atau', 'but': 'tetapi', 'for': 'untuk',
+        'with': 'dengan', 'without': 'tanpa', 'capital': 'ibukota', 'city': 'kota',
+        'country': 'negara', 'president': 'presiden', 'first': 'pertama',
+        'second': 'kedua', 'third': 'ketiga', 'fourth': 'keempat', 'fifth': 'kelima',
+        'largest': 'terbesar', 'smallest': 'terkecil', 'highest': 'tertinggi',
+        'lowest': 'terendah', 'longest': 'terpanjang', 'shortest': 'terpendek',
+        'oldest': 'tertua', 'youngest': 'termuda', 'most': 'paling', 'least': 'paling sedikit'
+      },
+      'th': {
+        'What': 'อะไร', 'Who': 'ใคร', 'Where': 'ที่ไหน', 'When': 'เมื่อไหร่',
+        'Why': 'ทำไม', 'How': 'อย่างไร', 'Which': 'อันไหน',
+        'is': 'คือ', 'are': 'คือ', 'the': 'ที่', 'this': 'นี้', 'that': 'นั้น',
+        'of': 'ของ', 'and': 'และ', 'or': 'หรือ', 'but': 'แต่',
+        'capital': 'เมืองหลวง', 'city': 'เมือง', 'country': 'ประเทศ',
+        'president': 'ประธานาธิบดี', 'first': 'แรก', 'second': 'ที่สอง', 'third': 'ที่สาม'
+      },
+      'vi': {
+        'What': 'Cái gì', 'Who': 'Ai', 'Where': 'Ở đâu', 'When': 'Khi nào',
+        'Why': 'Tại sao', 'How': 'Thế nào', 'Which': 'Cái nào',
+        'is': 'là', 'are': 'là', 'the': 'cái', 'this': 'này', 'that': 'đó',
+        'capital': 'thủ đô', 'city': 'thành phố', 'country': 'quốc gia',
+        'president': 'tổng thống', 'first': 'đầu tiên', 'second': 'thứ hai', 'third': 'thứ ba'
+      },
+      'zh': {
+        'What': '什么', 'Who': '谁', 'Where': '哪里', 'When': '什么时候',
+        'Why': '为什么', 'How': '如何', 'Which': '哪个',
+        'is': '是', 'are': '是', 'the': '的', 'this': '这', 'that': '那',
+        'capital': '首都', 'city': '城市', 'country': '国家',
+        'president': '总统', 'first': '第一', 'second': '第二', 'third': '第三'
+      },
+      'ja': {
+        'What': '何', 'Who': '誰', 'Where': 'どこ', 'When': 'いつ',
+        'Why': 'なぜ', 'How': 'どうやって', 'Which': 'どれ',
+        'is': 'です', 'are': 'です', 'the': 'その', 'this': 'これ', 'that': 'それ',
+        'capital': '首都', 'city': '都市', 'country': '国',
+        'president': '大統領', 'first': '最初', 'second': '第二', 'third': '第三'
+      },
+      'ko': {
+        'What': '무엇', 'Who': '누구', 'Where': '어디', 'When': '언제',
+        'Why': '왜', 'How': '어떻게', 'Which': '어느',
+        'is': '입니다', 'are': '입니다', 'the': '그', 'this': '이', 'that': '저',
+        'capital': '수도', 'city': '도시', 'country': '국가',
+        'president': '대통령', 'first': '첫 번째', 'second': '두 번째', 'third': '세 번째'
+      },
+      'ar': {
+        'What': 'ماذا', 'Who': 'من', 'Where': 'أين', 'When': 'متى',
+        'Why': 'لماذا', 'How': 'كيف', 'Which': 'أي',
+        'is': 'هو', 'are': 'هم', 'the': 'ال', 'this': 'هذا', 'that': 'ذلك',
+        'capital': 'العاصمة', 'city': 'مدينة', 'country': 'دولة',
+        'president': 'رئيس', 'first': 'الأول', 'second': 'الثاني', 'third': 'الثالث'
+      },
+      'es': {
+        'What': 'Qué', 'Who': 'Quién', 'Where': 'Dónde', 'When': 'Cuándo',
+        'Why': 'Por qué', 'How': 'Cómo', 'Which': 'Cuál',
+        'is': 'es', 'are': 'son', 'the': 'el/la', 'this': 'esto', 'that': 'eso',
+        'capital': 'capital', 'city': 'ciudad', 'country': 'país',
+        'president': 'presidente', 'first': 'primero', 'second': 'segundo', 'third': 'tercero'
+      },
+      'fr': {
+        'What': 'Quoi', 'Who': 'Qui', 'Where': 'Où', 'When': 'Quand',
+        'Why': 'Pourquoi', 'How': 'Comment', 'Which': 'Lequel',
+        'is': 'est', 'are': 'sont', 'the': 'le/la', 'this': 'ceci', 'that': 'cela',
+        'capital': 'capitale', 'city': 'ville', 'country': 'pays',
+        'president': 'président', 'first': 'premier', 'second': 'deuxième', 'third': 'troisième'
+      },
+      'de': {
+        'What': 'Was', 'Who': 'Wer', 'Where': 'Wo', 'When': 'Wann',
+        'Why': 'Warum', 'How': 'Wie', 'Which': 'Welcher',
+        'is': 'ist', 'are': 'sind', 'the': 'der/die/das', 'this': 'dies', 'that': 'das',
+        'capital': 'Hauptstadt', 'city': 'Stadt', 'country': 'Land',
+        'president': 'Präsident', 'first': 'erste', 'second': 'zweite', 'third': 'dritte'
+      },
+      'pt': {
+        'What': 'O que', 'Who': 'Quem', 'Where': 'Onde', 'When': 'Quando',
+        'Why': 'Por que', 'How': 'Como', 'Which': 'Qual',
+        'is': 'é', 'are': 'são', 'the': 'o/a', 'this': 'isto', 'that': 'isso',
+        'capital': 'capital', 'city': 'cidade', 'country': 'país',
+        'president': 'presidente', 'first': 'primeiro', 'second': 'segundo', 'third': 'terceiro'
+      },
+      'ru': {
+        'What': 'Что', 'Who': 'Кто', 'Where': 'Где', 'When': 'Когда',
+        'Why': 'Почему', 'How': 'Как', 'Which': 'Который',
+        'is': 'является', 'are': 'являются', 'the': '', 'this': 'это', 'that': 'то',
+        'capital': 'столица', 'city': 'город', 'country': 'страна',
+        'president': 'президент', 'first': 'первый', 'second': 'второй', 'third': 'третий'
+      }
+    };
+    
+    const dict = commonTranslations[targetLang];
+    if (!dict) {
+      throw new Error('ICU translations not available for this language');
+    }
+    
+    const words = text.split(' ');
+    const translatedWords = words.map(word => {
+      const cleanWord = word.replace(/[^a-zA-Z]/g, '');
+      const punct = word.replace(/[a-zA-Z]/g, '');
+      const lowerWord = cleanWord.toLowerCase();
+      for (const [key, value] of Object.entries(dict)) {
+        if (key.toLowerCase() === lowerWord) {
+          return value + punct;
+        }
+      }
+      return word;
+    });
+    
+    const result = translatedWords.join(' ');
+    if (result === text) {
+      throw new Error('No translation found in ICU dictionary');
+    }
+    
+    return result;
   }
   
   resetDailyCounter() {
@@ -1244,15 +1604,6 @@ export class GameServer {
       if (isCorrect && !this.quizHasWinner) {
         this.quizHasWinner = true;
         this.quizWinner = username;
-        
-        const points = await this._getQuizPoints();
-        const totalPoints = (points[username] || 0) + 1;
-        
-        this._broadcastQuizResult("quizWinner", {
-          username: username,
-          totalPoints: totalPoints,
-          correctAnswer: this.currentQuestion.correct
-        });
       }
       
     } catch(e) {
