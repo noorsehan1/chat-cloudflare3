@@ -65,7 +65,8 @@ const CONSTANTS = {
 };
 
 const QUIZ_SCHEDULE = {
-  SESSION1: { start: 0, end: 24 },
+  SESSION1: { start: 0, end: 7 },
+  SESSION2: { start: 8, end: 24 },
  
 };
 
