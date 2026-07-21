@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (CLEAN VERSION - NO LOGS) ====================
+// ==================== GAME-SERVER.JS (TANPA QUESTION ID DARI CLIENT) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -89,6 +89,8 @@ class TranslationManager {
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
+    this._translating = false;
+    this._translationPromise = null;
     
     this._translationCircuitBreaker = {
       failures: 0,
@@ -99,10 +101,24 @@ class TranslationManager {
   }
 
   async translateForUsers(question, options, usersByLang) {
-    const results = new Map();
+    if (this._translating) {
+      await this._translationPromise;
+    }
     
-    const cacheHits = new Map();
-    const needTranslate = [];
+    this._translating = true;
+    this._translationPromise = this._doTranslate(question, options, usersByLang);
+    
+    try {
+      return await this._translationPromise;
+    } finally {
+      this._translating = false;
+      this._translationPromise = null;
+    }
+  }
+  
+  async _doTranslate(question, options, usersByLang) {
+    const results = new Map();
+    const translatePromises = [];
     
     for (const [lang, users] of usersByLang) {
       if (lang === 'en') {
@@ -114,75 +130,52 @@ class TranslationManager {
       const cached = this._getCache(cacheKey);
       
       if (cached) {
-        cacheHits.set(lang, { ...cached, users });
-        results.set(lang, { ...cached, users, isFallback: false });
-      } else {
-        needTranslate.push({ lang, users });
-      }
-    }
-    
-    if (needTranslate.length === 0) {
-      this._sendResults(results);
-      return;
-    }
-    
-    const translatePromises = needTranslate.map(({ lang, users }) => 
-      this._translateWithTimeout(question, options, lang, users)
-    );
-    
-    const translatedResults = await this._executeWithConcurrencyLimit(
-      translatePromises,
-      this.MAX_PARALLEL
-    );
-    
-    for (const result of translatedResults) {
-      if (result.success) {
-        const { lang, translatedQuestion, translatedOptions, users } = result;
-        
-        const cacheKey = this._getCacheKey(question, options, lang);
-        this._setCache(cacheKey, {
-          question: translatedQuestion,
-          options: translatedOptions
-        });
-        
         results.set(lang, {
-          question: translatedQuestion,
-          options: translatedOptions,
+          question: cached.question,
+          options: cached.options,
           users,
           isFallback: false
         });
-      } else {
-        const { lang, users } = result;
-        results.set(lang, {
-          question: question,
-          options: options,
-          users,
-          isFallback: true
-        });
+        continue;
       }
-    }
-    
-    this._sendResults(results);
-  }
-  
-  async _executeWithConcurrencyLimit(promiseFactories, limit) {
-    const results = [];
-    const executing = [];
-    
-    for (const promiseFactory of promiseFactories) {
-      const p = promiseFactory().then(result => {
-        executing.splice(executing.indexOf(p), 1);
-        return result;
-      });
-      executing.push(p);
-      results.push(p);
       
-      if (executing.length >= limit) {
-        await Promise.race(executing);
+      translatePromises.push(
+        this._translateWithTimeout(question, options, lang, users)
+      );
+    }
+    
+    if (translatePromises.length > 0) {
+      const translated = await this._executeWithConcurrencyLimit(
+        translatePromises,
+        this.MAX_PARALLEL
+      );
+      
+      for (const result of translated) {
+        if (result.success) {
+          const cacheKey = this._getCacheKey(question, options, result.lang);
+          this._setCache(cacheKey, {
+            question: result.translatedQuestion,
+            options: result.translatedOptions
+          });
+          
+          results.set(result.lang, {
+            question: result.translatedQuestion,
+            options: result.translatedOptions,
+            users: result.users,
+            isFallback: false
+          });
+        } else {
+          results.set(result.lang, {
+            question: question,
+            options: options,
+            users: result.users,
+            isFallback: true
+          });
+        }
       }
     }
     
-    return Promise.all(results);
+    return results;
   }
   
   async _translateWithTimeout(question, options, lang, users) {
@@ -245,6 +238,29 @@ class TranslationManager {
       }
       return text;
     }
+  }
+  
+  async _translateOptions(options, targetLang) {
+    if (targetLang === 'en' || !options) return options;
+    
+    const keys = ['A', 'B', 'C', 'D'];
+    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
+    
+    if (texts.length === 0) return options;
+    
+    const translatedTexts = await Promise.all(
+      texts.map(text => this._translateText(text, targetLang))
+    );
+    
+    const result = { ...options };
+    let idx = 0;
+    for (const key of keys) {
+      if (options[key] && typeof options[key] === 'string') {
+        result[key] = translatedTexts[idx++] || options[key];
+      }
+    }
+    
+    return result;
   }
   
   async _callTranslateAPI(text, targetLang) {
@@ -317,29 +333,6 @@ class TranslationManager {
     throw lastError || new Error('All APIs failed');
   }
   
-  async _translateOptions(options, targetLang) {
-    if (targetLang === 'en' || !options) return options;
-    
-    const keys = ['A', 'B', 'C', 'D'];
-    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
-    
-    if (texts.length === 0) return options;
-    
-    const translatedTexts = await Promise.all(
-      texts.map(text => this._translateText(text, targetLang))
-    );
-    
-    const result = { ...options };
-    let idx = 0;
-    for (const key of keys) {
-      if (options[key] && typeof options[key] === 'string') {
-        result[key] = translatedTexts[idx++] || options[key];
-      }
-    }
-    
-    return result;
-  }
-  
   _getCacheKey(question, options, lang) {
     const optionStr = Object.values(options).join('|');
     return `${question}|${optionStr}|${lang}`;
@@ -374,7 +367,8 @@ class TranslationManager {
         {
           question: question || '',
           options: options || { A: '', B: '', C: '', D: '' },
-          isFallback: isFallback || false
+          isFallback: isFallback || false,
+          timeLimit: CONSTANTS.QUIZ_TIME_LIMIT_MS
         }
       ];
       
@@ -388,6 +382,26 @@ class TranslationManager {
         }
       }
     }
+  }
+  
+  async _executeWithConcurrencyLimit(promiseFactories, limit) {
+    const results = [];
+    const executing = [];
+    
+    for (const promiseFactory of promiseFactories) {
+      const p = promiseFactory().then(result => {
+        executing.splice(executing.indexOf(p), 1);
+        return result;
+      });
+      executing.push(p);
+      results.push(p);
+      
+      if (executing.length >= limit) {
+        await Promise.race(executing);
+      }
+    }
+    
+    return Promise.all(results);
   }
   
   resetDailyCounter() {
@@ -440,7 +454,8 @@ export class GameServer {
     this._tikCounter = 0;
     this._gameStartFlags = new Map();
     
-    this.quizAnswered = new Set();
+    // QUIZ STATE
+    this.quizAnswered = new Map(); // username -> timestamp
     this.quizHasWinner = false;
     this.quizWinner = null;
     this.quizTimer = null;
@@ -449,7 +464,12 @@ export class GameServer {
     this.isQuizWaiting = false;
     this.quizQuestionCache = {};
     this._quizStartTime = null;
+    this._questionLock = false;
+    this._currentQuestionId = null;
+    this._questionStartTime = null;
+    this._answeredUsers = new Set();
     
+    // QUIZ QUESTIONS
     this._allQuestions = [];
     this._currentQuestions = [];
     this._currentBatchStart = 0;
@@ -460,6 +480,7 @@ export class GameServer {
     this._currentBatchIndex = 0;
     this._lastLoadedBatch = 0;
     
+    // TRANSLATION
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -470,16 +491,19 @@ export class GameServer {
     
     this.translationManager = new TranslationManager(this);
     
+    // CF PROTECTION
     this._requestCount = 0;
     this._requestResetTime = Date.now() + 60000;
     this._cpuTimeUsed = 0;
     this._subRequestCount = 0;
     
+    // TIMERS
     this._quizTimeout = null;
     this._translateResetInterval = null;
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
     
+    // CIRCUIT BREAKER
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
@@ -571,11 +595,7 @@ export class GameServer {
   
   _getGameType(room) {
     const isInGameTime = this._isGameTime();
-    
-    if (!isInGameTime) {
-      return true;
-    }
-    
+    if (!isInGameTime) return true;
     return false;
   }
   
@@ -1028,7 +1048,7 @@ export class GameServer {
       
       this._broadcastToRoom(QUIZ_ROOM, [
         "quizNotification",
-        "📢 All 10,000 questions have been answered! Starting from question 1 again!",
+        "📢 All questions have been answered! Starting from question 1 again!",
         "info"
       ]);
     }
@@ -1070,7 +1090,11 @@ export class GameServer {
   }
   
   async _showQuestion() {
+    if (this._questionLock) return;
+    
     try {
+      this._questionLock = true;
+      
       if (!this._isQuizTime()) {
         const clients = this.wsClients.get(QUIZ_ROOM);
         if (clients && clients.size > 0) {
@@ -1129,20 +1153,28 @@ export class GameServer {
 
       const shuffled = this._shuffleQuestionOptions(q);
       
+      // Generate unique question ID untuk tracking internal
+      const questionId = `${this._questionPointer}_${Date.now()}`;
+      
       this.currentQuestion = {
-        ...q,
+        id: questionId,
+        question: q.question,
         options: shuffled.options,
-        correct: shuffled.correct
+        correct: shuffled.correct,
+        timestamp: Date.now(),
+        pointer: this._questionPointer
       };
       
+      this._currentQuestionId = questionId;
+      this._questionStartTime = Date.now();
       this._quizStartTime = Date.now();
-      this.quizAnswered = new Set();
       this.quizHasWinner = false;
       this.quizWinner = null;
+      this._answeredUsers = new Set();
       
       this._questionPointer++;
       this._totalQuestionsAnswered++;
-
+      
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -1162,6 +1194,7 @@ export class GameServer {
           if (!currentClients || currentClients.size === 0) {
             this._quizTimeout = null;
             this.currentQuestion = null;
+            this._questionLock = false;
             return;
           }
 
@@ -1192,6 +1225,9 @@ export class GameServer {
 
           this._quizTimeout = null;
           this.isQuizWaiting = true;
+          this.currentQuestion = null;
+          this._questionLock = false;
+          this._answeredUsers = new Set();
 
           this._quizBreakTimeout = setTimeout(() => {
             if (this.closing || this.isDestroyed) {
@@ -1200,7 +1236,6 @@ export class GameServer {
             }
             this.isQuizWaiting = false;
             this._quizBreakTimeout = null;
-            this.currentQuestion = null;
             if (!this.closing && !this.isDestroyed) {
               this.ensureQuizRunning();
             }
@@ -1210,6 +1245,8 @@ export class GameServer {
           this._quizTimeout = null;
           this.currentQuestion = null;
           this.isQuizWaiting = false;
+          this._questionLock = false;
+          this._answeredUsers = new Set();
         }
       }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
 
@@ -1217,6 +1254,8 @@ export class GameServer {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
+      this._questionLock = false;
+      this._answeredUsers = new Set();
     }
   }
   
@@ -1239,7 +1278,33 @@ export class GameServer {
       } catch(e) {}
     }
     
-    await this.translationManager.translateForUsers(question, options, usersByLang);
+    const translatedResults = await this.translationManager.translateForUsers(
+      question, 
+      options, 
+      usersByLang
+    );
+    
+    for (const [lang, data] of translatedResults) {
+      const message = [
+        "quizQuestion",
+        {
+          question: data.question || question,
+          options: data.options || options,
+          isFallback: data.isFallback || false,
+          timeLimit: CONSTANTS.QUIZ_TIME_LIMIT_MS
+        }
+      ];
+      
+      const msgStr = JSON.stringify(message);
+      
+      for (const ws of data.users) {
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {}
+        }
+      }
+    }
   }
   
   async submitQuizAnswer(ws, username, answer) {
@@ -1279,12 +1344,20 @@ export class GameServer {
         }
       }
       
+      // Cek apakah soal masih berlaku
+      const elapsed = Date.now() - this.currentQuestion.timestamp;
+      if (elapsed > CONSTANTS.QUIZ_TIME_LIMIT_MS) {
+        this._safeSend(ws, ["quizError", "Time's up!"]);
+        return;
+      }
+      
       if (this.quizHasWinner) {
         this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
         return;
       }
       
-      if (this.quizAnswered.has(username)) {
+      // Cek user sudah menjawab untuk question ini
+      if (this._answeredUsers.has(username)) {
         this._safeSend(ws, ["quizError", "You already answered!"]);
         return;
       }
@@ -1292,6 +1365,9 @@ export class GameServer {
       const answerKey = answer ? answer.toUpperCase().trim() : '';
       const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
       const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
+      
+      // Tandai user sudah menjawab
+      this._answeredUsers.add(username);
       
       const resultObj = {
         username: username,
@@ -1301,11 +1377,34 @@ export class GameServer {
       };
       
       this._broadcastToRoom(QUIZ_ROOM, ["quizAnswerResult", resultObj]);
-      this.quizAnswered.add(username);
       
       if (isCorrect && !this.quizHasWinner) {
         this.quizHasWinner = true;
         this.quizWinner = username;
+        
+        const points = await this._getQuizPoints();
+        points[username] = (points[username] || 0) + 1;
+        
+        if (this.env && this.env.QUESTIONS) {
+          this._incrementSubRequest();
+          await this.env.QUESTIONS.put(
+            CONSTANTS.QUIZ_POINT_KEY,
+            JSON.stringify(points)
+          );
+        }
+        
+        this._safeSend(ws, ["answerResult", { 
+          success: true, 
+          isCorrect: true, 
+          message: "Correct!",
+          points: points[username]
+        }]);
+      } else {
+        this._safeSend(ws, ["answerResult", { 
+          success: false, 
+          isCorrect: false, 
+          message: "Wrong answer!"
+        }]);
       }
       
     } catch(e) {
@@ -1373,8 +1472,11 @@ export class GameServer {
       this.isQuizWaiting = false;
       this.quizHasWinner = false;
       this.quizWinner = null;
-      this.quizAnswered = new Set();
+      this._answeredUsers = new Set();
       this._quizStartTime = null;
+      this._questionLock = false;
+      this._currentQuestionId = null;
+      this._questionStartTime = null;
       
       this._broadcastToRoom(QUIZ_ROOM, ["quizReset", "Quiz has been reset"]);
     } catch(e) {}
@@ -1541,7 +1643,9 @@ export class GameServer {
         currentBatchRange: `${this._currentBatchStart + 1} - ${this._currentBatchEnd}`,
         nextQuestionIndex: this._currentBatchStart + pointer + 1,
         batchSize: CONSTANTS.QUIZ_BATCH_SIZE,
-        isAllQuestionsLoaded: this._isAllQuestionsLoaded
+        isAllQuestionsLoaded: this._isAllQuestionsLoaded,
+        hasActiveQuestion: !!this.currentQuestion,
+        answeredUsers: this._answeredUsers ? this._answeredUsers.size : 0
       };
     } catch(e) {
       return { error: e.message };
@@ -3203,7 +3307,7 @@ export class GameServer {
       this._gameStartFlags.clear();
       this._roomBroadcastCount.clear();
       this._roomBroadcastReset.clear();
-      this.quizAnswered.clear();
+      this._answeredUsers = new Set();
       this.activeGames.clear();
       
       for (const [room, wsIds] of this.wsClients) {
