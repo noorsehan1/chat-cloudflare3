@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FIXED QUIZ LOGIC - ALL QUESTIONS) ====================
+// ==================== GAME-SERVER.JS (FULLY OPTIMIZED WITH PARALLEL TRANSLATE) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -50,14 +50,19 @@ const CONSTANTS = {
     'https://deeplx.mingming.dev/translate',
     'https://deeplx.azurewebsites.net/translate',
   ],
-  DEEPLX_TIMEOUT_MS: 8000,
-  DEEPLX_DELAY_MS: 1500,
+  DEEPLX_TIMEOUT_MS: 5000,
+  DEEPLX_DELAY_MS: 200,
   DEEPLX_BATCH_SIZE: 5,
-  DEEPLX_BATCH_DELAY_MS: 3000,
+  DEEPLX_BATCH_DELAY_MS: 1000,
   DEEPLX_MAX_RETRIES: 3,
   CF_SUBREQUEST_LIMIT: 50,
   CF_CPU_TIME_LIMIT_MS: 9000,
   CF_MEMORY_LIMIT_MB: 128,
+  // TRANSLATION OPTIMIZATION
+  MAX_PARALLEL_TRANSLATE: 10,
+  TRANSLATE_TIMEOUT_MS: 3000,
+  CACHE_TTL_MS: 3600000,
+  MAX_CACHE_SIZE: 10000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -70,6 +75,396 @@ const QUIZ_SCHEDULE = {
 };
 
 const QUIZ_ROOM = "Quiz";
+
+// ==================== TRANSLATION MANAGER CLASS ====================
+
+class TranslationManager {
+  constructor(gameServer) {
+    this.gameServer = gameServer;
+    this.cache = new Map();
+    this.pendingRequests = new Map();
+    this.MAX_CACHE_SIZE = CONSTANTS.MAX_CACHE_SIZE;
+    this.CACHE_TTL = CONSTANTS.CACHE_TTL_MS;
+    this.MAX_PARALLEL = CONSTANTS.MAX_PARALLEL_TRANSLATE;
+    this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
+    this.translateCount = 0;
+    this.translateDate = new Date().toUTCString();
+    this.translateLimitReached = false;
+    
+    // Circuit Breaker
+    this._translationCircuitBreaker = {
+      failures: 0,
+      lastFailureTime: 0,
+      isOpen: false,
+      resetTimer: null
+    };
+  }
+
+  // ==================== CORE METHOD ====================
+  
+  async translateForUsers(question, options, usersByLang) {
+    const startTime = Date.now();
+    const results = new Map();
+    
+    console.log(`🌍 Translating for ${usersByLang.size} languages...`);
+    
+    // 1️⃣ Cek cache untuk semua bahasa
+    const cacheHits = new Map();
+    const needTranslate = [];
+    
+    for (const [lang, users] of usersByLang) {
+      if (lang === 'en') {
+        // English tidak perlu translate
+        results.set(lang, { question, options, users, isFallback: false });
+        continue;
+      }
+      
+      const cacheKey = this._getCacheKey(question, options, lang);
+      const cached = this._getCache(cacheKey);
+      
+      if (cached) {
+        // ✅ Cache hit!
+        cacheHits.set(lang, { ...cached, users });
+        results.set(lang, { ...cached, users, isFallback: false });
+      } else {
+        // ❌ Cache miss, perlu translate
+        needTranslate.push({ lang, users });
+      }
+    }
+    
+    console.log(`📊 Cache: ${cacheHits.size} hit, ${needTranslate.length} miss`);
+    
+    // 2️⃣ Jika semua cache hit, langsung kirim
+    if (needTranslate.length === 0) {
+      this._sendResults(results);
+      console.log(`✅ All cached! ${Date.now() - startTime}ms`);
+      return;
+    }
+    
+    // 3️⃣ Translate yang belum di-cache secara PARALLEL
+    const translatePromises = needTranslate.map(({ lang, users }) => 
+      this._translateWithTimeout(question, options, lang, users)
+    );
+    
+    // 4️⃣ Tunggu semua selesai (dengan batasan parallel)
+    const translatedResults = await this._executeWithConcurrencyLimit(
+      translatePromises,
+      this.MAX_PARALLEL
+    );
+    
+    // 5️⃣ Simpan ke cache dan gabungkan hasil
+    for (const result of translatedResults) {
+      if (result.success) {
+        const { lang, translatedQuestion, translatedOptions, users } = result;
+        
+        // Simpan cache
+        const cacheKey = this._getCacheKey(question, options, lang);
+        this._setCache(cacheKey, {
+          question: translatedQuestion,
+          options: translatedOptions
+        });
+        
+        results.set(lang, {
+          question: translatedQuestion,
+          options: translatedOptions,
+          users,
+          isFallback: false
+        });
+      } else {
+        // ❌ Gagal, fallback ke English
+        const { lang, users } = result;
+        results.set(lang, {
+          question: question,
+          options: options,
+          users,
+          isFallback: true
+        });
+        console.log(`⚠️ Fallback to English for ${lang}`);
+      }
+    }
+    
+    // 6️⃣ Kirim semua hasil
+    this._sendResults(results);
+    console.log(`✅ All done! ${Date.now() - startTime}ms`);
+  }
+  
+  // ==================== PARALLEL WITH CONCURRENCY LIMIT ====================
+  
+  async _executeWithConcurrencyLimit(promiseFactories, limit) {
+    const results = [];
+    const executing = [];
+    
+    for (const promiseFactory of promiseFactories) {
+      const p = promiseFactory().then(result => {
+        executing.splice(executing.indexOf(p), 1);
+        return result;
+      });
+      executing.push(p);
+      results.push(p);
+      
+      if (executing.length >= limit) {
+        await Promise.race(executing);
+      }
+    }
+    
+    return Promise.all(results);
+  }
+  
+  // ==================== TRANSLATE WITH TIMEOUT ====================
+  
+  async _translateWithTimeout(question, options, lang, users) {
+    try {
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Translate timeout')), this.TRANSLATE_TIMEOUT);
+      });
+      
+      const translatePromise = (async () => {
+        // ✅ Translate question dan options secara PARALLEL
+        const [translatedQuestion, translatedOptions] = await Promise.all([
+          this._translateText(question, lang),
+          this._translateOptions(options, lang)
+        ]);
+        
+        return {
+          success: true,
+          lang,
+          users,
+          translatedQuestion,
+          translatedOptions
+        };
+      })();
+      
+      return await Promise.race([translatePromise, timeoutPromise]);
+      
+    } catch(e) {
+      // ❌ Timeout atau error, return fallback
+      return {
+        success: false,
+        lang,
+        users,
+        error: e.message
+      };
+    }
+  }
+  
+  // ==================== TRANSLATE TEXT (DENGAN RETRY) ====================
+  
+  async _translateText(text, targetLang, retryCount = 0) {
+    if (targetLang === 'en') return text;
+    if (!text || typeof text !== 'string') return text;
+    if (this.translateLimitReached) return text;
+    
+    try {
+      // Cek pending request (deduplicate)
+      const pendingKey = `${text}|${targetLang}`;
+      if (this.pendingRequests.has(pendingKey)) {
+        return await this.pendingRequests.get(pendingKey);
+      }
+      
+      // Buat promise translate
+      const translatePromise = this._callTranslateAPI(text, targetLang);
+      this.pendingRequests.set(pendingKey, translatePromise);
+      
+      const result = await translatePromise;
+      this.pendingRequests.delete(pendingKey);
+      this.translateCount++;
+      
+      return result;
+      
+    } catch(e) {
+      if (retryCount < CONSTANTS.DEEPLX_MAX_RETRIES) {
+        await this._delay(500 * (retryCount + 1));
+        return this._translateText(text, targetLang, retryCount + 1);
+      }
+      return text; // Fallback ke text asli
+    }
+  }
+  
+  // ==================== CALL TRANSLATE API ====================
+  
+  async _callTranslateAPI(text, targetLang) {
+    // Check circuit breaker
+    if (this._translationCircuitBreaker.isOpen) {
+      const now = Date.now();
+      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+      } else {
+        throw new Error('Circuit breaker is open');
+      }
+    }
+    
+    const apiUrls = CONSTANTS.DEEPLX_API_URLS;
+    let lastError = null;
+    
+    for (const apiUrl of apiUrls) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS);
+        
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: text,
+            source_lang: 'EN',
+            target_lang: targetLang.toUpperCase()
+          }),
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        const translated = data.data || data.text || data.result || data.translations?.[0]?.text;
+        
+        if (translated) {
+          // Reset circuit breaker on success
+          this._translationCircuitBreaker.failures = 0;
+          return translated;
+        }
+        
+        throw new Error('Invalid response');
+        
+      } catch(e) {
+        lastError = e;
+        // Lanjut ke API berikutnya
+      }
+    }
+    
+    // Update circuit breaker
+    this._translationCircuitBreaker.failures++;
+    this._translationCircuitBreaker.lastFailureTime = Date.now();
+    
+    if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
+      this._translationCircuitBreaker.isOpen = true;
+      
+      if (this._translationCircuitBreaker.resetTimer) {
+        clearTimeout(this._translationCircuitBreaker.resetTimer);
+      }
+      this._translationCircuitBreaker.resetTimer = setTimeout(() => {
+        this._translationCircuitBreaker.isOpen = false;
+        this._translationCircuitBreaker.failures = 0;
+        this._translationCircuitBreaker.resetTimer = null;
+      }, CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS);
+    }
+    
+    throw lastError || new Error('All APIs failed');
+  }
+  
+  // ==================== TRANSLATE OPTIONS ====================
+  
+  async _translateOptions(options, targetLang) {
+    if (targetLang === 'en' || !options) return options;
+    
+    const keys = ['A', 'B', 'C', 'D'];
+    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
+    
+    if (texts.length === 0) return options;
+    
+    // ✅ Translate semua options secara PARALLEL
+    const translatedTexts = await Promise.all(
+      texts.map(text => this._translateText(text, targetLang))
+    );
+    
+    const result = { ...options };
+    let idx = 0;
+    for (const key of keys) {
+      if (options[key] && typeof options[key] === 'string') {
+        result[key] = translatedTexts[idx++] || options[key];
+      }
+    }
+    
+    return result;
+  }
+  
+  // ==================== CACHE ====================
+  
+  _getCacheKey(question, options, lang) {
+    const optionStr = Object.values(options).join('|');
+    return `${question}|${optionStr}|${lang}`;
+  }
+  
+  _getCache(key) {
+    const entry = this.cache.get(key);
+    if (entry && Date.now() - entry.timestamp < this.CACHE_TTL) {
+      return entry.value;
+    }
+    return null;
+  }
+  
+  _setCache(key, value) {
+    // Limit cache size
+    if (this.cache.size >= this.MAX_CACHE_SIZE) {
+      const oldestKey = this.cache.keys().next().value;
+      this.cache.delete(oldestKey);
+    }
+    
+    this.cache.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+  }
+  
+  // ==================== SEND RESULTS ====================
+  
+  _sendResults(results) {
+    for (const [lang, data] of results) {
+      const { question, options, users, isFallback } = data;
+      
+      const message = [
+        "quizQuestion",
+        {
+          question: question || '',
+          options: options || { A: '', B: '', C: '', D: '' },
+          isFallback: isFallback || false
+        }
+      ];
+      
+      const msgStr = JSON.stringify(message);
+      
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {
+            // Ignore
+          }
+        }
+      }
+    }
+  }
+  
+  // ==================== RESET COUNTER ====================
+  
+  resetDailyCounter() {
+    const now = new Date().toUTCString();
+    if (now !== this.translateDate) {
+      this.translateDate = now;
+      this.translateCount = 0;
+      this.translateLimitReached = false;
+      
+      this._translationCircuitBreaker.isOpen = false;
+      this._translationCircuitBreaker.failures = 0;
+      if (this._translationCircuitBreaker.resetTimer) {
+        clearTimeout(this._translationCircuitBreaker.resetTimer);
+        this._translationCircuitBreaker.resetTimer = null;
+      }
+    }
+  }
+  
+  // ==================== UTILITY ====================
+  
+  _delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// ==================== GAME SERVER CLASS ====================
 
 export class GameServer {
   constructor(state, env) {
@@ -98,7 +493,7 @@ export class GameServer {
     this._tikCounter = 0;
     this._gameStartFlags = new Map();
     
-    // QUIZ - FIXED
+    // QUIZ
     this.quizAnswered = new Set();
     this.quizHasWinner = false;
     this.quizWinner = null;
@@ -109,7 +504,7 @@ export class GameServer {
     this.quizQuestionCache = {};
     this._quizStartTime = null;
     
-    // TRACKING UNTUK 10.000 SOAL - FIXED
+    // TRACKING UNTUK SOAL
     this._allQuestions = [];
     this._currentQuestions = [];
     this._currentBatchStart = 0;
@@ -120,7 +515,7 @@ export class GameServer {
     this._currentBatchIndex = 0;
     this._lastLoadedBatch = 0;
     
-    // DEEPLX TRANSLATION
+    // DEEPLX TRANSLATION - WITH OPTIMIZATION
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -128,6 +523,9 @@ export class GameServer {
     this.userCountry = new Map();
     this._translationQueue = [];
     this._isProcessingQueue = false;
+    
+    // ✅ Translation Manager
+    this.translationManager = new TranslationManager(this);
     
     // CF PROTECTION
     this._requestCount = 0;
@@ -659,7 +1057,7 @@ export class GameServer {
     }
   }
   
-  // ==================== LOAD SEMUA SOAL DARI KV - FIXED ====================
+  // ==================== LOAD SEMUA SOAL DARI KV ====================
   
   async _loadAllQuestionsFromKV() {
     if (!this.env || !this.env.QUESTIONS) return false;
@@ -689,7 +1087,6 @@ export class GameServer {
         // Load batch pertama
         this._loadNextBatch();
         
-        // Log untuk debugging
         console.log(`✅ Loaded ${this._allQuestions.length} questions from KV`);
         console.log(`📦 First batch: ${this._currentBatchStart + 1} - ${this._currentBatchEnd}`);
         
@@ -703,7 +1100,7 @@ export class GameServer {
     }
   }
   
-  // ==================== LOAD NEXT BATCH - FIXED ====================
+  // ==================== LOAD NEXT BATCH ====================
   
   _loadNextBatch() {
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
@@ -718,7 +1115,7 @@ export class GameServer {
       startIndex = 0;
       this._currentBatchStart = 0;
       this._currentBatchEnd = 0;
-      this._questionPointer = 0; // HANYA RESET KETIKA RESET TOTAL
+      this._questionPointer = 0;
       this._totalQuestionsAnswered = 0;
       this._currentBatchIndex = 0;
       
@@ -730,8 +1127,6 @@ export class GameServer {
       
       console.log('🔄 All questions completed! Resetting to start...');
     }
-    // ❌ JANGAN RESET POINTER DI SINI!
-    // Pointer tetap di posisi sebelumnya
     
     let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
     const batch = this._allQuestions.slice(startIndex, endIndex);
@@ -763,29 +1158,23 @@ export class GameServer {
     return true;
   }
   
-  // ==================== CHECK AND LOAD NEXT BATCH - FIXED ====================
+  // ==================== CHECK AND LOAD NEXT BATCH ====================
   
   _checkAndLoadNextBatch() {
     const questions = this.quizQuestionCache['en'] || [];
     
-    // HANYA LOAD BATCH BARU JIKA POINTER SUDAH MENCAPAI AKHIR BATCH
     if (this._questionPointer >= questions.length) {
-      // Simpan posisi pointer saat ini sebelum load
       const currentPointer = this._questionPointer;
       
       console.log(`📖 Reached end of batch (pointer: ${currentPointer}/${questions.length}), loading next batch...`);
       
       this._loadNextBatch();
       
-      // Jika batch baru dimulai dari awal (reset total), pointer = 0
-      // Jika tidak, pointer tetap di posisi yang sama (relative terhadap batch baru)
       const newQuestions = this.quizQuestionCache['en'] || [];
       if (this._currentBatchStart === 0 && newQuestions.length > 0) {
-        // Reset total, pointer = 0
         this._questionPointer = 0;
         console.log('🔄 Reset to beginning of all questions');
       }
-      // Jika tidak reset total, pointer sudah benar (tidak perlu diubah)
       
       return true;
     }
@@ -793,30 +1182,7 @@ export class GameServer {
     return false;
   }
   
-  // ==================== GET CURRENT QUESTION - FIXED ====================
-  
-  _getCurrentQuestion() {
-    const questions = this.quizQuestionCache['en'] || [];
-    
-    if (questions.length === 0) {
-      return null;
-    }
-    
-    // Jika pointer melebihi panjang batch, load batch berikutnya
-    if (this._questionPointer >= questions.length) {
-      this._loadNextBatch();
-      const newQuestions = this.quizQuestionCache['en'] || [];
-      if (newQuestions.length === 0) {
-        return null;
-      }
-      this._questionPointer = 0;
-      return newQuestions[0] || null;
-    }
-    
-    return questions[this._questionPointer] || null;
-  }
-  
-  // ==================== QUIZ CORE - FIXED ====================
+  // ==================== QUIZ CORE ====================
   
   async _showQuestion() {
     try {
@@ -853,12 +1219,10 @@ export class GameServer {
         return;
       }
 
-      // Cek dan load batch berikutnya jika pointer sudah mencapai akhir
       this._checkAndLoadNextBatch();
       
       const questions = this.quizQuestionCache['en'] || [];
       
-      // Jika tidak ada soal, load batch
       if (questions.length === 0) {
         const loaded = this._loadNextBatch();
         if (!loaded) {
@@ -870,11 +1234,9 @@ export class GameServer {
         }
       }
       
-      // Ambil soal berdasarkan pointer
       const q = questions[this._questionPointer];
       
       if (!q || !q.options) {
-        // Skip soal yang tidak valid
         this._questionPointer++;
         this._showQuestion();
         return;
@@ -893,14 +1255,13 @@ export class GameServer {
       this.quizHasWinner = false;
       this.quizWinner = null;
       
-      // Increment pointer untuk soal berikutnya
       this._questionPointer++;
       this._totalQuestionsAnswered++;
       
-      // Log untuk debugging
       const globalIndex = this._currentBatchStart + this._questionPointer;
-      console.log(`📖 Question ${globalIndex}/${this._allQuestions.length} (Batch ${this._currentBatchIndex + 1}, Pointer: ${this._questionPointer}/${questions.length})`);
+      console.log(`📖 Question ${globalIndex}/${this._allQuestions.length} (Batch ${this._currentBatchIndex + 1})`);
 
+      // ✅ BROADCAST DENGAN PARALLEL TRANSLATE
       await this._broadcastQuizQuestion(
         this.currentQuestion.question,
         this.currentQuestion.options
@@ -978,6 +1339,38 @@ export class GameServer {
       this._quizTimeout = null;
     }
   }
+  
+  // ==================== BROADCAST QUIZ WITH PARALLEL TRANSLATE ====================
+  
+  async _broadcastQuizQuestion(question, options) {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds || wsIds.size === 0) return;
+    
+    // ✅ Group users by language
+    const usersByLang = new Map();
+    
+    for (const wsId of wsIds) {
+      try {
+        const ws = this.wsMap.get(wsId);
+        if (!ws || ws.readyState !== 1) continue;
+        
+        const lang = this._getUserLanguage(ws);
+        if (!usersByLang.has(lang)) {
+          usersByLang.set(lang, []);
+        }
+        usersByLang.get(lang).push(ws);
+      } catch(e) {
+        // Ignore
+      }
+    }
+    
+    console.log(`🌍 Broadcasting to ${wsIds.size} users in ${usersByLang.size} languages`);
+    
+    // ✅ Gunakan Translation Manager untuk parallel translate
+    await this.translationManager.translateForUsers(question, options, usersByLang);
+  }
+  
+  // ==================== SUBMIT QUIZ ANSWER ====================
   
   async submitQuizAnswer(ws, username, answer) {
     try {
@@ -1256,7 +1649,7 @@ export class GameServer {
     }
   }
   
-  // ==================== GET QUIZ STATUS - FIXED ====================
+  // ==================== GET QUIZ STATUS ====================
   
   _getQuizStatus() {
     try {
@@ -1266,11 +1659,9 @@ export class GameServer {
       const pointer = this._questionPointer;
       const questions = this.quizQuestionCache['en'] || [];
       
-      // Perbaiki perhitungan remaining
       const remainingInBatch = Math.max(0, questions.length - pointer);
       const nextBatchStart = currentBatchEnd + 1;
       
-      // Hitung total progress yang sebenarnya
       const totalAnswered = this._currentBatchStart + pointer;
       const progress = total > 0 ? Math.round((totalAnswered / total) * 100) : 0;
       
@@ -1296,8 +1687,6 @@ export class GameServer {
       return { error: e.message };
     }
   }
-  
-  // ==================== GET QUIZ PROGRESS - NEW ====================
   
   _getQuizProgress() {
     try {
@@ -1436,34 +1825,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== DEEPLX TRANSLATE ====================
-  
-  _resetTranslateCounterDaily() {
-    if (this._translateResetInterval) {
-      clearInterval(this._translateResetInterval);
-      this._translateResetInterval = null;
-    }
-    this._translateResetInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this._translateResetInterval);
-        this._translateResetInterval = null;
-        return;
-      }
-      const now = new Date().toUTCString();
-      if (now !== this.translateDate) {
-        this.translateDate = now;
-        this.translateCount = 0;
-        this.translateLimitReached = false;
-        
-        this._translationCircuitBreaker.isOpen = false;
-        this._translationCircuitBreaker.failures = 0;
-        if (this._translationCircuitBreaker.resetTimer) {
-          clearTimeout(this._translationCircuitBreaker.resetTimer);
-          this._translationCircuitBreaker.resetTimer = null;
-        }
-      }
-    }, 60000);
-  }
+  // ==================== LANGUAGE DETECTION ====================
   
   _countryToLanguage(countryCode) {
     if (!countryCode) return 'en';
@@ -1490,252 +1852,10 @@ export class GameServer {
     if (!ws) return 'en';
     const wsId = this._getWsId(ws);
     if (!wsId) return 'en';
-    return this.userLanguage.get(wsId) || 'en';
-  }
-  
-  _delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-  
-  async _translateSingleText(text, targetLang, retryCount = 0) {
-    if (!this._canTranslate()) {
-      return text;
-    }
-    
-    if (targetLang === 'en') return text;
-    if (this.translateLimitReached) return text;
-    if (!text || typeof text !== 'string') return text;
-    
-    if (this.translateCount >= CONSTANTS.TRANSLATE_LIMIT) {
-      this.translateLimitReached = true;
-      return text;
-    }
-    
-    if (this._translationCircuitBreaker.isOpen) {
-      const now = Date.now();
-      if (now - this._translationCircuitBreaker.lastFailureTime > CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS) {
-        this._translationCircuitBreaker.isOpen = false;
-        this._translationCircuitBreaker.failures = 0;
-      } else {
-        return text;
-      }
-    }
-    
-    const apiUrls = CONSTANTS.DEEPLX_API_URLS || [
-      'https://api.deeplx.org/translate',
-      'https://deeplx.vercel.app/translate',
-    ];
-    
-    let lastError = null;
-    
-    for (const apiUrl of apiUrls) {
-      try {
-        if (!this._checkCFLimits()) {
-          return text;
-        }
-        
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS || 8000);
-        
-        const response = await fetch(apiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: text,
-            source_lang: 'EN',
-            target_lang: targetLang.toUpperCase()
-          }),
-          signal: controller.signal
-        });
-        
-        clearTimeout(timeoutId);
-        this._incrementSubRequest();
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        
-        const data = await response.json();
-        
-        let translated = null;
-        if (data && data.data && typeof data.data === 'string') {
-          translated = data.data;
-        } else if (data && data.translations && Array.isArray(data.translations) && data.translations.length > 0) {
-          translated = data.translations[0].text;
-        } else if (data && data.result && typeof data.result === 'string') {
-          translated = data.result;
-        } else if (data && data.text && typeof data.text === 'string') {
-          translated = data.text;
-        }
-        
-        if (translated) {
-          this.translateCount++;
-          this._translationCircuitBreaker.failures = 0;
-          return translated;
-        }
-        
-        throw new Error('Invalid response format');
-        
-      } catch(e) {
-        lastError = e;
-      }
-    }
-    
-    this._translationCircuitBreaker.failures++;
-    this._translationCircuitBreaker.lastFailureTime = Date.now();
-    
-    if (this._translationCircuitBreaker.failures >= CONSTANTS.CIRCUIT_BREAKER_THRESHOLD) {
-      this._translationCircuitBreaker.isOpen = true;
-      
-      if (this._translationCircuitBreaker.resetTimer) {
-        clearTimeout(this._translationCircuitBreaker.resetTimer);
-      }
-      this._translationCircuitBreaker.resetTimer = setTimeout(() => {
-        this._translationCircuitBreaker.isOpen = false;
-        this._translationCircuitBreaker.failures = 0;
-        this._translationCircuitBreaker.resetTimer = null;
-      }, CONSTANTS.CIRCUIT_BREAKER_TIMEOUT_MS);
-    }
-    
-    return text;
-  }
-  
-  async _translateBatch(texts, targetLang) {
-    if (!texts || texts.length === 0) return [];
-    if (targetLang === 'en') return texts;
-    if (this.translateLimitReached) return texts;
-    
-    if (!this._checkCFLimits()) {
-      return texts;
-    }
-    
-    const results = [];
-    const total = texts.length;
-    const delayMs = CONSTANTS.DEEPLX_DELAY_MS || 1500;
-    const batchSize = CONSTANTS.DEEPLX_BATCH_SIZE || 5;
-    
-    for (let i = 0; i < total; i++) {
-      if (!this._checkCFLimits()) {
-        for (let j = i; j < total; j++) {
-          results.push(texts[j]);
-        }
-        break;
-      }
-      
-      const text = texts[i];
-      const startTime = Date.now();
-      
-      try {
-        let translated = await this._translateSingleText(text, targetLang);
-        results.push(translated);
-      } catch(e) {
-        results.push(text);
-      }
-      
-      if (i < total - 1) {
-        await this._delay(delayMs);
-      }
-      
-      if ((i + 1) % batchSize === 0 && i < total - 1) {
-        await this._delay(CONSTANTS.DEEPLX_BATCH_DELAY_MS || 3000);
-      }
-    }
-    
-    return results;
-  }
-  
-  async _translateOptions(options, targetLang) {
-    if (targetLang === 'en' || this.translateLimitReached || !options) {
-      return options;
-    }
-    
-    const translatedOptions = {};
-    const keys = ['A', 'B', 'C', 'D'];
-    const texts = [];
-    const textMap = {};
-    
-    for (const key of keys) {
-      if (options[key] && typeof options[key] === 'string') {
-        texts.push(options[key]);
-        textMap[key] = options[key];
-      }
-    }
-    
-    if (texts.length === 0) return options;
-    
-    const translatedTexts = await this._translateBatch(texts, targetLang);
-    
-    let idx = 0;
-    for (const key of keys) {
-      if (textMap[key]) {
-        translatedOptions[key] = translatedTexts[idx] || textMap[key];
-        idx++;
-      } else {
-        translatedOptions[key] = options[key] || '';
-      }
-    }
-    
-    return translatedOptions;
-  }
-  
-  // ==================== BROADCAST QUIZ ====================
-  
-  async _broadcastQuizQuestion(question, options) {
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds) return;
-    const wsIdArray = Array.from(wsIds);
-    
-    const usersByLang = new Map();
-    
-    for (const wsId of wsIdArray) {
-      try {
-        const ws = this.wsMap.get(wsId);
-        if (!ws || ws.readyState !== 1) continue;
-        
-        const lang = this._getUserLanguage(ws);
-        if (!usersByLang.has(lang)) {
-          usersByLang.set(lang, []);
-        }
-        usersByLang.get(lang).push(ws);
-      } catch(e) {}
-    }
-    
-    for (const [lang, users] of usersByLang) {
-      try {
-        let finalQuestion = question;
-        let finalOptions = options;
-        
-        if (lang !== 'en' && !this.translateLimitReached) {
-          try {
-            if (this._canTranslate()) {
-              finalQuestion = await this._translateSingleText(question, lang);
-              finalOptions = await this._translateOptions(options, lang);
-            }
-          } catch(e) {
-            finalQuestion = question;
-            finalOptions = options;
-          }
-        }
-        
-        const questionObj = {
-          question: finalQuestion || '',
-          options: finalOptions || { A: '', B: '', C: '', D: '' }
-        };
-        
-        for (const ws of users) {
-          this._safeSend(ws, ["quizQuestion", questionObj]);
-        }
-        
-      } catch(e) {
-        const fallbackObj = {
-          question: question || '',
-          options: options || { A: '', B: '', C: '', D: '' }
-        };
-        for (const ws of users) {
-          this._safeSend(ws, ["quizQuestion", fallbackObj]);
-        }
-      }
-    }
+    const lang = this.userLanguage.get(wsId);
+    if (lang) return lang;
+    const country = this.userCountry.get(wsId);
+    return this._countryToLanguage(country) || 'en';
   }
   
   // ==================== SHUFFLE HELPERS ====================
@@ -2989,9 +3109,9 @@ export class GameServer {
           quizAutoEnabled: this.quizAutoEnabled || false,
           isQuizRunning: !!this.currentQuestion,
           quizProgress: this._getQuizStatus(),
-          translateCount: this.translateCount,
-          translateLimitReached: this.translateLimitReached,
-          circuitBreakerOpen: this._translationCircuitBreaker.isOpen,
+          translateCount: this.translationManager.translateCount || 0,
+          translateLimitReached: this.translationManager.translateLimitReached || false,
+          circuitBreakerOpen: this.translationManager._translationCircuitBreaker.isOpen || false,
           subRequestCount: this._subRequestCount,
           cfLimitRemaining: Math.max(0, CONSTANTS.CF_SUBREQUEST_LIMIT - this._subRequestCount),
           timestamp: Date.now()
@@ -3323,7 +3443,7 @@ export class GameServer {
       const loaded = await this._loadAllQuestionsFromKV();
       if (loaded) {
         this._startQuizLoop();
-        this._resetTranslateCounterDaily();
+        this._startTranslateResetCounter();
         return true;
       }
       if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
@@ -3338,6 +3458,23 @@ export class GameServer {
     }
   }
   
+  // ==================== TRANSLATE RESET COUNTER ====================
+  
+  _startTranslateResetCounter() {
+    if (this._translateResetInterval) {
+      clearInterval(this._translateResetInterval);
+      this._translateResetInterval = null;
+    }
+    this._translateResetInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._translateResetInterval);
+        this._translateResetInterval = null;
+        return;
+      }
+      this.translationManager.resetDailyCounter();
+    }, 60000);
+  }
+  
   // ==================== ENSURE SINGLE CONNECTION ====================
   
   _ensureSingleConnection(room, username, newWs, newWsId) {
@@ -3347,7 +3484,6 @@ export class GameServer {
       
       const existingWsId = game.playerWsId?.get(username);
       if (existingWsId && existingWsId !== newWsId) {
-        // Remove old connection
         const oldWs = this.wsMap.get(existingWsId);
         if (oldWs) {
           try {
@@ -3355,7 +3491,6 @@ export class GameServer {
           } catch(e) {}
           this._removeClient(room, oldWs);
         }
-        // Update to new connection
         if (game.playerWsId) {
           game.playerWsId.set(username, newWsId);
         }
