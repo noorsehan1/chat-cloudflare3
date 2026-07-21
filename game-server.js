@@ -1,7 +1,4 @@
-// ==================== GAME-SERVER.JS (QUIZ 23:00-04:00 WIB) ====================
-// ==================== DENGAN CPU MONITOR & AUTO RESUME ====================
-// ==================== TANPA AUTO-KICK / CLEANUP SAAT SWITCH ROOM ====================
-// ==================== TANPA ICU TRANSLATE ====================
+// ==================== GAME-SERVER.JS (DENGAN CPU STOP 7ms) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -35,345 +32,238 @@ const CONSTANTS = {
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
   SCHEDULER_INTERVAL_MS: 60000,
-  QUIZ_BATCH_SIZE: 100,
+  QUIZ_BATCH_SIZE: 50,
   MAX_QUESTIONS: 10000,
-  CF_SUBREQUEST_LIMIT: 50,
-  DEEPLX_TIMEOUT_MS: 8000,
-  DEEPLX_MAX_RETRIES: 5,
-  TRANSLATE_TIMEOUT_MS: 10000,
+  DEEPLX_TIMEOUT_MS: 3000,
+  DEEPLX_MAX_RETRIES: 3,
+  TRANSLATE_TIMEOUT_MS: 3000,
   QUIZ_KEEP_ALIVE_INTERVAL_MS: 5000,
   QUIZ_NEXT_QUESTION_DELAY_MS: 5000,
-  // CPU CONFIG
-  MAX_CPU_MS: 7,
-  CPU_CHECK_INTERVAL_MS: 50,
-  MAX_BATCH_SIZE: 5,
-  RATE_LIMIT_PER_USER: 3,
-  CPU_EMERGENCY_THRESHOLD: 6,
-  CPU_THROTTLE_THRESHOLD: 4,
+  
+  // ==================== CPU LIMIT - STOP AKTIVITAS JIKA > 7ms ====================
+  CF_CPU_STOP_THRESHOLD_MS: 7,
+  CF_CPU_RESUME_AFTER_MS: 3000,
+  CF_MEMORY_LIMIT_MB: 128,
+  CF_SUBREQUEST_LIMIT: 50,
+  CF_CPU_RESET_INTERVAL_MS: 60000,
+  CF_CACHE_MAX_SIZE: 500,
+  CF_CACHE_TTL_MS: 3600000,
 };
 
 const QUIZ_SCHEDULE = {
   START_HOUR: 16,
-  END_HOUR: 23,
+  END_HOUR: 21,
 };
 
 const QUIZ_ROOM = "Quiz";
 
-// ==================== CPU MONITOR ====================
+// ==================== CPU LIMITER CLASS ====================
 
-class CPUMonitor {
-  constructor(maxCpuMs = CONSTANTS.MAX_CPU_MS) {
-    this.maxCpuMs = maxCpuMs;
-    this.startTime = 0;
-    this.currentCpu = 0;
-    this.shouldStop = false;
-    this.reason = '';
-    this.operations = [];
-    this.isHeavyOperation = false;
-    this.lastCheckTime = 0;
-    this.isPaused = false;
-    this.resumeQueue = [];
-    this.isResuming = false;
+class CPULimiter {
+  constructor() {
+    this.startTime = Date.now();
+    this.cpuTimeUsed = 0;
+    this.requestCount = 0;
+    this.subRequestCount = 0;
+    this.isStopped = false;
+    this.stopUntil = 0;
+    this.memoryUsed = 0;
+    this.totalCPUTime = 0;
+    this._cpuCheckPoints = [];
+    this.history = [];
+    
+    this.stats = {
+      quiz: { count: 0, cpuTime: 0, stopped: 0 },
+      game: { count: 0, cpuTime: 0, stopped: 0 },
+      broadcast: { count: 0, cpuTime: 0, stopped: 0 },
+      translate: { count: 0, cpuTime: 0, stopped: 0 },
+      websocket: { count: 0, cpuTime: 0, stopped: 0 },
+      kv: { count: 0, cpuTime: 0, stopped: 0 },
+      other: { count: 0, cpuTime: 0, stopped: 0 }
+    };
   }
 
-  start() {
-    this.startTime = performance.now();
-    this.currentCpu = 0;
-    this.shouldStop = false;
-    this.reason = '';
-    this.operations = [];
-    this.isHeavyOperation = false;
-    this.lastCheckTime = this.startTime;
-    this.isPaused = false;
-  }
-
-  check(operation = '') {
-    if (this.isPaused) return false;
-    if (this.shouldStop) return false;
-    
-    const now = performance.now();
-    this.currentCpu = now - this.startTime;
-    
-    if (now - this.lastCheckTime < 50 && operation !== 'force_check') {
+  resetIfNeeded() {
+    const elapsed = Date.now() - this.startTime;
+    if (elapsed > CONSTANTS.CF_CPU_RESET_INTERVAL_MS) {
+      this.startTime = Date.now();
+      this.cpuTimeUsed = 0;
+      this.requestCount = 0;
+      this.subRequestCount = 0;
+      this.isStopped = false;
+      this.stopUntil = 0;
+      this.totalCPUTime = 0;
+      this._cpuCheckPoints = [];
+      
+      if (this.cpuTimeUsed > 0) {
+        this.history.push({
+          time: new Date().toISOString(),
+          cpuTimeUsed: this.cpuTimeUsed,
+          requestCount: this.requestCount,
+          stats: { ...this.stats }
+        });
+        if (this.history.length > 20) this.history.shift();
+      }
+      
+      for (const key in this.stats) {
+        this.stats[key] = { count: 0, cpuTime: 0, stopped: 0 };
+      }
       return true;
     }
-    this.lastCheckTime = now;
-    
-    if (this.currentCpu > this.maxCpuMs) {
-      this.shouldStop = true;
-      this.reason = `CPU exceeded: ${this.currentCpu.toFixed(2)}ms > ${this.maxCpuMs}ms${operation ? ` (${operation})` : ''}`;
+    return false;
+  }
+
+  checkAndStop() {
+    this.resetIfNeeded();
+
+    if (this.isStopped && Date.now() < this.stopUntil) {
       return false;
     }
-    
-    if (operation) {
-      this.operations.push({
-        op: operation,
-        time: this.currentCpu.toFixed(2)
-      });
-      if (this.operations.length > 20) {
-        this.operations.shift();
-      }
+
+    if (this.isStopped && Date.now() >= this.stopUntil) {
+      this.isStopped = false;
+      this.stopUntil = 0;
+      return true;
     }
-    
+
+    if (this.cpuTimeUsed > CONSTANTS.CF_CPU_STOP_THRESHOLD_MS) {
+      this.isStopped = true;
+      this.stopUntil = Date.now() + CONSTANTS.CF_CPU_RESUME_AFTER_MS;
+      return false;
+    }
+
+    if (this.subRequestCount > CONSTANTS.CF_SUBREQUEST_LIMIT) {
+      this.isStopped = true;
+      this.stopUntil = Date.now() + CONSTANTS.CF_CPU_RESUME_AFTER_MS;
+      return false;
+    }
+
+    if (this.memoryUsed > CONSTANTS.CF_MEMORY_LIMIT_MB) {
+      this.isStopped = true;
+      this.stopUntil = Date.now() + CONSTANTS.CF_CPU_RESUME_AFTER_MS;
+      return false;
+    }
+
     return true;
   }
 
-  checkHeavy(operation = '') {
-    if (this.isPaused) return false;
+  recordCPU(ms, category = 'other') {
+    this.cpuTimeUsed += ms;
+    this.totalCPUTime += ms;
+    this.requestCount++;
+    this._cpuCheckPoints.push({ time: Date.now(), cpu: ms, category: category });
     
-    const heavyThreshold = Math.min(this.maxCpuMs * 0.7, 5);
-    if (this.currentCpu > heavyThreshold) {
-      this.shouldStop = true;
-      this.reason = `Heavy operation stopped: ${this.currentCpu.toFixed(2)}ms > ${heavyThreshold.toFixed(2)}ms${operation ? ` (${operation})` : ''}`;
+    if (this.stats[category]) {
+      this.stats[category].count++;
+      this.stats[category].cpuTime += ms;
+    } else {
+      this.stats.other.count++;
+      this.stats.other.cpuTime += ms;
+    }
+    
+    if (this._cpuCheckPoints.length > 50) this._cpuCheckPoints.shift();
+
+    if (this.cpuTimeUsed > CONSTANTS.CF_CPU_STOP_THRESHOLD_MS && !this.isStopped) {
+      this.isStopped = true;
+      this.stopUntil = Date.now() + CONSTANTS.CF_CPU_RESUME_AFTER_MS;
+      if (this.stats[category]) {
+        this.stats[category].stopped++;
+      }
+    }
+  }
+
+  recordSubRequest(category = 'other') {
+    this.subRequestCount++;
+    if (this.stats[category]) {
+      this.stats[category].count++;
+    }
+  }
+
+  recordMemory(mb) {
+    this.memoryUsed = mb;
+  }
+
+  canProceed() {
+    if (this.isStopped && Date.now() < this.stopUntil) {
       return false;
     }
-    this.isHeavyOperation = true;
-    return this.check(operation);
-  }
-
-  pause(reason = 'CPU high') {
-    this.isPaused = true;
-    this.reason = reason;
-    console.log(`[CPU] Paused: ${reason}`);
-  }
-
-  resume() {
-    this.isPaused = false;
-    this.shouldStop = false;
-    this.reason = '';
-    this.startTime = performance.now();
-    this.currentCpu = 0;
-    console.log('[CPU] Resumed');
-    this._processResumeQueue();
-  }
-
-  async _processResumeQueue() {
-    if (this.isResuming || this.resumeQueue.length === 0) return;
-    this.isResuming = true;
-    
-    console.log(`[CPU] Processing ${this.resumeQueue.length} queued tasks`);
-    
-    for (const task of this.resumeQueue) {
-      if (this.isPaused) {
-        console.log('[CPU] Paused again, stopping queue');
-        break;
-      }
-      try {
-        await task();
-      } catch(e) {
-        console.error('[CPU] Queue task error:', e);
-      }
+    if (this.isStopped && Date.now() >= this.stopUntil) {
+      this.isStopped = false;
+      this.stopUntil = 0;
+      return true;
     }
-    
-    this.resumeQueue = [];
-    this.isResuming = false;
-    console.log('[CPU] Queue processing complete');
-  }
-
-  addToResumeQueue(task) {
-    this.resumeQueue.push(task);
-    console.log(`[CPU] Added to queue (${this.resumeQueue.length} tasks)`);
+    return true;
   }
 
   getStatus() {
     return {
-      cpuMs: this.currentCpu,
-      maxAllowed: this.maxCpuMs,
-      shouldStop: this.shouldStop,
-      isPaused: this.isPaused,
-      reason: this.reason,
-      operations: this.operations.slice(-10),
-      remainingMs: Math.max(0, this.maxCpuMs - this.currentCpu),
-      queueLength: this.resumeQueue.length
+      isStopped: this.isStopped,
+      stopUntil: this.stopUntil,
+      stopRemaining: this.isStopped ? Math.max(0, Math.round((this.stopUntil - Date.now()) / 1000)) : 0,
+      cpuTimeUsed: Math.round(this.cpuTimeUsed * 100) / 100,
+      cpuThreshold: CONSTANTS.CF_CPU_STOP_THRESHOLD_MS,
+      cpuPercent: Math.min(100, Math.round((this.cpuTimeUsed / CONSTANTS.CF_CPU_STOP_THRESHOLD_MS) * 100)),
+      subRequestCount: this.subRequestCount,
+      subRequestLimit: CONSTANTS.CF_SUBREQUEST_LIMIT
     };
   }
 
-  reset() {
-    this.startTime = performance.now();
-    this.currentCpu = 0;
-    this.shouldStop = false;
-    this.reason = '';
-    this.operations = [];
-    this.isHeavyOperation = false;
-    this.lastCheckTime = this.startTime;
-    this.isPaused = false;
-  }
-
-  forceStop(reason = 'Manual stop') {
-    this.shouldStop = true;
-    this.reason = reason;
-  }
-
-  isSafe() {
-    return !this.shouldStop && !this.isPaused;
-  }
-
-  getCpuMs() {
-    return this.currentCpu;
-  }
-
-  getRemainingMs() {
-    return Math.max(0, this.maxCpuMs - this.currentCpu);
-  }
-
-  canContinueHeavy() {
-    return this.currentCpu < this.maxCpuMs * 0.5;
-  }
-}
-
-// ==================== AUTO RESUME MANAGER ====================
-
-class AutoResumeManager {
-  constructor(cpuMonitor, checkInterval = 1000) {
-    this.cpuMonitor = cpuMonitor;
-    this.checkInterval = checkInterval;
-    this.isRunning = false;
-    this.intervalId = null;
-    this.callbacks = [];
-    this.isPaused = false;
-  }
-
-  start() {
-    if (this.isRunning) return;
-    this.isRunning = true;
-    this.isPaused = false;
-    
-    this.intervalId = setInterval(() => {
-      this._checkAndResume();
-    }, this.checkInterval);
-    
-    console.log('[AutoResume] Started');
-  }
-
-  stop() {
-    this.isRunning = false;
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
-    console.log('[AutoResume] Stopped');
-  }
-
-  _checkAndResume() {
-    if (!this.cpuMonitor.isPaused) return;
-    
-    const status = this.cpuMonitor.getStatus();
-    
-    if (status.cpuMs < this.cpuMonitor.maxCpuMs * 0.5) {
-      console.log(`[AutoResume] CPU dropped to ${status.cpuMs.toFixed(2)}ms, resuming...`);
-      this.cpuMonitor.resume();
-      this._triggerCallbacks('resume');
-    } else {
-      console.log(`[AutoResume] CPU still high: ${status.cpuMs.toFixed(2)}ms`);
-    }
-  }
-
-  onResume(callback) {
-    this.callbacks.push(callback);
-  }
-
-  _triggerCallbacks(event) {
-    for (const callback of this.callbacks) {
-      try {
-        callback(event);
-      } catch(e) {}
-    }
-  }
-
-  getStatus() {
-    return {
-      isRunning: this.isRunning,
-      isPaused: this.isPaused,
-      checkInterval: this.checkInterval,
-      cpuStatus: this.cpuMonitor.getStatus()
-    };
-  }
-
-  pause() {
-    this.isPaused = true;
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
-  }
-
-  resume() {
-    this.isPaused = false;
-    if (this.isRunning && !this.intervalId) {
-      this.intervalId = setInterval(() => {
-        this._checkAndResume();
-      }, this.checkInterval);
-    }
-  }
-}
-
-// ==================== CPU DASHBOARD ====================
-
-class CPUDashboard {
-  constructor() {
-    this.history = [];
-    this.maxHistory = 100;
-    this.alerts = [];
-    this.requestCount = 0;
-    this.requestLimit = 50;
-    this.resetTime = Date.now() + 60000;
-  }
-
-  log(status) {
-    this.history.push({
-      timestamp: Date.now(),
-      cpuMs: status.cpuMs,
-      maxAllowed: status.maxAllowed,
-      shouldStop: status.shouldStop,
-      isPaused: status.isPaused,
-      reason: status.reason,
-      operations: status.operations
-    });
-    
-    if (this.history.length > this.maxHistory) {
-      this.history.shift();
-    }
-    
-    if (status.cpuMs > 5 && status.shouldStop) {
-      this.alerts.push({
-        timestamp: Date.now(),
-        level: 'WARNING',
-        message: `CPU critical: ${status.cpuMs.toFixed(2)}ms - ${status.reason}`
-      });
-      if (this.alerts.length > 20) {
-        this.alerts.shift();
-      }
-    }
-  }
-
-  checkRateLimit() {
-    const now = Date.now();
-    if (now > this.resetTime) {
-      this.requestCount = 0;
-      this.resetTime = now + 60000;
-    }
-    this.requestCount++;
-    return this.requestCount <= this.requestLimit;
-  }
-
-  getStats() {
-    const recent = this.history.slice(-20);
-    const avgCpu = recent.length > 0 ? recent.reduce((a,b) => a + b.cpuMs, 0) / recent.length : 0;
-    const maxCpu = recent.length > 0 ? Math.max(...recent.map(h => h.cpuMs)) : 0;
-    const stopCount = recent.filter(h => h.shouldStop).length;
-    const pauseCount = recent.filter(h => h.isPaused).length;
+  getUsage() {
+    const total = this.totalCPUTime || 1;
+    const status = this.getStatus();
     
     return {
-      averageCpuMs: avgCpu.toFixed(2),
-      maxCpuMs: maxCpu.toFixed(2),
-      totalRequests: this.history.length,
-      stopEvents: stopCount,
-      pauseEvents: pauseCount,
-      alertCount: this.alerts.length,
+      ...status,
+      memoryUsed: Math.round(this.memoryUsed * 100) / 100,
+      memoryLimit: CONSTANTS.CF_MEMORY_LIMIT_MB,
       requestCount: this.requestCount,
-      requestLimit: this.requestLimit,
-      recentAlerts: this.alerts.slice(-5),
-      health: avgCpu < 3 ? 'GOOD' : avgCpu < 5 ? 'WARNING' : 'CRITICAL'
+      totalCPUTime: Math.round(this.totalCPUTime * 100) / 100,
+      averageCPUPerRequest: this.requestCount > 0 ? Math.round((this.totalCPUTime / this.requestCount) * 100) / 100 : 0,
+      stats: {
+        quiz: {
+          count: this.stats.quiz.count,
+          cpuTime: Math.round(this.stats.quiz.cpuTime * 100) / 100,
+          percent: Math.round((this.stats.quiz.cpuTime / total) * 100),
+          stopped: this.stats.quiz.stopped
+        },
+        game: {
+          count: this.stats.game.count,
+          cpuTime: Math.round(this.stats.game.cpuTime * 100) / 100,
+          percent: Math.round((this.stats.game.cpuTime / total) * 100),
+          stopped: this.stats.game.stopped
+        },
+        broadcast: {
+          count: this.stats.broadcast.count,
+          cpuTime: Math.round(this.stats.broadcast.cpuTime * 100) / 100,
+          percent: Math.round((this.stats.broadcast.cpuTime / total) * 100),
+          stopped: this.stats.broadcast.stopped
+        },
+        translate: {
+          count: this.stats.translate.count,
+          cpuTime: Math.round(this.stats.translate.cpuTime * 100) / 100,
+          percent: Math.round((this.stats.translate.cpuTime / total) * 100),
+          stopped: this.stats.translate.stopped
+        },
+        websocket: {
+          count: this.stats.websocket.count,
+          cpuTime: Math.round(this.stats.websocket.cpuTime * 100) / 100,
+          percent: Math.round((this.stats.websocket.cpuTime / total) * 100),
+          stopped: this.stats.websocket.stopped
+        },
+        kv: {
+          count: this.stats.kv.count,
+          cpuTime: Math.round(this.stats.kv.cpuTime * 100) / 100,
+          percent: Math.round((this.stats.kv.cpuTime / total) * 100),
+          stopped: this.stats.kv.stopped
+        },
+        other: {
+          count: this.stats.other.count,
+          cpuTime: Math.round(this.stats.other.cpuTime * 100) / 100,
+          percent: Math.round((this.stats.other.cpuTime / total) * 100),
+          stopped: this.stats.other.stopped
+        }
+      },
+      history: this.history.slice(-5)
     };
   }
 }
@@ -384,88 +274,65 @@ class TranslationManager {
   constructor(gameServer) {
     this.gameServer = gameServer;
     this.questionCache = new Map();
+    this.globalCache = new Map();
+    this.MAX_GLOBAL_CACHE = CONSTANTS.CF_CACHE_MAX_SIZE;
+    this.GLOBAL_CACHE_TTL = CONSTANTS.CF_CACHE_TTL_MS;
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
-    this.cpuMonitor = new CPUMonitor(CONSTANTS.MAX_CPU_MS * 0.7);
-    this.translationQueue = [];
-    this.isProcessing = false;
-    this.maxCacheSize = 500;
-    this.pendingTranslations = [];
-    this.isPaused = false;
+    this._processingQueue = false;
+    this._translateQueue = [];
     
-    this.autoResume = new AutoResumeManager(this.cpuMonitor, 1000);
-    this.autoResume.onResume(() => {
-      this._processPendingTranslations();
-    });
-    this.autoResume.start();
+    this._translationCircuitBreaker = {
+      failures: 0,
+      lastFailureTime: 0,
+      isOpen: false,
+      resetTimer: null
+    };
+  }
+
+  _canTranslate() {
+    const cpuLimiter = this.gameServer.cpuLimiter;
+    if (!cpuLimiter) return true;
+    return cpuLimiter.canProceed();
+  }
+
+  _recordCPU(ms) {
+    const cpuLimiter = this.gameServer.cpuLimiter;
+    if (cpuLimiter) cpuLimiter.recordCPU(ms, 'translate');
+  }
+
+  _recordSubRequest() {
+    const cpuLimiter = this.gameServer.cpuLimiter;
+    if (cpuLimiter) cpuLimiter.recordSubRequest('translate');
   }
 
   resetQuestionCache() {
-    if (this.questionCache.size > this.maxCacheSize) {
-      const entries = Array.from(this.questionCache.entries());
-      const toDelete = entries.slice(0, this.questionCache.size - this.maxCacheSize);
-      for (const [key] of toDelete) {
-        this.questionCache.delete(key);
-      }
+    if (this.questionCache.size > 0) {
+      this.questionCache.clear();
     }
     this.translateCount = 0;
     this.translateLimitReached = false;
   }
 
   async translateForUsers(question, options, usersByLang) {
-    this.cpuMonitor.start();
-    this.resetQuestionCache();
-    
-    if (this.cpuMonitor.isPaused) {
-      console.log('[CPU] Translation paused, adding to queue');
-      return new Promise((resolve) => {
-        this.pendingTranslations.push({
-          question,
-          options,
-          usersByLang,
-          resolve
-        });
-      });
+    if (!this._canTranslate()) {
+      this._sendWithoutTranslation(question, options, usersByLang);
+      return;
     }
-    
+
     const results = new Map();
-    
-    if (!this.cpuMonitor.check('translate_start')) {
-      console.warn(`[CPU] Early exit: ${this.cpuMonitor.reason}`);
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached during translation');
-        this.pendingTranslations.push({
-          question,
-          options,
-          usersByLang,
-          resolve: () => {}
-        });
-      }
-      return this._fallbackToEnglish(question, options, usersByLang);
-    }
+    this.resetQuestionCache();
     
     const needTranslate = [];
     
     for (const [lang, users] of usersByLang) {
-      if (!this.cpuMonitor.check('iterate_lang')) {
-        console.warn(`[CPU] Stopping at language: ${lang}, reason: ${this.cpuMonitor.reason}`);
-        results.set(lang, {
-          question,
-          options,
-          users,
-          isFallback: true,
-          fromCache: false
-        });
-        continue;
-      }
-      
       if (lang === 'en') {
-        results.set(lang, {
-          question,
-          options,
-          users,
+        results.set(lang, { 
+          question, 
+          options, 
+          users, 
           isFallback: false,
           fromCache: false
         });
@@ -476,81 +343,43 @@ class TranslationManager {
       const cached = this.questionCache.get(cacheKey);
       
       if (cached) {
-        results.set(lang, {
-          ...cached,
-          users,
-          fromCache: true
+        results.set(lang, { 
+          ...cached, 
+          users, 
+          fromCache: true 
         });
-        continue;
+      } else {
+        needTranslate.push({ lang, users });
       }
-      
-      if (!this.cpuMonitor.checkHeavy('translate_prep')) {
-        console.warn(`[CPU] CPU too high for translation: ${this.cpuMonitor.reason}`);
-        results.set(lang, {
-          question,
-          options,
-          users,
-          isFallback: true,
-          fromCache: false
-        });
-        continue;
-      }
-      
-      needTranslate.push({ lang, users });
     }
     
-    if (!this.cpuMonitor.check('before_translate')) {
-      console.warn(`[CPU] Stopping before translation: ${this.cpuMonitor.reason}`);
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached before translation');
-        this.pendingTranslations.push({
-          question,
-          options,
-          usersByLang,
-          resolve: () => {}
-        });
-      }
-      return this._fallbackToEnglish(question, options, usersByLang);
+    if (needTranslate.length === 0) {
+      this._sendResults(results);
+      return;
     }
     
     for (const { lang, users } of needTranslate) {
-      if (!this.cpuMonitor.check(`translate_${lang}`)) {
-        console.warn(`[CPU] Stopped translation for ${lang}: ${this.cpuMonitor.reason}`);
+      if (!this._canTranslate()) {
         results.set(lang, {
-          question,
-          options,
+          question: question,
+          options: options,
           users,
           isFallback: true,
           fromCache: false
         });
-        if (this.cpuMonitor.shouldStop) {
-          this.cpuMonitor.pause(`CPU limit reached during ${lang} translation`);
-          break;
-        }
         continue;
       }
       
       try {
+        const startTime = Date.now();
         const [translatedQuestion, translatedOptions] = await Promise.all([
           this._translateText(question, lang),
           this._translateOptions(options, lang)
         ]);
+        const elapsed = Date.now() - startTime;
         
-        if (!this.cpuMonitor.check(`translate_done_${lang}`)) {
-          console.warn(`[CPU] CPU exceeded after translation ${lang}: ${this.cpuMonitor.reason}`);
-          results.set(lang, {
-            question,
-            options,
-            users,
-            isFallback: true,
-            fromCache: false
-          });
-          if (this.cpuMonitor.shouldStop) {
-            this.cpuMonitor.pause(`CPU limit reached after ${lang} translation`);
-            break;
-          }
-          continue;
-        }
+        this._recordCPU(elapsed);
+        this._recordSubRequest();
         
         const cacheKey = this._getCacheKey(question, options, lang);
         this.questionCache.set(cacheKey, {
@@ -568,133 +397,56 @@ class TranslationManager {
         });
         
       } catch(e) {
-        if (!this.cpuMonitor.check('translate_error')) {
-          console.warn(`[CPU] CPU exceeded after error: ${this.cpuMonitor.reason}`);
-        }
         results.set(lang, {
-          question,
-          options,
+          question: question,
+          options: options,
           users,
           isFallback: true,
           fromCache: false
         });
       }
-      
-      if (!this.cpuMonitor.check(`translate_complete_${lang}`)) {
-        console.warn(`[CPU] Stopping after ${lang}: ${this.cpuMonitor.reason}`);
-        if (this.cpuMonitor.shouldStop) {
-          this.cpuMonitor.pause(`CPU limit reached after ${lang}`);
-        }
-        break;
-      }
-    }
-    
-    if (!this.cpuMonitor.check('before_broadcast')) {
-      console.warn(`[CPU] CPU too high for broadcast: ${this.cpuMonitor.reason}`);
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached before broadcast');
-        this.pendingTranslations.push({
-          question,
-          options,
-          usersByLang,
-          resolve: () => {}
-        });
-      }
-      return this._fallbackToEnglish(question, options, usersByLang);
     }
     
     this._sendResults(results);
-    
-    const status = this.cpuMonitor.getStatus();
-    console.log(`[CPU] Translation complete: ${status.cpuMs.toFixed(2)}ms, paused: ${status.isPaused}, languages: ${results.size}`);
-    this.gameServer.cpuDashboard.log(status);
   }
 
-  async _processPendingTranslations() {
-    if (this.pendingTranslations.length === 0) return;
-    
-    console.log(`[CPU] Processing ${this.pendingTranslations.length} pending translations`);
-    
-    const pending = [...this.pendingTranslations];
-    this.pendingTranslations = [];
-    
-    for (const item of pending) {
-      try {
-        await this.translateForUsers(item.question, item.options, item.usersByLang);
-        if (item.resolve) item.resolve();
-      } catch(e) {
-        console.error('[CPU] Pending translation error:', e);
-        if (item.resolve) item.resolve();
-      }
-    }
-    
-    console.log('[CPU] Pending translations processed');
-  }
-
-  _fallbackToEnglish(question, options, usersByLang) {
-    console.warn('[CPU] Using English fallback for all users');
-    const results = new Map();
+  _sendWithoutTranslation(question, options, usersByLang) {
     for (const [lang, users] of usersByLang) {
-      results.set(lang, {
-        question,
-        options,
-        users,
-        isFallback: true,
-        fromCache: false
-      });
-    }
-    this._sendResults(results);
-  }
-
-  async _translateWithRetry(question, options, lang) {
-    let lastError = null;
-    
-    if (!this.cpuMonitor.check('retry_start')) {
-      throw new Error('CPU limit reached before retry');
-    }
-    
-    for (let i = 0; i < 5; i++) {
-      if (!this.cpuMonitor.check(`retry_${i}`)) {
-        console.warn(`[CPU] Stopping retry ${i}: ${this.cpuMonitor.reason}`);
-        break;
-      }
+      const message = [
+        "quizQuestion",
+        {
+          question: question || '',
+          options: options || { A: '', B: '', C: '', D: '' },
+          isFallback: true
+        }
+      ];
       
-      try {
-        const translatedQuestion = await this._translateText(question, lang);
-        const translatedOptions = await this._translateOptions(options, lang);
-        
-        return {
-          question: translatedQuestion || question,
-          options: translatedOptions || options
-        };
-      } catch(e) {
-        lastError = e;
-        await this._delay(1000 * (i + 1));
+      const msgStr = JSON.stringify(message);
+      
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try { ws.send(msgStr); } catch(e) {}
+        }
       }
     }
-    
-    throw lastError || new Error('All retries failed');
   }
 
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (!text || typeof text !== 'string') return text;
-    
-    if (!this.cpuMonitor.check(`translate_text_${targetLang}`)) {
-      console.warn(`[CPU] Stopping text translation: ${this.cpuMonitor.reason}`);
-      return text;
-    }
+    if (!this._canTranslate()) return text;
     
     try {
       const result = await this._callTranslateAPI(text, targetLang);
       this.translateCount++;
       return result;
+      
     } catch(e) {
-      if (retryCount < 5) {
-        await this._delay(1000 * (retryCount + 1));
+      if (retryCount < CONSTANTS.DEEPLX_MAX_RETRIES) {
+        await this._delay(500 * (retryCount + 1));
         return this._translateText(text, targetLang, retryCount + 1);
       }
-      throw e;
+      return text;
     }
   }
 
@@ -705,11 +457,6 @@ class TranslationManager {
     const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
     
     if (texts.length === 0) return options;
-    
-    if (!this.cpuMonitor.check(`translate_options_${targetLang}`)) {
-      console.warn(`[CPU] Stopping options translation: ${this.cpuMonitor.reason}`);
-      return options;
-    }
     
     const translatedTexts = await Promise.all(
       texts.map(text => this._translateText(text, targetLang))
@@ -732,17 +479,7 @@ class TranslationManager {
   }
 
   _sendResults(results) {
-    if (!this.cpuMonitor.check('send_results')) {
-      console.warn(`[CPU] Stopping send results: ${this.cpuMonitor.reason}`);
-      return;
-    }
-    
     for (const [lang, data] of results) {
-      if (!this.cpuMonitor.check(`send_${lang}`)) {
-        console.warn(`[CPU] Stopping send for ${lang}: ${this.cpuMonitor.reason}`);
-        break;
-      }
-      
       const { question, options, users, isFallback, fromCache } = data;
       
       const message = [
@@ -750,8 +487,7 @@ class TranslationManager {
         {
           question: question || '',
           options: options || { A: '', B: '', C: '', D: '' },
-          isFallback: isFallback || false,
-          fromCache: fromCache || false
+          isFallback: isFallback || false
         }
       ];
       
@@ -759,19 +495,18 @@ class TranslationManager {
       
       for (const ws of users) {
         if (ws && ws.readyState === 1) {
-          try {
-            ws.send(msgStr);
-          } catch(e) {}
+          try { ws.send(msgStr); } catch(e) {}
         }
       }
     }
   }
 
   async _callTranslateAPI(text, targetLang) {
-    if (!this.cpuMonitor.check('api_call_start')) {
-      throw new Error('CPU limit reached before API call');
+    if (!this._canTranslate()) {
+      throw new Error('CPU limit reached');
     }
-    
+
+    const startTime = Date.now();
     const apiUrls = [
       'https://deeplx.1stg.me/translate',
       'https://deeplx.pages.dev/translate',
@@ -781,11 +516,6 @@ class TranslationManager {
     let lastError = null;
     
     for (const apiUrl of apiUrls) {
-      if (!this.cpuMonitor.check(`api_${apiUrl.substring(0, 20)}`)) {
-        console.warn(`[CPU] Stopping API call: ${this.cpuMonitor.reason}`);
-        break;
-      }
-      
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), CONSTANTS.DEEPLX_TIMEOUT_MS);
@@ -811,6 +541,9 @@ class TranslationManager {
         const translated = data.data || data.text || data.result || data.translations?.[0]?.text;
         
         if (translated) {
+          const elapsed = Date.now() - startTime;
+          this._recordCPU(elapsed);
+          this._recordSubRequest();
           return translated;
         }
         
@@ -821,40 +554,32 @@ class TranslationManager {
       }
     }
     
-    // FALLBACK: Google Translate
-    try {
-      if (this.cpuMonitor.check('google_fallback')) {
-        const googleResult = await this._callGoogleTranslate(text, targetLang);
-        if (googleResult) {
-          return googleResult;
+    if (this._canTranslate()) {
+      try {
+        const result = await this._callGoogleTranslate(text, targetLang);
+        if (result) {
+          const elapsed = Date.now() - startTime;
+          this._recordCPU(elapsed);
+          this._recordSubRequest();
+          return result;
         }
+      } catch(e) {
+        lastError = e;
       }
-    } catch(e) {
-      lastError = e;
     }
     
-    // FALLBACK: MyMemory
-    try {
-      if (this.cpuMonitor.check('mymemory_fallback')) {
-        const myMemoryResult = await this._callMyMemory(text, targetLang);
-        if (myMemoryResult) {
-          return myMemoryResult;
+    if (this._canTranslate()) {
+      try {
+        const result = await this._callLibreTranslate(text, targetLang);
+        if (result) {
+          const elapsed = Date.now() - startTime;
+          this._recordCPU(elapsed);
+          this._recordSubRequest();
+          return result;
         }
+      } catch(e) {
+        lastError = e;
       }
-    } catch(e) {
-      lastError = e;
-    }
-    
-    // FALLBACK: LibreTranslate
-    try {
-      if (this.cpuMonitor.check('libre_fallback')) {
-        const libreResult = await this._callLibreTranslate(text, targetLang);
-        if (libreResult) {
-          return libreResult;
-        }
-      }
-    } catch(e) {
-      lastError = e;
     }
     
     throw lastError || new Error('All translation APIs failed');
@@ -879,50 +604,20 @@ class TranslationManager {
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${target}&dt=t&q=${encodeURIComponent(text)}`;
     
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
     
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
     
     clearTimeout(timeoutId);
     
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (data && data[0] && data[0][0] && data[0][0][0]) {
       return data[0][0][0];
     }
-    
-    throw new Error('Invalid response');
-  }
-
-  async _callMyMemory(text, targetLang) {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|${targetLang}&de=demo@example.com`;
-    
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    
-    const response = await fetch(url, {
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    
-    const data = await response.json();
-    if (data && data.responseData && data.responseData.translatedText) {
-      return data.responseData.translatedText;
-    }
-    
     throw new Error('Invalid response');
   }
 
@@ -938,7 +633,7 @@ class TranslationManager {
     for (const instance of instances) {
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
         
         const response = await fetch(instance, {
           method: 'POST',
@@ -954,15 +649,11 @@ class TranslationManager {
         
         clearTimeout(timeoutId);
         
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         if (data && data.translatedText) {
           return data.translatedText;
         }
-        
         throw new Error('Invalid response');
         
       } catch(e) {
@@ -996,6 +687,8 @@ export class GameServer {
     this.closing = false;
     this.isDestroyed = false;
     this._initialized = false;
+    
+    this.cpuLimiter = new CPULimiter();
     
     this.activeGames = new Map();
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
@@ -1049,21 +742,6 @@ export class GameServer {
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
     
-    // CPU Monitor
-    this.cpuMonitor = new CPUMonitor(CONSTANTS.MAX_CPU_MS);
-    this.cpuDashboard = new CPUDashboard();
-    this.gameCpuMonitor = new CPUMonitor(CONSTANTS.MAX_CPU_MS * 0.8);
-    
-    // Auto Resume Manager
-    this.autoResume = new AutoResumeManager(this.cpuMonitor, 1000);
-    this.autoResume.onResume(() => {
-      this._onCpuResume();
-    });
-    this.autoResume.start();
-    
-    this.pendingOperations = [];
-    this.isProcessingPending = false;
-    
     this.translationManager = new TranslationManager(this);
     
     this._quizKeepAliveInterval = null;
@@ -1077,74 +755,34 @@ export class GameServer {
     }, 3000);
   }
 
-  // ==================== CPU RESUME HANDLER ====================
-  
-  _onCpuResume() {
-    console.log('[GameServer] CPU resumed, processing pending operations');
-    this._processPendingOperations();
-    
-    if (this._isQuizTime() && !this.currentQuestion) {
-      this.forceStartQuiz();
-    }
-    
-    this._broadcastToRoom(QUIZ_ROOM, [
-      "quizStatus",
-      "Server is back to normal"
-    ]);
+  // ==================== CPU LIMITER METHODS ====================
+
+  _checkCPULimit() {
+    return this.cpuLimiter.checkAndStop();
   }
 
-  async _processPendingOperations() {
-    if (this.isProcessingPending || this.pendingOperations.length === 0) return;
-    
-    this.isProcessingPending = true;
-    console.log(`[GameServer] Processing ${this.pendingOperations.length} pending ops`);
-    
-    const pending = [...this.pendingOperations];
-    this.pendingOperations = [];
-    
-    for (const op of pending) {
-      try {
-        await op();
-      } catch(e) {
-        console.error('[GameServer] Pending op error:', e);
-      }
-    }
-    
-    this.isProcessingPending = false;
-    console.log('[GameServer] Pending ops processed');
+  _recordCPU(ms, category = 'other') {
+    this.cpuLimiter.recordCPU(ms, category);
   }
 
-  async _executeWithCpuCheck(operation, fallback = null) {
-    if (!this.cpuMonitor.check('execute')) {
-      console.warn(`[CPU] Cannot execute: ${this.cpuMonitor.reason}`);
-      
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached during execution');
-        return new Promise((resolve) => {
-          this.pendingOperations.push(async () => {
-            try {
-              const result = await operation();
-              resolve(result);
-            } catch(e) {
-              resolve(fallback);
-            }
-          });
-        });
-      }
-      
-      return fallback;
-    }
-    
-    try {
-      return await operation();
-    } catch(e) {
-      return fallback;
-    }
+  _recordSubRequest(category = 'other') {
+    this.cpuLimiter.recordSubRequest(category);
   }
+
+  getCPUUsage() {
+    return this.cpuLimiter.getUsage();
+  }
+
+  // ==================== ASYNC INIT ====================
 
   async _initAsync() {
     if (this._initialized) return;
     this._initialized = true;
+    
+    if (!this._checkCPULimit()) {
+      setTimeout(() => this._initAsync(), 1000);
+      return;
+    }
     
     await this._initQuiz();
     this._startQuizScheduler();
@@ -1157,7 +795,7 @@ export class GameServer {
 
   _incrementSubRequest() {
     this._subRequestCount++;
-    this._requestCount++;
+    this._recordSubRequest('kv');
   }
 
   _getCurrentUTCHours() {
@@ -1173,7 +811,6 @@ export class GameServer {
     const now = new Date();
     const startTime = new Date(now);
     startTime.setUTCHours(QUIZ_SCHEDULE.START_HOUR, 0, 0, 0);
-    
     if (startTime <= now) {
       startTime.setUTCDate(startTime.getUTCDate() + 1);
     }
@@ -1184,15 +821,12 @@ export class GameServer {
     const now = Date.now();
     const nextStart = this._getNextQuizStartTime();
     const timeLeft = nextStart.getTime() - now;
-    
     if (timeLeft <= 0) {
       return { minutes: 0, seconds: 0, isRunning: this._isQuizTime() };
     }
-    
     const totalSeconds = Math.floor(timeLeft / 1000);
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
-    
     return { minutes, seconds, isRunning: false };
   }
 
@@ -1208,9 +842,16 @@ export class GameServer {
   async _getQuizPoints() {
     if (!this.env || !this.env.QUESTIONS) return {};
     try {
+      if (!this._checkCPULimit()) {
+        this._recordCPU(1, 'kv');
+        return {};
+      }
       const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json');
+      this._recordSubRequest('kv');
+      this._recordCPU(2, 'kv');
       return points || {};
     } catch(e) {
+      this._recordCPU(1, 'kv');
       return {};
     }
   }
@@ -1218,56 +859,50 @@ export class GameServer {
   async _getLastWeekWinner() {
     if (!this.env || !this.env.QUESTIONS) return null;
     try {
+      if (!this._checkCPULimit()) {
+        this._recordCPU(1, 'kv');
+        return null;
+      }
       const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
+      this._recordSubRequest('kv');
+      this._recordCPU(2, 'kv');
       return winner || null;
     } catch(e) {
+      this._recordCPU(1, 'kv');
       return null;
     }
   }
 
   async _checkAndResetWeeklyPoints() {
     if (!this.env || !this.env.QUESTIONS) return false;
-    
     try {
+      if (!this._checkCPULimit()) return false;
       const currentWeek = this._getCurrentWeek();
       const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
-      
+      this._recordSubRequest('kv');
       if (savedWeek !== currentWeek) {
         const points = await this._getQuizPoints();
-        
         let winner = null;
         let highestScore = 0;
-        
         for (const [username, score] of Object.entries(points)) {
           if (score > highestScore) {
             highestScore = score;
             winner = username;
           }
         }
-        
         if (winner) {
           const winnerData = {
             username: winner,
             score: highestScore,
             week: savedWeek || currentWeek
           };
-          
-          await this.env.QUESTIONS.put(
-            CONSTANTS.QUIZ_LAST_WEEK_WINNER,
-            JSON.stringify(winnerData)
-          );
-          
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizLastWeekWinner",
-            winner,
-            highestScore,
-            savedWeek || currentWeek
-          ]);
+          await this.env.QUESTIONS.put(CONSTANTS.QUIZ_LAST_WEEK_WINNER, JSON.stringify(winnerData));
+          this._recordSubRequest('kv');
+          this._broadcastToRoom(QUIZ_ROOM, ["quizLastWeekWinner", winner, highestScore, savedWeek || currentWeek]);
         }
-        
         await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify({}));
         await this.env.QUESTIONS.put(CONSTANTS.QUIZ_WEEK_KEY, currentWeek);
-        
+        this._recordSubRequest('kv');
         return true;
       }
       return false;
@@ -1281,14 +916,13 @@ export class GameServer {
       clearInterval(this.quizAutoTimer);
       this.quizAutoTimer = null;
     }
-    
     this.quizAutoTimer = setInterval(() => {
       if (this.closing || this.isDestroyed) {
         clearInterval(this.quizAutoTimer);
         this.quizAutoTimer = null;
         return;
       }
-      
+      if (!this._checkCPULimit()) return;
       try {
         this.translationManager.resetDailyCounter();
         this._checkQuizAutoStatus();
@@ -1300,21 +934,12 @@ export class GameServer {
   async _checkQuizAutoStatus() {
     try {
       const isQuizTime = this._isQuizTime();
-      
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏳ Quiz will start soon!",
-            false
-          ]);
-          
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "⏳ Quiz will start soon!", false]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
-          
-          if (!this._quizStartTimeout) {
-            this.forceStartQuiz();
-          }
+          if (!this._quizStartTimeout) this.forceStartQuiz();
         } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
           await this._showQuestion();
         }
@@ -1323,11 +948,7 @@ export class GameServer {
         if (this.quizAutoEnabled) {
           this.quizAutoEnabled = false;
           await this.resetQuiz();
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏸️ Quiz has ended. See you tomorrow!",
-            true
-          ]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "⏸️ Quiz has ended. See you tomorrow!", true]);
         }
         return true;
       }
@@ -1337,34 +958,13 @@ export class GameServer {
   }
 
   forceStartQuiz() {
-    if (!this.cpuMonitor.check('force_start_quiz')) {
-      console.warn(`[CPU] Cannot force start quiz: ${this.cpuMonitor.reason}`);
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached during force start');
-        this.pendingOperations.push(() => this.forceStartQuiz());
-      }
-      return false;
-    }
-    
-    if (!this._isQuizTime()) {
-      return false;
-    }
-    
-    if (this.currentQuestion) {
-      return false;
-    }
-    
-    if (this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
-      return false;
-    }
-    
+    if (!this._isQuizTime()) return false;
+    if (this.currentQuestion) return false;
+    if (this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) return false;
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-      this._initQuiz().then(() => {
-        this._showQuestion();
-      });
+      this._initQuiz().then(() => this._showQuestion());
       return false;
     }
-    
     this.quizAutoEnabled = true;
     this._showQuestion();
     return true;
@@ -1372,15 +972,11 @@ export class GameServer {
 
   _checkAndRestartQuiz() {
     try {
-      if (!this._isQuizTime()) {
-        return;
-      }
-      
+      if (!this._isQuizTime()) return;
       const isRunning = this.currentQuestion !== null;
       const isWaiting = this.isQuizWaiting;
       const hasTimeout = this._quizTimeout !== null;
       const hasBreak = this._quizBreakTimeout !== null;
-      
       if (!isRunning && !isWaiting && !hasTimeout && !hasBreak) {
         this.quizAutoEnabled = true;
         this._showQuestion();
@@ -1389,82 +985,47 @@ export class GameServer {
   }
 
   ensureQuizStarted() {
-    if (this._quizTimeout) {
-      clearTimeout(this._quizTimeout);
-      this._quizTimeout = null;
-    }
-    if (this._quizBreakTimeout) {
-      clearTimeout(this._quizBreakTimeout);
-      this._quizBreakTimeout = null;
-    }
-    if (this._quizStartTimeout) {
-      clearTimeout(this._quizStartTimeout);
-      this._quizStartTimeout = null;
-    }
-    
+    if (this._quizTimeout) { clearTimeout(this._quizTimeout); this._quizTimeout = null; }
+    if (this._quizBreakTimeout) { clearTimeout(this._quizBreakTimeout); this._quizBreakTimeout = null; }
+    if (this._quizStartTimeout) { clearTimeout(this._quizStartTimeout); this._quizStartTimeout = null; }
     this.forceStartQuiz();
   }
 
   ensureQuizRunning() {
     try {
+      if (!this._checkCPULimit()) return;
       this._forceStartQuizIfTime();
-      
       if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
         this._initQuiz().then(() => {
-          if (!this.closing && !this.isDestroyed) {
-            this.forceStartQuiz();
-          }
+          if (!this.closing && !this.isDestroyed) this.forceStartQuiz();
         });
         return;
       }
-      
       if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
         this.forceStartQuiz();
       }
-      
-      if (!this._quizKeepAliveInterval) {
-        this._startQuizKeepAlive();
-      }
-      
+      if (!this._quizKeepAliveInterval) this._startQuizKeepAlive();
     } catch(e) {}
   }
 
   _forceStartQuizIfTime() {
-    if (!this._isQuizTime()) {
-      return;
-    }
-    
-    if (this.currentQuestion) {
-      return;
-    }
-    
-    if (this._quizTimeout) {
-      return;
-    }
-    
-    if (this.isQuizWaiting) {
-      return;
-    }
-    
-    if (this._quizStartTimeout) {
-      return;
-    }
-    
+    if (!this._isQuizTime()) return;
+    if (this.currentQuestion) return;
+    if (this._quizTimeout) return;
+    if (this.isQuizWaiting) return;
+    if (this._quizStartTimeout) return;
     this.quizAutoEnabled = true;
     this._showQuestion();
   }
 
   _sendQuizTimeLeftToUser(ws) {
     if (!ws || ws.readyState !== 1) return false;
-    
     try {
       const isQuizTime = this._isQuizTime();
       const timeLeft = this._getTimeLeftUntilNextEvent();
       const isQuizActive = this.currentQuestion !== null || this._quizTimeout !== null;
-      
       let message = "";
       let canType = true;
-      
       if (isQuizTime && isQuizActive) {
         let remaining = "";
         if (this._quizStartTime) {
@@ -1473,11 +1034,7 @@ export class GameServer {
           const left = Math.max(0, total - elapsed);
           const minutes = Math.floor(left / 60);
           const seconds = Math.floor(left % 60);
-          if (minutes > 0) {
-            remaining = `${minutes}m ${seconds}s remaining`;
-          } else {
-            remaining = `${seconds}s remaining`;
-          }
+          remaining = minutes > 0 ? `${minutes}m ${seconds}s remaining` : `${seconds}s remaining`;
         }
         message = `📝 Quiz is running! ${remaining}`;
         canType = false;
@@ -1490,7 +1047,6 @@ export class GameServer {
         return false;
       } else {
         const totalSeconds = timeLeft.minutes * 60 + timeLeft.seconds;
-        
         let countdown = "";
         if (totalSeconds <= 0) {
           countdown = "Now!";
@@ -1498,15 +1054,12 @@ export class GameServer {
           const hours = Math.floor(totalSeconds / 3600);
           const minutes = Math.floor((totalSeconds % 3600) / 60);
           const seconds = Math.floor(totalSeconds % 60);
-          
           let parts = [];
           if (hours > 0) parts.push(`${hours} hour${hours > 1 ? 's' : ''}`);
           if (minutes > 0) parts.push(`${minutes} minute${minutes > 1 ? 's' : ''}`);
           if (seconds > 0 && parts.length === 0) parts.push(`${seconds} second${seconds > 1 ? 's' : ''}`);
-          
           countdown = parts.join(" ");
         }
-        
         message = `⏸️ Quiz starts in ${countdown}`;
         canType = true;
         this._safeSend(ws, ["quizTimeLeft", message, canType]);
@@ -1519,31 +1072,18 @@ export class GameServer {
 
   _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
     if (!ws || ws.readyState !== 1) return false;
-    
     try {
       const timeLeft = this._getTimeLeftUntilNextEvent();
       let message = "";
-      
       switch(errorType) {
-        case "NOT_QUIZ_TIME":
-          message = "Quiz is offline";
-          break;
-        case "QUIZ_DISABLED":
-          message = "Quiz is currently unavailable";
-          break;
-        case "QUIZ_ENDED":
-          message = "Quiz has ended";
-          break;
+        case "NOT_QUIZ_TIME": message = "Quiz is offline"; break;
+        case "QUIZ_DISABLED": message = "Quiz is currently unavailable"; break;
+        case "QUIZ_ENDED": message = "Quiz has ended"; break;
         case "QUIZ_NOT_STARTED":
-          const timeStr = timeLeft.minutes > 0 ? 
-            `${timeLeft.minutes}m ${timeLeft.seconds}s` : 
-            `${timeLeft.seconds}s`;
-          message = `Quiz starts in: ${timeStr}`;
-          break;
-        default:
-          message = customMessage || "Quiz error occurred";
+          const timeStr = timeLeft.minutes > 0 ? `${timeLeft.minutes}m ${timeLeft.seconds}s` : `${timeLeft.seconds}s`;
+          message = `Quiz starts in: ${timeStr}`; break;
+        default: message = customMessage || "Quiz error occurred";
       }
-      
       this._safeSend(ws, ["quizError", message]);
       return true;
     } catch(e) {
@@ -1555,17 +1095,12 @@ export class GameServer {
     if (!ws) return 'en';
     const wsId = this._getWsId(ws);
     if (!wsId) return 'en';
-    
     this.userCountry.set(wsId, countryCode);
-    
     const lang = this._countryToLanguage(countryCode);
     this.userLanguage.set(wsId, lang);
-    
     return lang;
   }
 
-  // ==================== SWITCH ROOM (TANPA AUTO-CLEANUP) ====================
-  
   async switchRoom(ws, room, username = null) {
     if (this.isDestroyed) {
       this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
@@ -1575,23 +1110,17 @@ export class GameServer {
       this._safeSend(ws, ["gameLowCardError", "Invalid room name"]);
       return;
     }
-    
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
-    
     if (!wsId) {
       this._safeSend(ws, ["gameLowCardError", "Connection error"]);
       return;
     }
-    
     const lockKey = `switch_${wsId}`;
     if (this._switchLocks.has(lockKey)) return;
     this._switchLocks.set(lockKey, Date.now());
-    
     try {
       const oldRoom = this.clientRooms.get(wsId);
-      
-      // Jika sama, tidak usah pindah
       if (oldRoom === roomName) {
         if (roomName === QUIZ_ROOM) {
           let lang = this.userLanguage.get(wsId);
@@ -1599,18 +1128,13 @@ export class GameServer {
             const country = this.userCountry.get(wsId) || 'US';
             lang = this._setUserLanguage(ws, country);
           }
-          
           if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
             await this._initQuiz();
           }
-          
           if (this._isQuizTime()) {
-            if (!this.quizAutoEnabled) {
-              this.quizAutoEnabled = true;
-            }
+            if (!this.quizAutoEnabled) this.quizAutoEnabled = true;
             this.forceStartQuiz();
           }
-          
           setTimeout(() => {
             if (this.closing || this.isDestroyed) return;
             this._sendQuizTimeLeftToUser(ws);
@@ -1618,24 +1142,15 @@ export class GameServer {
         }
         return;
       }
-      
-      // HAPUS dari room lama (tanpa cleanup otomatis)
-      if (oldRoom) {
-        this._removeClientFromRoom(oldRoom, wsId);
-      }
-      
-      // TAMBAHKAN ke room baru
+      if (oldRoom) this._removeClientFromRoom(oldRoom, wsId);
       this._addClient(roomName, ws, username, false);
       ws.room = roomName;
       ws.roomname = roomName;
       ws.username = username;
-      
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn) conn.room = roomName;
       }
-      
-      // KALAU ROOM QUIZ
       if (roomName === QUIZ_ROOM) {
         let country = this.userCountry.get(wsId);
         if (!country) {
@@ -1643,51 +1158,36 @@ export class GameServer {
           country = cf.country || 'US';
           this.userCountry.set(wsId, country);
         }
-        
         this._setUserLanguage(ws, country);
-        
         if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           await this._initQuiz();
         }
-        
         if (this._isQuizTime()) {
-          if (!this.quizAutoEnabled) {
-            this.quizAutoEnabled = true;
-          }
+          if (!this.quizAutoEnabled) this.quizAutoEnabled = true;
           this.forceStartQuiz();
         }
-        
         setTimeout(() => {
           if (this.closing || this.isDestroyed) return;
           this._sendQuizTimeLeftToUser(ws);
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
       }
-      
     } finally {
       this._switchLocks.delete(lockKey);
     }
   }
 
-  // ==================== LOAD QUESTIONS ====================
-  
   async _loadAllQuestionsFromKV() {
     if (!this.env || !this.env.QUESTIONS) return false;
-    
-    if (!this.cpuMonitor.check('load_questions')) {
-      console.warn(`[CPU] Cannot load questions: ${this.cpuMonitor.reason}`);
-      return false;
-    }
-    
     try {
+      if (!this._checkCPULimit()) {
+        this._recordCPU(1, 'kv');
+        return false;
+      }
       this._incrementSubRequest();
       const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
-      
+      this._recordSubRequest('kv');
+      this._recordCPU(2, 'kv');
       if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
-        if (!this.cpuMonitor.check('process_questions')) {
-          console.warn(`[CPU] Cannot process questions: ${this.cpuMonitor.reason}`);
-          return false;
-        }
-        
         this._allQuestions = cached.questions.map((q, index) => ({
           id: index + 1,
           question: q.question || '',
@@ -1696,38 +1196,27 @@ export class GameServer {
           category: q.category || 'General',
           difficulty: q.difficulty || 'medium'
         }));
-        
         this._isAllQuestionsLoaded = true;
         this._currentBatchStart = 0;
         this._currentBatchEnd = 0;
         this._questionPointer = 0;
         this._totalQuestionsAnswered = 0;
         this._currentBatchIndex = 0;
-        
         this._loadNextBatch();
-        
+        this._recordCPU(5, 'kv');
         return true;
       }
-      
       return false;
     } catch(e) {
+      this._recordCPU(1, 'kv');
       return false;
     }
   }
 
   _loadNextBatch() {
-    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-      return false;
-    }
-    
-    if (!this.cpuMonitor.check('load_batch')) {
-      console.warn(`[CPU] Cannot load batch: ${this.cpuMonitor.reason}`);
-      return false;
-    }
-    
+    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) return false;
     const totalQuestions = this._allQuestions.length;
     let startIndex = this._currentBatchEnd;
-    
     if (startIndex >= totalQuestions) {
       startIndex = 0;
       this._currentBatchStart = 0;
@@ -1736,84 +1225,75 @@ export class GameServer {
       this._totalQuestionsAnswered = 0;
       this._currentBatchIndex = 0;
     }
-    
     let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
     const batch = this._allQuestions.slice(startIndex, endIndex);
-    
     this.quizQuestionCache['en'] = batch;
     this._currentQuestions = batch;
     this._currentBatchStart = startIndex;
     this._currentBatchEnd = endIndex;
     this._currentBatchIndex = Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE);
     this._lastLoadedBatch = this._currentBatchIndex;
-    
     return true;
   }
 
   _checkAndLoadNextBatch() {
     const questions = this.quizQuestionCache['en'] || [];
-    
     if (this._questionPointer >= questions.length) {
       this._loadNextBatch();
-      
       const newQuestions = this.quizQuestionCache['en'] || [];
       if (this._currentBatchStart === 0 && newQuestions.length > 0) {
         this._questionPointer = 0;
       }
-      
       return true;
     }
-    
     return false;
   }
 
   async _broadcastQuizQuestion(question, options) {
-    if (!this.cpuMonitor.check('broadcast_quiz_start')) {
-      console.warn(`[CPU] Cannot broadcast quiz: ${this.cpuMonitor.reason}`);
+    const startTime = Date.now();
+    if (!this._checkCPULimit()) {
+      const wsIds = this.wsClients.get(QUIZ_ROOM);
+      if (wsIds && wsIds.size > 0) {
+        const message = ["quizQuestion", { question: question || '', options: options || { A: '', B: '', C: '', D: '' }, isFallback: true }];
+        const msgStr = JSON.stringify(message);
+        for (const wsId of wsIds) {
+          const ws = this.wsMap.get(wsId);
+          if (ws && ws.readyState === 1) { try { ws.send(msgStr); } catch(e) {} }
+        }
+      }
+      this._recordCPU(Date.now() - startTime, 'broadcast');
       return;
     }
-    
     const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds || wsIds.size === 0) return;
-    
+    if (!wsIds || wsIds.size === 0) {
+      this._recordCPU(Date.now() - startTime, 'broadcast');
+      return;
+    }
     const usersByLang = new Map();
-    
     for (const wsId of wsIds) {
-      if (!this.cpuMonitor.check('broadcast_user')) {
-        console.warn(`[CPU] Stopping user broadcast: ${this.cpuMonitor.reason}`);
-        break;
-      }
-      
       try {
         const ws = this.wsMap.get(wsId);
         if (!ws || ws.readyState !== 1) continue;
-        
         const lang = this.userLanguage.get(wsId) || 'en';
-        
-        if (!usersByLang.has(lang)) {
-          usersByLang.set(lang, []);
-        }
+        if (!usersByLang.has(lang)) usersByLang.set(lang, []);
         usersByLang.get(lang).push(ws);
       } catch(e) {}
     }
-    
-    if (usersByLang.size === 0) return;
-    
-    await this.translationManager.translateForUsers(question, options, usersByLang);
+    if (usersByLang.size > 0) {
+      await this.translationManager.translateForUsers(question, options, usersByLang);
+    }
+    this._recordCPU(Date.now() - startTime, 'broadcast');
   }
 
   _broadcastQuizResult(type, data) {
+    if (!this._checkCPULimit()) return;
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds || wsIds.size === 0) return;
-    
     const msgStr = JSON.stringify([type, data]);
-    
     for (const wsId of wsIds) {
       try {
         const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1) {
-          ws.send(msgStr);
-        }
+        if (ws && ws.readyState === 1) { ws.send(msgStr); }
       } catch(e) {}
     }
   }
@@ -1823,35 +1303,24 @@ export class GameServer {
       clearInterval(this._quizKeepAliveInterval);
       this._quizKeepAliveInterval = null;
     }
-    
     this._quizKeepAliveInterval = setInterval(() => {
       if (this.closing || this.isDestroyed) {
         clearInterval(this._quizKeepAliveInterval);
         this._quizKeepAliveInterval = null;
         return;
       }
-      
+      if (!this._checkCPULimit()) return;
       if (this._isQuizTime()) {
         const now = Date.now();
-        const idleTime = (now - this._lastActivityTime) / 1000;
-        
         if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-          if (this.quizAutoEnabled) {
-            this._showQuestion();
-          } else {
-            this.quizAutoEnabled = true;
-            this._showQuestion();
-          }
+          if (this.quizAutoEnabled) { this._showQuestion(); } 
+          else { this.quizAutoEnabled = true; this._showQuestion(); }
         }
-        
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (now - this._quizStartTime) / 1000;
           const maxTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
-          
-          if (elapsed > maxTime - 2) {
-            if (!this._quizTimeout) {
-              this._forceEvaluateQuiz();
-            }
+          if (elapsed > maxTime - 2 && !this._quizTimeout) {
+            this._forceEvaluateQuiz();
           }
         }
       }
@@ -1859,74 +1328,35 @@ export class GameServer {
   }
 
   async _forceEvaluateQuiz() {
-    if (!this.currentQuestion) return;
-    if (this._quizTimeout) return;
-    
-    if (!this.cpuMonitor.check('force_evaluate')) {
-      console.warn(`[CPU] Cannot force evaluate: ${this.cpuMonitor.reason}`);
-      return;
-    }
-    
+    if (!this.currentQuestion || this._quizTimeout) return;
+    if (!this._checkCPULimit()) return;
     try {
       const currentClients = this.wsClients.get(QUIZ_ROOM);
-      if (!currentClients || currentClients.size === 0) {
-        this.currentQuestion = null;
-        return;
-      }
-
+      if (!currentClients || currentClients.size === 0) { this.currentQuestion = null; return; }
       const correctAnswer = this.currentQuestion.correct;
       const question = this.currentQuestion.question;
       const options = this.currentQuestion.options;
-
       if (this.quizHasWinner && this.quizWinner) {
         const points = await this._getQuizPoints();
         points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-        
         if (this.env && this.env.QUESTIONS) {
           this._incrementSubRequest();
-          await this.env.QUESTIONS.put(
-            CONSTANTS.QUIZ_POINT_KEY,
-            JSON.stringify(points)
-          );
+          await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
         }
-        
         const totalPoints = points[this.quizWinner] || 0;
-        
-        this._broadcastQuizResult("quizWinner", {
-          username: this.quizWinner,
-          totalPoints: totalPoints,
-          correctAnswer: correctAnswer
-        });
-        
+        this._broadcastQuizResult("quizWinner", { username: this.quizWinner, totalPoints: totalPoints, correctAnswer: correctAnswer });
       } else {
-        this._broadcastQuizResult("quizNoWinner", {
-          message: "No one answered correctly!",
-          correctAnswer: correctAnswer
-        });
+        this._broadcastQuizResult("quizNoWinner", { message: "No one answered correctly!", correctAnswer: correctAnswer });
       }
-      
-      this._broadcastQuizResult("quizCorrectAnswer", {
-        question: question,
-        options: options,
-        correctAnswer: correctAnswer
-      });
-
+      this._broadcastQuizResult("quizCorrectAnswer", { question: question, options: options, correctAnswer: correctAnswer });
       this.currentQuestion = null;
       this.isQuizWaiting = true;
-
       this._quizBreakTimeout = setTimeout(() => {
-        if (this.closing || this.isDestroyed) {
-          this._quizBreakTimeout = null;
-          return;
-        }
+        if (this.closing || this.isDestroyed) { this._quizBreakTimeout = null; return; }
         this.isQuizWaiting = false;
         this._quizBreakTimeout = null;
-        
-        if (!this.closing && !this.isDestroyed) {
-          this.ensureQuizRunning();
-        }
+        if (!this.closing && !this.isDestroyed) this.ensureQuizRunning();
       }, CONSTANTS.QUIZ_BREAK_MS);
-
     } catch(e) {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
@@ -1934,293 +1364,200 @@ export class GameServer {
   }
 
   async _showQuestion() {
-    if (!this.cpuMonitor.check('show_question_start')) {
-      console.warn(`[CPU] Cannot show question: ${this.cpuMonitor.reason}`);
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached before showing question');
-        this.pendingOperations.push(() => this._showQuestion());
-      }
-      this._broadcastToRoom(QUIZ_ROOM, [
-        "quizError",
-        "Server is busy, please wait"
-      ]);
-      return;
-    }
-    
+    const startTime = Date.now();
     try {
+      if (!this._checkCPULimit()) {
+        this._recordCPU(Date.now() - startTime, 'quiz');
+        return;
+      }
       this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
-      
       if (!this._isQuizTime()) {
         const clients = this.wsClients.get(QUIZ_ROOM);
         if (clients && clients.size > 0) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏸️ Quiz is offline.",
-            true
-          ]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "⏸️ Quiz is offline.", true]);
         }
+        this._recordCPU(Date.now() - startTime, 'quiz');
         return;
       }
-      
       if (!this.quizAutoEnabled) {
         this.quizAutoEnabled = true;
         const clients = this.wsClients.get(QUIZ_ROOM);
         if (clients && clients.size > 0) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏳ Quiz will start soon!",
-            true
-          ]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "⏳ Quiz will start soon!", true]);
         }
+        this._recordCPU(Date.now() - startTime, 'quiz');
         return;
       }
-      
       if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) {
+        this._recordCPU(Date.now() - startTime, 'quiz');
         return;
       }
-
       this._checkAndLoadNextBatch();
-      
       const questions = this.quizQuestionCache['en'] || [];
-      
       if (questions.length === 0) {
         const loaded = this._loadNextBatch();
         if (!loaded) {
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizError",
-            "No questions available! Please add questions to KV."
-          ]);
-          return;
+          this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available! Please add questions to KV."]);
         }
-      }
-      
-      if (!this.cpuMonitor.check('show_question_loaded')) {
-        console.warn(`[CPU] Stopping after load: ${this.cpuMonitor.reason}`);
+        this._recordCPU(Date.now() - startTime, 'quiz');
         return;
       }
-      
       const q = questions[this._questionPointer];
-      
       if (!q || !q.options) {
         this._questionPointer++;
         this._showQuestion();
+        this._recordCPU(Date.now() - startTime, 'quiz');
         return;
       }
-
       const shuffled = this._shuffleQuestionOptions(q);
-      
-      this.currentQuestion = {
-        ...q,
-        options: shuffled.options,
-        correct: shuffled.correct
-      };
-      
+      this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
       this._quizStartTime = Date.now();
       this.quizAnswered = new Set();
       this.quizHasWinner = false;
       this.quizWinner = null;
-      
       this._questionPointer++;
       this._totalQuestionsAnswered++;
-
-      if (!this.cpuMonitor.check('show_question_broadcast')) {
-        console.warn(`[CPU] Stopping before broadcast: ${this.cpuMonitor.reason}`);
-        return;
-      }
-
-      await this._broadcastQuizQuestion(
-        this.currentQuestion.question,
-        this.currentQuestion.options
-      );
-
+      this._recordCPU(2, 'quiz');
+      await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
       this._broadcastToRoom(QUIZ_ROOM, [
         "quizTimeLeft",
         `📝 Question ${this._questionPointer}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
         false
       ]);
-
       if (this._quizTimeout) clearTimeout(this._quizTimeout);
       if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
-
       this._quizTimeout = setTimeout(async () => {
         try {
-          if (this.closing || this.isDestroyed) {
+          if (this.closing || this.isDestroyed) { this._quizTimeout = null; return; }
+          if (!this._checkCPULimit()) {
             this._quizTimeout = null;
+            this.currentQuestion = null;
+            this.isQuizWaiting = false;
+            this._recordCPU(1, 'quiz');
             return;
           }
-
           const currentClients = this.wsClients.get(QUIZ_ROOM);
           if (!currentClients || currentClients.size === 0) {
             this._quizTimeout = null;
             this.currentQuestion = null;
+            this._recordCPU(1, 'quiz');
             return;
           }
-
           const correctAnswer = this.currentQuestion.correct;
           const question = this.currentQuestion.question;
           const options = this.currentQuestion.options;
-
           if (this.quizHasWinner && this.quizWinner) {
             const points = await this._getQuizPoints();
             points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-            
             if (this.env && this.env.QUESTIONS) {
               this._incrementSubRequest();
-              await this.env.QUESTIONS.put(
-                CONSTANTS.QUIZ_POINT_KEY,
-                JSON.stringify(points)
-              );
+              await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
             }
-            
             const totalPoints = points[this.quizWinner] || 0;
-            
-            this._broadcastQuizResult("quizWinner", {
-              username: this.quizWinner,
-              totalPoints: totalPoints,
-              correctAnswer: correctAnswer
-            });
-            
+            this._broadcastQuizResult("quizWinner", { username: this.quizWinner, totalPoints: totalPoints, correctAnswer: correctAnswer });
           } else {
-            this._broadcastQuizResult("quizNoWinner", {
-              message: "No one answered correctly!",
-              correctAnswer: correctAnswer
-            });
+            this._broadcastQuizResult("quizNoWinner", { message: "No one answered correctly!", correctAnswer: correctAnswer });
           }
-          
-          this._broadcastQuizResult("quizCorrectAnswer", {
-            question: question,
-            options: options,
-            correctAnswer: correctAnswer
-          });
-
+          this._broadcastQuizResult("quizCorrectAnswer", { question: question, options: options, correctAnswer: correctAnswer });
           this._quizTimeout = null;
           this.isQuizWaiting = true;
-
           this._quizBreakTimeout = setTimeout(() => {
-            if (this.closing || this.isDestroyed) {
-              this._quizBreakTimeout = null;
-              return;
-            }
+            if (this.closing || this.isDestroyed) { this._quizBreakTimeout = null; return; }
             this.isQuizWaiting = false;
             this._quizBreakTimeout = null;
             this.currentQuestion = null;
-            
-            this._broadcastToRoom(QUIZ_ROOM, [
-              "quizNextQuestionIn",
-              "5"
-            ]);
-            
-            setTimeout(() => {
-              this._broadcastToRoom(QUIZ_ROOM, [
-                "quizNextQuestionIn",
-                "3"
-              ]);
-            }, 2000);
-            
-            setTimeout(() => {
-              this._broadcastToRoom(QUIZ_ROOM, [
-                "quizNextQuestionIn",
-                "1"
-              ]);
-            }, 4000);
-            
-            if (!this.closing && !this.isDestroyed) {
-              this.ensureQuizRunning();
-            }
+            this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "5"]);
+            setTimeout(() => { this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "3"]); }, 2000);
+            setTimeout(() => { this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "1"]); }, 4000);
+            if (!this.closing && !this.isDestroyed) this.ensureQuizRunning();
           }, CONSTANTS.QUIZ_BREAK_MS);
-
         } catch(e) {
           this._quizTimeout = null;
           this.currentQuestion = null;
           this.isQuizWaiting = false;
         }
+        this._recordCPU(Date.now() - startTime, 'quiz');
       }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
-
     } catch(e) {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
     }
+    this._recordCPU(Date.now() - startTime, 'quiz');
   }
 
   async submitQuizAnswer(ws, username, answer) {
-    if (!this.cpuMonitor.check('submit_answer_start')) {
-      this._safeSend(ws, ["quizError", "Server is busy, please wait"]);
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached during answer submission');
-        this.pendingOperations.push(() => this.submitQuizAnswer(ws, username, answer));
-      }
-      return;
-    }
-    
     try {
-      if (!ws || !username) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
+      if (!this._checkCPULimit()) {
+        this._sendQuizErrorWithTime(ws, "ERROR", "Server is busy");
+        this._recordCPU(0.5, 'quiz');
         return;
       }
-      
+      if (!ws || !username) {
+        this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
+        this._recordCPU(0.5, 'quiz');
+        return;
+      }
       const room = this._ensureRoomConsistency(ws);
       if (room !== QUIZ_ROOM) {
         this._safeSend(ws, ["quizError", "Quiz only available in Quiz room"]);
+        this._recordCPU(0.5, 'quiz');
         return;
       }
-      
       if (!this._isQuizTime()) {
         this._sendQuizErrorWithTime(ws, "NOT_QUIZ_TIME");
+        this._recordCPU(0.5, 'quiz');
         return;
       }
-      
       if (!this.quizAutoEnabled) {
         this._sendQuizErrorWithTime(ws, "QUIZ_DISABLED");
+        this._recordCPU(0.5, 'quiz');
         return;
       }
-      
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients || clients.size === 0) {
         this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
+        this._recordCPU(0.5, 'quiz');
         return;
       }
-      
       if (!this.currentQuestion) {
         this._startQuizIfNeeded();
         if (!this.currentQuestion) {
           this._sendQuizErrorWithTime(ws, "QUIZ_NOT_STARTED");
+          this._recordCPU(0.5, 'quiz');
           return;
         }
       }
-      
       if (this.quizHasWinner) {
         this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
+        this._recordCPU(0.5, 'quiz');
         return;
       }
-      
       if (this.quizAnswered.has(username)) {
         this._safeSend(ws, ["quizError", "You already answered!"]);
+        this._recordCPU(0.5, 'quiz');
         return;
       }
-      
       const answerKey = answer ? answer.toUpperCase().trim() : '';
       const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
       const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
-      
       const resultObj = {
         username: username,
         answer: isValidAnswer ? answerKey : "?",
         isCorrect: isCorrect,
         correctAnswer: this.currentQuestion.correct
       };
-      
       this._broadcastQuizResult("quizAnswerResult", resultObj);
       this.quizAnswered.add(username);
-      
       if (isCorrect && !this.quizHasWinner) {
         this.quizHasWinner = true;
         this.quizWinner = username;
       }
-      
+      this._recordCPU(1, 'quiz');
     } catch(e) {
       this._safeSend(ws, ["quizError", e.message]);
+      this._recordCPU(0.5, 'quiz');
     }
   }
 
@@ -2229,37 +1566,26 @@ export class GameServer {
       clearInterval(this.quizTimer);
       this.quizTimer = null;
     }
-    
     this.quizTimer = setInterval(() => {
       if (this.closing || this.isDestroyed) {
         clearInterval(this.quizTimer);
         this.quizTimer = null;
         return;
       }
-      
+      if (!this._checkCPULimit()) return;
       if (this._isQuizTime()) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏳ Quiz will start soon!",
-            true
-          ]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "⏳ Quiz will start soon!", true]);
         }
-        
         if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
           this._showQuestion();
         }
-        
       } else {
         if (this.quizAutoEnabled) {
           this.quizAutoEnabled = false;
           this.resetQuiz();
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizTimeLeft",
-            "⏸️ Quiz has ended. See you tomorrow!",
-            true
-          ]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "⏸️ Quiz has ended. See you tomorrow!", true]);
         }
       }
     }, CONSTANTS.QUIZ_INTERVAL_MS);
@@ -2267,59 +1593,40 @@ export class GameServer {
 
   async resetQuiz() {
     try {
-      if (this._quizTimeout) {
-        clearTimeout(this._quizTimeout);
-        this._quizTimeout = null;
-      }
-      if (this._quizBreakTimeout) {
-        clearTimeout(this._quizBreakTimeout);
-        this._quizBreakTimeout = null;
-      }
-      if (this._quizStartTimeout) {
-        clearTimeout(this._quizStartTimeout);
-        this._quizStartTimeout = null;
-      }
+      if (this._quizTimeout) { clearTimeout(this._quizTimeout); this._quizTimeout = null; }
+      if (this._quizBreakTimeout) { clearTimeout(this._quizBreakTimeout); this._quizBreakTimeout = null; }
+      if (this._quizStartTimeout) { clearTimeout(this._quizStartTimeout); this._quizStartTimeout = null; }
       if (this._quizKeepAliveInterval) {
         clearInterval(this._quizKeepAliveInterval);
         this._quizKeepAliveInterval = null;
       }
-      
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this.quizHasWinner = false;
       this.quizWinner = null;
       this.quizAnswered = new Set();
       this._quizStartTime = null;
-      
     } catch(e) {}
   }
 
   async startQuizWithDelay(delayMs) {
     if (this._quizStartTimeout) return;
-    
     this._quizStartTimeout = setTimeout(() => {
-      if (this.closing || this.isDestroyed) {
-        this._quizStartTimeout = null;
-        return;
-      }
+      if (this.closing || this.isDestroyed) { this._quizStartTimeout = null; return; }
       this._quizStartTimeout = null;
-      
-      if (!this.currentQuestion && this.quizAutoEnabled) {
-        this.forceStartQuiz();
-      }
+      if (!this.currentQuestion && this.quizAutoEnabled) this.forceStartQuiz();
     }, delayMs);
   }
 
   _startQuizIfNeeded() {
     try {
+      if (!this._checkCPULimit()) return;
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients || clients.size === 0) return;
       if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
         if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           this._initQuiz().then(() => {
-            if (!this.closing && !this.isDestroyed) {
-              this._showQuestion();
-            }
+            if (!this.closing && !this.isDestroyed) this._showQuestion();
           });
           return;
         }
@@ -2330,6 +1637,12 @@ export class GameServer {
 
   async _initQuiz(retryCount = 0) {
     try {
+      if (!this._checkCPULimit()) {
+        if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ) {
+          setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+        }
+        return false;
+      }
       const loaded = await this._loadAllQuestionsFromKV();
       if (loaded) {
         this._startQuizLoop();
@@ -2365,103 +1678,110 @@ export class GameServer {
   }
 
   async handleEvent(ws, data) {
-    if (this.isDestroyed || !ws || !data || !data[0]) return;
-    
-    if (!this.cpuMonitor.check('handle_event_start')) {
+    if (!this._checkCPULimit()) {
       this._safeSend(ws, ["gameLowCardError", "Server is busy, please try again"]);
-      if (this.cpuMonitor.shouldStop) {
-        this.cpuMonitor.pause('CPU limit reached during event handling');
-        this.pendingOperations.push(() => this.handleEvent(ws, data));
-      }
+      this._recordCPU(0.5, 'websocket');
       return;
     }
-    
+    if (this.isDestroyed || !ws || !data || !data[0]) {
+      this._recordCPU(0.5, 'websocket');
+      return;
+    }
     const evt = data[0];
-    
-    if (evt === "switchRoom") {
-      const [_, room, username] = data;
-      await this.switchRoom(ws, room, username);
-      return;
-    }
-    
-    if (evt === "submitQuizAnswer") {
-      const [_, username, answer] = data;
-      await this.submitQuizAnswer(ws, username, answer);
-      return;
-    }
-    
-    if (evt === "getQuizLastWeekWinner") {
-      const winner = await this._getLastWeekWinner();
-      if (winner) {
-        this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
-      } else {
-        this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
+    const startTime = Date.now();
+    try {
+      if (evt === "switchRoom") {
+        const [_, room, username] = data;
+        await this.switchRoom(ws, room, username);
+        this._recordCPU(Date.now() - startTime, 'websocket');
+        return;
       }
-      return;
-    }
-    
-    if (evt === "getQuizLeaderboard") {
-      let limit = 10;
-      if (data.length > 1 && typeof data[1] === 'number') {
-        limit = Math.min(data[1], 30);
+      if (evt === "submitQuizAnswer") {
+        const [_, username, answer] = data;
+        await this.submitQuizAnswer(ws, username, answer);
+        this._recordCPU(Date.now() - startTime, 'quiz');
+        return;
       }
-      
-      const points = await this._getQuizPoints();
-      const sorted = Object.entries(points)
-        .map(([username, score]) => ({ username, score }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit);
-      
-      const result = sorted.map(item => `${item.username}|${item.score}`);
-      this._safeSend(ws, ["quizLeaderboard", result]);
-      return;
-    }
-    
-    if (evt === "deleteQuizLastWeekWinner") {
-      try {
-        if (this.env && this.env.QUESTIONS) {
-          this._incrementSubRequest();
-          await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
-          this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Deleted successfully"]);
+      if (evt === "getQuizLastWeekWinner") {
+        const winner = await this._getLastWeekWinner();
+        if (winner) {
+          this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
         } else {
-          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
+          this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
         }
-      } catch(e) {
-        this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
+        this._recordCPU(Date.now() - startTime, 'kv');
+        return;
       }
-      return;
-    }
-    
-    const room = this._ensureRoomConsistency(ws);
-    if (!room) {
-      this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
-      return;
-    }
-    
-    if (room === QUIZ_ROOM) {
-      this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
-      return;
-    }
-    
-    switch (evt) {
-      case "gameLowCardStart":
-        await this.startGame(ws, data[1], data[2]);
-        break;
-      case "gameLowCardJoin":
-        await this.joinGame(ws, data[1]);
-        break;
-      case "gameLowCardNumber":
-        await this.submitNumber(ws, data[1], data[2] || "", data[3]);
-        break;
-      case "gameLowCardLeave":
-        await this.leaveGame(ws, data[1]);
-        break;
-      case "checkGameRunning":
-        await this.checkGameRunning(ws, data[1]);
-        break;
-      default:
-        this._safeSend(ws, ["gameLowCardError", `Unknown event: ${evt}`]);
-        break;
+      if (evt === "getQuizLeaderboard") {
+        let limit = 10;
+        if (data.length > 1 && typeof data[1] === 'number') {
+          limit = Math.min(data[1], 30);
+        }
+        const points = await this._getQuizPoints();
+        const sorted = Object.entries(points)
+          .map(([username, score]) => ({ username, score }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit);
+        const result = sorted.map(item => `${item.username}|${item.score}`);
+        this._safeSend(ws, ["quizLeaderboard", result]);
+        this._recordCPU(Date.now() - startTime, 'kv');
+        return;
+      }
+      if (evt === "deleteQuizLastWeekWinner") {
+        try {
+          if (this.env && this.env.QUESTIONS) {
+            this._incrementSubRequest();
+            await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Deleted successfully"]);
+          } else {
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
+        }
+        this._recordCPU(Date.now() - startTime, 'kv');
+        return;
+      }
+      const room = this._ensureRoomConsistency(ws);
+      if (!room) {
+        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
+        this._recordCPU(Date.now() - startTime, 'websocket');
+        return;
+      }
+      if (room === QUIZ_ROOM) {
+        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
+        this._recordCPU(Date.now() - startTime, 'game');
+        return;
+      }
+      switch (evt) {
+        case "gameLowCardStart":
+          await this.startGame(ws, data[1], data[2]);
+          this._recordCPU(Date.now() - startTime, 'game');
+          break;
+        case "gameLowCardJoin":
+          await this.joinGame(ws, data[1]);
+          this._recordCPU(Date.now() - startTime, 'game');
+          break;
+        case "gameLowCardNumber":
+          await this.submitNumber(ws, data[1], data[2] || "", data[3]);
+          this._recordCPU(Date.now() - startTime, 'game');
+          break;
+        case "gameLowCardLeave":
+          await this.leaveGame(ws, data[1]);
+          this._recordCPU(Date.now() - startTime, 'game');
+          break;
+        case "checkGameRunning":
+          await this.checkGameRunning(ws, data[1]);
+          this._recordCPU(Date.now() - startTime, 'game');
+          break;
+        default:
+          this._safeSend(ws, ["gameLowCardError", `Unknown event: ${evt}`]);
+          this._recordCPU(Date.now() - startTime, 'other');
+          break;
+      }
+    } catch(e) {
+      this._safeSend(ws, ["gameLowCardError", e.message || "Error"]);
+      this._recordCPU(Date.now() - startTime, 'other');
     }
   }
 
@@ -2472,9 +1792,7 @@ export class GameServer {
     return `${String(hours).padStart(2, '0')}:${minutes}`;
   }
 
-  _getWsId(ws) {
-    return ws ? ws._wsId : null;
-  }
+  _getWsId(ws) { return ws ? ws._wsId : null; }
 
   _getRoomForWs(ws) {
     if (!ws) return null;
@@ -2493,9 +1811,7 @@ export class GameServer {
       ws.room = room;
       ws.roomname = room;
     }
-    if (!this.wsClients.has(room)) {
-      this.wsClients.set(room, new Set());
-    }
+    if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
     if (!this.wsClients.get(room).has(wsId)) {
       this.wsClients.get(room).add(wsId);
       this.clientRooms.set(wsId, room);
@@ -2511,25 +1827,13 @@ export class GameServer {
       return;
     }
     if (username && isNewConnection) {
-      this.userConnections.set(username, {
-        wsId: wsId,
-        ws: ws,
-        room: room,
-        timestamp: Date.now()
-      });
+      this.userConnections.set(username, { wsId: wsId, ws: ws, room: room, timestamp: Date.now() });
     }
     if (username && !isNewConnection) {
       const conn = this.userConnections.get(username);
-      if (conn) {
-        conn.room = room;
-        conn.timestamp = Date.now();
-      } else {
-        this.userConnections.set(username, {
-          wsId: wsId,
-          ws: ws,
-          room: room,
-          timestamp: Date.now()
-        });
+      if (conn) { conn.room = room; conn.timestamp = Date.now(); } 
+      else {
+        this.userConnections.set(username, { wsId: wsId, ws: ws, room: room, timestamp: Date.now() });
       }
     }
     if (this.clientRooms.has(wsId)) {
@@ -2565,14 +1869,11 @@ export class GameServer {
     const wsId = this._getWsId(ws);
     if (!wsId) return;
     const username = ws.username;
-    
     this._removeClientFromRoom(room, wsId);
     this.clientRooms.delete(wsId);
     this.wsMap.delete(wsId);
-    
     this.userLanguage.delete(wsId);
     this.userCountry.delete(wsId);
-    
     if (username) {
       const conn = this.userConnections.get(username);
       if (conn && conn.wsId === wsId) this.userConnections.delete(username);
@@ -2589,7 +1890,6 @@ export class GameServer {
 
   _countryToLanguage(countryCode) {
     if (!countryCode) return 'en';
-    
     const map = {
       'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id',
       'TH': 'th', 'VN': 'vi', 'KH': 'km', 'LA': 'lo',
@@ -2617,7 +1917,6 @@ export class GameServer {
       'GR': 'el', 'HU': 'hu', 'CS': 'cs', 'SK': 'sk',
       'RO': 'ro', 'BG': 'bg', 'HR': 'hr', 'SI': 'sl',
     };
-    
     return map[countryCode.toUpperCase()] || 'en';
   }
 
@@ -2641,10 +1940,7 @@ export class GameServer {
       newOptions[newKey] = item.text;
       if (item.isCorrect) newCorrect = newKey;
     });
-    return {
-      options: newOptions,
-      correct: newCorrect || 'A'
-    };
+    return { options: newOptions, correct: newCorrect || 'A' };
   }
 
   _shuffleArray(array) {
@@ -2658,21 +1954,28 @@ export class GameServer {
   }
 
   _broadcastToRoom(room, message) {
-    if (this.closing || this.isDestroyed || !room || !message) return;
+    const startTime = Date.now();
+    if (!this._checkCPULimit()) {
+      this._recordCPU(Date.now() - startTime, 'broadcast');
+      return;
+    }
+    if (this.closing || this.isDestroyed || !room || !message) {
+      this._recordCPU(Date.now() - startTime, 'broadcast');
+      return;
+    }
     const wsIds = this.wsClients.get(room);
-    if (!wsIds || wsIds.size === 0) return;
-    
+    if (!wsIds || wsIds.size === 0) {
+      this._recordCPU(Date.now() - startTime, 'broadcast');
+      return;
+    }
     const msgStr = JSON.stringify(message);
-    const wsIdArray = Array.from(wsIds);
-    
-    for (const wsId of wsIdArray) {
+    for (const wsId of wsIds) {
       const ws = this.wsMap.get(wsId);
       if (ws && ws.readyState === 1) {
-        try {
-          ws.send(msgStr);
-        } catch(e) {}
+        try { ws.send(msgStr); } catch(e) {}
       }
     }
+    this._recordCPU(Date.now() - startTime, 'broadcast');
   }
 
   _safeSend(ws, message) {
@@ -2684,6 +1987,8 @@ export class GameServer {
       return false;
     }
   }
+
+  // ==================== GAME LOWCARD METHODS ====================
 
   _isGameActuallyRunning(game) {
     if (!game) return false;
@@ -3151,31 +2456,12 @@ export class GameServer {
   }
 
   _evaluateRound(room, game) {
-    if (!this.gameCpuMonitor.check('evaluate_start')) {
-      console.warn(`[CPU] Cannot evaluate: ${this.gameCpuMonitor.reason}`);
-      if (this.gameCpuMonitor.shouldStop) {
-        this.gameCpuMonitor.pause('CPU limit reached during evaluation');
-        this.pendingOperations.push(() => this._evaluateRound(room, game));
-      }
-      this._broadcastToRoom(room, ["gameLowCardError", "Server busy, please try again"]);
-      return;
-    }
-    
     try {
       if (this.isDestroyed || !game || game._gameEnded || !game._isActive || game._isEvaluating) return;
       if (!game.players) return;
-      
       const currentGame = this.activeGames.get(room);
       if (currentGame !== game) return;
-      
       game._isEvaluating = true;
-      
-      if (!this.gameCpuMonitor.check('evaluate_setup')) {
-        console.warn(`[CPU] Stopped during setup: ${this.gameCpuMonitor.reason}`);
-        game._isEvaluating = false;
-        return;
-      }
-      
       game._safetyTimer = setTimeout(() => {
         try {
           if (game && game._isEvaluating) {
@@ -3184,7 +2470,6 @@ export class GameServer {
           }
         } catch(e) {}
       }, CONSTANTS.EVALUATION_TIMEOUT_MS);
-      
       if (game._evalTimer) {
         clearTimeout(game._evalTimer);
         game._evalTimer = null;
@@ -3193,32 +2478,16 @@ export class GameServer {
         for (const id of game._botTimeouts) clearTimeout(id);
         game._botTimeouts.clear();
       }
-      
       const numbers = game.numbers || new Map();
       const players = game.players || new Map();
       const eliminated = game.eliminated || new Set();
       const tanda = game.tanda || new Map();
-      
-      if (!this.gameCpuMonitor.check('evaluate_data')) {
-        console.warn(`[CPU] Stopped after data fetch: ${this.gameCpuMonitor.reason}`);
-        game._isEvaluating = false;
-        return;
-      }
-      
       const entries = Array.from(numbers.entries());
-      const activeIds = this._getActivePlayerIds(game);
-      
-      if (!this.gameCpuMonitor.check('evaluate_map')) {
-        console.warn(`[CPU] Stopped after mapping: ${this.gameCpuMonitor.reason}`);
-        game._isEvaluating = false;
-        return;
-      }
-      
       const submittedIds = new Set(numbers.keys());
+      const activeIds = this._getActivePlayerIds(game);
       for (const id of activeIds) {
         if (!submittedIds.has(id)) eliminated.add(id);
       }
-      
       if (entries.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) {
@@ -3232,7 +2501,6 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
-      
       if (entries.length === 1 && eliminated.size === activeIds.length - 1) {
         const winnerId = entries[0][0];
         const winnerName = players.get(winnerId)?.name || winnerId;
@@ -3249,44 +2517,15 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
-      
-      const batchSize = CONSTANTS.MAX_BATCH_SIZE;
-      let allValues = [];
-      
-      for (let i = 0; i < entries.length; i += batchSize) {
-        if (!this.gameCpuMonitor.check(`evaluate_batch_${i}`)) {
-          console.warn(`[CPU] Stopped at batch ${i}: ${this.gameCpuMonitor.reason}`);
-          game._isEvaluating = false;
-          if (game._safetyTimer) {
-            clearTimeout(game._safetyTimer);
-            game._safetyTimer = null;
-          }
-          this._broadcastToRoom(room, ["gameLowCardError", "Processing interrupted, please start new game"]);
-          return;
-        }
-        
-        const batch = entries.slice(i, i + batchSize);
-        allValues = allValues.concat(batch.map(([, n]) => n));
-      }
-      
-      const values = allValues;
-      const allSame = values.length > 0 && values.every(v => v === values[0]);
+      const values = entries.map(([, n]) => n);
+      const allSame = values.every(v => v === values[0]);
       let losers = [];
-      
       if (!allSame && values.length > 0) {
         const lowest = Math.min(...values);
         losers = entries.filter(([, n]) => n === lowest).map(([id]) => id);
         for (const id of losers) eliminated.add(id);
       }
-      
       const remaining = Array.from(players.keys()).filter(id => !eliminated.has(id));
-      
-      if (!this.gameCpuMonitor.check('evaluate_broadcast')) {
-        console.warn(`[CPU] Stopped before broadcast: ${this.gameCpuMonitor.reason}`);
-        game._isEvaluating = false;
-        return;
-      }
-      
       if (allSame && remaining.length >= 2) {
         game._isEvaluating = false;
         if (game._safetyTimer) {
@@ -3320,7 +2559,6 @@ export class GameServer {
         }
         return;
       }
-      
       if (remaining.length === 1 && !game._gameEnded) {
         const winnerId = remaining[0];
         const winnerName = players.get(winnerId)?.name || winnerId;
@@ -3337,7 +2575,6 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
-      
       if (remaining.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) {
@@ -3351,7 +2588,6 @@ export class GameServer {
         this._scheduleGameCleanup(room, game);
         return;
       }
-      
       const numbersArr = entries.map(([id, n]) => {
         const name = players.get(id)?.name || id;
         const t = tanda.get(id) || "";
@@ -3362,7 +2598,6 @@ export class GameServer {
       this._broadcastToRoom(room, [
         "gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames
       ]);
-      
       numbers.clear();
       tanda.clear();
       game.round++;
@@ -3394,6 +2629,11 @@ export class GameServer {
 
   async startGame(ws, bet, username) {
     try {
+      if (!this._checkCPULimit()) {
+        this._safeSend(ws, ["gameLowCardError", "Server is busy"]);
+        this._recordCPU(0.5, 'game');
+        return;
+      }
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
         return;
@@ -3412,7 +2652,6 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
         return;
       }
-      
       const startKey = `start_${room}`;
       if (this._gameStartFlags.has(startKey)) {
         this._safeSend(ws, ["gameLowCardError", "Game is already starting..."]);
@@ -3482,11 +2721,9 @@ export class GameServer {
         game.playerWsId.set(usernameClean, wsId);
         this.activeGames.set(room, game);
         this._addClient(room, ws, usernameClean, false);
-        
         this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
         this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._startRegistration(room, game);
-        
         setTimeout(() => {
           try {
             this._gameStartFlags.delete(startKey);
@@ -3501,6 +2738,7 @@ export class GameServer {
       }
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
+      this._recordCPU(0.5, 'game');
     }
   }
 
@@ -3536,6 +2774,11 @@ export class GameServer {
 
   async joinGame(ws, username) {
     try {
+      if (!this._checkCPULimit()) {
+        this._safeSend(ws, ["gameLowCardError", "Server is busy"]);
+        this._recordCPU(0.5, 'game');
+        return;
+      }
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
         return;
@@ -3551,7 +2794,6 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
       }
-      
       const lockKey = `join_${room}_${usernameClean}`;
       if (this._joinLocks.has(lockKey)) {
         this._safeSend(ws, ["gameLowCardError", "Join in progress, please wait"]);
@@ -3594,11 +2836,17 @@ export class GameServer {
       }
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Failed to join game"]);
+      this._recordCPU(0.5, 'game');
     }
   }
 
   async submitNumber(ws, number, tanda, username) {
     try {
+      if (!this._checkCPULimit()) {
+        this._safeSend(ws, ["gameLowCardError", "Server is busy"]);
+        this._recordCPU(0.5, 'game');
+        return;
+      }
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
         return;
@@ -3674,6 +2922,7 @@ export class GameServer {
       }
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Failed to submit number"]);
+      this._recordCPU(0.5, 'game');
     }
   }
 
@@ -3705,6 +2954,7 @@ export class GameServer {
       this._removePlayerFromGame(usernameClean, room);
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Failed to leave game"]);
+      this._recordCPU(0.5, 'game');
     }
   }
 
@@ -3725,6 +2975,7 @@ export class GameServer {
       this._safeSend(ws, ["gameStatus", { running: isRunning ? "true" : "false" }]);
     } catch(e) {
       this._safeSend(ws, ["gameStatus", { running: "false" }]);
+      this._recordCPU(0.5, 'game');
     }
   }
 
@@ -3854,7 +3105,6 @@ export class GameServer {
     try {
       const game = this.activeGames.get(room);
       if (!game) return newWsId;
-      
       const existingWsId = game.playerWsId?.get(username);
       if (existingWsId && existingWsId !== newWsId) {
         const oldWs = this.wsMap.get(existingWsId);
@@ -3868,7 +3118,6 @@ export class GameServer {
           game.playerWsId.set(username, newWsId);
         }
       }
-      
       return newWsId;
     } catch(e) {
       return newWsId;
@@ -3876,26 +3125,51 @@ export class GameServer {
   }
 
   async fetch(req) {
+    if (!this._checkCPULimit()) {
+      this._recordCPU(0.5, 'other');
+      return new Response("Server is busy (CPU limit), please try again later", { 
+        status: 503,
+        headers: { 'Retry-After': '5' }
+      });
+    }
     if (this.closing || this.isDestroyed) {
+      this._recordCPU(0.5, 'other');
       return new Response("Shutting down", { status: 503 });
     }
     try {
       const url = new URL(req.url);
-      
+      if (url.pathname === "/game/health") {
+        const cpuUsage = this.getCPUUsage();
+        this._recordCPU(0.5, 'other');
+        return new Response(JSON.stringify({
+          status: this.isDestroyed ? 'down' : 'healthy',
+          games: this.activeGames ? this.activeGames.size : 0,
+          connections: this.wsMap ? this.wsMap.size : 0,
+          questions: this._allQuestions ? this._allQuestions.length : 0,
+          kvAvailable: !!(this.env && this.env.QUESTIONS),
+          quizAutoEnabled: this.quizAutoEnabled || false,
+          isQuizRunning: !!this.currentQuestion,
+          translateCount: this.translationManager.translateCount || 0,
+          translateLimitReached: this.translationManager.translateLimitReached || false,
+          schedule: "23:00 - 04:00 WIB",
+          currentTimeWIB: this._getWIBTime(),
+          cpu: cpuUsage,
+          timestamp: Date.now()
+        }), { headers: { 'Content-Type': 'application/json' } });
+      }
       if (url.pathname === "/game/ws") {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
+          this._recordCPU(0.5, 'websocket');
           return new Response("WebSocket only", { status: 400 });
         }
-        
         if (this.wsMap.size >= CONSTANTS.MAX_WS_CLIENTS) {
+          this._recordCPU(0.5, 'websocket');
           return new Response("Server at maximum capacity", { status: 503 });
         }
-        
         try {
           const pair = new WebSocketPair();
           const [client, server] = [pair[0], pair[1]];
-          
           const wsId = ++this._wsIdCounter;
           server._wsId = wsId;
           server._closing = false;
@@ -3903,26 +3177,20 @@ export class GameServer {
           server.roomname = null;
           server._createdAt = Date.now();
           server.username = null;
-          
           const cf = req.cf || {};
           let country = 'US';
-          if (cf && cf.country) {
-            country = cf.country;
-          }
-          
+          if (cf && cf.country) country = cf.country;
           this.userCountry.set(wsId, country);
           const lang = this._countryToLanguage(country);
           this.userLanguage.set(wsId, lang);
           server._cf = cf;
           server._country = country;
           server._language = lang;
-          
-          try { 
-            this.state.acceptWebSocket(server);
-          } catch(e) { 
+          try { this.state.acceptWebSocket(server); } 
+          catch(e) { 
+            this._recordCPU(0.5, 'websocket');
             return new Response("WebSocket acceptance failed", { status: 500 }); 
           }
-          
           server.addEventListener("message", async (event) => {
             try {
               const data = JSON.parse(event.data);
@@ -3932,7 +3200,6 @@ export class GameServer {
               this._safeSend(server, ["gameLowCardError", e.message || "Error"]);
             }
           });
-          
           server.addEventListener("close", () => {
             try {
               if (server.room || server.roomname) {
@@ -3944,18 +3211,13 @@ export class GameServer {
                 this.userCountry.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
-                  if (conn && conn.wsId === wsId) {
-                    this.userConnections.delete(username);
-                  }
+                  if (conn && conn.wsId === wsId) this.userConnections.delete(username);
                 }
               }
               const clients = this.wsClients.get(QUIZ_ROOM);
-              if (clients && clients.size > 0) {
-                this.ensureQuizRunning();
-              }
+              if (clients && clients.size > 0) this.ensureQuizRunning();
             } catch(e) {}
           });
-          
           server.addEventListener("error", () => {
             try {
               if (server.room || server.roomname) {
@@ -3967,24 +3229,22 @@ export class GameServer {
                 this.userCountry.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
-                  if (conn && conn.wsId === wsId) {
-                    this.userConnections.delete(username);
-                  }
+                  if (conn && conn.wsId === wsId) this.userConnections.delete(username);
                 }
               }
             } catch(e) {}
           });
-          
+          this._recordCPU(0.5, 'websocket');
           return new Response(null, { status: 101, webSocket: client });
-          
         } catch(e) {
+          this._recordCPU(0.5, 'websocket');
           return new Response("WebSocket creation failed", { status: 500 });
         }
       }
-      
+      this._recordCPU(0.5, 'other');
       return new Response("Game Server", { status: 200 });
-      
     } catch(e) {
+      this._recordCPU(0.5, 'other');
       return new Response("Internal Server Error: " + e.message, { status: 500 });
     }
   }
@@ -3995,15 +3255,6 @@ export class GameServer {
       if (!ws._wsId) return;
       const data = JSON.parse(msg);
       if (!Array.isArray(data) || data.length === 0) return;
-      
-      if (!this.cpuMonitor.check('websocket_message')) {
-        if (this.cpuMonitor.shouldStop) {
-          this.cpuMonitor.pause('CPU limit reached during websocket message');
-          this.pendingOperations.push(() => this.webSocketMessage(ws, msg));
-        }
-        return;
-      }
-      
       await this.handleEvent(ws, data);
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", e.message || "Error"]);
@@ -4023,9 +3274,7 @@ export class GameServer {
       this.userCountry.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
-        if (conn && conn.wsId === wsId) {
-          this.userConnections.delete(username);
-        }
+        if (conn && conn.wsId === wsId) this.userConnections.delete(username);
       }
       if (wsId) {
         this.clientRooms.delete(wsId);
@@ -4036,9 +3285,7 @@ export class GameServer {
       ws._wsId = null;
       ws.username = null;
       const clients = this.wsClients.get(QUIZ_ROOM);
-      if (clients && clients.size > 0) {
-        this.ensureQuizRunning();
-      }
+      if (clients && clients.size > 0) this.ensureQuizRunning();
     } catch(e) {}
   }
 
@@ -4055,9 +3302,7 @@ export class GameServer {
       this.userCountry.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
-        if (conn && conn.wsId === wsId) {
-          this.userConnections.delete(username);
-        }
+        if (conn && conn.wsId === wsId) this.userConnections.delete(username);
       }
       if (wsId) {
         this.clientRooms.delete(wsId);
