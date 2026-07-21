@@ -58,10 +58,10 @@ const CONSTANTS = {
   CF_SUBREQUEST_LIMIT: 50,
   CF_CPU_TIME_LIMIT_MS: 9000,
   CF_MEMORY_LIMIT_MB: 128,
-  MAX_PARALLEL_TRANSLATE: 10,
-  TRANSLATE_TIMEOUT_MS: 3000,
-  CACHE_TTL_MS: 3600000,
-  MAX_CACHE_SIZE: 10000,
+  MAX_PARALLEL_TRANSLATE: 5,
+  TRANSLATE_TIMEOUT_MS: 5000,
+  CACHE_TTL_MS: 86400000,
+  MAX_CACHE_SIZE: 50000,
 };
 
 // ==================== QUIZ SCHEDULE - MALAM (18:00 - 23:00 WIB) ====================
@@ -80,9 +80,15 @@ const QUIZ_ROOM = "Quiz";
 class TranslationManager {
   constructor(gameServer) {
     this.gameServer = gameServer;
-    // ❌ TIDAK PAKAI CACHE - translate selalu fresh
-    // this.cache = new Map();
-    // this.pendingRequests = new Map();
+    
+    // ✅ CACHE PER SOAL (di-reset setiap soal)
+    this.questionCache = new Map();
+    
+    // ✅ GLOBAL CACHE (untuk teks yang sama di banyak soal)
+    this.globalCache = new Map();
+    this.MAX_GLOBAL_CACHE = 50000;
+    this.GLOBAL_CACHE_TTL = 86400000; // 24 jam
+    
     this.MAX_PARALLEL = CONSTANTS.MAX_PARALLEL_TRANSLATE;
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
     this.translateCount = 0;
@@ -95,6 +101,18 @@ class TranslationManager {
       isOpen: false,
       resetTimer: null
     };
+    
+    // ✅ PRE-TRANSLATE COMMON WORDS
+    this.commonWords = this._loadCommonWords();
+  }
+
+  // ==================== RESET CACHE PER SOAL ====================
+  
+  resetQuestionCache() {
+    if (this.questionCache.size > 0) {
+      console.log(`🔄 Resetting question cache (${this.questionCache.size} entries)`);
+      this.questionCache.clear();
+    }
   }
 
   // ==================== TRANSLATE FOR USERS BY LANGUAGE ====================
@@ -104,28 +122,52 @@ class TranslationManager {
     const results = new Map();
     
     console.log(`🌍 Translating for ${usersByLang.size} languages...`);
+    console.log(`📊 Languages: ${Array.from(usersByLang.keys()).join(', ')}`);
     
-    // ✅ LANGSUNG TRANSLATE SEMUA BAHASA (TANPA CACHE)
+    // ✅ RESET CACHE PER SOAL
+    this.resetQuestionCache();
+    
     const needTranslate = [];
+    let cacheHits = 0;
     
     for (const [lang, users] of usersByLang) {
       if (lang === 'en') {
-        results.set(lang, { question, options, users, isFallback: false });
+        results.set(lang, { 
+          question, 
+          options, 
+          users, 
+          isFallback: false,
+          fromCache: false
+        });
         continue;
       }
       
-      needTranslate.push({ lang, users });
+      // ✅ CEK CACHE PER BAHASA (dalam soal yang sama)
+      const cacheKey = this._getCacheKey(question, options, lang);
+      const cached = this.questionCache.get(cacheKey);
+      
+      if (cached) {
+        cacheHits++;
+        console.log(`📦 Cache hit for ${lang}`);
+        results.set(lang, { 
+          ...cached, 
+          users, 
+          fromCache: true 
+        });
+      } else {
+        needTranslate.push({ lang, users });
+      }
     }
     
-    console.log(`📊 Need translate: ${needTranslate.length} languages`);
+    console.log(`📊 Cache hits: ${cacheHits}, Need translate: ${needTranslate.length}`);
     
     if (needTranslate.length === 0) {
       this._sendResults(results);
-      console.log(`✅ All done! ${Date.now() - startTime}ms`);
+      console.log(`✅ All from cache! ${Date.now() - startTime}ms`);
       return;
     }
     
-    // Translate per bahasa
+    // ✅ TRANSLATE PER BAHASA
     const translatePromises = needTranslate.map(({ lang, users }) => 
       this._translateWithTimeout(question, options, lang, users)
     );
@@ -139,27 +181,42 @@ class TranslationManager {
       if (result.success) {
         const { lang, translatedQuestion, translatedOptions, users } = result;
         
+        // ✅ SIMPAN DI CACHE PER SOAL
+        const cacheKey = this._getCacheKey(question, options, lang);
+        this.questionCache.set(cacheKey, {
+          question: translatedQuestion,
+          options: translatedOptions,
+          isFallback: false
+        });
+        
+        console.log(`✅ Translated to ${lang} (cached)`);
+        
         results.set(lang, {
           question: translatedQuestion,
           options: translatedOptions,
           users,
-          isFallback: false
+          isFallback: false,
+          fromCache: false
         });
       } else {
         const { lang, users } = result;
+        console.log(`⚠️ Fallback to English for ${lang}`);
+        
         results.set(lang, {
           question: question,
           options: options,
           users,
-          isFallback: true
+          isFallback: true,
+          fromCache: false
         });
-        console.log(`⚠️ Fallback to English for ${lang}`);
       }
     }
     
     this._sendResults(results);
-    console.log(`✅ All done! ${Date.now() - startTime}ms`);
+    console.log(`✅ Broadcast complete! ${Date.now() - startTime}ms`);
   }
+  
+  // ==================== EXECUTE WITH CONCURRENCY LIMIT ====================
   
   async _executeWithConcurrencyLimit(promiseFactories, limit) {
     const results = [];
@@ -180,6 +237,8 @@ class TranslationManager {
     
     return Promise.all(results);
   }
+  
+  // ==================== TRANSLATE WITH TIMEOUT ====================
   
   async _translateWithTimeout(question, options, lang, users) {
     try {
@@ -214,15 +273,32 @@ class TranslationManager {
     }
   }
   
+  // ==================== TRANSLATE TEXT ====================
+  
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en') return text;
     if (!text || typeof text !== 'string') return text;
     if (this.translateLimitReached) return text;
     
+    // ✅ CEK PRE-TRANSLATE COMMON WORDS
+    if (this.commonWords[targetLang] && this.commonWords[targetLang][text]) {
+      return this.commonWords[targetLang][text];
+    }
+    
+    // ✅ CEK GLOBAL CACHE (untuk teks yang sama di banyak soal)
+    const globalCacheKey = `global_${text}|${targetLang}`;
+    const globalCached = this._getGlobalCache(globalCacheKey);
+    if (globalCached) {
+      return globalCached;
+    }
+    
     try {
-      // ✅ TANPA CACHE - langsung translate
       const result = await this._callTranslateAPI(text, targetLang);
+      
+      // ✅ SIMPAN DI GLOBAL CACHE
+      this._setGlobalCache(globalCacheKey, result);
       this.translateCount++;
+      
       return result;
       
     } catch(e) {
@@ -233,6 +309,90 @@ class TranslationManager {
       return text;
     }
   }
+  
+  // ==================== TRANSLATE OPTIONS ====================
+  
+  async _translateOptions(options, targetLang) {
+    if (targetLang === 'en' || !options) return options;
+    
+    const keys = ['A', 'B', 'C', 'D'];
+    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
+    
+    if (texts.length === 0) return options;
+    
+    const translatedTexts = await Promise.all(
+      texts.map(text => this._translateText(text, targetLang))
+    );
+    
+    const result = { ...options };
+    let idx = 0;
+    for (const key of keys) {
+      if (options[key] && typeof options[key] === 'string') {
+        result[key] = translatedTexts[idx++] || options[key];
+      }
+    }
+    
+    return result;
+  }
+  
+  // ==================== CACHE METHODS ====================
+  
+  _getCacheKey(question, options, lang) {
+    const optionStr = Object.values(options).join('|');
+    return `${question}|${optionStr}|${lang}`;
+  }
+  
+  _getGlobalCache(key) {
+    const entry = this.globalCache.get(key);
+    if (entry && Date.now() - entry.timestamp < this.GLOBAL_CACHE_TTL) {
+      return entry.value;
+    }
+    return null;
+  }
+  
+  _setGlobalCache(key, value) {
+    if (this.globalCache.size >= this.MAX_GLOBAL_CACHE) {
+      const keysToDelete = Array.from(this.globalCache.keys()).slice(0, this.MAX_GLOBAL_CACHE * 0.2);
+      for (const k of keysToDelete) {
+        this.globalCache.delete(k);
+      }
+    }
+    this.globalCache.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+  }
+  
+  // ==================== SEND RESULTS ====================
+  
+  _sendResults(results) {
+    for (const [lang, data] of results) {
+      const { question, options, users, isFallback, fromCache } = data;
+      
+      const message = [
+        "quizQuestion",
+        {
+          question: question || '',
+          options: options || { A: '', B: '', C: '', D: '' },
+          isFallback: isFallback || false
+        }
+      ];
+      
+      const msgStr = JSON.stringify(message);
+      
+      console.log(`📤 Sending to ${users.length} users (${lang})${fromCache ? ' [CACHE]' : ''}`);
+      
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {}
+        }
+      }
+    }
+  }
+  
+  // ==================== CALL TRANSLATE API ====================
   
   async _callTranslateAPI(text, targetLang) {
     if (this._translationCircuitBreaker.isOpen) {
@@ -304,53 +464,303 @@ class TranslationManager {
     throw lastError || new Error('All APIs failed');
   }
   
-  async _translateOptions(options, targetLang) {
-    if (targetLang === 'en' || !options) return options;
-    
-    const keys = ['A', 'B', 'C', 'D'];
-    const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
-    
-    if (texts.length === 0) return options;
-    
-    const translatedTexts = await Promise.all(
-      texts.map(text => this._translateText(text, targetLang))
-    );
-    
-    const result = { ...options };
-    let idx = 0;
-    for (const key of keys) {
-      if (options[key] && typeof options[key] === 'string') {
-        result[key] = translatedTexts[idx++] || options[key];
-      }
-    }
-    
-    return result;
+  // ==================== LOAD COMMON WORDS ====================
+  
+  _loadCommonWords() {
+    // ✅ KATA-KATA UMUM YANG SERING MUNCUL DI SOAL
+    return {
+      'id': {
+        'Jakarta': 'Jakarta',
+        'Indonesia': 'Indonesia',
+        'Surabaya': 'Surabaya',
+        'Bandung': 'Bandung',
+        'Medan': 'Medan',
+        'Yogyakarta': 'Yogyakarta',
+        'Semarang': 'Semarang',
+        'Makassar': 'Makassar',
+        'Palembang': 'Palembang',
+        'Aceh': 'Aceh',
+        'Bali': 'Bali',
+        'Lombok': 'Lombok',
+        'Papua': 'Papua',
+        'Kalimantan': 'Kalimantan',
+        'Sumatra': 'Sumatra',
+        'Jawa': 'Jawa',
+        'Sulawesi': 'Sulawesi',
+        'Soekarno': 'Soekarno',
+        'Soeharto': 'Soeharto',
+        'Habibie': 'Habibie',
+        'Megawati': 'Megawati',
+        'Susilo': 'Susilo',
+        'Jokowi': 'Jokowi',
+        'Jakarta': 'Jakarta',
+        'What': 'Apa',
+        'Who': 'Siapa',
+        'Where': 'Di mana',
+        'When': 'Kapan',
+        'Why': 'Mengapa',
+        'How': 'Bagaimana',
+        'Which': 'Yang mana',
+        'capital': 'ibukota',
+        'city': 'kota',
+        'country': 'negara',
+        'president': 'presiden',
+        'first': 'pertama',
+        'second': 'kedua',
+        'third': 'ketiga',
+        'fourth': 'keempat',
+        'fifth': 'kelima',
+        'largest': 'terbesar',
+        'smallest': 'terkecil',
+        'highest': 'tertinggi',
+        'lowest': 'terendah',
+        'longest': 'terpanjang',
+        'shortest': 'terpendek',
+        'oldest': 'tertua',
+        'youngest': 'termuda',
+        'most': 'paling',
+        'least': 'paling sedikit',
+        'many': 'banyak',
+        'few': 'sedikit',
+        'great': 'besar',
+        'small': 'kecil',
+        'new': 'baru',
+        'old': 'lama',
+        'good': 'baik',
+        'bad': 'buruk',
+        'beautiful': 'indah',
+        'ugly': 'jelek',
+        'rich': 'kaya',
+        'poor': 'miskin',
+        'strong': 'kuat',
+        'weak': 'lemah',
+        'fast': 'cepat',
+        'slow': 'lambat',
+        'hot': 'panas',
+        'cold': 'dingin',
+        'warm': 'hangat',
+        'cool': 'sejuk',
+        'wet': 'basah',
+        'dry': 'kering',
+        'clean': 'bersih',
+        'dirty': 'kotor',
+        'easy': 'mudah',
+        'hard': 'sulit',
+        'simple': 'sederhana',
+        'complex': 'kompleks',
+        'important': 'penting',
+        'necessary': 'perlu',
+        'possible': 'mungkin',
+        'impossible': 'tidak mungkin',
+        'never': 'tidak pernah',
+        'always': 'selalu',
+        'often': 'sering',
+        'sometimes': 'kadang-kadang',
+        'rarely': 'jarang',
+        'usually': 'biasanya',
+      },
+      'th': {
+        'Jakarta': 'จาการ์ตา',
+        'Indonesia': 'อินโดนีเซีย',
+        'What': 'อะไร',
+        'Who': 'ใคร',
+        'Where': 'ที่ไหน',
+        'When': 'เมื่อไหร่',
+        'Why': 'ทำไม',
+        'How': 'อย่างไร',
+        'Which': 'อันไหน',
+        'capital': 'เมืองหลวง',
+        'city': 'เมือง',
+        'country': 'ประเทศ',
+        'president': 'ประธานาธิบดี',
+        'first': 'แรก',
+        'second': 'ที่สอง',
+        'third': 'ที่สาม',
+      },
+      'vi': {
+        'Jakarta': 'Jakarta',
+        'Indonesia': 'Indonesia',
+        'What': 'Cái gì',
+        'Who': 'Ai',
+        'Where': 'Ở đâu',
+        'When': 'Khi nào',
+        'Why': 'Tại sao',
+        'How': 'Thế nào',
+        'Which': 'Cái nào',
+        'capital': 'thủ đô',
+        'city': 'thành phố',
+        'country': 'quốc gia',
+        'president': 'tổng thống',
+        'first': 'đầu tiên',
+        'second': 'thứ hai',
+        'third': 'thứ ba',
+      },
+      'zh': {
+        'Jakarta': '雅加达',
+        'Indonesia': '印度尼西亚',
+        'What': '什么',
+        'Who': '谁',
+        'Where': '哪里',
+        'When': '什么时候',
+        'Why': '为什么',
+        'How': '如何',
+        'Which': '哪个',
+        'capital': '首都',
+        'city': '城市',
+        'country': '国家',
+        'president': '总统',
+        'first': '第一',
+        'second': '第二',
+        'third': '第三',
+      },
+      'ja': {
+        'Jakarta': 'ジャカルタ',
+        'Indonesia': 'インドネシア',
+        'What': '何',
+        'Who': '誰',
+        'Where': 'どこ',
+        'When': 'いつ',
+        'Why': 'なぜ',
+        'How': 'どうやって',
+        'Which': 'どれ',
+        'capital': '首都',
+        'city': '都市',
+        'country': '国',
+        'president': '大統領',
+        'first': '最初',
+        'second': '第二',
+        'third': '第三',
+      },
+      'ko': {
+        'Jakarta': '자카르타',
+        'Indonesia': '인도네시아',
+        'What': '무엇',
+        'Who': '누구',
+        'Where': '어디',
+        'When': '언제',
+        'Why': '왜',
+        'How': '어떻게',
+        'Which': '어느',
+        'capital': '수도',
+        'city': '도시',
+        'country': '국가',
+        'president': '대통령',
+        'first': '첫 번째',
+        'second': '두 번째',
+        'third': '세 번째',
+      },
+      'ar': {
+        'Jakarta': 'جاكرتا',
+        'Indonesia': 'إندونيسيا',
+        'What': 'ماذا',
+        'Who': 'من',
+        'Where': 'أين',
+        'When': 'متى',
+        'Why': 'لماذا',
+        'How': 'كيف',
+        'Which': 'أي',
+        'capital': 'العاصمة',
+        'city': 'مدينة',
+        'country': 'دولة',
+        'president': 'رئيس',
+        'first': 'الأول',
+        'second': 'الثاني',
+        'third': 'الثالث',
+      },
+      'es': {
+        'Jakarta': 'Yakarta',
+        'Indonesia': 'Indonesia',
+        'What': 'Qué',
+        'Who': 'Quién',
+        'Where': 'Dónde',
+        'When': 'Cuándo',
+        'Why': 'Por qué',
+        'How': 'Cómo',
+        'Which': 'Cuál',
+        'capital': 'capital',
+        'city': 'ciudad',
+        'country': 'país',
+        'president': 'presidente',
+        'first': 'primero',
+        'second': 'segundo',
+        'third': 'tercero',
+      },
+      'fr': {
+        'Jakarta': 'Jakarta',
+        'Indonesia': 'Indonésie',
+        'What': 'Quoi',
+        'Who': 'Qui',
+        'Where': 'Où',
+        'When': 'Quand',
+        'Why': 'Pourquoi',
+        'How': 'Comment',
+        'Which': 'Lequel',
+        'capital': 'capitale',
+        'city': 'ville',
+        'country': 'pays',
+        'president': 'président',
+        'first': 'premier',
+        'second': 'deuxième',
+        'third': 'troisième',
+      },
+      'de': {
+        'Jakarta': 'Jakarta',
+        'Indonesia': 'Indonesien',
+        'What': 'Was',
+        'Who': 'Wer',
+        'Where': 'Wo',
+        'When': 'Wann',
+        'Why': 'Warum',
+        'How': 'Wie',
+        'Which': 'Welcher',
+        'capital': 'Hauptstadt',
+        'city': 'Stadt',
+        'country': 'Land',
+        'president': 'Präsident',
+        'first': 'erste',
+        'second': 'zweite',
+        'third': 'dritte',
+      },
+      'pt': {
+        'Jakarta': 'Jacarta',
+        'Indonesia': 'Indonésia',
+        'What': 'O que',
+        'Who': 'Quem',
+        'Where': 'Onde',
+        'When': 'Quando',
+        'Why': 'Por que',
+        'How': 'Como',
+        'Which': 'Qual',
+        'capital': 'capital',
+        'city': 'cidade',
+        'country': 'país',
+        'president': 'presidente',
+        'first': 'primeiro',
+        'second': 'segundo',
+        'third': 'terceiro',
+      },
+      'ru': {
+        'Jakarta': 'Джакарта',
+        'Indonesia': 'Индонезия',
+        'What': 'Что',
+        'Who': 'Кто',
+        'Where': 'Где',
+        'When': 'Когда',
+        'Why': 'Почему',
+        'How': 'Как',
+        'Which': 'Который',
+        'capital': 'столица',
+        'city': 'город',
+        'country': 'страна',
+        'president': 'президент',
+        'first': 'первый',
+        'second': 'второй',
+        'third': 'третий',
+      },
+    };
   }
   
-  _sendResults(results) {
-    for (const [lang, data] of results) {
-      const { question, options, users, isFallback } = data;
-      
-      const message = [
-        "quizQuestion",
-        {
-          question: question || '',
-          options: options || { A: '', B: '', C: '', D: '' },
-          isFallback: isFallback || false
-        }
-      ];
-      
-      const msgStr = JSON.stringify(message);
-      
-      for (const ws of users) {
-        if (ws && ws.readyState === 1) {
-          try {
-            ws.send(msgStr);
-          } catch(e) {}
-        }
-      }
-    }
-  }
+  // ==================== RESET DAILY COUNTER ====================
   
   resetDailyCounter() {
     const now = new Date().toUTCString();
@@ -413,6 +823,7 @@ export class GameServer {
     this.quizQuestionCache = {};
     this._quizStartTime = null;
     
+    // TRACKING SOAL
     this._allQuestions = [];
     this._currentQuestions = [];
     this._currentBatchStart = 0;
@@ -432,18 +843,22 @@ export class GameServer {
     this._translationQueue = [];
     this._isProcessingQueue = false;
     
+    // Translation Manager
     this.translationManager = new TranslationManager(this);
     
+    // CF PROTECTION
     this._requestCount = 0;
     this._requestResetTime = Date.now() + 60000;
     this._cpuTimeUsed = 0;
     this._subRequestCount = 0;
     
+    // TIMERS
     this._quizTimeout = null;
     this._translateResetInterval = null;
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
     
+    // CIRCUIT BREAKER
     this._translationCircuitBreaker = {
       failures: 0,
       lastFailureTime: 0,
@@ -454,6 +869,7 @@ export class GameServer {
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
     
+    // LOG STARTUP
     console.log('🚀 GameServer starting...');
     console.log(`🕐 Current UTC time: ${new Date().toUTCString()}`);
     console.log(`📅 Quiz Schedule: 18:00 - 23:00 WIB (${QUIZ_SCHEDULE.EVENING.start}:00 - ${QUIZ_SCHEDULE.EVENING.end}:00 UTC)`);
@@ -642,7 +1058,7 @@ export class GameServer {
     }
   }
   
-  // ==================== QUIZ SCHEDULE - MALAM (18:00 - 23:00 WIB) ====================
+  // ==================== QUIZ SCHEDULE ====================
   
   _isQuizTime() {
     const hour = this._getCurrentUTCHours();
@@ -994,13 +1410,10 @@ export class GameServer {
             this._sendQuizTimeLeftToUser(ws);
           }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
         } else {
-          const gameType = this._getGameType(roomName);
-          this._safeSend(ws, ["gameType", gameType]);
-          
           const game = this.activeGames.get(roomName);
           const isRunning = game && game._isActive && !game._gameEnded;
           if (isRunning) {
-            this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
+            this._safeSend(ws, ["gameLowCardError", "Game is already running"]);
           }
         }
         return;
@@ -1037,13 +1450,10 @@ export class GameServer {
           this._sendQuizTimeLeftToUser(ws);
         }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
       } else {
-        const gameType = this._getGameType(roomName);
-        this._safeSend(ws, ["gameType", gameType]);
-        
         const game = this.activeGames.get(roomName);
         const isRunning = game && game._isActive && !game._gameEnded;
         if (isRunning) {
-          this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
+          this._safeSend(ws, ["gameLowCardError", "Game is already running"]);
         }
       }
       
@@ -1052,7 +1462,7 @@ export class GameServer {
     }
   }
   
-  // ==================== LOAD SEMUA SOAL DARI KV ====================
+  // ==================== LOAD SOAL DARI KV ====================
   
   async _loadAllQuestionsFromKV() {
     if (!this.env || !this.env.QUESTIONS) return false;
@@ -1139,10 +1549,7 @@ export class GameServer {
     const questions = this.quizQuestionCache['en'] || [];
     
     if (this._questionPointer >= questions.length) {
-      const currentPointer = this._questionPointer;
-      
-      console.log(`📖 Reached end of batch (pointer: ${currentPointer}/${questions.length}), loading next batch...`);
-      
+      console.log(`📖 Reached end of batch, loading next batch...`);
       this._loadNextBatch();
       
       const newQuestions = this.quizQuestionCache['en'] || [];
@@ -1251,7 +1658,7 @@ export class GameServer {
         this.currentQuestion.options
       );
 
-      // ✅ Kirim quizTimeLeft saat soal ditampilkan
+      // Kirim quizTimeLeft
       this._broadcastToRoom(QUIZ_ROOM, [
         "quizTimeLeft",
         `📝 Question ${this._questionPointer}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
@@ -1348,7 +1755,7 @@ export class GameServer {
     
     console.log(`🌍 Broadcasting question to ${wsIds.size} users`);
     
-    // Kumpulkan user berdasarkan bahasa
+    // ✅ Kumpulkan user berdasarkan bahasa
     const usersByLang = new Map();
     
     for (const wsId of wsIds) {
@@ -1371,38 +1778,9 @@ export class GameServer {
       return;
     }
     
-    // ✅ TRANSLATE SEMUA BAHASA (TANPA CACHE)
-    const results = new Map();
+    // ✅ Gunakan TranslationManager untuk translate per bahasa
+    await this.translationManager.translateForUsers(question, options, usersByLang);
     
-    for (const [lang, users] of usersByLang) {
-      if (lang === 'en') {
-        results.set(lang, { question, options, users, isFallback: false });
-        continue;
-      }
-      
-      // ✅ SELALU TRANSLATE - TIDAK PAKAI CACHE
-      try {
-        console.log(`🔄 Translating to ${lang}...`);
-        const translated = await this._translateQuestionForLanguage(question, options, lang);
-        if (translated) {
-          results.set(lang, { 
-            question: translated.question, 
-            options: translated.options, 
-            users, 
-            isFallback: false 
-          });
-          console.log(`✅ Translated to ${lang}`);
-        } else {
-          results.set(lang, { question, options, users, isFallback: true });
-          console.log(`⚠️ Fallback to English for ${lang}`);
-        }
-      } catch(e) {
-        results.set(lang, { question, options, users, isFallback: true });
-        console.log(`❌ Error translating ${lang}: ${e.message}, using English`);
-      }
-    }
-    
-    this._sendQuizResults(results);
     console.log(`✅ Broadcast complete to ${wsIds.size} users`);
   }
   
@@ -1414,16 +1792,13 @@ export class GameServer {
     }
     
     try {
-      // ✅ TRANSLATE LANGSUNG - TANPA CACHE
       const translatedQuestion = await this.translationManager._translateText(question, targetLang);
       const translatedOptions = await this._translateOptionsForLanguage(options, targetLang);
       
-      const result = {
+      return {
         question: translatedQuestion || question,
         options: translatedOptions || options
       };
-      
-      return result;
       
     } catch(e) {
       console.error(`❌ Error translating to ${targetLang}:`, e.message);
@@ -1454,33 +1829,6 @@ export class GameServer {
     }
     
     return result;
-  }
-  
-  // ==================== SEND QUIZ RESULTS TO USERS ====================
-  
-  _sendQuizResults(results) {
-    for (const [lang, data] of results) {
-      const { question, options, users, isFallback } = data;
-      
-      const message = [
-        "quizQuestion",
-        {
-          question: question || '',
-          options: options || { A: '', B: '', C: '', D: '' },
-          isFallback: isFallback || false
-        }
-      ];
-      
-      const msgStr = JSON.stringify(message);
-      
-      for (const ws of users) {
-        if (ws && ws.readyState === 1) {
-          try {
-            ws.send(msgStr);
-          } catch(e) {}
-        }
-      }
-    }
   }
   
   // ==================== SUBMIT QUIZ ANSWER ====================
@@ -2658,13 +3006,6 @@ export class GameServer {
         return;
       }
       
-      const gameType = this._getGameType(room);
-      if (gameType) {
-        this._safeSend(ws, ["gameLowCardError", "Game is not available at this time"]);
-        this._safeSend(ws, ["gameType", gameType]);
-        return;
-      }
-      
       const startKey = `start_${room}`;
       if (this._gameStartFlags.has(startKey)) {
         this._safeSend(ws, ["gameLowCardError", "Game is already starting..."]);
@@ -2672,7 +3013,7 @@ export class GameServer {
       }
       const existingGame = this.activeGames.get(room);
       if (existingGame && existingGame._isActive && !existingGame._gameEnded) {
-        this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
+        this._safeSend(ws, ["gameLowCardError", "Game is already running"]);
         return;
       }
       this._gameStartFlags.set(startKey, Date.now());
@@ -2803,13 +3144,6 @@ export class GameServer {
       const room = this._ensureRoomConsistency(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
-        return;
-      }
-      
-      const gameType = this._getGameType(room);
-      if (gameType) {
-        this._safeSend(ws, ["gameLowCardError", "Game is not available at this time"]);
-        this._safeSend(ws, ["gameType", gameType]);
         return;
       }
       
