@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (QUIZ CONTINUOUS UNTIL TIME ENDS) ====================
+// ==================== GAME-SERVER.JS (CLEAN VERSION) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -68,8 +68,8 @@ const QUIZ_SCHEDULE = {
   SESSION1: { start: 0, end: 2 },
   SESSION2: { start: 4, end: 6 },
   SESSION3: { start: 8, end: 10 },
-  SESSION4: { start: 12, end: 22 },
-  SESSION5: { start: 16, end: 22 },
+  SESSION4: { start: 12, end: 14 },
+  SESSION5: { start: 16, end: 18 },
   SESSION6: { start: 20, end: 22 },
 };
 
@@ -111,8 +111,6 @@ export class GameServer {
     this.isQuizWaiting = false;
     this.quizQuestionCache = {};
     this._quizStartTime = null;
-    this._quizSessionEndTime = null; // Track when quiz session ends
-    this._isQuizSessionActive = false; // Track if quiz session is active
     
     this._allQuestions = [];
     this._currentQuestions = [];
@@ -143,7 +141,6 @@ export class GameServer {
     this._translateResetInterval = null;
     this._quizBreakTimeout = null;
     this._quizStartTimeout = null;
-    this._quizSessionCheckInterval = null; // Check session end
     
     this._translationCircuitBreaker = {
       failures: 0,
@@ -154,8 +151,6 @@ export class GameServer {
     
     this.quizAutoEnabled = false;
     this.quizAutoTimer = null;
-    this._quizCheckInterval = null;
-    this._quizForceRunning = false;
     
     this._initAsync();
     
@@ -174,169 +169,9 @@ export class GameServer {
     this._startQuizScheduler();
     await this._checkAndResetWeeklyPoints();
     
-    // Check quiz session every 5 seconds
-    this._quizSessionCheckInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this._quizSessionCheckInterval);
-        this._quizSessionCheckInterval = null;
-        return;
-      }
-      
-      this._checkQuizSessionStatus();
-    }, 5000);
-    
-    this._quizCheckInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this._quizCheckInterval);
-        this._quizCheckInterval = null;
-        return;
-      }
-      
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      const hasClients = clients && clients.size > 0;
-      
-      if (hasClients && this._isQuizSessionActive) {
-        this._ensureQuizAlwaysRunning();
-      }
-    }, 2000);
-    
     setTimeout(() => {
       this.ensureQuizRunning();
     }, 2000);
-  }
-  
-  // ==================== CHECK QUIZ SESSION STATUS ====================
-  
-  _checkQuizSessionStatus() {
-    try {
-      const isQuizTime = this._isQuizTime();
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      const hasClients = clients && clients.size > 0;
-      
-      if (isQuizTime) {
-        // Quiz session is active
-        if (!this._isQuizSessionActive) {
-          this._isQuizSessionActive = true;
-          this._quizSessionEndTime = this._getSessionEndTime();
-          this.quizAutoEnabled = true;
-          this._quizForceRunning = true;
-          
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizSessionStarted",
-            { 
-              message: "📚 Quiz session started!",
-              endTime: this._quizSessionEndTime
-            }
-          ]);
-        }
-        
-        // Always keep quiz running during session
-        if (hasClients) {
-          this._ensureQuizAlwaysRunning();
-        }
-        
-        // Broadcast time remaining every 30 seconds
-        if (this._quizSessionEndTime) {
-          const remaining = this._quizSessionEndTime - Date.now();
-          if (remaining > 0 && remaining < 60000) {
-            // Last minute
-            const seconds = Math.ceil(remaining / 1000);
-            if (seconds % 10 === 0 || seconds <= 10) {
-              this._broadcastToRoom(QUIZ_ROOM, [
-                "quizTimeRemaining",
-                { 
-                  seconds: seconds,
-                  message: `⏰ ${seconds} seconds remaining!`
-                }
-              ]);
-            }
-          }
-        }
-        
-      } else {
-        // Quiz session ended
-        if (this._isQuizSessionActive) {
-          this._isQuizSessionActive = false;
-          this._quizSessionEndTime = null;
-          this.quizAutoEnabled = false;
-          this._quizForceRunning = false;
-          
-          // Reset quiz
-          this.resetQuiz();
-          
-          this._broadcastToRoom(QUIZ_ROOM, [
-            "quizSessionEnded",
-            { 
-              message: "⏰ Quiz session has ended! See you next session."
-            }
-          ]);
-        }
-      }
-    } catch(e) {
-      // Silent
-    }
-  }
-  
-  _getSessionEndTime() {
-    const now = new Date();
-    const hour = now.getUTCHours();
-    const schedules = [
-      QUIZ_SCHEDULE.SESSION1,
-      QUIZ_SCHEDULE.SESSION2,
-      QUIZ_SCHEDULE.SESSION3,
-      QUIZ_SCHEDULE.SESSION4,
-      QUIZ_SCHEDULE.SESSION5,
-      QUIZ_SCHEDULE.SESSION6
-    ];
-    
-    let currentSession = null;
-    for (const schedule of schedules) {
-      if (hour >= schedule.start && hour < schedule.end) {
-        currentSession = schedule;
-        break;
-      }
-    }
-    
-    if (currentSession) {
-      const endTime = new Date(now);
-      endTime.setUTCHours(currentSession.end, 0, 0, 0);
-      return endTime.getTime();
-    }
-    
-    // If no session, return next session start
-    const nextStart = this._getNextQuizStartTime();
-    return nextStart.getTime();
-  }
-  
-  // ==================== ENSURE QUIZ ALWAYS RUNNING ====================
-  
-  _ensureQuizAlwaysRunning() {
-    try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients || clients.size === 0) return;
-      
-      // Only run if session is active
-      if (!this._isQuizSessionActive) return;
-      
-      this.quizAutoEnabled = true;
-      this._quizForceRunning = true;
-      
-      // If no question is showing, show one
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting) {
-        this._showQuestion();
-        
-        if (!this.currentQuestion) {
-          setTimeout(() => {
-            if (!this.closing && !this.isDestroyed && this._isQuizSessionActive) {
-              this._showQuestion();
-            }
-          }, 500);
-        }
-      }
-      
-    } catch(e) {
-      // Silent
-    }
   }
   
   // ==================== CF PROTECTION ====================
@@ -400,9 +235,6 @@ export class GameServer {
   }
   
   _getGameType(room) {
-    if (room === QUIZ_ROOM) {
-      return !this._isQuizSessionActive;
-    }
     return !this._isGameTime();
   }
   
@@ -545,7 +377,7 @@ export class GameServer {
     const timeLeft = nextStart.getTime() - now;
     
     if (timeLeft <= 0) {
-      return { minutes: 0, seconds: 0, isRunning: this._isQuizSessionActive };
+      return { minutes: 0, seconds: 0, isRunning: this._isQuizTime() };
     }
     
     const totalSeconds = Math.floor(timeLeft / 1000);
@@ -554,32 +386,6 @@ export class GameServer {
       seconds: totalSeconds % 60,
       isRunning: false
     };
-  }
-  
-  _getTimeLeftMessage() {
-    if (this._isQuizSessionActive) {
-      return "⏰ Quiz is running!";
-    }
-    
-    const timeLeft = this._getTimeLeftUntilNextEvent();
-    const totalSeconds = timeLeft.minutes * 60 + timeLeft.seconds;
-    
-    if (totalSeconds <= 0) {
-      return "⏰ Quiz is starting now!";
-    }
-    
-    const days = Math.floor(totalSeconds / 86400);
-    const hours = Math.floor((totalSeconds % 86400) / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = Math.floor(totalSeconds % 60);
-    
-    let parts = [];
-    if (days > 0) parts.push(`${days}d`);
-    if (hours > 0) parts.push(`${hours}h`);
-    if (minutes > 0) parts.push(`${minutes}m`);
-    if (seconds > 0 && parts.length === 0) parts.push(`${seconds}s`);
-    
-    return `⏸️ Quiz is offline. Starts in ${parts.join(" ")}`;
   }
   
   // ==================== QUIZ AUTO SCHEDULER ====================
@@ -600,6 +406,7 @@ export class GameServer {
       try {
         this._resetDailyTranslateCounter();
         this._checkQuizAutoStatus();
+        this._checkAndRestartQuiz();
       } catch(e) {
         // Silent
       }
@@ -608,37 +415,34 @@ export class GameServer {
   
   async _checkQuizAutoStatus() {
     try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      const hasClients = clients && clients.size > 0;
+      const isQuizTime = this._isQuizTime();
       
-      if (this._isQuizSessionActive) {
+      if (isQuizTime) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._quizForceRunning = true;
-          if (hasClients) {
-            this._broadcastToRoom(QUIZ_ROOM, [
-              "quizTimeLeft",
-              "⏰ Quiz is running!",
-              false
-            ]);
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏳ Quiz will start soon!",
+            false
+          ]);
+          
+          await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
+          
+          if (!this._quizStartTimeout) {
+            this.forceStartQuiz();
           }
-        }
-        
-        // Always show questions during session if there are clients
-        if (hasClients && !this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+        } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
           await this._showQuestion();
         }
       } else {
         if (this.quizAutoEnabled) {
           this.quizAutoEnabled = false;
-          this._quizForceRunning = false;
-          if (hasClients) {
-            this._broadcastToRoom(QUIZ_ROOM, [
-              "quizTimeLeft",
-              this._getTimeLeftMessage(),
-              true
-            ]);
-          }
+          await this.resetQuiz();
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏸️ Quiz is offline. Check schedule for next session.",
+            true
+          ]);
         }
       }
     } catch(e) {
@@ -649,96 +453,43 @@ export class GameServer {
   // ==================== FORCE START QUIZ ====================
   
   forceStartQuiz() {
-    if (this.currentQuestion) {
-      this._broadcastCurrentQuestion();
-      return true;
-    }
-    
-    if (this._quizTimeout || this.isQuizWaiting) {
-      return false;
-    }
-    
-    if (this._quizStartTimeout) {
-      clearTimeout(this._quizStartTimeout);
-      this._quizStartTimeout = null;
-    }
+    if (!this._isQuizTime()) return false;
+    if (this.currentQuestion) return true;
+    if (this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) return false;
     
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
       this._initQuiz().then(() => {
-        if (!this.closing && !this.isDestroyed && this._isQuizSessionActive) {
-          this._showQuestion();
-        }
+        this._showQuestion();
       });
       return false;
     }
     
-    // Only start if session is active
-    if (!this._isQuizSessionActive) {
-      return false;
-    }
-    
     this.quizAutoEnabled = true;
-    this._quizForceRunning = true;
     this._showQuestion();
     return true;
   }
   
-  // ==================== BROADCAST CURRENT QUESTION ====================
+  // ==================== CHECK AND RESTART QUIZ ====================
   
-  _broadcastCurrentQuestion() {
-    if (!this.currentQuestion) return;
-    
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds || wsIds.size === 0) return;
-    
-    const question = this.currentQuestion.question;
-    const options = this.currentQuestion.options;
-    
-    this._broadcastQuizQuestion(question, options);
-  }
-  
-  // ==================== ENSURE QUIZ RUNNING ====================
-  
-  ensureQuizRunning() {
+  _checkAndRestartQuiz() {
     try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      const hasClients = clients && clients.size > 0;
+      if (!this._isQuizTime()) return;
       
-      if (hasClients && this._isQuizSessionActive) {
+      const isRunning = this.currentQuestion !== null;
+      const isWaiting = this.isQuizWaiting;
+      const hasTimeout = this._quizTimeout !== null;
+      const hasBreak = this._quizBreakTimeout !== null;
+      
+      if (!isRunning && !isWaiting && !hasTimeout && !hasBreak) {
         this.quizAutoEnabled = true;
-        this._quizForceRunning = true;
-        
-        this.forceStartQuiz();
-        
-        if (!this.currentQuestion) {
-          setTimeout(() => {
-            if (this._isQuizSessionActive) {
-              this.forceStartQuiz();
-            }
-          }, 1000);
-        }
-        
-        this._broadcastToRoom(QUIZ_ROOM, [
-          "quizTimeLeft",
-          "⏰ Quiz is running!",
-          false
-        ]);
-      } else if (hasClients) {
-        // Session not active, show waiting message
-        this._broadcastToRoom(QUIZ_ROOM, [
-          "quizTimeLeft",
-          this._getTimeLeftMessage(),
-          true
-        ]);
-      } else {
-        if (this._isQuizSessionActive && !this.quizAutoEnabled) {
-          this.quizAutoEnabled = true;
-        }
+        this._showQuestion();
       }
     } catch(e) {
       // Silent
     }
   }
+  
+  // ==================== ENSURE QUIZ STARTED ====================
   
   ensureQuizStarted() {
     if (this._quizTimeout) {
@@ -754,9 +505,7 @@ export class GameServer {
       this._quizStartTimeout = null;
     }
     
-    if (this._isQuizSessionActive) {
-      this.forceStartQuiz();
-    }
+    this.forceStartQuiz();
   }
   
   // ==================== SEND TO USER ====================
@@ -765,68 +514,82 @@ export class GameServer {
     if (!ws || ws.readyState !== 1) return false;
     
     try {
+      const isQuizTime = this._isQuizTime();
+      const timeLeft = this._getTimeLeftUntilNextEvent();
+      const isQuizActive = this.currentQuestion !== null || this._quizTimeout !== null;
+      
       let message = "";
       let canType = true;
-      let gameType = true;
       
-      if (this._isQuizSessionActive) {
-        message = "⏰ Quiz is running!";
+      if (isQuizTime && isQuizActive) {
+        let remaining = "";
+        if (this._quizStartTime) {
+          const elapsed = (Date.now() - this._quizStartTime) / 1000;
+          const total = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+          const left = Math.max(0, total - elapsed);
+          const minutes = Math.floor(left / 60);
+          const seconds = Math.floor(left % 60);
+          remaining = minutes > 0 ? `${minutes}m ${seconds}s remaining` : `${seconds}s remaining`;
+        }
+        message = `⏰ Quiz is running! ${remaining}`;
         canType = false;
-        gameType = false;
-      } else {
-        message = this._getTimeLeftMessage();
+      } else if (isQuizTime && !isQuizActive) {
+        message = `⏳ Quiz will start soon!`;
         canType = true;
-        gameType = true;
+      } else {
+        const totalSeconds = timeLeft.minutes * 60 + timeLeft.seconds;
+        let countdown = "";
+        if (totalSeconds <= 0) {
+          countdown = "Now!";
+        } else {
+          const days = Math.floor(totalSeconds / 86400);
+          const hours = Math.floor((totalSeconds % 86400) / 3600);
+          const minutes = Math.floor((totalSeconds % 3600) / 60);
+          const seconds = Math.floor(totalSeconds % 60);
+          
+          let parts = [];
+          if (days > 0) parts.push(`${days}d`);
+          if (hours > 0) parts.push(`${hours}h`);
+          if (minutes > 0) parts.push(`${minutes}m`);
+          if (seconds > 0 && parts.length === 0) parts.push(`${seconds}s`);
+          countdown = parts.join(" ");
+        }
+        message = `⏸️ Quiz is offline. Starts in ${countdown}`;
+        canType = true;
       }
       
-      this._safeSend(ws, ["quizTimeLeft", message, canType, gameType]);
-      this._safeSend(ws, ["quizTimeStatus", { 
-        isQuizTime: this._isQuizSessionActive,
-        gameType: gameType,
-        forceRunning: this._quizForceRunning
-      }]);
-      
-      if (this._isQuizSessionActive && this.currentQuestion) {
-        this._sendCurrentQuestionToUser(ws);
-      } else if (this._isQuizSessionActive) {
-        this.forceStartQuiz();
-        setTimeout(() => {
-          if (this.currentQuestion) {
-            this._sendCurrentQuestionToUser(ws);
-          }
-        }, 500);
-      }
-      
+      this._safeSend(ws, ["quizTimeLeft", message, canType]);
       return true;
     } catch(e) {
       return false;
     }
   }
   
-  _sendCurrentQuestionToUser(ws) {
-    if (!ws || ws.readyState !== 1 || !this.currentQuestion) return;
-    
-    const question = this.currentQuestion.question;
-    const options = this.currentQuestion.options;
-    
-    this._safeSend(ws, [
-      "quizQuestion",
-      {
-        question: question || '',
-        options: options || { A: '', B: '', C: '', D: '' },
-        isFallback: false
-      }
-    ]);
-  }
-  
   _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
     if (!ws || ws.readyState !== 1) return false;
     
     try {
-      let message = customMessage || "Quiz error occurred";
+      const timeLeft = this._getTimeLeftUntilNextEvent();
+      let message = "";
       
-      if (this._isQuizSessionActive) {
-        this.forceStartQuiz();
+      switch(errorType) {
+        case "NOT_QUIZ_TIME":
+          message = "Quiz is currently offline";
+          break;
+        case "QUIZ_DISABLED":
+          message = "Quiz is not available right now";
+          break;
+        case "QUIZ_ENDED":
+          message = "Quiz session has ended";
+          break;
+        case "QUIZ_NOT_STARTED":
+          const timeStr = timeLeft.minutes > 0 ? 
+            `${timeLeft.minutes}m ${timeLeft.seconds}s` : 
+            `${timeLeft.seconds}s`;
+          message = `Quiz hasn't started yet. Starting in: ${timeStr}`;
+          break;
+        default:
+          message = customMessage || "Quiz error occurred";
       }
       
       this._safeSend(ws, ["quizError", message]);
@@ -865,31 +628,12 @@ export class GameServer {
       
       if (oldRoom === roomName) {
         if (roomName === QUIZ_ROOM) {
-          this._safeSend(ws, ["quizTimeStatus", { 
-            isQuizTime: this._isQuizSessionActive,
-            gameType: !this._isQuizSessionActive,
-            forceRunning: this._quizForceRunning
-          }]);
-          
-          if (this._isQuizSessionActive) {
-            this.quizAutoEnabled = true;
-            this._quizForceRunning = true;
-            this.forceStartQuiz();
-            
-            if (!this.currentQuestion) {
-              setTimeout(() => {
-                if (!this.closing && !this.isDestroyed && this._isQuizSessionActive) {
-                  this.forceStartQuiz();
-                }
-              }, 500);
-            }
-          }
-          
           if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
             await this._initQuiz();
-            if (this._isQuizSessionActive) {
-              this.forceStartQuiz();
-            }
+          }
+          
+          if (this._isQuizTime() && !this.quizAutoEnabled) {
+            this.quizAutoEnabled = true;
           }
           
           setTimeout(() => {
@@ -901,7 +645,8 @@ export class GameServer {
           this._safeSend(ws, ["gameType", gameType]);
           
           const game = this.activeGames.get(roomName);
-          if (game && game._isActive && !game._gameEnded) {
+          const isRunning = game && game._isActive && !game._gameEnded;
+          if (isRunning) {
             this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
           }
         }
@@ -923,31 +668,13 @@ export class GameServer {
       }
       
       if (roomName === QUIZ_ROOM) {
-        this._safeSend(ws, ["quizTimeStatus", { 
-          isQuizTime: this._isQuizSessionActive,
-          gameType: !this._isQuizSessionActive,
-          forceRunning: this._quizForceRunning
-        }]);
-        
-        if (this._isQuizSessionActive) {
-          this.quizAutoEnabled = true;
-          this._quizForceRunning = true;
-          this.forceStartQuiz();
-          
-          if (!this.currentQuestion) {
-            setTimeout(() => {
-              if (!this.closing && !this.isDestroyed && this._isQuizSessionActive) {
-                this.forceStartQuiz();
-              }
-            }, 500);
-          }
-        }
-        
         if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           await this._initQuiz();
-          if (this._isQuizSessionActive) {
-            this.forceStartQuiz();
-          }
+        }
+        
+        if (this._isQuizTime()) {
+          if (!this.quizAutoEnabled) this.quizAutoEnabled = true;
+          this.forceStartQuiz();
         }
         
         setTimeout(() => {
@@ -959,7 +686,8 @@ export class GameServer {
         this._safeSend(ws, ["gameType", gameType]);
         
         const game = this.activeGames.get(roomName);
-        if (game && game._isActive && !game._gameEnded) {
+        const isRunning = game && game._isActive && !game._gameEnded;
+        if (isRunning) {
           this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
         }
       }
@@ -1023,7 +751,7 @@ export class GameServer {
       
       this._broadcastToRoom(QUIZ_ROOM, [
         "quizNotification",
-        "📢 All questions have been answered! Starting from question 1 again!",
+        "📢 All 10,000 questions have been answered! Starting from question 1 again!",
         "info"
       ]);
     }
@@ -1074,45 +802,33 @@ export class GameServer {
   
   async _showQuestion() {
     try {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      const hasClients = clients && clients.size > 0;
-      
-      // Only show questions if session is active and there are clients
-      if (!this._isQuizSessionActive || !hasClients) {
-        return;
-      }
-      
-      if (this.currentQuestion) {
-        this._broadcastCurrentQuestion();
-        return;
-      }
-      
-      if (this._quizTimeout || this.isQuizWaiting) {
+      if (!this._isQuizTime()) {
+        const clients = this.wsClients.get(QUIZ_ROOM);
+        if (clients && clients.size > 0) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏸️ Quiz is offline. Check schedule for next session.",
+            true
+          ]);
+        }
         return;
       }
       
       if (!this.quizAutoEnabled) {
         this.quizAutoEnabled = true;
-        this._quizForceRunning = true;
-      }
-      
-      if (this.isDestroyed) {
+        const clients = this.wsClients.get(QUIZ_ROOM);
+        if (clients && clients.size > 0) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏳ Quiz will start soon!",
+            true
+          ]);
+        }
         return;
       }
-
-      if (this._quizStartTimeout) {
-        clearTimeout(this._quizStartTimeout);
-        this._quizStartTimeout = null;
-      }
-
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        const loaded = await this._loadAllQuestionsFromKV();
-        if (!loaded) {
-          setTimeout(() => {
-            this._showQuestion();
-          }, 1000);
-          return;
-        }
+      
+      if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) {
+        return;
       }
 
       this._checkAndLoadNextBatch();
@@ -1120,15 +836,14 @@ export class GameServer {
       const questions = this.quizQuestionCache['en'] || [];
       
       if (questions.length === 0) {
-        this._loadNextBatch();
-        setTimeout(() => {
-          this._showQuestion();
-        }, 500);
-        return;
-      }
-      
-      if (this._questionPointer >= questions.length) {
-        this._questionPointer = 0;
+        const loaded = this._loadNextBatch();
+        if (!loaded) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizError",
+            "No questions available! Please add questions to KV."
+          ]);
+          return;
+        }
       }
       
       const q = questions[this._questionPointer];
@@ -1167,13 +882,6 @@ export class GameServer {
         try {
           if (this.closing || this.isDestroyed) {
             this._quizTimeout = null;
-            return;
-          }
-
-          // Check if session is still active
-          if (!this._isQuizSessionActive) {
-            this._quizTimeout = null;
-            this.currentQuestion = null;
             return;
           }
 
@@ -1221,12 +929,8 @@ export class GameServer {
             this._quizBreakTimeout = null;
             this.currentQuestion = null;
             
-            // Continue showing questions if session is still active
-            if (!this.closing && !this.isDestroyed && this._isQuizSessionActive) {
-              const clients = this.wsClients.get(QUIZ_ROOM);
-              if (clients && clients.size > 0) {
-                this._showQuestion();
-              }
+            if (!this.closing && !this.isDestroyed) {
+              this.ensureQuizRunning();
             }
           }, CONSTANTS.QUIZ_BREAK_MS);
 
@@ -1241,11 +945,6 @@ export class GameServer {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
-      setTimeout(() => {
-        if (this._isQuizSessionActive) {
-          this._showQuestion();
-        }
-      }, 2000);
     }
   }
   
@@ -1620,15 +1319,14 @@ export class GameServer {
         return;
       }
       
-      if (!this._isQuizSessionActive) {
+      if (!this._isQuizTime()) {
         this._sendQuizErrorWithTime(ws, "NOT_QUIZ_TIME");
         return;
       }
       
       if (!this.quizAutoEnabled) {
-        this.quizAutoEnabled = true;
-        this._quizForceRunning = true;
-        this.forceStartQuiz();
+        this._sendQuizErrorWithTime(ws, "QUIZ_DISABLED");
+        return;
       }
       
       const clients = this.wsClients.get(QUIZ_ROOM);
@@ -1640,11 +1338,8 @@ export class GameServer {
       if (!this.currentQuestion) {
         this._startQuizIfNeeded();
         if (!this.currentQuestion) {
-          this.forceStartQuiz();
-          if (!this.currentQuestion) {
-            this._sendQuizErrorWithTime(ws, "QUIZ_NOT_STARTED");
-            return;
-          }
+          this._sendQuizErrorWithTime(ws, "QUIZ_NOT_STARTED");
+          return;
         }
       }
       
@@ -1695,30 +1390,30 @@ export class GameServer {
         return;
       }
       
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      const hasClients = clients && clients.size > 0;
-      
-      if (hasClients && this._isQuizSessionActive) {
+      if (this._isQuizTime()) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._quizForceRunning = true;
           this._broadcastToRoom(QUIZ_ROOM, [
             "quizTimeLeft",
-            "⏰ Quiz is running!",
-            false
+            "⏳ Quiz will start soon!",
+            true
           ]);
         }
         
         if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
           this._showQuestion();
         }
-      } else if (hasClients) {
-        // Show waiting message
-        this._broadcastToRoom(QUIZ_ROOM, [
-          "quizTimeLeft",
-          this._getTimeLeftMessage(),
-          true
-        ]);
+        
+      } else {
+        if (this.quizAutoEnabled) {
+          this.quizAutoEnabled = false;
+          this.resetQuiz();
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizTimeLeft",
+            "⏸️ Quiz is offline. Check schedule for next session.",
+            true
+          ]);
+        }
       }
     }, CONSTANTS.QUIZ_INTERVAL_MS);
   }
@@ -1747,8 +1442,6 @@ export class GameServer {
       this.quizAnswered = new Set();
       this._quizStartTime = null;
       
-      this._quizForceRunning = false;
-      
       this._broadcastToRoom(QUIZ_ROOM, ["quizReset", "Quiz has been reset"]);
     } catch(e) {
       // Silent
@@ -1764,7 +1457,7 @@ export class GameServer {
         return;
       }
       this._quizStartTimeout = null;
-      if (!this.currentQuestion && this.quizAutoEnabled && this._isQuizSessionActive) {
+      if (!this.currentQuestion && this.quizAutoEnabled) {
         this.forceStartQuiz();
       }
     }, delayMs);
@@ -1861,35 +1554,23 @@ export class GameServer {
       return;
     }
     
-    if (evt === "getQuizTimeStatus") {
-      const clients = this.wsClients.get(QUIZ_ROOM);
-      const hasClients = clients && clients.size > 0;
-      
-      this._safeSend(ws, ["quizTimeStatus", {
-        isQuizTime: this._isQuizSessionActive,
-        gameType: !this._isQuizSessionActive,
-        forceRunning: this._quizForceRunning && this._isQuizSessionActive,
-        hasClients: hasClients
-      }]);
-      return;
-    }
-    
-    if (evt === "quizDebug") {
-      this._safeSend(ws, ["quizDebug", {
+    if (evt === "getQuizDebugInfo") {
+      const info = {
         isQuizTime: this._isQuizTime(),
-        isSessionActive: this._isQuizSessionActive,
+        quizAutoEnabled: this.quizAutoEnabled,
         hasQuestion: !!this.currentQuestion,
         hasTimeout: !!this._quizTimeout,
         isWaiting: this.isQuizWaiting,
+        hasStartTimeout: !!this._quizStartTimeout,
         questionsLoaded: this._isAllQuestionsLoaded,
         totalQuestions: this._allQuestions.length,
+        currentBatch: this._currentBatchIndex + 1,
         pointer: this._questionPointer,
         usersInRoom: this.wsClients.get(QUIZ_ROOM)?.size || 0,
-        currentHour: new Date().getUTCHours(),
-        quizAutoEnabled: this.quizAutoEnabled,
-        quizForceRunning: this._quizForceRunning,
-        sessionEndTime: this._quizSessionEndTime
-      }]);
+        currentTime: new Date().toUTCString(),
+        currentHour: new Date().getUTCHours()
+      };
+      this._safeSend(ws, ["quizDebugInfo", info]);
       return;
     }
     
@@ -1958,10 +1639,7 @@ export class GameServer {
         currentBatchRange: `${this._currentBatchStart + 1} - ${this._currentBatchEnd}`,
         nextQuestionIndex: this._currentBatchStart + pointer + 1,
         batchSize: CONSTANTS.QUIZ_BATCH_SIZE,
-        isAllQuestionsLoaded: this._isAllQuestionsLoaded,
-        isForceRunning: this._quizForceRunning,
-        isSessionActive: this._isQuizSessionActive,
-        sessionEndTime: this._quizSessionEndTime
+        isAllQuestionsLoaded: this._isAllQuestionsLoaded
       };
     } catch(e) {
       return { error: e.message };
@@ -2247,15 +1925,36 @@ export class GameServer {
   
   // ==================== ENSURE QUIZ RUNNING ====================
   
+  ensureQuizRunning() {
+    try {
+      this._forceStartQuizIfTime();
+      
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        this._initQuiz().then(() => {
+          if (!this.closing && !this.isDestroyed) {
+            this.forceStartQuiz();
+          }
+        });
+        return;
+      }
+      
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+        this.forceStartQuiz();
+      }
+      
+    } catch(e) {
+      // Silent
+    }
+  }
+  
   _startQuizIfNeeded() {
     try {
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients || clients.size === 0) return;
-      if (!this._isQuizSessionActive) return;
       if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
         if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
           this._initQuiz().then(() => {
-            if (!this.closing && !this.isDestroyed && this._isQuizSessionActive) {
+            if (!this.closing && !this.isDestroyed) {
               this._showQuestion();
             }
           });
@@ -2266,6 +1965,17 @@ export class GameServer {
     } catch(e) {
       // Silent
     }
+  }
+  
+  _forceStartQuizIfTime() {
+    if (!this._isQuizTime()) return;
+    if (this.currentQuestion) return;
+    if (this._quizTimeout) return;
+    if (this.isQuizWaiting) return;
+    if (this._quizStartTimeout) return;
+    
+    this.quizAutoEnabled = true;
+    this._showQuestion();
   }
   
   async _initQuiz(retryCount = 0) {
@@ -3464,15 +3174,12 @@ export class GameServer {
           kvAvailable: !!(this.env && this.env.QUESTIONS),
           quizAutoEnabled: this.quizAutoEnabled || false,
           isQuizRunning: !!this.currentQuestion,
-          isSessionActive: this._isQuizSessionActive || false,
           quizProgress: this._getQuizStatus(),
           translateCount: this.translateCount || 0,
           translateLimitReached: this.translateLimitReached || false,
           circuitBreakerOpen: this._translationCircuitBreaker.isOpen || false,
           subRequestCount: this._subRequestCount,
           cfLimitRemaining: Math.max(0, CONSTANTS.CF_SUBREQUEST_LIMIT - this._subRequestCount),
-          quizForceRunning: this._quizForceRunning || false,
-          sessionEndTime: this._quizSessionEndTime,
           timestamp: Date.now()
         }), { 
           headers: { 'Content-Type': 'application/json' }
@@ -3676,14 +3383,6 @@ export class GameServer {
       if (this._translateResetInterval) {
         clearInterval(this._translateResetInterval);
         this._translateResetInterval = null;
-      }
-      if (this._quizSessionCheckInterval) {
-        clearInterval(this._quizSessionCheckInterval);
-        this._quizSessionCheckInterval = null;
-      }
-      if (this._quizCheckInterval) {
-        clearInterval(this._quizCheckInterval);
-        this._quizCheckInterval = null;
       }
       if (this._quizTimeout) {
         clearTimeout(this._quizTimeout);
