@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL CLASS WITH BATCH SYSTEM) ====================
+// ==================== GAME-SERVER.JS (FIXED - QUIZ BATCH SYSTEM) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -36,21 +36,15 @@ const CONSTANTS = {
   QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
   SCHEDULER_INTERVAL_MS: 60000,
-  QUIZ_BATCH_SIZE: 100,
-  QUIZ_BATCH_THRESHOLD: 20,
+  QUIZ_BATCH_SIZE: 100,        // ← 100 SOAL PER BATCH
+  QUIZ_BATCH_THRESHOLD: 20,    // ← TIDAK DIPAKAI LAGI (HAPUS)
   MAX_QUESTIONS: 10000,
-  
-  // BATCH SYSTEM UNTUK 10.000 SOAL
-  QUIZ_BATCH_PREFIX: 'quiz_batch_',
-  QUIZ_METADATA_KEY: 'quiz_metadata',
-  QUIZ_TOTAL_KEY: 'quiz_total',
-  QUIZ_BATCH_CACHE_SIZE: 1,
-  
+  // GAME SCHEDULE - JAM MAIN GAME
   GAME_SCHEDULE: {
     START_HOUR: 0,
     END_HOUR: 23,
   },
-  
+  // DEEPLX CONFIG - DENGAN PROTEKSI LIMIT
   DEEPLX_API_URLS: [
     'https://api.deeplx.org/translate',
     'https://deeplx.vercel.app/translate',
@@ -63,7 +57,7 @@ const CONSTANTS = {
   DEEPLX_BATCH_SIZE: 5,
   DEEPLX_BATCH_DELAY_MS: 3000,
   DEEPLX_MAX_RETRIES: 3,
-  
+  // CF LIMIT PROTECTION
   CF_SUBREQUEST_LIMIT: 50,
   CF_CPU_TIME_LIMIT_MS: 9000,
   CF_MEMORY_LIMIT_MB: 128,
@@ -109,7 +103,7 @@ export class GameServer {
     this._tikCounter = 0;
     this._gameStartFlags = new Map();
     
-    // QUIZ
+    // QUIZ - BATCH SYSTEM (FIXED)
     this.quizAnswered = new Set();
     this.quizHasWinner = false;
     this.quizWinner = null;
@@ -117,29 +111,25 @@ export class GameServer {
     this.isQuizRunning = false;
     this.currentQuestion = null;
     this.isQuizWaiting = false;
-    this.quizQuestionCache = {};
     this._quizStartTime = null;
     
-    // ==================== BATCH SYSTEM UNTUK 10.000 SOAL ====================
-    this._allQuestions = [];
-    this._currentQuestions = [];
-    this._currentBatchStart = 0;
-    this._currentBatchEnd = 0;
-    this._isAllQuestionsLoaded = false;
-    this._questionPointer = 0;
+    // ✅ BATCH SYSTEM - HANYA 100 SOAL DI MEMORY
+    this._currentBatch = [];          // ← Hanya 100 soal
+    this._currentBatchNumber = 0;     // ← Nomor batch (1-100)
+    this._totalBatches = 0;           // ← Total batch
+    this._questionPointer = 0;        // ← Index di batch
+    this._totalQuestions = 0;         // ← Total semua soal
+    this._isMetadataLoaded = false;   // ← Metadata sudah load?
     
-    // BATCH SYSTEM BARU
-    this._totalQuestions = 0;
-    this._totalBatches = 0;
-    this._currentBatchIndex = -1;
-    this._currentBatchQuestions = [];
-    this._isAllBatchesLoaded = false;
-    this._batchLoadCount = 0;
-    this._questionCounter = 0;
-    this._lastBatchLoaded = -1;
-    this._nextBatchCache = [];
+    // ❌ HAPUS INI:
+    // this._allQuestions = [];
+    // this._currentQuestions = [];
+    // this._currentBatchStart = 0;
+    // this._currentBatchEnd = 0;
+    // this._isAllQuestionsLoaded = false;
+    // this.quizQuestionCache = {};
     
-    // DEEPLX TRANSLATION
+    // DEEPLX TRANSLATION - DENGAN PROTEKSI
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
@@ -606,7 +596,7 @@ export class GameServer {
       
       if (oldRoom === roomName) {
         if (roomName === QUIZ_ROOM) {
-          if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+          if (!this._isMetadataLoaded || this._totalBatches === 0) {
             await this._initQuiz();
           }
           
@@ -648,7 +638,7 @@ export class GameServer {
       }
       
       if (roomName === QUIZ_ROOM) {
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        if (!this._isMetadataLoaded || this._totalBatches === 0) {
           await this._initQuiz();
         }
         
@@ -678,31 +668,29 @@ export class GameServer {
     }
   }
   
-  // ==================== LOAD SEMUA SOAL DARI KV ====================
+  // ==================== LOAD METADATA DARI KV ====================
   
-  async _loadAllQuestionsFromKV() {
+  async _loadQuizMetadata() {
     if (!this.env || !this.env.QUESTIONS) return false;
     
     try {
       this._incrementSubRequest();
-      const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
+      const meta = await this.env.QUESTIONS.get('quiz_metadata', 'json');
       
-      if (cached && cached.questions && Array.isArray(cached.questions) && cached.questions.length > 0) {
-        this._allQuestions = cached.questions.map((q, index) => ({
-          id: index + 1,
-          question: q.question || '',
-          options: q.options || { A: '', B: '', C: '', D: '' },
-          correct: q.correct || 'A',
-          category: q.category || 'General',
-          difficulty: q.difficulty || 'medium'
-        }));
+      if (meta && meta.total && meta.total > 0) {
+        this._totalQuestions = meta.total;
+        this._totalBatches = Math.ceil(meta.total / CONSTANTS.QUIZ_BATCH_SIZE);
+        this._isMetadataLoaded = true;
         
-        this._isAllQuestionsLoaded = true;
-        this._currentBatchStart = 0;
-        this._currentBatchEnd = 0;
-        this._questionPointer = 0;
-        
-        this._loadNextBatch();
+        // Broadcast info metadata
+        this._broadcastToRoom(QUIZ_ROOM, [
+          "quizMetadataLoaded",
+          {
+            total: this._totalQuestions,
+            batches: this._totalBatches,
+            batchSize: CONSTANTS.QUIZ_BATCH_SIZE
+          }
+        ]);
         
         return true;
       }
@@ -713,67 +701,118 @@ export class GameServer {
     }
   }
   
-  _loadNextBatch() {
-    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-      return false;
-    }
+  // ==================== LOAD SATU BATCH DARI KV (100 SOAL) ====================
+  
+  async _loadBatchFromKV(batchNumber) {
+    if (!this.env || !this.env.QUESTIONS) return null;
     
-    const totalQuestions = this._allQuestions.length;
-    let startIndex = this._currentBatchEnd;
-    
-    if (startIndex >= totalQuestions) {
-      startIndex = 0;
-      this._currentBatchStart = 0;
-      this._questionPointer = 0;
+    try {
+      this._incrementSubRequest();
+      const key = `quiz_batch_${batchNumber}`;
+      const data = await this.env.QUESTIONS.get(key, 'json');
       
-      this._broadcastToRoom(QUIZ_ROOM, [
-        "quizNotification",
-        "📢 All 10,000 questions have been answered! Starting from question 1 again!",
-        "info"
-      ]);
-    }
-    
-    let endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
-    const batch = this._allQuestions.slice(startIndex, endIndex);
-    
-    this.quizQuestionCache['en'] = batch;
-    this._currentQuestions = batch;
-    this._currentBatchStart = startIndex;
-    this._currentBatchEnd = endIndex;
-    this._questionPointer = 0;
-    
-    const startNum = startIndex + 1;
-    const endNum = endIndex;
-    
-    this._broadcastToRoom(QUIZ_ROOM, [
-      "quizBatchLoaded",
-      {
-        start: startNum,
-        end: endNum,
-        total: totalQuestions,
-        remaining: totalQuestions - endNum,
-        batch: Math.floor(startIndex / CONSTANTS.QUIZ_BATCH_SIZE) + 1,
-        totalBatches: Math.ceil(totalQuestions / CONSTANTS.QUIZ_BATCH_SIZE)
+      if (data && data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
+        // Format ulang soal
+        return data.questions.map((q, index) => ({
+          id: ((batchNumber - 1) * CONSTANTS.QUIZ_BATCH_SIZE) + index + 1,
+          question: q.question || '',
+          options: q.options || { A: '', B: '', C: '', D: '' },
+          correct: q.correct || 'A',
+          category: q.category || 'General',
+          difficulty: q.difficulty || 'medium'
+        }));
       }
-    ]);
-    
-    return true;
+      
+      return null;
+    } catch(e) {
+      return null;
+    }
   }
   
-  _checkAndLoadNextBatch() {
-    const currentQuestions = this.quizQuestionCache['en'] || [];
-    
-    if (currentQuestions.length < CONSTANTS.QUIZ_BATCH_THRESHOLD) {
-      this._loadNextBatch();
+  // ==================== LOAD BATCH BERIKUTNYA (HAPUS BATCH LAMA) ====================
+  
+  async _loadNextBatch() {
+    try {
+      // Cek apakah metadata sudah load
+      if (!this._isMetadataLoaded || this._totalBatches === 0) {
+        const loaded = await this._loadQuizMetadata();
+        if (!loaded) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizError",
+            "No quiz metadata found! Please upload questions."
+          ]);
+          return false;
+        }
+      }
+      
+      // Reset jika sudah batch terakhir
+      if (this._currentBatchNumber >= this._totalBatches) {
+        this._currentBatchNumber = 0;
+        this._questionPointer = 0;
+        
+        this._broadcastToRoom(QUIZ_ROOM, [
+          "quizNotification",
+          "📢 All questions answered! Starting from question 1 again!",
+          "info"
+        ]);
+      }
+      
+      const nextBatchNumber = this._currentBatchNumber + 1;
+      
+      // Ambil batch dari KV
+      const batch = await this._loadBatchFromKV(nextBatchNumber);
+      
+      if (!batch || batch.length === 0) {
+        // Fallback: coba batch 1
+        const fallback = await this._loadBatchFromKV(1);
+        if (fallback) {
+          // ✅ HAPUS BATCH LAMA (GC akan membersihkan)
+          this._currentBatch = null;
+          
+          // ✅ SIMPAN BATCH BARU
+          this._currentBatch = fallback;
+          this._currentBatchNumber = 1;
+          this._questionPointer = 0;
+          
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizBatchLoaded",
+            {
+              batch: this._currentBatchNumber,
+              totalBatches: this._totalBatches,
+              questionsInBatch: fallback.length,
+              progress: Math.round((this._currentBatchNumber / this._totalBatches) * 100)
+            }
+          ]);
+          
+          return true;
+        }
+        return false;
+      }
+      
+      // ✅ HAPUS BATCH LAMA (GC akan membersihkan)
+      this._currentBatch = null;
+      
+      // ✅ SIMPAN BATCH BARU
+      this._currentBatch = batch;
+      this._currentBatchNumber = nextBatchNumber;
+      this._questionPointer = 0;
+      
+      // Broadcast info batch baru
+      this._broadcastToRoom(QUIZ_ROOM, [
+        "quizBatchLoaded",
+        {
+          batch: this._currentBatchNumber,
+          totalBatches: this._totalBatches,
+          questionsInBatch: batch.length,
+          progress: Math.round((this._currentBatchNumber / this._totalBatches) * 100)
+        }
+      ]);
+      
       return true;
+      
+    } catch(e) {
+      return false;
     }
-    
-    if (this._currentBatchEnd >= this._allQuestions.length && this._isAllQuestionsLoaded) {
-      this._loadNextBatch();
-      return true;
-    }
-    
-    return false;
   }
   
   // ==================== QUIZ CORE ====================
@@ -813,14 +852,43 @@ export class GameServer {
         return;
       }
 
-      // Ambil soal berikutnya dari batch system
-      const q = await this._getNextQuestion();
+      // ✅ CEK APAKAH BATCH KOSONG ATAU SUDAH HABIS
+      if (!this._currentBatch || this._currentBatch.length === 0) {
+        const loaded = await this._loadNextBatch();
+        if (!loaded) {
+          this._broadcastToRoom(QUIZ_ROOM, [
+            "quizError",
+            "No questions available! Please add questions to KV."
+          ]);
+          return;
+        }
+        // Cek lagi setelah load
+        if (!this._currentBatch || this._currentBatch.length === 0) {
+          return;
+        }
+      }
       
-      if (!q) {
-        this._broadcastToRoom(QUIZ_ROOM, [
-          "quizError",
-          "No questions available! Please add questions to KV."
-        ]);
+      // ✅ CEK APAKAH POINTER SUDAH MENCAPAI AKHIR BATCH
+      if (this._questionPointer >= this._currentBatch.length) {
+        const loaded = await this._loadNextBatch(); // ← Load 100 baru, hapus yang lama
+        if (!loaded) {
+          return;
+        }
+        // Reset pointer untuk batch baru
+        if (this._currentBatch && this._currentBatch.length > 0) {
+          this._questionPointer = 0;
+        } else {
+          return;
+        }
+      }
+      
+      // ✅ AMBIL SOAL DARI BATCH AKTIF
+      const q = this._currentBatch[this._questionPointer];
+      this._questionPointer++;
+      
+      if (!q || !q.options) {
+        // Skip soal yang tidak valid
+        this._showQuestion();
         return;
       }
 
@@ -1144,24 +1212,22 @@ export class GameServer {
   
   _getQuizStatus() {
     try {
-      const total = this._allQuestions.length || 0;
-      const currentBatchStart = this._currentBatchStart + 1;
-      const currentBatchEnd = this._currentBatchEnd;
+      const total = this._totalQuestions || 0;
+      const currentBatch = this._currentBatchNumber;
+      const totalBatches = this._totalBatches;
       const pointer = this._questionPointer;
-      const remainingInBatch = (this.quizQuestionCache['en'] || []).length - pointer;
-      const nextBatchStart = currentBatchEnd + 1;
+      const remainingInBatch = this._currentBatch ? this._currentBatch.length - pointer : 0;
       
       return {
         total: total,
-        currentBatchStart: currentBatchStart,
-        currentBatchEnd: currentBatchEnd,
+        currentBatch: currentBatch,
+        totalBatches: totalBatches,
         pointer: pointer,
         remainingInBatch: remainingInBatch,
-        nextBatchStart: nextBatchStart,
-        currentBatch: Math.floor(this._currentBatchStart / CONSTANTS.QUIZ_BATCH_SIZE) + 1,
-        totalBatches: Math.ceil(total / CONSTANTS.QUIZ_BATCH_SIZE),
-        isComplete: this._currentBatchEnd >= total,
-        progress: total > 0 ? Math.round((this._currentBatchEnd / total) * 100) : 0
+        progress: total > 0 ? Math.round((currentBatch / totalBatches) * 100) : 0,
+        isComplete: currentBatch >= totalBatches,
+        batchSize: CONSTANTS.QUIZ_BATCH_SIZE,
+        isMetadataLoaded: this._isMetadataLoaded
       };
     } catch(e) {
       return { error: e.message };
@@ -1282,7 +1348,7 @@ export class GameServer {
     ws.username = null;
   }
   
-  // ==================== DEEPLX TRANSLATE ====================
+  // ==================== DEEPLX TRANSLATE - DENGAN PROTEKSI CF ====================
   
   _resetTranslateCounterDaily() {
     if (this._translateResetInterval) {
@@ -1343,6 +1409,7 @@ export class GameServer {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
   
+  // TRANSLATE SATU TEKS - DENGAN PROTEKSI CF
   async _translateSingleText(text, targetLang, retryCount = 0) {
     if (!this._canTranslate()) {
       return text;
@@ -1446,6 +1513,7 @@ export class GameServer {
     return text;
   }
   
+  // TRANSLATE BATCH - DENGAN PROTEKSI CF
   async _translateBatch(texts, targetLang) {
     if (!texts || texts.length === 0) return [];
     if (targetLang === 'en') return texts;
@@ -1469,6 +1537,7 @@ export class GameServer {
       }
       
       const text = texts[i];
+      const startTime = Date.now();
       
       try {
         let translated = await this._translateSingleText(text, targetLang);
@@ -2829,7 +2898,7 @@ export class GameServer {
           status: this.isDestroyed ? 'down' : 'healthy',
           games: this.activeGames ? this.activeGames.size : 0,
           connections: this.wsMap ? this.wsMap.size : 0,
-          questions: this._allQuestions ? this._allQuestions.length : 0,
+          questions: this._totalQuestions || 0,
           kvAvailable: !!(this.env && this.env.QUESTIONS),
           quizAutoEnabled: this.quizAutoEnabled || false,
           isQuizRunning: !!this.currentQuestion,
@@ -3089,7 +3158,8 @@ export class GameServer {
       }
       this._cleanupTimers.clear();
       
-      this.quizQuestionCache = {};
+      // ✅ HAPUS BATCH
+      this._currentBatch = null;
       this.userLanguage.clear();
       this.userCountry.clear();
       this.wsClients.clear();
@@ -3129,7 +3199,7 @@ export class GameServer {
       
       this._forceStartQuizIfTime();
       
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+      if (!this._isMetadataLoaded || this._totalBatches === 0) {
         this._initQuiz().then(() => {
           if (!this.closing && !this.isDestroyed) {
             this._startQuizIfNeeded();
@@ -3148,7 +3218,7 @@ export class GameServer {
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients || clients.size === 0) return;
       if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        if (!this._isMetadataLoaded || this._totalBatches === 0) {
           this._initQuiz().then(() => {
             if (!this.closing && !this.isDestroyed) {
               this._showQuestion();
@@ -3165,264 +3235,35 @@ export class GameServer {
   
   async _initQuiz(retryCount = 0) {
     try {
-      const loaded = await this._loadAllQuestionsFromKV();
-      if (loaded) {
-        this._startQuizLoop();
-        this._resetTranslateCounterDaily();
-        return true;
-      }
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    } catch(e) {
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
-      }
-      return false;
-    }
-  }
-  
-  // ==================== BATCH SYSTEM METHODS (BARU) ====================
-  
-  async _loadQuizMetadata() {
-    if (!this.env || !this.env.QUESTIONS) return false;
-    
-    try {
-      this._incrementSubRequest();
-      const metadata = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_METADATA_KEY, 'json');
-      
-      if (metadata && metadata.totalQuestions) {
-        this._totalQuestions = metadata.totalQuestions;
-        this._totalBatches = Math.ceil(this._totalQuestions / CONSTANTS.QUIZ_BATCH_SIZE);
-        this._currentBatchIndex = -1;
-        this._questionPointer = 0;
-        this._isAllBatchesLoaded = false;
-        this._batchLoadCount = 0;
-        this._questionCounter = 0;
-        this._lastBatchLoaded = -1;
-        this._currentBatchQuestions = [];
-        this._nextBatchCache = [];
-        
-        console.log(`📊 Metadata loaded: ${this._totalQuestions} questions, ${this._totalBatches} batches`);
-        return true;
-      }
-      
-      return false;
-    } catch(e) {
-      console.error('Failed to load quiz metadata:', e);
-      return false;
-    }
-  }
-  
-  async _loadBatchFromKV(batchIndex) {
-    if (!this.env || !this.env.QUESTIONS) return false;
-    
-    try {
-      if (batchIndex < 0 || batchIndex >= this._totalBatches) {
-        console.error(`❌ Invalid batch index: ${batchIndex}`);
+      // 1. Load metadata
+      const metaLoaded = await this._loadQuizMetadata();
+      if (!metaLoaded) {
+        if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+          setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+        }
         return false;
       }
       
-      // HAPUS BATCH LAMA
-      if (this._currentBatchQuestions.length > 0) {
-        console.log(`🗑️  Hapus batch ${this._currentBatchIndex} dari memory`);
-        this._currentBatchQuestions = [];
+      // 2. Load batch pertama
+      const batchLoaded = await this._loadNextBatch();
+      if (!batchLoaded) {
+        if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+          setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+        }
+        return false;
       }
       
-      // AMBIL BATCH BARU DARI KV
-      this._incrementSubRequest();
-      const batchKey = `${CONSTANTS.QUIZ_BATCH_PREFIX}${batchIndex}`;
-      const batch = await this.env.QUESTIONS.get(batchKey, 'json');
-      
-      if (batch && Array.isArray(batch) && batch.length > 0) {
-        this._currentBatchQuestions = batch;
-        this._currentBatchIndex = batchIndex;
-        this._questionPointer = 0;
-        this._lastBatchLoaded = batchIndex;
-        this._batchLoadCount++;
-        this._questionCounter = batchIndex * CONSTANTS.QUIZ_BATCH_SIZE;
-        
-        const startNum = batchIndex * CONSTANTS.QUIZ_BATCH_SIZE + 1;
-        const endNum = Math.min(
-          (batchIndex + 1) * CONSTANTS.QUIZ_BATCH_SIZE,
-          this._totalQuestions
-        );
-        
-        console.log(`✅ Load batch ${batchIndex}: questions ${startNum}-${endNum} (${batch.length} questions)`);
-        console.log(`📊 Memory: ${this._currentBatchQuestions.length} questions (${(this._currentBatchQuestions.length * 300 / 1024).toFixed(2)} KB)`);
-        
-        this._isAllBatchesLoaded = (batchIndex >= this._totalBatches - 1);
-        
-        this._broadcastToRoom(QUIZ_ROOM, [
-          "quizBatchLoaded",
-          {
-            start: startNum,
-            end: endNum,
-            total: this._totalQuestions,
-            remaining: this._totalQuestions - endNum,
-            batch: batchIndex + 1,
-            totalBatches: this._totalBatches,
-            progress: Math.round((endNum / this._totalQuestions) * 100)
-          }
-        ]);
-        
-        return true;
-      }
-      
-      return false;
-    } catch(e) {
-      console.error(`Failed to load batch ${batchIndex}:`, e);
-      return false;
-    }
-  }
-  
-  async _loadNextBatch() {
-    if (this._totalQuestions === 0 || this._totalBatches === 0) {
-      return false;
-    }
-    
-    let nextBatchIndex = this._currentBatchIndex + 1;
-    
-    if (nextBatchIndex >= this._totalBatches) {
-      nextBatchIndex = 0;
-      this._questionCounter = 0;
-      
-      console.log('🔄 All batches completed! Starting from batch 0 again');
-      
-      this._broadcastToRoom(QUIZ_ROOM, [
-        "quizNotification",
-        "📢 All 10,000 questions have been answered! Starting from question 1 again!",
-        "info"
-      ]);
-    }
-    
-    if (nextBatchIndex === this._lastBatchLoaded && this._currentBatchQuestions.length > 0) {
-      console.log(`⚠️ Batch ${nextBatchIndex} already loaded, skip`);
-      return true;
-    }
-    
-    // CEK CACHE DULU
-    if (this._nextBatchCache && this._nextBatchCache.length > 0 && this._nextBatchCache._batchIndex === nextBatchIndex) {
-      console.log(`📦 Using cached batch ${nextBatchIndex}`);
-      this._currentBatchQuestions = this._nextBatchCache;
-      this._currentBatchIndex = nextBatchIndex;
-      this._questionPointer = 0;
-      this._lastBatchLoaded = nextBatchIndex;
-      this._questionCounter = nextBatchIndex * CONSTANTS.QUIZ_BATCH_SIZE;
-      this._nextBatchCache = [];
-      return true;
-    }
-    
-    return await this._loadBatchFromKV(nextBatchIndex);
-  }
-  
-  async _getNextQuestion() {
-    if (this._currentBatchQuestions.length === 0) {
-      const loaded = await this._loadBatchFromKV(0);
-      if (!loaded) return null;
-    }
-    
-    if (this._questionPointer >= this._currentBatchQuestions.length) {
-      const loaded = await this._loadNextBatch();
-      if (!loaded) return null;
-    }
-    
-    const question = this._currentBatchQuestions[this._questionPointer];
-    this._questionPointer++;
-    this._questionCounter++;
-    
-    // Preload batch berikutnya jika sisa 5 soal
-    if (this._currentBatchQuestions.length - this._questionPointer <= 5 && !this._isAllBatchesLoaded) {
-      const nextIndex = this._currentBatchIndex + 1;
-      if (nextIndex < this._totalBatches) {
-        this._preloadBatch(nextIndex);
-      }
-    }
-    
-    return question;
-  }
-  
-  async _preloadBatch(batchIndex) {
-    if (!this.env || !this.env.QUESTIONS) return;
-    try {
-      const batchKey = `${CONSTANTS.QUIZ_BATCH_PREFIX}${batchIndex}`;
-      const batch = await this.env.QUESTIONS.get(batchKey, 'json');
-      if (batch && Array.isArray(batch) && batch.length > 0) {
-        batch._batchIndex = batchIndex;
-        this._nextBatchCache = batch;
-        console.log(`📦 Pre-loaded batch ${batchIndex}`);
-      }
-    } catch(e) {
-      // Silent
-    }
-  }
-  
-  async resetQuiz() {
-    try {
-      this.currentQuestion = null;
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this.quizAnswered = new Set();
-      this.isQuizWaiting = false;
-      this.quizAutoEnabled = false;
-      
-      if (this._quizTimeout) {
-        clearTimeout(this._quizTimeout);
-        this._quizTimeout = null;
-      }
-      if (this._quizBreakTimeout) {
-        clearTimeout(this._quizBreakTimeout);
-        this._quizBreakTimeout = null;
-      }
-      if (this._quizStartTimeout) {
-        clearTimeout(this._quizStartTimeout);
-        this._quizStartTimeout = null;
-      }
-      
-      // Reset batch
-      this._currentBatchQuestions = [];
-      this._currentBatchIndex = -1;
-      this._questionPointer = 0;
-      this._questionCounter = 0;
-      this._nextBatchCache = [];
+      // 3. Start quiz loop
+      this._startQuizLoop();
+      this._resetTranslateCounterDaily();
       
       return true;
+      
     } catch(e) {
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initQuiz(retryCount + 1), 5000);
+      }
       return false;
     }
-  }
-  
-  async startQuizWithDelay(delayMs) {
-    if (this._quizStartTimeout) {
-      clearTimeout(this._quizStartTimeout);
-      this._quizStartTimeout = null;
-    }
-    
-    this._quizStartTimeout = setTimeout(() => {
-      if (this.closing || this.isDestroyed) return;
-      this._quizStartTimeout = null;
-      if (this._isQuizTime() && this.quizAutoEnabled) {
-        this._showQuestion();
-      }
-    }, delayMs);
-  }
-  
-  _ensureSingleConnection(room, username, newWs, newWsId) {
-    const game = this.activeGames.get(room);
-    if (!game) return newWsId;
-    
-    const existingWsId = game.playerWsId?.get(username);
-    if (existingWsId && existingWsId !== newWsId) {
-      const existingWs = this.wsMap.get(existingWsId);
-      if (existingWs && existingWs.readyState === 1) {
-        try {
-          existingWs.close(1000, "Duplicate connection");
-        } catch(e) {}
-      }
-      game.playerWsId.set(username, newWsId);
-    }
-    
-    return newWsId;
   }
 }
