@@ -68,8 +68,8 @@ const QUIZ_SCHEDULE = {
   SESSION1: { start: 0, end: 2 },
   SESSION2: { start: 4, end: 6 },
   SESSION3: { start: 8, end: 10 },
-  SESSION4: { start: 12, end: 14 },
-  SESSION5: { start: 16, end: 18 },
+  SESSION4: { start: 12, end: 22 },
+  SESSION5: { start: 16, end: 22 },
   SESSION6: { start: 20, end: 22 },
 };
 
