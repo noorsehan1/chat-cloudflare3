@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL COMPLETE - CLEAR) ====================
+// ==================== GAME-SERVER.JS (FULL COMPLETE - FIXED) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -55,7 +55,7 @@ const QUIZ_SCHEDULE = {
 
 const QUIZ_ROOM = "Quiz";
 
-// ==================== CPU PROTECTION ====================
+// ==================== CPU PROTECTION MIXIN ====================
 
 class CPUProtection {
   constructor() {
@@ -211,16 +211,6 @@ class TranslationManager extends CPUProtection {
     this._translateResetInterval = null;
     this._pendingTranslations = new Map();
     this._translationCache = new Map();
-    this._userLanguageCache = new Map();
-  }
-
-  clearUserCache() {
-    if (this._userLanguageCache.size > 0) {
-      this._userLanguageCache.clear();
-    }
-    if (this.questionCache.size > 0) {
-      this.questionCache.clear();
-    }
   }
 
   resetQuestionCache() {
@@ -231,16 +221,17 @@ class TranslationManager extends CPUProtection {
 
   async translateForUsersSync(question, options, usersByLang) {
     const results = new Map();
+    const cacheKey = this._getCacheKey(question, options);
     const needTranslate = [];
 
     for (const [lang, users] of usersByLang) {
-      const cacheKey = this._getCacheKey(question, options);
-      const langCacheKey = `${cacheKey}_${lang}`;
-      
-      let cached = this._translationCache.get(langCacheKey);
-      if (!cached) {
-        cached = this._userLanguageCache.get(langCacheKey);
+      if (lang === 'en') {
+        results.set(lang, { question, options, users, isFallback: false, fromCache: true });
+        continue;
       }
+
+      const langCacheKey = `${cacheKey}_${lang}`;
+      const cached = this._translationCache.get(langCacheKey);
 
       if (cached) {
         results.set(lang, {
@@ -258,27 +249,18 @@ class TranslationManager extends CPUProtection {
     if (needTranslate.length > 0) {
       const translatePromises = needTranslate.map(async ({ lang, users }) => {
         try {
-          let translatedQuestion, translatedOptions;
-          
-          if (lang === 'en') {
-            translatedQuestion = question;
-            translatedOptions = options;
-          } else {
-            [translatedQuestion, translatedOptions] = await Promise.all([
-              this._translateText(question, lang),
-              this._translateOptions(options, lang)
-            ]);
-          }
+          const [translatedQuestion, translatedOptions] = await Promise.all([
+            this._translateText(question, lang),
+            this._translateOptions(options, lang)
+          ]);
 
           const result = {
             question: translatedQuestion || question,
             options: translatedOptions || options
           };
 
-          const cacheKey = this._getCacheKey(question, options);
           const langCacheKey = `${cacheKey}_${lang}`;
           this._translationCache.set(langCacheKey, result);
-          this._userLanguageCache.set(langCacheKey, result);
 
           return { lang, users, result, isFallback: false };
         } catch(e) {
@@ -307,32 +289,8 @@ class TranslationManager extends CPUProtection {
     this._sendResults(results);
   }
 
-  _sendResults(results) {
-    for (const [lang, data] of results) {
-      const { question, options, users, isFallback, fromCache } = data;
-      const message = ["quizQuestion", {
-        question: question || '',
-        options: options || { A: '', B: '', C: '', D: '' },
-        isFallback: isFallback || false,
-        lang: lang
-      }];
-      const msgStr = JSON.stringify(message);
-
-      for (const ws of users) {
-        if (ws && ws.readyState === 1) {
-          try { ws.send(msgStr); } catch(e) {}
-        }
-      }
-    }
-  }
-
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en' || !text || typeof text !== 'string') return text;
-
-    const userCacheKey = `${text}_${targetLang}`;
-    if (this._userLanguageCache.has(userCacheKey)) {
-      return this._userLanguageCache.get(userCacheKey);
-    }
 
     const cacheKey = `${text}_${targetLang}`;
     if (this._translationCache.has(cacheKey)) {
@@ -343,7 +301,6 @@ class TranslationManager extends CPUProtection {
       const result = await this._safeExecute(async () => await this._callTranslateAPI(text, targetLang));
       this.translateCount++;
       this._translationCache.set(cacheKey, result);
-      this._userLanguageCache.set(userCacheKey, result);
       return result;
     } catch(e) {
       if (retryCount < 5) {
@@ -376,6 +333,24 @@ class TranslationManager extends CPUProtection {
 
   _getCacheKey(question, options) {
     return `${question}|${Object.values(options).join('|')}`;
+  }
+
+  _sendResults(results) {
+    for (const [lang, data] of results) {
+      const { question, options, users, isFallback, fromCache } = data;
+      const message = ["quizQuestion", {
+        question: question || '',
+        options: options || { A: '', B: '', C: '', D: '' },
+        isFallback: isFallback || false
+      }];
+      const msgStr = JSON.stringify(message);
+
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try { ws.send(msgStr); } catch(e) {}
+        }
+      }
+    }
   }
 
   async _callTranslateAPI(text, targetLang) {
@@ -496,7 +471,7 @@ class TranslationManager extends CPUProtection {
   }
 }
 
-// ==================== GAME SERVER ====================
+// ==================== GAME SERVER CLASS ====================
 
 export class GameServer extends CPUProtection {
   constructor(state, env) {
@@ -751,6 +726,7 @@ export class GameServer extends CPUProtection {
   async _checkQuizAutoStatus() {
     try {
       const isQuizTime = this._isQuizTime();
+      const wibTime = this._getCurrentWIBTime();
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
@@ -1292,21 +1268,12 @@ export class GameServer extends CPUProtection {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds?.size) return;
 
-    this.translationManager.clearUserCache();
-
     const usersByLang = new Map();
     for (const wsId of wsIds) {
       try {
         const ws = this.wsMap.get(wsId);
         if (!ws || ws.readyState !== 1) continue;
-        
-        let lang = this.userLanguage.get(wsId) || 'en';
-        if (!lang || lang === 'undefined') {
-          const country = this.userCountry.get(wsId) || 'US';
-          lang = this._countryToLanguage(country);
-          this.userLanguage.set(wsId, lang);
-        }
-        
+        const lang = this.userLanguage.get(wsId) || 'en';
         if (!usersByLang.has(lang)) usersByLang.set(lang, []);
         usersByLang.get(lang).push(ws);
       } catch(e) {}
@@ -1423,44 +1390,25 @@ export class GameServer extends CPUProtection {
     try {
       const wsId = this._getWsId(ws);
       if (!wsId) return;
-      
-      let lang = this.userLanguage.get(wsId) || 'en';
-      if (!lang || lang === 'undefined') {
-        const country = this.userCountry.get(wsId) || 'US';
-        lang = this._countryToLanguage(country);
-        this.userLanguage.set(wsId, lang);
-      }
-      
+      const lang = this.userLanguage.get(wsId) || 'en';
       const question = this.currentQuestion.question;
       const options = this.currentQuestion.options;
 
       if (lang === 'en') {
-        this._safeSend(ws, ["quizQuestion", { 
-          question, 
-          options, 
-          isFallback: false,
-          lang: 'en'
-        }]);
-        return;
-      }
-
-      this.translationManager._translateText(question, lang).then(translatedQ => {
-        this.translationManager._translateOptions(options, lang).then(translatedOpts => {
-          this._safeSend(ws, ["quizQuestion", {
-            question: translatedQ || question,
-            options: translatedOpts || options,
-            isFallback: false,
-            lang: lang
-          }]);
+        this._safeSend(ws, ["quizQuestion", { question, options, isFallback: false }]);
+      } else {
+        this.translationManager._translateText(question, lang).then(translatedQ => {
+          this.translationManager._translateOptions(options, lang).then(translatedOpts => {
+            this._safeSend(ws, ["quizQuestion", {
+              question: translatedQ || question,
+              options: translatedOpts || options,
+              isFallback: false
+            }]);
+          });
+        }).catch(() => {
+          this._safeSend(ws, ["quizQuestion", { question, options, isFallback: true }]);
         });
-      }).catch(() => {
-        this._safeSend(ws, ["quizQuestion", { 
-          question, 
-          options, 
-          isFallback: true,
-          lang: 'en'
-        }]);
-      });
+      }
 
       if (this._quizStartTime) {
         const elapsed = (Date.now() - this._quizStartTime) / 1000;
@@ -1671,7 +1619,7 @@ export class GameServer extends CPUProtection {
   _countryToLanguage(countryCode) {
     if (!countryCode) return 'en';
     const map = {
-      'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id', 'BN': 'id',
+      'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id',
       'TH': 'th', 'VN': 'vi', 'KH': 'km', 'LA': 'lo',
       'MM': 'my', 'TL': 'pt',
       'CN': 'zh', 'TW': 'zh', 'HK': 'zh', 'MO': 'zh',
@@ -1697,14 +1645,7 @@ export class GameServer extends CPUProtection {
       'GR': 'el', 'HU': 'hu', 'CS': 'cs', 'SK': 'sk',
       'RO': 'ro', 'BG': 'bg', 'HR': 'hr', 'SI': 'sl',
     };
-    const lang = map[countryCode.toUpperCase()];
-    if (!lang) {
-      if (['ID', 'MY', 'SG', 'PH', 'TH', 'VN'].includes(countryCode.toUpperCase())) {
-        return 'id';
-      }
-      return 'en';
-    }
-    return lang;
+    return map[countryCode.toUpperCase()] || 'en';
   }
 
   async switchRoom(ws, room, username = null) {
