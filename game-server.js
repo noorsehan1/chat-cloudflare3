@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FIXED INFINITE RESTART) ====================
+// ==================== GAME-SERVER.JS (FIXED TIME UP POSITION) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -231,7 +231,6 @@ class CountryBasedQuizSystem {
 
   async loadAllQuestions() {
     try {
-      // Prevent multiple simultaneous loads
       if (this._loading) {
         return this._isLoaded;
       }
@@ -595,6 +594,8 @@ export class GameServer extends CPUProtection {
       this._isShowingQuestion = false;
       this._quizInitAttempts = 0;
       this._maxQuizInitAttempts = 3;
+      this._timeUpNotified = false;
+      this._timeUpTimer = null; // Timer untuk notifikasi time up 5 detik
 
       this.quizEndedToday = false;
       this.quizEndMessageShown = false;
@@ -602,13 +603,11 @@ export class GameServer extends CPUProtection {
 
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
 
-      // Initialize with a single attempt
       this._initAsync();
 
       this._startCPUMonitor();
       this._startHealthCheck();
 
-      // Single delayed load attempt
       setTimeout(async () => {
         try {
           if (!this.closing && !this.isDestroyed) {
@@ -627,7 +626,6 @@ export class GameServer extends CPUProtection {
         }
       }, 5000);
 
-      // Single force start after initialization
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
           this.forceStartQuiz();
@@ -664,7 +662,6 @@ export class GameServer extends CPUProtection {
       }
       this._errorCount++;
       
-      // Only attempt recovery if not already recovering and under max attempts
       if (this._errorCount > CONSTANTS.MAX_UNHANDLED_ERRORS && 
           !this._isRecovering && 
           this._recoveryAttempts < this._maxRecoveryAttempts) {
@@ -709,13 +706,17 @@ export class GameServer extends CPUProtection {
         }
       }
 
-      // Don't auto-restart quiz in health check - let the scheduler handle it
       if (this._isQuizTime() && this.currentQuestion && this._quizStartTime) {
         const elapsed = (now - this._quizStartTime) / 1000;
         if (elapsed > (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) + 30) {
           this.currentQuestion = null;
           this._quizTimeout = null;
           this._isShowingQuestion = false;
+          this._timeUpNotified = false;
+          if (this._timeUpTimer) {
+            clearTimeout(this._timeUpTimer);
+            this._timeUpTimer = null;
+          }
         }
       }
 
@@ -752,12 +753,10 @@ export class GameServer extends CPUProtection {
       this._resetCriticalState();
       this._cleanupResources();
       
-      // Don't re-initialize if already initialized
       if (!this._initialized && !this._initializing) {
         this._initAsync();
       }
       
-      // Don't force start quiz - let scheduler handle it
       if (this._isQuizTime()) {
         this.quizAutoEnabled = true;
       }
@@ -778,6 +777,11 @@ export class GameServer extends CPUProtection {
       this.quizAnswered = new Set();
       this._quizStartTime = null;
       this._isShowingQuestion = false;
+      this._timeUpNotified = false;
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
+      }
       if (this._eventQueue) {
         this._eventQueue = [];
       }
@@ -800,6 +804,10 @@ export class GameServer extends CPUProtection {
       if (this._quizStartTimeout) {
         clearTimeout(this._quizStartTimeout);
         this._quizStartTimeout = null;
+      }
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
       }
       if (this.quizTimer) {
         clearInterval(this.quizTimer);
@@ -931,7 +939,6 @@ export class GameServer extends CPUProtection {
 
   async _initAsync() {
     try {
-      // Prevent multiple simultaneous initializations
       if (this._initializing) {
         return;
       }
@@ -942,10 +949,8 @@ export class GameServer extends CPUProtection {
       
       this._initializing = true;
       
-      // Load questions from KV (only once)
       await this.countryQuizSystem.loadAllQuestions();
       
-      // Initialize quiz with loaded questions
       await this._initQuiz();
       this._startQuizScheduler();
       await this._checkAndResetWeeklyPoints();
@@ -959,7 +964,6 @@ export class GameServer extends CPUProtection {
       this._initializing = false;
       this._handleError('initAsync', e);
       
-      // Only retry if under max attempts
       if (this._quizInitAttempts < this._maxQuizInitAttempts && !this.closing && !this.isDestroyed) {
         this._quizInitAttempts++;
         setTimeout(() => {
@@ -1226,7 +1230,6 @@ export class GameServer extends CPUProtection {
 
   forceStartQuiz() {
     try {
-      // Prevent multiple simultaneous starts
       if (this._isShowingQuestion) {
         return false;
       }
@@ -1262,7 +1265,6 @@ export class GameServer extends CPUProtection {
 
   ensureQuizRunning() {
     try {
-      // Only attempt if not already showing and initialized
       if (this._isShowingQuestion) {
         return;
       }
@@ -1430,8 +1432,7 @@ export class GameServer extends CPUProtection {
                 countryName: userQuestion.countryName,
                 flag: userQuestion.flag,
                 isTranslated: userQuestion.isTranslated,
-                questionId: this._questionPointer,
-                totalQuestions: this._allQuestions.length
+                questionId: this._questionPointer
               }];
               this._safeSend(ws, message);
             }
@@ -1459,7 +1460,6 @@ export class GameServer extends CPUProtection {
 
   async _showQuestion() {
     try {
-      // Prevent duplicate question display
       if (this._isShowingQuestion) {
         return;
       }
@@ -1487,6 +1487,11 @@ export class GameServer extends CPUProtection {
       if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) return;
 
       this._isShowingQuestion = true;
+      this._timeUpNotified = false;
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
+      }
 
       try {
         this._checkAndLoadNextBatch();
@@ -1505,7 +1510,6 @@ export class GameServer extends CPUProtection {
           return;
         }
         
-        // Pick a random question
         const randomIndex = Math.floor(Math.random() * totalQuestions);
         const q = this._allQuestions[randomIndex];
         
@@ -1540,18 +1544,64 @@ export class GameServer extends CPUProtection {
 
         this._broadcastToRoom(QUIZ_ROOM, [
           "quizTimeLeft",
-          `Question ${this._questionPointer}/${this._allQuestions.length} - ${remainingTime}s remaining`,
+          `${remainingTime}s remaining`,
           false
         ]);
 
         if (this._quizTimeout) clearTimeout(this._quizTimeout);
         if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
 
+        // ==================== TIME UP NOTIFICATION 5 DETIK SEBELUM HABIS ====================
+        // Kirim notifikasi "Time is up!" 5 detik sebelum waktu habis
+        const timeUpDelay = CONSTANTS.QUIZ_TIME_LIMIT_MS - 5000; // 5 detik sebelum habis
+        if (this._timeUpTimer) {
+          clearTimeout(this._timeUpTimer);
+          this._timeUpTimer = null;
+        }
+        
+        this._timeUpTimer = setTimeout(() => {
+          try {
+            if (this.closing || this.isDestroyed || !this.currentQuestion) {
+              this._timeUpTimer = null;
+              return;
+            }
+            
+            // Kirim notifikasi time up di atas pertanyaan
+            if (!this._timeUpNotified && !this.quizHasWinner) {
+              this._timeUpNotified = true;
+              const correctAnswer = this.currentQuestion.correct;
+              const question = this.currentQuestion.question;
+              const options = this.currentQuestion.options;
+              
+              // Broadcast time up notification ke semua user
+              this._broadcastQuizNotification("quizTimeUp", {
+                message: "⏰ Time is up!",
+                correctAnswer: correctAnswer,
+                question: question,
+                options: options
+              });
+              
+              // Kirim ke room sebagai peringatan
+              this._broadcastToRoom(QUIZ_ROOM, ["quizTimeUp", {
+                message: "⏰ Time is up!",
+                correctAnswer: correctAnswer
+              }]);
+            }
+            this._timeUpTimer = null;
+          } catch(e) {
+            this._timeUpTimer = null;
+          }
+        }, timeUpDelay);
+
         this._quizTimeout = setTimeout(async () => {
           try {
             if (this.closing || this.isDestroyed) { 
               this._quizTimeout = null; 
               this._isShowingQuestion = false;
+              if (this._timeUpTimer) {
+                clearTimeout(this._timeUpTimer);
+                this._timeUpTimer = null;
+              }
               return; 
             }
             const currentClients = this.wsClients.get(QUIZ_ROOM);
@@ -1559,6 +1609,10 @@ export class GameServer extends CPUProtection {
               this._quizTimeout = null; 
               this.currentQuestion = null;
               this._isShowingQuestion = false;
+              if (this._timeUpTimer) {
+                clearTimeout(this._timeUpTimer);
+                this._timeUpTimer = null;
+              }
               return; 
             }
 
@@ -1566,7 +1620,11 @@ export class GameServer extends CPUProtection {
             const question = this.currentQuestion.question;
             const options = this.currentQuestion.options;
 
-            this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
+            // Jangan kirim ulang time up disini, sudah dikirim 5 detik sebelumnya
+            if (!this._timeUpNotified) {
+              this._timeUpNotified = true;
+              this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
+            }
 
             if (this.quizHasWinner && this.quizWinner) {
               const points = await this._getQuizPoints();
@@ -1585,13 +1643,20 @@ export class GameServer extends CPUProtection {
                 correctAnswer
               });
             } else {
-              this._broadcastQuizNotification("quizTimeout", { noWinner: true });
-              this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
+              // Hanya kirim jika belum ada winner dan belum pernah dikirim
+              if (!this._timeUpNotified) {
+                this._broadcastQuizNotification("quizTimeout", { noWinner: true });
+                this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
+              }
             }
 
             this._quizTimeout = null;
             this.isQuizWaiting = true;
             this._isShowingQuestion = false;
+            if (this._timeUpTimer) {
+              clearTimeout(this._timeUpTimer);
+              this._timeUpTimer = null;
+            }
 
             this._quizBreakTimeout = setTimeout(() => {
               if (this.closing || this.isDestroyed) { 
@@ -1601,16 +1666,18 @@ export class GameServer extends CPUProtection {
               this.isQuizWaiting = false;
               this._quizBreakTimeout = null;
               this.currentQuestion = null;
-              this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "5"]);
-              setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "3"]), 2000);
-              setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "1"]), 4000);
-              // Don't auto-restart here - let scheduler handle it
+              this._timeUpNotified = false;
             }, CONSTANTS.QUIZ_BREAK_MS);
           } catch(e) {
             this._quizTimeout = null;
             this.currentQuestion = null;
             this.isQuizWaiting = false;
             this._isShowingQuestion = false;
+            this._timeUpNotified = false;
+            if (this._timeUpTimer) {
+              clearTimeout(this._timeUpTimer);
+              this._timeUpTimer = null;
+            }
           }
         }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
       } catch(e) {
@@ -1618,12 +1685,22 @@ export class GameServer extends CPUProtection {
         this.currentQuestion = null;
         this.isQuizWaiting = false;
         this._quizTimeout = null;
+        this._timeUpNotified = false;
+        if (this._timeUpTimer) {
+          clearTimeout(this._timeUpTimer);
+          this._timeUpTimer = null;
+        }
       }
     } catch(e) {
       this._isShowingQuestion = false;
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
+      this._timeUpNotified = false;
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
+      }
     }
   }
 
@@ -1634,6 +1711,11 @@ export class GameServer extends CPUProtection {
       if (!currentClients?.size) { 
         this.currentQuestion = null;
         this._isShowingQuestion = false;
+        this._timeUpNotified = false;
+        if (this._timeUpTimer) {
+          clearTimeout(this._timeUpTimer);
+          this._timeUpTimer = null;
+        }
         return; 
       }
 
@@ -1641,7 +1723,10 @@ export class GameServer extends CPUProtection {
       const question = this.currentQuestion.question;
       const options = this.currentQuestion.options;
 
-      this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
+      if (!this._timeUpNotified) {
+        this._timeUpNotified = true;
+        this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
+      }
 
       if (this.quizHasWinner && this.quizWinner) {
         const points = await this._getQuizPoints();
@@ -1660,13 +1745,19 @@ export class GameServer extends CPUProtection {
           correctAnswer
         });
       } else {
-        this._broadcastQuizNotification("quizTimeout", { noWinner: true });
-        this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
+        if (!this._timeUpNotified) {
+          this._broadcastQuizNotification("quizTimeout", { noWinner: true });
+          this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
+        }
       }
 
       this.currentQuestion = null;
       this.isQuizWaiting = true;
       this._isShowingQuestion = false;
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
+      }
 
       this._quizBreakTimeout = setTimeout(() => {
         if (this.closing || this.isDestroyed) { 
@@ -1675,12 +1766,17 @@ export class GameServer extends CPUProtection {
         }
         this.isQuizWaiting = false;
         this._quizBreakTimeout = null;
-        // Don't auto-restart here - let scheduler handle it
+        this._timeUpNotified = false;
       }, CONSTANTS.QUIZ_BREAK_MS);
     } catch(e) {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._isShowingQuestion = false;
+      this._timeUpNotified = false;
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
+      }
     }
   }
 
@@ -1824,6 +1920,10 @@ export class GameServer extends CPUProtection {
       if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
       if (this._quizStartTimeout) clearTimeout(this._quizStartTimeout);
       if (this._quizKeepAliveInterval) clearInterval(this._quizKeepAliveInterval);
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
+      }
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this.quizHasWinner = false;
@@ -1832,6 +1932,7 @@ export class GameServer extends CPUProtection {
       this._quizStartTime = null;
       this.quizEndNotified = false;
       this._isShowingQuestion = false;
+      this._timeUpNotified = false;
       this._startQuizKeepAlive();
     } catch(e) {}
   }
@@ -1923,7 +2024,10 @@ export class GameServer extends CPUProtection {
                 this.currentQuestion = null;
                 this._quizTimeout = null;
                 this._isShowingQuestion = false;
-                // Don't auto-show here - let scheduler handle it
+                if (this._timeUpTimer) {
+                  clearTimeout(this._timeUpTimer);
+                  this._timeUpTimer = null;
+                }
               }
             }
           } else {
@@ -1945,6 +2049,11 @@ export class GameServer extends CPUProtection {
       this.quizWinner = null;
       this.isQuizWaiting = false;
       this._isShowingQuestion = false;
+      this._timeUpNotified = false;
+      if (this._timeUpTimer) {
+        clearTimeout(this._timeUpTimer);
+        this._timeUpTimer = null;
+      }
       
       if (this._quizTimeout) {
         clearTimeout(this._quizTimeout);
