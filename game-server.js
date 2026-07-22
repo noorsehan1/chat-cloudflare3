@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL COMPLETE - FIXED) ====================
+// ==================== GAME-SERVER.JS (FULL COMPLETE - FIXED SUBMIT & WINNER) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -63,8 +63,6 @@ class CPUProtection {
     this._cpuTotalTime = 0;
     this._cpuCheckCount = 0;
     this._isThrottled = false;
-    this._pendingOperations = [];
-    this._isProcessingPending = false;
     this._cpuHistory = [];
     this._cpuAverage = 0;
     this._eventQueue = [];
@@ -203,20 +201,12 @@ class TranslationManager extends CPUProtection {
   constructor(gameServer) {
     super();
     this.gameServer = gameServer;
-    this.questionCache = new Map();
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
     this._translateResetInterval = null;
-    this._pendingTranslations = new Map();
     this._translationCache = new Map();
-  }
-
-  resetQuestionCache() {
-    if (this.questionCache.size > 0) this.questionCache.clear();
-    this.translateCount = 0;
-    this.translateLimitReached = false;
   }
 
   async translateForUsersSync(question, options, usersByLang) {
@@ -226,7 +216,7 @@ class TranslationManager extends CPUProtection {
 
     for (const [lang, users] of usersByLang) {
       if (lang === 'en') {
-        results.set(lang, { question, options, users, isFallback: false, fromCache: true });
+        results.set(lang, { question, options, users, isFallback: false });
         continue;
       }
 
@@ -238,8 +228,7 @@ class TranslationManager extends CPUProtection {
           question: cached.question,
           options: cached.options,
           users,
-          isFallback: false,
-          fromCache: true
+          isFallback: false
         });
       } else {
         needTranslate.push({ lang, users });
@@ -280,8 +269,7 @@ class TranslationManager extends CPUProtection {
           question: result.question,
           options: result.options,
           users,
-          isFallback,
-          fromCache: false
+          isFallback
         });
       }
     }
@@ -337,7 +325,7 @@ class TranslationManager extends CPUProtection {
 
   _sendResults(results) {
     for (const [lang, data] of results) {
-      const { question, options, users, isFallback, fromCache } = data;
+      const { question, options, users, isFallback } = data;
       const message = ["quizQuestion", {
         question: question || '',
         options: options || { A: '', B: '', C: '', D: '' },
@@ -495,9 +483,6 @@ export class GameServer extends CPUProtection {
     this.roomViewers = new Map();
     this.userConnections = new Map();
     this._cleanupTimers = new Map();
-    this._roomBroadcastCount = new Map();
-    this._roomBroadcastReset = new Map();
-    this._tikCounter = 0;
     this._gameStartFlags = new Map();
 
     this.quizAnswered = new Set();
@@ -530,17 +515,15 @@ export class GameServer extends CPUProtection {
     this.quizAutoTimer = null;
     this._quizKeepAliveInterval = null;
     this._lastActivityTime = Date.now();
-    this._isQuizIdle = false;
     this._isSwitchingToQuiz = false;
     this._switchQuizTimeout = null;
-    this._timeLeftSentCount = new Map();
 
     this._quizState = {
       isEvaluating: false,
       isEvaluated: false,
       evaluationStartTime: null,
-      evaluationLock: null,
-      lastEvaluationResult: null
+      lastEvaluationResult: null,
+      isLocked: false
     };
 
     this._usedQuestionIndices = new Set();
@@ -557,12 +540,7 @@ export class GameServer extends CPUProtection {
     this._quizState.isEvaluated = false;
     this._quizState.evaluationStartTime = null;
     this._quizState.lastEvaluationResult = null;
-    if (this._quizState.evaluationLock) {
-      this._quizState.evaluationLock = null;
-    }
-    this.quizHasWinner = false;
-    this.quizWinner = null;
-    this.quizAnswered = new Set();
+    this._quizState.isLocked = false;
   }
 
   async _initAsync() {
@@ -730,7 +708,7 @@ export class GameServer extends CPUProtection {
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", `⏳ Quiz will start soon!`, false]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", `⏳ Quiz will start soon! (${wibTime.formatted})`, false]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
           if (!this._quizStartTimeout) this.forceStartQuiz();
         } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
@@ -742,12 +720,9 @@ export class GameServer extends CPUProtection {
           this.quizAutoEnabled = false;
           await this.resetQuiz();
           const timeInfo = this._getTimeLeftUntilNextEvent();
-          const { hours, minutes } = timeInfo;
-          let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
-            minutes > 0 ? `${minutes}m` : "less than 1 minute";
           const statusMsg = timeInfo.status === 'before' ?
-            `⏳ ${timeStr}` :
-            `⏸️ ${timeStr}`;
+            `⏳ Quiz starts at ${timeInfo.startTime}\n🕐 Now: ${timeInfo.currentTime}` :
+            `⏸️ Quiz has ended. Back ${timeInfo.dayText} at ${timeInfo.startTime}`;
           this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", statusMsg, true]);
         }
         return true;
@@ -920,7 +895,6 @@ export class GameServer extends CPUProtection {
   async _showQuestion() {
     try {
       this._lastActivityTime = Date.now();
-      this._isQuizIdle = false;
 
       if (!this._isQuizTime()) {
         const clients = this.wsClients.get(QUIZ_ROOM);
@@ -939,6 +913,9 @@ export class GameServer extends CPUProtection {
       if (this._isSwitchingToQuiz) return;
 
       this._resetQuizState();
+      this.quizHasWinner = false;
+      this.quizWinner = null;
+      this.quizAnswered = new Set();
 
       this._checkAndLoadNextBatch();
 
@@ -953,18 +930,28 @@ export class GameServer extends CPUProtection {
       this._quizStartTime = Date.now();
 
       await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
-      this._broadcastToRoom(QUIZ_ROOM, [
-        "quizTimeLeft",
-        `📝 ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
-        false
-      ]);
 
-      if (this._quizTimeout) clearTimeout(this._quizTimeout);
-      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
+      if (this._quizTimeout) {
+        clearTimeout(this._quizTimeout);
+        this._quizTimeout = null;
+      }
+      if (this._quizBreakTimeout) {
+        clearTimeout(this._quizBreakTimeout);
+        this._quizBreakTimeout = null;
+      }
 
       this._quizTimeout = setTimeout(async () => {
         try {
-          if (this.closing || this.isDestroyed) { this._quizTimeout = null; return; }
+          if (this.closing || this.isDestroyed) {
+            this._quizTimeout = null;
+            return;
+          }
+
+          if (this._quizState.isEvaluated || this._quizState.isEvaluating || this._quizState.isLocked) {
+            this._quizTimeout = null;
+            return;
+          }
+
           await this._evaluateQuizWithLock();
           this._quizTimeout = null;
         } catch(e) {
@@ -982,10 +969,11 @@ export class GameServer extends CPUProtection {
   }
 
   async _evaluateQuizWithLock() {
-    if (this._quizState.isEvaluating || this._quizState.isEvaluated) {
+    if (this._quizState.isEvaluating || this._quizState.isEvaluated || this._quizState.isLocked) {
       return null;
     }
 
+    this._quizState.isLocked = true;
     this._quizState.isEvaluating = true;
     this._quizState.evaluationStartTime = Date.now();
 
@@ -998,6 +986,7 @@ export class GameServer extends CPUProtection {
       throw e;
     } finally {
       this._quizState.isEvaluating = false;
+      this._quizState.isLocked = false;
     }
   }
 
@@ -1009,8 +998,10 @@ export class GameServer extends CPUProtection {
     const question = this.currentQuestion.question;
     const options = this.currentQuestion.options;
 
+    let points = {};
+
     if (this.quizHasWinner && this.quizWinner) {
-      const points = await this._getQuizPoints();
+      points = await this._getQuizPoints();
       points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
       if (this.env?.QUESTIONS) {
         this._incrementSubRequest();
@@ -1029,6 +1020,7 @@ export class GameServer extends CPUProtection {
     }
 
     this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
+
     this.currentQuestion = null;
     this._quizStartTime = null;
     this.isQuizWaiting = true;
@@ -1049,7 +1041,9 @@ export class GameServer extends CPUProtection {
   }
 
   async _forceEvaluateQuiz() {
-    if (this._quizState.isEvaluating || this._quizState.isEvaluated) return;
+    if (this._quizState.isEvaluating || this._quizState.isEvaluated || this._quizState.isLocked) {
+      return;
+    }
     if (this._quizTimeout) {
       clearTimeout(this._quizTimeout);
       this._quizTimeout = null;
@@ -1091,6 +1085,11 @@ export class GameServer extends CPUProtection {
         return;
       }
 
+      if (this._quizState.isEvaluating || this._quizState.isLocked) {
+        this._safeSend(ws, ["quizError", "Quiz is being evaluated, please wait"]);
+        return;
+      }
+
       if (!this.currentQuestion) {
         this._startQuizIfNeeded();
         if (!this.currentQuestion) {
@@ -1121,34 +1120,24 @@ export class GameServer extends CPUProtection {
       });
       this.quizAnswered.add(username);
 
-      if (isCorrect && !this.quizHasWinner && !this._quizState.isEvaluated) {
+      if (isCorrect && !this.quizHasWinner && !this._quizState.isEvaluated && !this._quizState.isEvaluating) {
         this.quizHasWinner = true;
         this.quizWinner = username;
 
-        this._broadcastQuizResult("quizWinner", {
-          username: username,
-          correctAnswer: this.currentQuestion.correct
-        });
+        const totalPlayers = clients.size;
+        const answeredCount = this.quizAnswered.size;
 
-        if (this._quizTimeout) {
-          clearTimeout(this._quizTimeout);
-          this._quizTimeout = null;
+        if (answeredCount >= totalPlayers) {
+          if (this._quizTimeout) {
+            clearTimeout(this._quizTimeout);
+            this._quizTimeout = null;
+          }
+          await this._evaluateQuizWithLock();
         }
-        await this._evaluateQuizWithLock();
-      }
-
-      const totalPlayers = clients.size;
-      const answeredCount = this.quizAnswered.size;
-      if (!this.quizHasWinner && answeredCount >= totalPlayers) {
-        if (this._quizTimeout) {
-          clearTimeout(this._quizTimeout);
-          this._quizTimeout = null;
-        }
-        await this._evaluateQuizWithLock();
       }
 
     } catch(e) {
-      this._safeSend(ws, ["quizError", "Error submitting answer"]);
+      this._safeSend(ws, ["quizError", e.message || "Error submitting answer"]);
     }
   }
 
@@ -1248,7 +1237,7 @@ export class GameServer extends CPUProtection {
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (now - this._quizStartTime) / 1000;
           if (elapsed >= (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) &&
-              !this._quizState.isEvaluated && !this._quizState.isEvaluating) {
+              !this._quizState.isEvaluated && !this._quizState.isEvaluating && !this._quizState.isLocked) {
             if (this._quizTimeout) {
               clearTimeout(this._quizTimeout);
               this._quizTimeout = null;
@@ -1306,26 +1295,20 @@ export class GameServer extends CPUProtection {
   _sendQuizTimeLeftToUser(ws) {
     if (!ws || ws.readyState !== 1) return false;
     try {
-      const wsId = this._getWsId(ws);
-      if (!wsId) return false;
-      
       const timeInfo = this._getTimeLeftUntilNextEvent();
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
-      
       if (isQuizTime) {
-        this._timeLeftSentCount.delete(wsId);
-        
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (Date.now() - this._quizStartTime) / 1000;
           const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
           const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-          message = minutes > 0 ? `📝 ${minutes}m ${seconds}s remaining` : `📝 ${seconds}s remaining`;
+          message = minutes > 0 ? `📝 Quiz running! ${minutes}m ${seconds}s remaining` : `📝 Quiz running! ${seconds}s remaining`;
           canType = false;
         } else if (this.isQuizWaiting) {
           message = `⏳ Preparing next question...`;
           canType = false;
         } else {
-          message = `⏳ Quiz will start soon!`;
+          message = `⏳ Quiz will start soon! (${timeInfo.currentTime})`;
           canType = true;
         }
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
@@ -1340,32 +1323,16 @@ export class GameServer extends CPUProtection {
         }]);
         return false;
       } else {
-        const sentData = this._timeLeftSentCount.get(wsId) || { count: 0 };
-        if (sentData.count >= 2) {
-          const { hours, minutes, startTime } = timeInfo;
-          this._safeSend(ws, ["quizStatus", {
-            isRunning: false,
-            currentQuestion: false,
-            isWaiting: false,
-            timeLeft: 0,
-            nextQuizIn: (hours * 3600) + (minutes * 60),
-            nextQuizTime: startTime,
-            totalQuestions: this._allQuestions.length || 0
-          }]);
-          return true;
-        }
-        
-        const { hours, minutes } = timeInfo;
+        const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
         const totalSeconds = (hours * 3600) + (minutes * 60);
         let countdownText = totalSeconds <= 0 ? "Soon!" :
           hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
           minutes > 0 ? `${minutes}m` : "Less than 1 minute";
-        
-        message = timeInfo.status === 'before' ? `⏳ ${countdownText}` : `⏸️ ${countdownText}`;
-        
-        sentData.count += 1;
-        this._timeLeftSentCount.set(wsId, sentData);
-        
+        if (status === 'before') {
+          message = `⏳ Quiz starts ${dayText} at ${startTime} (WIB)\n🕐 Now: ${currentTime}\n⏱️ Remaining: ${countdownText}`;
+        } else {
+          message = `⏸️ Quiz ended today. Back ${dayText} at ${startTime} (WIB)\n🕐 Now: ${currentTime}\n⏱️ Remaining: ${countdownText}`;
+        }
         canType = true;
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
         this._safeSend(ws, ["quizStatus", {
@@ -1374,7 +1341,7 @@ export class GameServer extends CPUProtection {
           isWaiting: false,
           timeLeft: 0,
           nextQuizIn: totalSeconds,
-          nextQuizTime: timeInfo.startTime,
+          nextQuizTime: startTime,
           totalQuestions: this._allQuestions.length || 0
         }]);
         return true;
@@ -1431,26 +1398,27 @@ export class GameServer extends CPUProtection {
         const elapsed = (Date.now() - this._quizStartTime) / 1000;
         const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
         const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-        message = minutes > 0 ? `📝 ${minutes}m ${seconds}s remaining` : `📝 ${seconds}s remaining`;
+        message = minutes > 0 ? `📝 Quiz running! ${minutes}m ${seconds}s remaining` : `📝 Quiz running! ${seconds}s remaining`;
         canType = false;
       } else if (this.isQuizWaiting) {
         message = `⏳ Preparing next question...`;
         canType = false;
       } else {
-        message = `⏳ Quiz will start soon!`;
+        message = `⏳ Quiz will start soon! (${timeInfo.currentTime})`;
         canType = true;
       }
     } else {
-      for (const wsId of wsIds) {
-        const sentData = this._timeLeftSentCount.get(wsId) || { count: 0 };
-        if (sentData.count < 2) {
-          const ws = this.wsMap.get(wsId);
-          if (ws && ws.readyState === 1) {
-            this._sendQuizTimeLeftToUser(ws);
-          }
-        }
+      const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
+      const totalSeconds = (hours * 3600) + (minutes * 60);
+      let countdownText = totalSeconds <= 0 ? "Soon!" :
+        hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
+        minutes > 0 ? `${minutes}m` : "Less than 1 minute";
+      if (status === 'before') {
+        message = `⏳ Quiz starts ${dayText} at ${startTime}\n⏱️ Remaining: ${countdownText}`;
+      } else {
+        message = `⏸️ Quiz ended today. Back ${dayText} at ${startTime}\n⏱️ Remaining: ${countdownText}`;
       }
-      return;
+      canType = true;
     }
     this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, canType, isQuizTime]);
   }
@@ -1463,46 +1431,31 @@ export class GameServer extends CPUProtection {
       switch(errorType) {
         case "NOT_QUIZ_TIME":
           if (timeInfo.status === 'before') {
-            const { hours, minutes } = timeInfo;
+            const { hours, minutes, startTime, currentTime } = timeInfo;
             let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
               minutes > 0 ? `${minutes}m` : "less than 1 minute";
-            message = `⏳ ${timeStr}`;
+            message = `⏳ Quiz starts at ${startTime} (WIB)\n🕐 Now: ${currentTime}\n⏱️ Remaining: ${timeStr}`;
           } else {
-            const { hours, minutes } = timeInfo;
-            let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
-              minutes > 0 ? `${minutes}m` : "less than 1 minute";
-            message = `⏸️ ${timeStr}`;
+            const { startTime, currentTime } = timeInfo;
+            message = `⏸️ Quiz has ended.\n🕐 Now: ${currentTime}\n📅 Back tomorrow at ${startTime} (WIB)`;
           }
           break;
-        case "QUIZ_DISABLED": 
-          message = "❌ Quiz is currently unavailable"; 
-          break;
+        case "QUIZ_DISABLED": message = "❌ Quiz is currently unavailable"; break;
         case "QUIZ_ENDED":
-          const { hours, minutes } = timeInfo;
+          const { hours, minutes, startTime, currentTime } = timeInfo;
           let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
             minutes > 0 ? `${minutes}m` : "less than 1 minute";
-          message = `⏸️ ${timeStr}`;
+          message = `⏸️ Quiz has ended.\n🕐 Now: ${currentTime}\n📅 Continues tomorrow at ${startTime} (WIB)\n⏱️ Remaining: ${timeStr}`;
           break;
-        case "QUIZ_NOT_STARTED": 
-          message = `⏳ Quiz will start soon`; 
-          break;
-        default: 
-          message = customMessage || "❌ An error occurred in the Quiz";
+        case "QUIZ_NOT_STARTED": message = `⏳ Quiz will start at ${QUIZ_SCHEDULE.START_HOUR}:00 WIB`; break;
+        default: message = customMessage || "❌ An error occurred in the Quiz";
       }
       this._safeSend(ws, ["quizError", message]);
       return true;
-    } catch(e) { 
-      this._safeSend(ws, ["quizError", "❌ Quiz error"]);
-      return false; 
-    }
+    } catch(e) { return false; }
   }
 
   _getWsId(ws) { return ws?._wsId || null; }
-
-  _getRoomForWs(ws) {
-    if (!ws) return null;
-    return ws.room || ws.roomname || null;
-  }
 
   _ensureRoomConsistency(ws) {
     if (!ws) return null;
@@ -1591,7 +1544,6 @@ export class GameServer extends CPUProtection {
     this.wsMap.delete(wsId);
     this.userLanguage.delete(wsId);
     this.userCountry.delete(wsId);
-    this._timeLeftSentCount.delete(wsId);
     if (username) {
       const conn = this.userConnections.get(username);
       if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -1655,8 +1607,6 @@ export class GameServer extends CPUProtection {
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
     if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
-
-    this._timeLeftSentCount.delete(wsId);
 
     const lockKey = `switch_${wsId}`;
     if (this._switchLocks.has(lockKey)) { this._safeSend(ws, ["gameLowCardError", "Switch in progress"]); return; }
@@ -1845,8 +1795,6 @@ export class GameServer extends CPUProtection {
     if (!room || !game) return;
     if (game?._isActive && !game._gameEnded) return;
     if (this._cleanupTimers.has(room)) { clearTimeout(this._cleanupTimers.get(room)); this._cleanupTimers.delete(room); }
-    this._roomBroadcastCount.delete(room);
-    this._roomBroadcastReset.delete(room);
     if (game) {
       game._gameEnded = true;
       game._isActive = false;
@@ -2797,7 +2745,6 @@ export class GameServer extends CPUProtection {
           this.wsMap.delete(wsId);
           this.userLanguage.delete(wsId);
           this.userCountry.delete(wsId);
-          this._timeLeftSentCount.delete(wsId);
           for (const [username, conn] of this.userConnections) {
             if (conn?.wsId === wsId) { this.userConnections.delete(username); break; }
           }
@@ -2911,7 +2858,6 @@ export class GameServer extends CPUProtection {
       }
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
-      this._timeLeftSentCount.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -2937,7 +2883,6 @@ export class GameServer extends CPUProtection {
       }
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
-      this._timeLeftSentCount.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
