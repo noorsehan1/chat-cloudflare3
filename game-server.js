@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL CLEAN - RANDOM QUESTIONS - ENGLISH ONLY - NO SPAM) ====================
+// ==================== GAME-SERVER.JS (FULL COMPLETE - RANDOM QUESTIONS - ENGLISH ONLY - SYNC TRANSLATE) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -26,7 +26,7 @@ const CONSTANTS = {
   MAX_RETRY_INIT_QUIZ: 2,
   MAX_SHUTDOWN_WAIT_MS: 5000,
   MAX_WS_CLIENTS: 50,
-  MAX_ARRAY_SIZE: 50,
+  MAX_ARRAY_SIZE: 10000,
   QUIZ_SWITCH_DELAY_MS: 5000,
   QUIZ_POINT_KEY: 'quiz_points',
   QUIZ_WEEK_KEY: 'quiz_current_week',
@@ -219,95 +219,84 @@ class TranslationManager extends CPUProtection {
     this.translateLimitReached = false;
   }
 
-  async translateForUsers(question, options, usersByLang) {
+  async translateForUsersSync(question, options, usersByLang) {
     const results = new Map();
-    const needTranslate = [];
     const cacheKey = this._getCacheKey(question, options);
+    const needTranslate = [];
 
     for (const [lang, users] of usersByLang) {
       if (lang === 'en') {
-        results.set(lang, { question, options, users, isFallback: false, fromCache: false });
+        results.set(lang, { question, options, users, isFallback: false, fromCache: true });
         continue;
       }
-      
+
       const langCacheKey = `${cacheKey}_${lang}`;
       const cached = this._translationCache.get(langCacheKey);
-      
+
       if (cached) {
-        results.set(lang, { 
-          question: cached.question, 
-          options: cached.options, 
-          users, 
-          isFallback: false, 
-          fromCache: true 
+        results.set(lang, {
+          question: cached.question,
+          options: cached.options,
+          users,
+          isFallback: false,
+          fromCache: true
         });
       } else {
         needTranslate.push({ lang, users });
       }
     }
 
-    if (needTranslate.length === 0) { 
-      this._sendResults(results); 
-      return; 
-    }
-
-    for (const { lang, users } of needTranslate) {
-      try {
-        const langCacheKey = `${cacheKey}_${lang}`;
-        
-        if (this._pendingTranslations.has(langCacheKey)) {
-          const cached = await this._pendingTranslations.get(langCacheKey);
-          results.set(lang, { ...cached, users, fromCache: true });
-          continue;
-        }
-
-        const translatePromise = this._safeExecute(async () => {
+    if (needTranslate.length > 0) {
+      const translatePromises = needTranslate.map(async ({ lang, users }) => {
+        try {
           const [translatedQuestion, translatedOptions] = await Promise.all([
             this._translateText(question, lang),
             this._translateOptions(options, lang)
           ]);
-          return { question: translatedQuestion || question, options: translatedOptions || options };
-        });
 
-        this._pendingTranslations.set(langCacheKey, translatePromise);
-        
-        const result = await translatePromise;
-        
-        this._translationCache.set(langCacheKey, {
-          question: result.question,
-          options: result.options
-        });
-        
-        this._pendingTranslations.delete(langCacheKey);
-        
+          const result = {
+            question: translatedQuestion || question,
+            options: translatedOptions || options
+          };
+
+          const langCacheKey = `${cacheKey}_${lang}`;
+          this._translationCache.set(langCacheKey, result);
+
+          return { lang, users, result, isFallback: false };
+        } catch(e) {
+          return {
+            lang,
+            users,
+            result: { question, options },
+            isFallback: true
+          };
+        }
+      });
+
+      const translatedResults = await Promise.all(translatePromises);
+
+      for (const { lang, users, result, isFallback } of translatedResults) {
         results.set(lang, {
           question: result.question,
           options: result.options,
           users,
-          isFallback: false,
-          fromCache: false
-        });
-      } catch(e) {
-        results.set(lang, {
-          question: question,
-          options: options,
-          users,
-          isFallback: true,
+          isFallback,
           fromCache: false
         });
       }
     }
+
     this._sendResults(results);
   }
 
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en' || !text || typeof text !== 'string') return text;
-    
+
     const cacheKey = `${text}_${targetLang}`;
     if (this._translationCache.has(cacheKey)) {
       return this._translationCache.get(cacheKey);
     }
-    
+
     try {
       const result = await this._safeExecute(async () => await this._callTranslateAPI(text, targetLang));
       this.translateCount++;
@@ -327,11 +316,11 @@ class TranslationManager extends CPUProtection {
     const keys = ['A', 'B', 'C', 'D'];
     const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
     if (texts.length === 0) return options;
-    
+
     const translatedTexts = await this._safeExecute(async () => {
       return await Promise.all(texts.map(text => this._translateText(text, targetLang)));
     });
-    
+
     const result = { ...options };
     let idx = 0;
     for (const key of keys) {
@@ -355,6 +344,7 @@ class TranslationManager extends CPUProtection {
         isFallback: isFallback || false
       }];
       const msgStr = JSON.stringify(message);
+
       for (const ws of users) {
         if (ws && ws.readyState === 1) {
           try { ws.send(msgStr); } catch(e) {}
@@ -815,9 +805,9 @@ export class GameServer extends CPUProtection {
           category: q.category || 'General',
           difficulty: q.difficulty || 'medium'
         }));
-        
+
         this._allQuestions = this._shuffleArray(this._allQuestions);
-        
+
         this._isAllQuestionsLoaded = true;
         this._currentBatchStart = 0;
         this._currentBatchEnd = 0;
@@ -835,7 +825,7 @@ export class GameServer extends CPUProtection {
   _loadNextBatch() {
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) return false;
     const totalQuestions = this._allQuestions.length;
-    
+
     if (this._usedQuestionIndices.size >= totalQuestions) {
       this._usedQuestionIndices = new Set();
       this._allQuestions = this._shuffleArray(this._allQuestions);
@@ -845,7 +835,7 @@ export class GameServer extends CPUProtection {
       this._totalQuestionsAnswered = 0;
       this._currentBatchIndex = 0;
     }
-    
+
     let startIndex = this._currentBatchEnd;
     if (startIndex >= totalQuestions) {
       startIndex = 0;
@@ -853,7 +843,7 @@ export class GameServer extends CPUProtection {
       this._currentBatchEnd = 0;
       this._questionPointer = 0;
     }
-    
+
     const endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
     this.quizQuestionCache['en'] = this._allQuestions.slice(startIndex, endIndex);
     this._currentQuestions = this.quizQuestionCache['en'];
@@ -878,25 +868,25 @@ export class GameServer extends CPUProtection {
   _getRandomQuestion() {
     const questions = this.quizQuestionCache['en'] || [];
     if (questions.length === 0) return null;
-    
+
     const totalQuestions = this._allQuestions.length;
-    
+
     if (this._usedQuestionIndices.size >= totalQuestions) {
       this._usedQuestionIndices = new Set();
       this._allQuestions = this._shuffleArray(this._allQuestions);
       this._loadNextBatch();
     }
-    
+
     const availableIndices = [];
     const batchStart = this._currentBatchStart;
     const batchEnd = this._currentBatchEnd;
-    
+
     for (let i = batchStart; i < batchEnd && i < totalQuestions; i++) {
       if (!this._usedQuestionIndices.has(i)) {
         availableIndices.push(i);
       }
     }
-    
+
     if (availableIndices.length === 0) {
       for (let i = 0; i < totalQuestions; i++) {
         if (!this._usedQuestionIndices.has(i)) {
@@ -904,19 +894,19 @@ export class GameServer extends CPUProtection {
         }
       }
     }
-    
+
     if (availableIndices.length === 0) {
       this._usedQuestionIndices = new Set();
       this._allQuestions = this._shuffleArray(this._allQuestions);
       this._loadNextBatch();
       return this._getRandomQuestion();
     }
-    
+
     const randomIndex = availableIndices[Math.floor(Math.random() * availableIndices.length)];
     this._usedQuestionIndices.add(randomIndex);
     this._questionPointer++;
     this._totalQuestionsAnswered++;
-    
+
     return this._allQuestions[randomIndex];
   }
 
@@ -947,7 +937,7 @@ export class GameServer extends CPUProtection {
       this.quizAnswered = new Set();
 
       this._checkAndLoadNextBatch();
-      
+
       const q = this._getRandomQuestion();
       if (!q || !q.options) {
         this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
@@ -1260,6 +1250,7 @@ export class GameServer extends CPUProtection {
   async _broadcastQuizQuestion(question, options) {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds?.size) return;
+
     const usersByLang = new Map();
     for (const wsId of wsIds) {
       try {
@@ -1270,8 +1261,10 @@ export class GameServer extends CPUProtection {
         usersByLang.get(lang).push(ws);
       } catch(e) {}
     }
+
     if (usersByLang.size === 0) return;
-    await this.translationManager.translateForUsers(question, options, usersByLang);
+
+    await this.translationManager.translateForUsersSync(question, options, usersByLang);
   }
 
   async _broadcastQuizResult(type, data) {
@@ -1354,14 +1347,14 @@ export class GameServer extends CPUProtection {
     if (!ws || ws.readyState !== 1) return;
     if (!this.currentQuestion) return;
     if (this._isSwitchingToQuiz) return;
-    
+
     try {
       const wsId = this._getWsId(ws);
       if (!wsId) return;
       const lang = this.userLanguage.get(wsId) || 'en';
       const question = this.currentQuestion.question;
       const options = this.currentQuestion.options;
-      
+
       if (lang === 'en') {
         this._safeSend(ws, ["quizQuestion", { question, options, isFallback: false }]);
       } else {
@@ -1377,7 +1370,7 @@ export class GameServer extends CPUProtection {
           this._safeSend(ws, ["quizQuestion", { question, options, isFallback: true }]);
         });
       }
-      
+
       if (this._quizStartTime) {
         const elapsed = (Date.now() - this._quizStartTime) / 1000;
         const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
@@ -1641,7 +1634,7 @@ export class GameServer extends CPUProtection {
 
       if (roomName === QUIZ_ROOM) {
         this._isSwitchingToQuiz = true;
-        
+
         if (this._switchQuizTimeout) {
           clearTimeout(this._switchQuizTimeout);
           this._switchQuizTimeout = null;
@@ -1661,7 +1654,7 @@ export class GameServer extends CPUProtection {
         this._switchQuizTimeout = setTimeout(() => {
           this._isSwitchingToQuiz = false;
           this._switchQuizTimeout = null;
-          
+
           if (!this.closing && !this.isDestroyed) {
             if (this.currentQuestion) {
               this._sendCurrentQuestionToUser(ws);
@@ -2571,7 +2564,7 @@ export class GameServer extends CPUProtection {
 
   _shuffleArray(array) {
     if (!array?.length) return array || [];
-    const arr = array.length > CONSTANTS.MAX_ARRAY_SIZE ? array.slice(0, CONSTANTS.MAX_ARRAY_SIZE) : [...array];
+    const arr = [...array];
     for (let i = arr.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [arr[i], arr[j]] = [arr[j], arr[i]];
