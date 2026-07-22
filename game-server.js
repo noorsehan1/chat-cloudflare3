@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL COMPLETE - NO CACHE TRANSLATION) ====================
+// ==================== GAME-SERVER.JS (FULL COMPLETE - CLEAR) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -55,7 +55,7 @@ const QUIZ_SCHEDULE = {
 
 const QUIZ_ROOM = "Quiz";
 
-// ==================== CPU PROTECTION MIXIN ====================
+// ==================== CPU PROTECTION ====================
 
 class CPUProtection {
   constructor() {
@@ -63,6 +63,8 @@ class CPUProtection {
     this._cpuTotalTime = 0;
     this._cpuCheckCount = 0;
     this._isThrottled = false;
+    this._pendingOperations = [];
+    this._isProcessingPending = false;
     this._cpuHistory = [];
     this._cpuAverage = 0;
     this._eventQueue = [];
@@ -195,41 +197,109 @@ class CPUProtection {
   }
 }
 
-// ==================== TRANSLATION MANAGER (NO CACHE) ====================
+// ==================== TRANSLATION MANAGER ====================
 
 class TranslationManager extends CPUProtection {
   constructor(gameServer) {
     super();
     this.gameServer = gameServer;
+    this.questionCache = new Map();
     this.TRANSLATE_TIMEOUT = CONSTANTS.TRANSLATE_TIMEOUT_MS;
     this.translateCount = 0;
     this.translateDate = new Date().toUTCString();
     this.translateLimitReached = false;
     this._translateResetInterval = null;
-    // NO CACHE: this._translationCache = new Map(); // TIDAK PAKAI CACHE
+    this._pendingTranslations = new Map();
+    this._translationCache = new Map();
+    this._userLanguageCache = new Map();
+  }
+
+  clearUserCache() {
+    if (this._userLanguageCache.size > 0) {
+      this._userLanguageCache.clear();
+    }
+    if (this.questionCache.size > 0) {
+      this.questionCache.clear();
+    }
+  }
+
+  resetQuestionCache() {
+    if (this.questionCache.size > 0) this.questionCache.clear();
+    this.translateCount = 0;
+    this.translateLimitReached = false;
   }
 
   async translateForUsersSync(question, options, usersByLang) {
     const results = new Map();
-    const translatePromises = [];
+    const needTranslate = [];
 
     for (const [lang, users] of usersByLang) {
-      if (lang === 'en') {
-        results.set(lang, { question, options, users, isFallback: false });
-        continue;
+      const cacheKey = this._getCacheKey(question, options);
+      const langCacheKey = `${cacheKey}_${lang}`;
+      
+      let cached = this._translationCache.get(langCacheKey);
+      if (!cached) {
+        cached = this._userLanguageCache.get(langCacheKey);
       }
 
-      translatePromises.push(this._translateWithFallback(question, options, lang, users));
+      if (cached) {
+        results.set(lang, {
+          question: cached.question,
+          options: cached.options,
+          users,
+          isFallback: false,
+          fromCache: true
+        });
+      } else {
+        needTranslate.push({ lang, users });
+      }
     }
 
-    if (translatePromises.length > 0) {
+    if (needTranslate.length > 0) {
+      const translatePromises = needTranslate.map(async ({ lang, users }) => {
+        try {
+          let translatedQuestion, translatedOptions;
+          
+          if (lang === 'en') {
+            translatedQuestion = question;
+            translatedOptions = options;
+          } else {
+            [translatedQuestion, translatedOptions] = await Promise.all([
+              this._translateText(question, lang),
+              this._translateOptions(options, lang)
+            ]);
+          }
+
+          const result = {
+            question: translatedQuestion || question,
+            options: translatedOptions || options
+          };
+
+          const cacheKey = this._getCacheKey(question, options);
+          const langCacheKey = `${cacheKey}_${lang}`;
+          this._translationCache.set(langCacheKey, result);
+          this._userLanguageCache.set(langCacheKey, result);
+
+          return { lang, users, result, isFallback: false };
+        } catch(e) {
+          return {
+            lang,
+            users,
+            result: { question, options },
+            isFallback: true
+          };
+        }
+      });
+
       const translatedResults = await Promise.all(translatePromises);
+
       for (const { lang, users, result, isFallback } of translatedResults) {
         results.set(lang, {
           question: result.question,
           options: result.options,
           users,
-          isFallback
+          isFallback,
+          fromCache: false
         });
       }
     }
@@ -237,39 +307,43 @@ class TranslationManager extends CPUProtection {
     this._sendResults(results);
   }
 
-  async _translateWithFallback(question, options, lang, users) {
-    try {
-      const [translatedQuestion, translatedOptions] = await Promise.all([
-        this._translateText(question, lang),
-        this._translateOptions(options, lang)
-      ]);
+  _sendResults(results) {
+    for (const [lang, data] of results) {
+      const { question, options, users, isFallback, fromCache } = data;
+      const message = ["quizQuestion", {
+        question: question || '',
+        options: options || { A: '', B: '', C: '', D: '' },
+        isFallback: isFallback || false,
+        lang: lang
+      }];
+      const msgStr = JSON.stringify(message);
 
-      return {
-        lang,
-        users,
-        result: {
-          question: translatedQuestion || question,
-          options: translatedOptions || options
-        },
-        isFallback: false
-      };
-    } catch(e) {
-      return {
-        lang,
-        users,
-        result: { question, options },
-        isFallback: true
-      };
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try { ws.send(msgStr); } catch(e) {}
+        }
+      }
     }
   }
 
   async _translateText(text, targetLang, retryCount = 0) {
     if (targetLang === 'en' || !text || typeof text !== 'string') return text;
 
-    // NO CACHE: Langsung terjemahkan
+    const userCacheKey = `${text}_${targetLang}`;
+    if (this._userLanguageCache.has(userCacheKey)) {
+      return this._userLanguageCache.get(userCacheKey);
+    }
+
+    const cacheKey = `${text}_${targetLang}`;
+    if (this._translationCache.has(cacheKey)) {
+      return this._translationCache.get(cacheKey);
+    }
+
     try {
       const result = await this._safeExecute(async () => await this._callTranslateAPI(text, targetLang));
       this.translateCount++;
+      this._translationCache.set(cacheKey, result);
+      this._userLanguageCache.set(userCacheKey, result);
       return result;
     } catch(e) {
       if (retryCount < 5) {
@@ -300,22 +374,8 @@ class TranslationManager extends CPUProtection {
     return result;
   }
 
-  _sendResults(results) {
-    for (const [lang, data] of results) {
-      const { question, options, users, isFallback } = data;
-      const message = ["quizQuestion", {
-        question: question || '',
-        options: options || { A: '', B: '', C: '', D: '' },
-        isFallback: isFallback || false
-      }];
-      const msgStr = JSON.stringify(message);
-
-      for (const ws of users) {
-        if (ws && ws.readyState === 1) {
-          try { ws.send(msgStr); } catch(e) {}
-        }
-      }
-    }
+  _getCacheKey(question, options) {
+    return `${question}|${Object.values(options).join('|')}`;
   }
 
   async _callTranslateAPI(text, targetLang) {
@@ -436,7 +496,7 @@ class TranslationManager extends CPUProtection {
   }
 }
 
-// ==================== GAME SERVER CLASS ====================
+// ==================== GAME SERVER ====================
 
 export class GameServer extends CPUProtection {
   constructor(state, env) {
@@ -460,6 +520,9 @@ export class GameServer extends CPUProtection {
     this.roomViewers = new Map();
     this.userConnections = new Map();
     this._cleanupTimers = new Map();
+    this._roomBroadcastCount = new Map();
+    this._roomBroadcastReset = new Map();
+    this._tikCounter = 0;
     this._gameStartFlags = new Map();
 
     this.quizAnswered = new Set();
@@ -492,15 +555,17 @@ export class GameServer extends CPUProtection {
     this.quizAutoTimer = null;
     this._quizKeepAliveInterval = null;
     this._lastActivityTime = Date.now();
+    this._isQuizIdle = false;
     this._isSwitchingToQuiz = false;
     this._switchQuizTimeout = null;
+    this._timeLeftSentCount = new Map();
 
     this._quizState = {
       isEvaluating: false,
       isEvaluated: false,
       evaluationStartTime: null,
-      lastEvaluationResult: null,
-      isLocked: false
+      evaluationLock: null,
+      lastEvaluationResult: null
     };
 
     this._usedQuestionIndices = new Set();
@@ -517,7 +582,12 @@ export class GameServer extends CPUProtection {
     this._quizState.isEvaluated = false;
     this._quizState.evaluationStartTime = null;
     this._quizState.lastEvaluationResult = null;
-    this._quizState.isLocked = false;
+    if (this._quizState.evaluationLock) {
+      this._quizState.evaluationLock = null;
+    }
+    this.quizHasWinner = false;
+    this.quizWinner = null;
+    this.quizAnswered = new Set();
   }
 
   async _initAsync() {
@@ -681,11 +751,10 @@ export class GameServer extends CPUProtection {
   async _checkQuizAutoStatus() {
     try {
       const isQuizTime = this._isQuizTime();
-      const wibTime = this._getCurrentWIBTime();
       if (isQuizTime) {
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", `⏳ Quiz will start soon! (${wibTime.formatted})`, false]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", `⏳ Quiz will start soon!`, false]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
           if (!this._quizStartTimeout) this.forceStartQuiz();
         } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
@@ -697,9 +766,12 @@ export class GameServer extends CPUProtection {
           this.quizAutoEnabled = false;
           await this.resetQuiz();
           const timeInfo = this._getTimeLeftUntilNextEvent();
+          const { hours, minutes } = timeInfo;
+          let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
+            minutes > 0 ? `${minutes}m` : "less than 1 minute";
           const statusMsg = timeInfo.status === 'before' ?
-            `⏳ Quiz starts at ${timeInfo.startTime}\n🕐 Now: ${timeInfo.currentTime}` :
-            `⏸️ Quiz has ended. Back ${timeInfo.dayText} at ${timeInfo.startTime}`;
+            `⏳ ${timeStr}` :
+            `⏸️ ${timeStr}`;
           this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", statusMsg, true]);
         }
         return true;
@@ -869,76 +941,10 @@ export class GameServer extends CPUProtection {
     return this._allQuestions[randomIndex];
   }
 
-  // ==================== METHOD BARU: AMBIL SOAL LANGSUNG (TANPA CACHE BATCH) ====================
-  _getRandomQuestionDirect() {
-    if (!this._allQuestions || this._allQuestions.length === 0) return null;
-    
-    const totalQuestions = this._allQuestions.length;
-    
-    if (this._usedQuestionIndices.size >= totalQuestions) {
-      this._usedQuestionIndices = new Set();
-      this._allQuestions = this._shuffleArray(this._allQuestions);
-    }
-    
-    const availableIndices = [];
-    for (let i = 0; i < totalQuestions; i++) {
-      if (!this._usedQuestionIndices.has(i)) {
-        availableIndices.push(i);
-      }
-    }
-    
-    if (availableIndices.length === 0) {
-      this._usedQuestionIndices = new Set();
-      this._allQuestions = this._shuffleArray(this._allQuestions);
-      const idx = 0;
-      this._usedQuestionIndices.add(idx);
-      this._totalQuestionsAnswered++;
-      return this._allQuestions[idx];
-    }
-    
-    const randomIndex = availableIndices[Math.floor(Math.random() * availableIndices.length)];
-    this._usedQuestionIndices.add(randomIndex);
-    this._totalQuestionsAnswered++;
-    
-    return this._allQuestions[randomIndex];
-  }
-
-  // ==================== METHOD BARU: PASTIKAN SOAL LOADED ====================
-  async _ensureQuestionsLoaded() {
-    if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-      await this._loadAllQuestionsFromKV();
-    }
-    
-    if (this._allQuestions.length === 0) {
-      await this._loadQuestionsFromKVFallback();
-    }
-  }
-
-  async _loadQuestionsFromKVFallback() {
-    if (!this.env?.QUESTIONS) return false;
-    try {
-      const cached = await this.env.QUESTIONS.get('quiz_questions', 'json');
-      if (cached?.questions?.length > 0) {
-        this._allQuestions = cached.questions.map((q, index) => ({
-          id: index + 1,
-          question: q.question || '',
-          options: q.options || { A: '', B: '', C: '', D: '' },
-          correct: q.correct || 'A',
-          category: q.category || 'General',
-          difficulty: q.difficulty || 'medium'
-        }));
-        this._allQuestions = this._shuffleArray(this._allQuestions);
-        this._isAllQuestionsLoaded = true;
-        return true;
-      }
-      return false;
-    } catch(e) { return false; }
-  }
-
-  // ==================== PERUBAHAN: _showQuestion DENGAN TERJEMAHAN FRESH ====================
   async _showQuestion() {
     try {
       this._lastActivityTime = Date.now();
+      this._isQuizIdle = false;
 
       if (!this._isQuizTime()) {
         const clients = this.wsClients.get(QUIZ_ROOM);
@@ -957,52 +963,32 @@ export class GameServer extends CPUProtection {
       if (this._isSwitchingToQuiz) return;
 
       this._resetQuizState();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this.quizAnswered = new Set();
 
-      await this._ensureQuestionsLoaded();
+      this._checkAndLoadNextBatch();
 
-      const q = this._getRandomQuestionDirect();
+      const q = this._getRandomQuestion();
       if (!q || !q.options) {
-        await this._loadAllQuestionsFromKV();
-        const q2 = this._getRandomQuestionDirect();
-        if (!q2 || !q2.options) {
-          this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
-          return;
-        }
-        const shuffled = this._shuffleQuestionOptions(q2);
-        this.currentQuestion = { ...q2, options: shuffled.options, correct: shuffled.correct };
-      } else {
-        const shuffled = this._shuffleQuestionOptions(q);
-        this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
+        this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
+        return;
       }
-      
+
+      const shuffled = this._shuffleQuestionOptions(q);
+      this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
       this._quizStartTime = Date.now();
 
-      await this._broadcastQuizQuestionFresh(this.currentQuestion.question, this.currentQuestion.options);
+      await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
+      this._broadcastToRoom(QUIZ_ROOM, [
+        "quizTimeLeft",
+        `📝 ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
+        false
+      ]);
 
-      if (this._quizTimeout) {
-        clearTimeout(this._quizTimeout);
-        this._quizTimeout = null;
-      }
-      if (this._quizBreakTimeout) {
-        clearTimeout(this._quizBreakTimeout);
-        this._quizBreakTimeout = null;
-      }
+      if (this._quizTimeout) clearTimeout(this._quizTimeout);
+      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
 
       this._quizTimeout = setTimeout(async () => {
         try {
-          if (this.closing || this.isDestroyed) {
-            this._quizTimeout = null;
-            return;
-          }
-
-          if (this._quizState.isEvaluated || this._quizState.isEvaluating || this._quizState.isLocked) {
-            this._quizTimeout = null;
-            return;
-          }
-
+          if (this.closing || this.isDestroyed) { this._quizTimeout = null; return; }
           await this._evaluateQuizWithLock();
           this._quizTimeout = null;
         } catch(e) {
@@ -1019,77 +1005,11 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ==================== METHOD BARU: BROADCAST DENGAN TERJEMAHAN FRESH ====================
-  async _broadcastQuizQuestionFresh(question, options) {
-    const wsIds = this.wsClients.get(QUIZ_ROOM);
-    if (!wsIds?.size) return;
-
-    const usersByLang = new Map();
-    for (const wsId of wsIds) {
-      try {
-        const ws = this.wsMap.get(wsId);
-        if (!ws || ws.readyState !== 1) continue;
-        const lang = this.userLanguage.get(wsId) || 'en';
-        if (!usersByLang.has(lang)) usersByLang.set(lang, []);
-        usersByLang.get(lang).push(ws);
-      } catch(e) {}
-    }
-
-    if (usersByLang.size === 0) return;
-
-    const results = new Map();
-    
-    for (const [lang, users] of usersByLang) {
-      if (lang === 'en') {
-        results.set(lang, { question, options, users, isFallback: false });
-        continue;
-      }
-      
-      try {
-        const [translatedQuestion, translatedOptions] = await Promise.all([
-          this.translationManager._translateText(question, lang),
-          this.translationManager._translateOptions(options, lang)
-        ]);
-        
-        results.set(lang, {
-          question: translatedQuestion || question,
-          options: translatedOptions || options,
-          users,
-          isFallback: false
-        });
-      } catch(e) {
-        results.set(lang, {
-          question,
-          options,
-          users,
-          isFallback: true
-        });
-      }
-    }
-
-    for (const [lang, data] of results) {
-      const { question: q, options: opts, users, isFallback } = data;
-      const message = ["quizQuestion", {
-        question: q || '',
-        options: opts || { A: '', B: '', C: '', D: '' },
-        isFallback: isFallback || false
-      }];
-      const msgStr = JSON.stringify(message);
-
-      for (const ws of users) {
-        if (ws && ws.readyState === 1) {
-          try { ws.send(msgStr); } catch(e) {}
-        }
-      }
-    }
-  }
-
   async _evaluateQuizWithLock() {
-    if (this._quizState.isEvaluating || this._quizState.isEvaluated || this._quizState.isLocked) {
+    if (this._quizState.isEvaluating || this._quizState.isEvaluated) {
       return null;
     }
 
-    this._quizState.isLocked = true;
     this._quizState.isEvaluating = true;
     this._quizState.evaluationStartTime = Date.now();
 
@@ -1102,7 +1022,6 @@ export class GameServer extends CPUProtection {
       throw e;
     } finally {
       this._quizState.isEvaluating = false;
-      this._quizState.isLocked = false;
     }
   }
 
@@ -1114,10 +1033,8 @@ export class GameServer extends CPUProtection {
     const question = this.currentQuestion.question;
     const options = this.currentQuestion.options;
 
-    let points = {};
-
     if (this.quizHasWinner && this.quizWinner) {
-      points = await this._getQuizPoints();
+      const points = await this._getQuizPoints();
       points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
       if (this.env?.QUESTIONS) {
         this._incrementSubRequest();
@@ -1136,7 +1053,6 @@ export class GameServer extends CPUProtection {
     }
 
     this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
-
     this.currentQuestion = null;
     this._quizStartTime = null;
     this.isQuizWaiting = true;
@@ -1157,9 +1073,7 @@ export class GameServer extends CPUProtection {
   }
 
   async _forceEvaluateQuiz() {
-    if (this._quizState.isEvaluating || this._quizState.isEvaluated || this._quizState.isLocked) {
-      return;
-    }
+    if (this._quizState.isEvaluating || this._quizState.isEvaluated) return;
     if (this._quizTimeout) {
       clearTimeout(this._quizTimeout);
       this._quizTimeout = null;
@@ -1201,11 +1115,6 @@ export class GameServer extends CPUProtection {
         return;
       }
 
-      if (this._quizState.isEvaluating || this._quizState.isLocked) {
-        this._safeSend(ws, ["quizError", "Quiz is being evaluated, please wait"]);
-        return;
-      }
-
       if (!this.currentQuestion) {
         this._startQuizIfNeeded();
         if (!this.currentQuestion) {
@@ -1236,24 +1145,34 @@ export class GameServer extends CPUProtection {
       });
       this.quizAnswered.add(username);
 
-      if (isCorrect && !this.quizHasWinner && !this._quizState.isEvaluated && !this._quizState.isEvaluating) {
+      if (isCorrect && !this.quizHasWinner && !this._quizState.isEvaluated) {
         this.quizHasWinner = true;
         this.quizWinner = username;
 
-        const totalPlayers = clients.size;
-        const answeredCount = this.quizAnswered.size;
+        this._broadcastQuizResult("quizWinner", {
+          username: username,
+          correctAnswer: this.currentQuestion.correct
+        });
 
-        if (answeredCount >= totalPlayers) {
-          if (this._quizTimeout) {
-            clearTimeout(this._quizTimeout);
-            this._quizTimeout = null;
-          }
-          await this._evaluateQuizWithLock();
+        if (this._quizTimeout) {
+          clearTimeout(this._quizTimeout);
+          this._quizTimeout = null;
         }
+        await this._evaluateQuizWithLock();
+      }
+
+      const totalPlayers = clients.size;
+      const answeredCount = this.quizAnswered.size;
+      if (!this.quizHasWinner && answeredCount >= totalPlayers) {
+        if (this._quizTimeout) {
+          clearTimeout(this._quizTimeout);
+          this._quizTimeout = null;
+        }
+        await this._evaluateQuizWithLock();
       }
 
     } catch(e) {
-      this._safeSend(ws, ["quizError", e.message || "Error submitting answer"]);
+      this._safeSend(ws, ["quizError", "Error submitting answer"]);
     }
   }
 
@@ -1353,7 +1272,7 @@ export class GameServer extends CPUProtection {
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (now - this._quizStartTime) / 1000;
           if (elapsed >= (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) &&
-              !this._quizState.isEvaluated && !this._quizState.isEvaluating && !this._quizState.isLocked) {
+              !this._quizState.isEvaluated && !this._quizState.isEvaluating) {
             if (this._quizTimeout) {
               clearTimeout(this._quizTimeout);
               this._quizTimeout = null;
@@ -1367,6 +1286,35 @@ export class GameServer extends CPUProtection {
         }
       }
     }, CONSTANTS.QUIZ_KEEP_ALIVE_INTERVAL_MS);
+  }
+
+  async _broadcastQuizQuestion(question, options) {
+    const wsIds = this.wsClients.get(QUIZ_ROOM);
+    if (!wsIds?.size) return;
+
+    this.translationManager.clearUserCache();
+
+    const usersByLang = new Map();
+    for (const wsId of wsIds) {
+      try {
+        const ws = this.wsMap.get(wsId);
+        if (!ws || ws.readyState !== 1) continue;
+        
+        let lang = this.userLanguage.get(wsId) || 'en';
+        if (!lang || lang === 'undefined') {
+          const country = this.userCountry.get(wsId) || 'US';
+          lang = this._countryToLanguage(country);
+          this.userLanguage.set(wsId, lang);
+        }
+        
+        if (!usersByLang.has(lang)) usersByLang.set(lang, []);
+        usersByLang.get(lang).push(ws);
+      } catch(e) {}
+    }
+
+    if (usersByLang.size === 0) return;
+
+    await this.translationManager.translateForUsersSync(question, options, usersByLang);
   }
 
   async _broadcastQuizResult(type, data) {
@@ -1391,20 +1339,26 @@ export class GameServer extends CPUProtection {
   _sendQuizTimeLeftToUser(ws) {
     if (!ws || ws.readyState !== 1) return false;
     try {
+      const wsId = this._getWsId(ws);
+      if (!wsId) return false;
+      
       const timeInfo = this._getTimeLeftUntilNextEvent();
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
+      
       if (isQuizTime) {
+        this._timeLeftSentCount.delete(wsId);
+        
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (Date.now() - this._quizStartTime) / 1000;
           const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
           const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-          message = minutes > 0 ? `📝 Quiz running! ${minutes}m ${seconds}s remaining` : `📝 Quiz running! ${seconds}s remaining`;
+          message = minutes > 0 ? `📝 ${minutes}m ${seconds}s remaining` : `📝 ${seconds}s remaining`;
           canType = false;
         } else if (this.isQuizWaiting) {
           message = `⏳ Preparing next question...`;
           canType = false;
         } else {
-          message = `⏳ Quiz will start soon! (${timeInfo.currentTime})`;
+          message = `⏳ Quiz will start soon!`;
           canType = true;
         }
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
@@ -1419,16 +1373,32 @@ export class GameServer extends CPUProtection {
         }]);
         return false;
       } else {
-        const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
+        const sentData = this._timeLeftSentCount.get(wsId) || { count: 0 };
+        if (sentData.count >= 2) {
+          const { hours, minutes, startTime } = timeInfo;
+          this._safeSend(ws, ["quizStatus", {
+            isRunning: false,
+            currentQuestion: false,
+            isWaiting: false,
+            timeLeft: 0,
+            nextQuizIn: (hours * 3600) + (minutes * 60),
+            nextQuizTime: startTime,
+            totalQuestions: this._allQuestions.length || 0
+          }]);
+          return true;
+        }
+        
+        const { hours, minutes } = timeInfo;
         const totalSeconds = (hours * 3600) + (minutes * 60);
         let countdownText = totalSeconds <= 0 ? "Soon!" :
           hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
           minutes > 0 ? `${minutes}m` : "Less than 1 minute";
-        if (status === 'before') {
-          message = `⏳ Quiz starts ${dayText} at ${startTime} (WIB)\n🕐 Now: ${currentTime}\n⏱️ Remaining: ${countdownText}`;
-        } else {
-          message = `⏸️ Quiz ended today. Back ${dayText} at ${startTime} (WIB)\n🕐 Now: ${currentTime}\n⏱️ Remaining: ${countdownText}`;
-        }
+        
+        message = timeInfo.status === 'before' ? `⏳ ${countdownText}` : `⏸️ ${countdownText}`;
+        
+        sentData.count += 1;
+        this._timeLeftSentCount.set(wsId, sentData);
+        
         canType = true;
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
         this._safeSend(ws, ["quizStatus", {
@@ -1437,7 +1407,7 @@ export class GameServer extends CPUProtection {
           isWaiting: false,
           timeLeft: 0,
           nextQuizIn: totalSeconds,
-          nextQuizTime: startTime,
+          nextQuizTime: timeInfo.startTime,
           totalQuestions: this._allQuestions.length || 0
         }]);
         return true;
@@ -1445,7 +1415,6 @@ export class GameServer extends CPUProtection {
     } catch(e) { return true; }
   }
 
-  // ==================== PERUBAHAN: _sendCurrentQuestionToUser TANPA CACHE ====================
   _sendCurrentQuestionToUser(ws) {
     if (!ws || ws.readyState !== 1) return;
     if (!this.currentQuestion) return;
@@ -1454,26 +1423,44 @@ export class GameServer extends CPUProtection {
     try {
       const wsId = this._getWsId(ws);
       if (!wsId) return;
-      const lang = this.userLanguage.get(wsId) || 'en';
+      
+      let lang = this.userLanguage.get(wsId) || 'en';
+      if (!lang || lang === 'undefined') {
+        const country = this.userCountry.get(wsId) || 'US';
+        lang = this._countryToLanguage(country);
+        this.userLanguage.set(wsId, lang);
+      }
+      
       const question = this.currentQuestion.question;
       const options = this.currentQuestion.options;
 
       if (lang === 'en') {
-        this._safeSend(ws, ["quizQuestion", { question, options, isFallback: false }]);
-      } else {
-        Promise.all([
-          this.translationManager._translateText(question, lang),
-          this.translationManager._translateOptions(options, lang)
-        ]).then(([translatedQ, translatedOpts]) => {
+        this._safeSend(ws, ["quizQuestion", { 
+          question, 
+          options, 
+          isFallback: false,
+          lang: 'en'
+        }]);
+        return;
+      }
+
+      this.translationManager._translateText(question, lang).then(translatedQ => {
+        this.translationManager._translateOptions(options, lang).then(translatedOpts => {
           this._safeSend(ws, ["quizQuestion", {
             question: translatedQ || question,
             options: translatedOpts || options,
-            isFallback: false
+            isFallback: false,
+            lang: lang
           }]);
-        }).catch(() => {
-          this._safeSend(ws, ["quizQuestion", { question, options, isFallback: true }]);
         });
-      }
+      }).catch(() => {
+        this._safeSend(ws, ["quizQuestion", { 
+          question, 
+          options, 
+          isFallback: true,
+          lang: 'en'
+        }]);
+      });
 
       if (this._quizStartTime) {
         const elapsed = (Date.now() - this._quizStartTime) / 1000;
@@ -1496,27 +1483,26 @@ export class GameServer extends CPUProtection {
         const elapsed = (Date.now() - this._quizStartTime) / 1000;
         const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
         const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-        message = minutes > 0 ? `📝 Quiz running! ${minutes}m ${seconds}s remaining` : `📝 Quiz running! ${seconds}s remaining`;
+        message = minutes > 0 ? `📝 ${minutes}m ${seconds}s remaining` : `📝 ${seconds}s remaining`;
         canType = false;
       } else if (this.isQuizWaiting) {
         message = `⏳ Preparing next question...`;
         canType = false;
       } else {
-        message = `⏳ Quiz will start soon! (${timeInfo.currentTime})`;
+        message = `⏳ Quiz will start soon!`;
         canType = true;
       }
     } else {
-      const { hours, minutes, status, startTime, currentTime, dayText } = timeInfo;
-      const totalSeconds = (hours * 3600) + (minutes * 60);
-      let countdownText = totalSeconds <= 0 ? "Soon!" :
-        hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
-        minutes > 0 ? `${minutes}m` : "Less than 1 minute";
-      if (status === 'before') {
-        message = `⏳ Quiz starts ${dayText} at ${startTime}\n⏱️ Remaining: ${countdownText}`;
-      } else {
-        message = `⏸️ Quiz ended today. Back ${dayText} at ${startTime}\n⏱️ Remaining: ${countdownText}`;
+      for (const wsId of wsIds) {
+        const sentData = this._timeLeftSentCount.get(wsId) || { count: 0 };
+        if (sentData.count < 2) {
+          const ws = this.wsMap.get(wsId);
+          if (ws && ws.readyState === 1) {
+            this._sendQuizTimeLeftToUser(ws);
+          }
+        }
       }
-      canType = true;
+      return;
     }
     this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, canType, isQuizTime]);
   }
@@ -1529,31 +1515,46 @@ export class GameServer extends CPUProtection {
       switch(errorType) {
         case "NOT_QUIZ_TIME":
           if (timeInfo.status === 'before') {
-            const { hours, minutes, startTime, currentTime } = timeInfo;
+            const { hours, minutes } = timeInfo;
             let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
               minutes > 0 ? `${minutes}m` : "less than 1 minute";
-            message = `⏳ Quiz starts at ${startTime} (WIB)\n🕐 Now: ${currentTime}\n⏱️ Remaining: ${timeStr}`;
+            message = `⏳ ${timeStr}`;
           } else {
-            const { startTime, currentTime } = timeInfo;
-            message = `⏸️ Quiz has ended.\n🕐 Now: ${currentTime}\n📅 Back tomorrow at ${startTime} (WIB)`;
+            const { hours, minutes } = timeInfo;
+            let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
+              minutes > 0 ? `${minutes}m` : "less than 1 minute";
+            message = `⏸️ ${timeStr}`;
           }
           break;
-        case "QUIZ_DISABLED": message = "❌ Quiz is currently unavailable"; break;
+        case "QUIZ_DISABLED": 
+          message = "❌ Quiz is currently unavailable"; 
+          break;
         case "QUIZ_ENDED":
-          const { hours, minutes, startTime, currentTime } = timeInfo;
+          const { hours, minutes } = timeInfo;
           let timeStr = hours > 0 ? (minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`) :
             minutes > 0 ? `${minutes}m` : "less than 1 minute";
-          message = `⏸️ Quiz has ended.\n🕐 Now: ${currentTime}\n📅 Continues tomorrow at ${startTime} (WIB)\n⏱️ Remaining: ${timeStr}`;
+          message = `⏸️ ${timeStr}`;
           break;
-        case "QUIZ_NOT_STARTED": message = `⏳ Quiz will start at ${QUIZ_SCHEDULE.START_HOUR}:00 WIB`; break;
-        default: message = customMessage || "❌ An error occurred in the Quiz";
+        case "QUIZ_NOT_STARTED": 
+          message = `⏳ Quiz will start soon`; 
+          break;
+        default: 
+          message = customMessage || "❌ An error occurred in the Quiz";
       }
       this._safeSend(ws, ["quizError", message]);
       return true;
-    } catch(e) { return false; }
+    } catch(e) { 
+      this._safeSend(ws, ["quizError", "❌ Quiz error"]);
+      return false; 
+    }
   }
 
   _getWsId(ws) { return ws?._wsId || null; }
+
+  _getRoomForWs(ws) {
+    if (!ws) return null;
+    return ws.room || ws.roomname || null;
+  }
 
   _ensureRoomConsistency(ws) {
     if (!ws) return null;
@@ -1591,10 +1592,7 @@ export class GameServer extends CPUProtection {
   _addClient(room, ws, username = null, isNewConnection = false) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
-    if (!wsId) { 
-      this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
-      return; 
-    }
+    if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
 
     ws.room = room;
     ws.roomname = room;
@@ -1607,35 +1605,21 @@ export class GameServer extends CPUProtection {
       }
     }
 
-    if (username) {
-      const existingConn = this.userConnections.get(username);
-      if (existingConn) {
-        existingConn.wsId = wsId;
-        existingConn.ws = ws;
-        existingConn.room = room;
-        existingConn.timestamp = Date.now();
-        this.userConnections.set(username, existingConn);
-      } else {
-        this.userConnections.set(username, { 
-          wsId, 
-          ws, 
-          room, 
-          timestamp: Date.now() 
-        });
-      }
+    if (username && isNewConnection) {
+      this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() });
+    } else if (username) {
+      const conn = this.userConnections.get(username);
+      if (conn) { conn.room = room; conn.timestamp = Date.now(); conn.ws = ws; conn.wsId = wsId; }
+      else { this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() }); }
     }
 
-    if (!this.wsClients.has(room)) {
-      this.wsClients.set(room, new Set());
-    }
+    if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
     this.wsClients.get(room).add(wsId);
     this.clientRooms.set(wsId, room);
     this.wsMap.set(wsId, ws);
 
     if (username) {
-      if (!this.roomViewers.has(room)) {
-        this.roomViewers.set(room, new Set());
-      }
+      if (!this.roomViewers.has(room)) this.roomViewers.set(room, new Set());
       this.roomViewers.get(room).add(username);
     }
   }
@@ -1654,46 +1638,20 @@ export class GameServer extends CPUProtection {
     const wsId = this._getWsId(ws);
     if (!wsId) return;
     const username = ws.username;
-    
     this._removeClientFromRoom(room, wsId);
     this.clientRooms.delete(wsId);
     this.wsMap.delete(wsId);
     this.userLanguage.delete(wsId);
     this.userCountry.delete(wsId);
-    
+    this._timeLeftSentCount.delete(wsId);
     if (username) {
-      let hasOtherConnection = false;
-      let otherWsId = null;
-      let otherWs = null;
-      
-      for (const [otherId, otherWsInstance] of this.wsMap) {
-        if (otherId !== wsId && otherWsInstance && otherWsInstance.username === username) {
-          hasOtherConnection = true;
-          otherWsId = otherId;
-          otherWs = otherWsInstance;
-          break;
-        }
-      }
-      
-      if (hasOtherConnection && otherWsId) {
-        this.userConnections.set(username, { 
-          wsId: otherWsId, 
-          ws: otherWs, 
-          room: otherWs.room || room, 
-          timestamp: Date.now() 
-        });
-      } else {
-        this.userConnections.delete(username);
-      }
-      
+      const conn = this.userConnections.get(username);
+      if (conn?.wsId === wsId) this.userConnections.delete(username);
       if (this.roomViewers.has(room)) {
         this.roomViewers.get(room).delete(username);
-        if (this.roomViewers.get(room).size === 0) {
-          this.roomViewers.delete(room);
-        }
+        if (this.roomViewers.get(room).size === 0) this.roomViewers.delete(room);
       }
     }
-    
     ws.room = null;
     ws.roomname = null;
     ws._wsId = null;
@@ -1713,7 +1671,7 @@ export class GameServer extends CPUProtection {
   _countryToLanguage(countryCode) {
     if (!countryCode) return 'en';
     const map = {
-      'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id',
+      'ID': 'id', 'MY': 'id', 'SG': 'id', 'PH': 'id', 'BN': 'id',
       'TH': 'th', 'VN': 'vi', 'KH': 'km', 'LA': 'lo',
       'MM': 'my', 'TL': 'pt',
       'CN': 'zh', 'TW': 'zh', 'HK': 'zh', 'MO': 'zh',
@@ -1739,31 +1697,28 @@ export class GameServer extends CPUProtection {
       'GR': 'el', 'HU': 'hu', 'CS': 'cs', 'SK': 'sk',
       'RO': 'ro', 'BG': 'bg', 'HR': 'hr', 'SI': 'sl',
     };
-    return map[countryCode.toUpperCase()] || 'en';
+    const lang = map[countryCode.toUpperCase()];
+    if (!lang) {
+      if (['ID', 'MY', 'SG', 'PH', 'TH', 'VN'].includes(countryCode.toUpperCase())) {
+        return 'id';
+      }
+      return 'en';
+    }
+    return lang;
   }
 
   async switchRoom(ws, room, username = null) {
-    if (this.isDestroyed) { 
-      this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); 
-      return; 
-    }
-    if (!room || room.trim() === "") { 
-      this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); 
-      return; 
-    }
+    if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
+    if (!room || room.trim() === "") { this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); return; }
 
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
-    if (!wsId) { 
-      this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
-      return; 
-    }
+    if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
+
+    this._timeLeftSentCount.delete(wsId);
 
     const lockKey = `switch_${wsId}`;
-    if (this._switchLocks.has(lockKey)) { 
-      this._safeSend(ws, ["gameLowCardError", "Switch in progress"]); 
-      return; 
-    }
+    if (this._switchLocks.has(lockKey)) { this._safeSend(ws, ["gameLowCardError", "Switch in progress"]); return; }
     this._switchLocks.set(lockKey, Date.now());
 
     try {
@@ -1781,20 +1736,8 @@ export class GameServer extends CPUProtection {
 
       if (username) {
         let conn = this.userConnections.get(username);
-        if (conn) { 
-          conn.room = roomName; 
-          conn.wsId = wsId; 
-          conn.ws = ws; 
-          conn.timestamp = Date.now();
-          this.userConnections.set(username, conn);
-        } else { 
-          this.userConnections.set(username, { 
-            wsId, 
-            ws, 
-            room: roomName, 
-            timestamp: Date.now() 
-          }); 
-        }
+        if (conn) { conn.room = roomName; conn.wsId = wsId; conn.ws = ws; conn.timestamp = Date.now(); }
+        else { this.userConnections.set(username, { wsId, ws, room: roomName, timestamp: Date.now() }); }
       }
 
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
@@ -1807,62 +1750,48 @@ export class GameServer extends CPUProtection {
           this._switchQuizTimeout = null;
         }
 
-        try {
-          let country = this.userCountry.get(wsId);
-          if (!country) { 
-            const cf = ws._cf || {}; 
-            country = cf.country || 'US'; 
-            this.userCountry.set(wsId, country); 
-          }
-          const lang = this._setUserLanguage(ws, country);
-          this._safeSend(ws, ["userLanguage", lang]);
+        let country = this.userCountry.get(wsId);
+        if (!country) { const cf = ws._cf || {}; country = cf.country || 'US'; this.userCountry.set(wsId, country); }
+        const lang = this._setUserLanguage(ws, country);
+        this._safeSend(ws, ["userLanguage", lang]);
 
-          if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-            await this._initQuiz();
-          }
-
-          this._sendQuizTimeLeftToUser(ws);
-
-          this._switchQuizTimeout = setTimeout(() => {
-            this._isSwitchingToQuiz = false;
-            this._switchQuizTimeout = null;
-
-            if (!this.closing && !this.isDestroyed) {
-              if (this.currentQuestion) {
-                this._sendCurrentQuestionToUser(ws);
-              }
-              this._sendQuizTimeLeftToUser(ws);
-            }
-          }, 1000);
-
-          this._getLastWeekWinner().then(winner => {
-            if (winner) {
-              this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
-            }
-          }).catch(() => {});
-
-          this._getQuizPoints().then(points => {
-            const sorted = Object.entries(points)
-              .map(([username, score]) => ({ username, score }))
-              .sort((a, b) => b.score - a.score)
-              .slice(0, 10);
-            const result = sorted.map(item => `${item.username}|${item.score}`);
-            this._safeSend(ws, ["quizLeaderboard", result]);
-          }).catch(() => {});
-
-        } catch(e) {
-          this._isSwitchingToQuiz = false;
-          this._safeSend(ws, ["quizError", "Error loading quiz data"]);
+        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+          await this._initQuiz();
         }
+
+        this._sendQuizTimeLeftToUser(ws);
+
+        this._switchQuizTimeout = setTimeout(() => {
+          this._isSwitchingToQuiz = false;
+          this._switchQuizTimeout = null;
+
+          if (!this.closing && !this.isDestroyed) {
+            if (this.currentQuestion) {
+              this._sendCurrentQuestionToUser(ws);
+            }
+            this._sendQuizTimeLeftToUser(ws);
+          }
+        }, 1000);
+
+        this._getLastWeekWinner().then(winner => {
+          if (winner) {
+            this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
+          }
+        });
+
+        this._getQuizPoints().then(points => {
+          const sorted = Object.entries(points)
+            .map(([username, score]) => ({ username, score }))
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 10);
+          const result = sorted.map(item => `${item.username}|${item.score}`);
+          this._safeSend(ws, ["quizLeaderboard", result]);
+        });
       }
 
       this._broadcastToRoom(roomName, ["userJoinedRoom", username, roomName]);
-      if (oldRoom) {
-        this._broadcastToRoom(oldRoom, ["userLeftRoom", username, oldRoom]);
-      }
+      if (oldRoom) this._broadcastToRoom(oldRoom, ["userLeftRoom", username, oldRoom]);
 
-    } catch(e) {
-      this._safeSend(ws, ["gameLowCardError", "Failed to switch room"]);
     } finally {
       this._switchLocks.delete(lockKey);
     }
@@ -1975,6 +1904,8 @@ export class GameServer extends CPUProtection {
     if (!room || !game) return;
     if (game?._isActive && !game._gameEnded) return;
     if (this._cleanupTimers.has(room)) { clearTimeout(this._cleanupTimers.get(room)); this._cleanupTimers.delete(room); }
+    this._roomBroadcastCount.delete(room);
+    this._roomBroadcastReset.delete(room);
     if (game) {
       game._gameEnded = true;
       game._isActive = false;
@@ -2711,26 +2642,17 @@ export class GameServer extends CPUProtection {
     try {
       const game = this.activeGames.get(room);
       if (!game) return newWsId;
-      
       const existingWsId = game.playerWsId?.get(username);
       if (existingWsId && existingWsId !== newWsId) {
-        if (game.playerWsId) {
-          game.playerWsId.set(username, newWsId);
+        const oldWs = this.wsMap.get(existingWsId);
+        if (oldWs) {
+          try { oldWs.close(1000, "Duplicate connection"); } catch(e) {}
+          this._removeClient(room, oldWs);
         }
-        
-        const conn = this.userConnections.get(username);
-        if (conn) {
-          conn.wsId = newWsId;
-          conn.ws = newWs;
-          conn.timestamp = Date.now();
-          this.userConnections.set(username, conn);
-        }
+        if (game.playerWsId) game.playerWsId.set(username, newWsId);
       }
-      
       return newWsId;
-    } catch(e) { 
-      return newWsId; 
-    }
+    } catch(e) { return newWsId; }
   }
 
   _shuffleQuestionOptions(question) {
@@ -2922,82 +2844,22 @@ export class GameServer extends CPUProtection {
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
-      const now = Date.now();
-      
       for (const [wsId, ws] of this.wsMap) {
-        if (!ws) {
-          toRemove.push(wsId);
-          continue;
-        }
-        
-        let isDead = false;
-        try {
-          if (ws.readyState === undefined || ws.readyState === null) {
-            isDead = true;
-          } else if (ws.readyState === 3) {
-            isDead = true;
-          } else if (ws.readyState === 2) {
-            isDead = true;
-          } else if (ws.readyState === 0) {
-            if (ws._createdAt && (now - ws._createdAt) > 30000) {
-              isDead = true;
-            }
-          }
-        } catch(e) {
-          isDead = true;
-        }
-        
-        if (isDead) {
-          toRemove.push(wsId);
-        }
+        if (!ws || ws.readyState !== 1 || ws._closing) toRemove.push(wsId);
       }
-      
       for (const wsId of toRemove) {
         const ws = this.wsMap.get(wsId);
         if (ws) {
           const room = this.clientRooms.get(wsId);
-          const username = ws.username;
-          
-          if (room) {
-            this._removeClientFromRoom(room, wsId);
-          }
-          
+          if (room) this._removeClientFromRoom(room, wsId);
           this.clientRooms.delete(wsId);
           this.wsMap.delete(wsId);
           this.userLanguage.delete(wsId);
           this.userCountry.delete(wsId);
-          
-          if (username) {
-            let hasOther = false;
-            for (const [otherId, otherWs] of this.wsMap) {
-              if (otherId !== wsId && otherWs && otherWs.username === username) {
-                hasOther = true;
-                break;
-              }
-            }
-            
-            if (!hasOther) {
-              this.userConnections.delete(username);
-            } else {
-              for (const [otherId, otherWs] of this.wsMap) {
-                if (otherId !== wsId && otherWs && otherWs.username === username) {
-                  const existingConn = this.userConnections.get(username);
-                  if (existingConn) {
-                    existingConn.wsId = otherId;
-                    existingConn.ws = otherWs;
-                    existingConn.timestamp = Date.now();
-                    this.userConnections.set(username, existingConn);
-                  }
-                  break;
-                }
-              }
-            }
+          this._timeLeftSentCount.delete(wsId);
+          for (const [username, conn] of this.userConnections) {
+            if (conn?.wsId === wsId) { this.userConnections.delete(username); break; }
           }
-          
-          ws.room = null;
-          ws.roomname = null;
-          ws._wsId = null;
-          ws.username = null;
         }
       }
     } catch(e) {}
@@ -3101,39 +2963,23 @@ export class GameServer extends CPUProtection {
     try {
       if (!ws) return;
       const wsId = this._getWsId(ws);
-      if (!wsId) return;
-      
       const username = ws.username;
-      const room = ws.room || ws.roomname;
-      
-      if (room) {
-        this._removeClientFromRoom(room, wsId);
+      if (ws.room || ws.roomname) {
+        const room = ws.room || ws.roomname;
+        this._removeClient(room, ws);
       }
-      
-      this.clientRooms.delete(wsId);
-      this.wsMap.delete(wsId);
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
-      
+      this._timeLeftSentCount.delete(wsId);
       if (username) {
-        let hasOther = false;
-        for (const [otherId, otherWs] of this.wsMap) {
-          if (otherId !== wsId && otherWs && otherWs.username === username) {
-            hasOther = true;
-            break;
-          }
-        }
-        
-        if (!hasOther) {
-          this.userConnections.delete(username);
-        }
+        const conn = this.userConnections.get(username);
+        if (conn?.wsId === wsId) this.userConnections.delete(username);
       }
-      
+      if (wsId) { this.clientRooms.delete(wsId); this.wsMap.delete(wsId); }
       ws.room = null;
       ws.roomname = null;
       ws._wsId = null;
       ws.username = null;
-      
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (clients?.size > 0) this.ensureQuizRunning();
     } catch(e) {}
@@ -3143,34 +2989,19 @@ export class GameServer extends CPUProtection {
     try {
       if (!ws) return;
       const wsId = this._getWsId(ws);
-      if (!wsId) return;
-      
       const username = ws.username;
-      const room = ws.room || ws.roomname;
-      
-      if (room) {
-        this._removeClientFromRoom(room, wsId);
+      if (ws.room || ws.roomname) {
+        const room = ws.room || ws.roomname;
+        this._removeClient(room, ws);
       }
-      
-      this.clientRooms.delete(wsId);
-      this.wsMap.delete(wsId);
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
-      
+      this._timeLeftSentCount.delete(wsId);
       if (username) {
-        let hasOther = false;
-        for (const [otherId, otherWs] of this.wsMap) {
-          if (otherId !== wsId && otherWs && otherWs.username === username) {
-            hasOther = true;
-            break;
-          }
-        }
-        
-        if (!hasOther) {
-          this.userConnections.delete(username);
-        }
+        const conn = this.userConnections.get(username);
+        if (conn?.wsId === wsId) this.userConnections.delete(username);
       }
-      
+      if (wsId) { this.clientRooms.delete(wsId); this.wsMap.delete(wsId); }
       ws.room = null;
       ws.roomname = null;
       ws._wsId = null;
