@@ -1490,7 +1490,6 @@ export class GameServer extends CPUProtection {
     return room || null;
   }
 
-  // ==================== PERBAIKAN _addClient ====================
   _addClient(room, ws, username = null, isNewConnection = false) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
@@ -1510,7 +1509,6 @@ export class GameServer extends CPUProtection {
       }
     }
 
-    // FIX: Update userConnections dengan aman
     if (username) {
       const existingConn = this.userConnections.get(username);
       if (existingConn) {
@@ -1553,7 +1551,6 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ==================== PERBAIKAN _removeClient ====================
   _removeClient(room, ws) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
@@ -1566,7 +1563,6 @@ export class GameServer extends CPUProtection {
     this.userLanguage.delete(wsId);
     this.userCountry.delete(wsId);
     
-    // FIX: Hapus userConnections hanya jika TIDAK ADA koneksi lain
     if (username) {
       let hasOtherConnection = false;
       let otherWsId = null;
@@ -1648,7 +1644,6 @@ export class GameServer extends CPUProtection {
     return map[countryCode.toUpperCase()] || 'en';
   }
 
-  // ==================== PERBAIKAN switchRoom ====================
   async switchRoom(ws, room, username = null) {
     if (this.isDestroyed) { 
       this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); 
@@ -1714,7 +1709,6 @@ export class GameServer extends CPUProtection {
           this._switchQuizTimeout = null;
         }
 
-        // FIX: Handle error dengan aman
         try {
           let country = this.userCountry.get(wsId);
           if (!country) { 
@@ -1759,7 +1753,6 @@ export class GameServer extends CPUProtection {
           }).catch(() => {});
 
         } catch(e) {
-          // FIX: Jangan biarkan user kehilangan room
           this._isSwitchingToQuiz = false;
           this._safeSend(ws, ["quizError", "Error loading quiz data"]);
         }
@@ -1771,7 +1764,6 @@ export class GameServer extends CPUProtection {
       }
 
     } catch(e) {
-      // FIX: Jangan biarkan user kehilangan room
       this._safeSend(ws, ["gameLowCardError", "Failed to switch room"]);
     } finally {
       this._switchLocks.delete(lockKey);
@@ -2451,7 +2443,6 @@ export class GameServer extends CPUProtection {
             this._safeSend(ws, ["gameLowCardError", "You have been eliminated"]);
             return;
           }
-          // FIX: Gunakan _ensureSingleConnection yang sudah diperbaiki
           const finalWsId = this._ensureSingleConnection(room, usernameClean, ws, wsId);
           if (game.numbers.has(usernameClean)) {
             this._safeSend(ws, ["gameLowCardPlayerDraw", usernameClean, game.numbers.get(usernameClean), game.tanda.get(usernameClean) || ""]);
@@ -2618,7 +2609,6 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ==================== PERBAIKAN _ensureSingleConnection ====================
   _ensureSingleConnection(room, username, newWs, newWsId) {
     try {
       const game = this.activeGames.get(room);
@@ -2626,15 +2616,10 @@ export class GameServer extends CPUProtection {
       
       const existingWsId = game.playerWsId?.get(username);
       if (existingWsId && existingWsId !== newWsId) {
-        // FIX: JANGAN tutup koneksi lama!
-        // Biarkan kedua koneksi tetap aktif, update mapping ke yang baru
-        
-        // Update mapping ke koneksi baru
         if (game.playerWsId) {
           game.playerWsId.set(username, newWsId);
         }
         
-        // Update userConnections
         const conn = this.userConnections.get(username);
         if (conn) {
           conn.wsId = newWsId;
@@ -2836,7 +2821,6 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== PERBAIKAN _cleanupDeadConnections ====================
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
@@ -2848,28 +2832,19 @@ export class GameServer extends CPUProtection {
           continue;
         }
         
-        // FIX: Deteksi hanya koneksi yang benar-benar mati
         let isDead = false;
         try {
-          // readyState:
-          // 0 = CONNECTING
-          // 1 = OPEN (aktif)
-          // 2 = CLOSING
-          // 3 = CLOSED
           if (ws.readyState === undefined || ws.readyState === null) {
             isDead = true;
-          } else if (ws.readyState === 3) { // CLOSED
+          } else if (ws.readyState === 3) {
             isDead = true;
-          } else if (ws.readyState === 2) { // CLOSING
+          } else if (ws.readyState === 2) {
             isDead = true;
-          } else if (ws.readyState === 0) { // CONNECTING
-            // Jika connecting lebih dari 30 detik, anggap gagal
+          } else if (ws.readyState === 0) {
             if (ws._createdAt && (now - ws._createdAt) > 30000) {
               isDead = true;
             }
           }
-          // FIX: JANGAN gunakan ws._closing sebagai indikator!
-          // Koneksi dengan readyState 1 (OPEN) tetap dianggap hidup
         } catch(e) {
           isDead = true;
         }
@@ -2894,7 +2869,6 @@ export class GameServer extends CPUProtection {
           this.userLanguage.delete(wsId);
           this.userCountry.delete(wsId);
           
-          // FIX: Hapus dari userConnections dengan aman
           if (username) {
             let hasOther = false;
             for (const [otherId, otherWs] of this.wsMap) {
@@ -2907,7 +2881,6 @@ export class GameServer extends CPUProtection {
             if (!hasOther) {
               this.userConnections.delete(username);
             } else {
-              // Update ke koneksi yang masih aktif
               for (const [otherId, otherWs] of this.wsMap) {
                 if (otherId !== wsId && otherWs && otherWs.username === username) {
                   const existingConn = this.userConnections.get(username);
@@ -3030,22 +3003,39 @@ export class GameServer extends CPUProtection {
     try {
       if (!ws) return;
       const wsId = this._getWsId(ws);
+      if (!wsId) return;
+      
       const username = ws.username;
-      if (ws.room || ws.roomname) {
-        const room = ws.room || ws.roomname;
-        this._removeClient(room, ws);
+      const room = ws.room || ws.roomname;
+      
+      if (room) {
+        this._removeClientFromRoom(room, wsId);
       }
+      
+      this.clientRooms.delete(wsId);
+      this.wsMap.delete(wsId);
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
+      
       if (username) {
-        const conn = this.userConnections.get(username);
-        if (conn?.wsId === wsId) this.userConnections.delete(username);
+        let hasOther = false;
+        for (const [otherId, otherWs] of this.wsMap) {
+          if (otherId !== wsId && otherWs && otherWs.username === username) {
+            hasOther = true;
+            break;
+          }
+        }
+        
+        if (!hasOther) {
+          this.userConnections.delete(username);
+        }
       }
-      if (wsId) { this.clientRooms.delete(wsId); this.wsMap.delete(wsId); }
+      
       ws.room = null;
       ws.roomname = null;
       ws._wsId = null;
       ws.username = null;
+      
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (clients?.size > 0) this.ensureQuizRunning();
     } catch(e) {}
@@ -3055,18 +3045,34 @@ export class GameServer extends CPUProtection {
     try {
       if (!ws) return;
       const wsId = this._getWsId(ws);
+      if (!wsId) return;
+      
       const username = ws.username;
-      if (ws.room || ws.roomname) {
-        const room = ws.room || ws.roomname;
-        this._removeClient(room, ws);
+      const room = ws.room || ws.roomname;
+      
+      if (room) {
+        this._removeClientFromRoom(room, wsId);
       }
+      
+      this.clientRooms.delete(wsId);
+      this.wsMap.delete(wsId);
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
+      
       if (username) {
-        const conn = this.userConnections.get(username);
-        if (conn?.wsId === wsId) this.userConnections.delete(username);
+        let hasOther = false;
+        for (const [otherId, otherWs] of this.wsMap) {
+          if (otherId !== wsId && otherWs && otherWs.username === username) {
+            hasOther = true;
+            break;
+          }
+        }
+        
+        if (!hasOther) {
+          this.userConnections.delete(username);
+        }
       }
-      if (wsId) { this.clientRooms.delete(wsId); this.wsMap.delete(wsId); }
+      
       ws.room = null;
       ws.roomname = null;
       ws._wsId = null;
