@@ -1490,10 +1490,14 @@ export class GameServer extends CPUProtection {
     return room || null;
   }
 
+  // ==================== PERBAIKAN _addClient ====================
   _addClient(room, ws, username = null, isNewConnection = false) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
-    if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
+    if (!wsId) { 
+      this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
+      return; 
+    }
 
     ws.room = room;
     ws.roomname = room;
@@ -1506,21 +1510,36 @@ export class GameServer extends CPUProtection {
       }
     }
 
-    if (username && isNewConnection) {
-      this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() });
-    } else if (username) {
-      const conn = this.userConnections.get(username);
-      if (conn) { conn.room = room; conn.timestamp = Date.now(); conn.ws = ws; conn.wsId = wsId; }
-      else { this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() }); }
+    // FIX: Update userConnections dengan aman
+    if (username) {
+      const existingConn = this.userConnections.get(username);
+      if (existingConn) {
+        existingConn.wsId = wsId;
+        existingConn.ws = ws;
+        existingConn.room = room;
+        existingConn.timestamp = Date.now();
+        this.userConnections.set(username, existingConn);
+      } else {
+        this.userConnections.set(username, { 
+          wsId, 
+          ws, 
+          room, 
+          timestamp: Date.now() 
+        });
+      }
     }
 
-    if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
+    if (!this.wsClients.has(room)) {
+      this.wsClients.set(room, new Set());
+    }
     this.wsClients.get(room).add(wsId);
     this.clientRooms.set(wsId, room);
     this.wsMap.set(wsId, ws);
 
     if (username) {
-      if (!this.roomViewers.has(room)) this.roomViewers.set(room, new Set());
+      if (!this.roomViewers.has(room)) {
+        this.roomViewers.set(room, new Set());
+      }
       this.roomViewers.get(room).add(username);
     }
   }
@@ -1534,24 +1553,53 @@ export class GameServer extends CPUProtection {
     }
   }
 
+  // ==================== PERBAIKAN _removeClient ====================
   _removeClient(room, ws) {
     if (!ws) return;
     const wsId = this._getWsId(ws);
     if (!wsId) return;
     const username = ws.username;
+    
     this._removeClientFromRoom(room, wsId);
     this.clientRooms.delete(wsId);
     this.wsMap.delete(wsId);
     this.userLanguage.delete(wsId);
     this.userCountry.delete(wsId);
+    
+    // FIX: Hapus userConnections hanya jika TIDAK ADA koneksi lain
     if (username) {
-      const conn = this.userConnections.get(username);
-      if (conn?.wsId === wsId) this.userConnections.delete(username);
+      let hasOtherConnection = false;
+      let otherWsId = null;
+      let otherWs = null;
+      
+      for (const [otherId, otherWsInstance] of this.wsMap) {
+        if (otherId !== wsId && otherWsInstance && otherWsInstance.username === username) {
+          hasOtherConnection = true;
+          otherWsId = otherId;
+          otherWs = otherWsInstance;
+          break;
+        }
+      }
+      
+      if (hasOtherConnection && otherWsId) {
+        this.userConnections.set(username, { 
+          wsId: otherWsId, 
+          ws: otherWs, 
+          room: otherWs.room || room, 
+          timestamp: Date.now() 
+        });
+      } else {
+        this.userConnections.delete(username);
+      }
+      
       if (this.roomViewers.has(room)) {
         this.roomViewers.get(room).delete(username);
-        if (this.roomViewers.get(room).size === 0) this.roomViewers.delete(room);
+        if (this.roomViewers.get(room).size === 0) {
+          this.roomViewers.delete(room);
+        }
       }
     }
+    
     ws.room = null;
     ws.roomname = null;
     ws._wsId = null;
@@ -1600,16 +1648,29 @@ export class GameServer extends CPUProtection {
     return map[countryCode.toUpperCase()] || 'en';
   }
 
+  // ==================== PERBAIKAN switchRoom ====================
   async switchRoom(ws, room, username = null) {
-    if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
-    if (!room || room.trim() === "") { this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); return; }
+    if (this.isDestroyed) { 
+      this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); 
+      return; 
+    }
+    if (!room || room.trim() === "") { 
+      this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); 
+      return; 
+    }
 
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
-    if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
+    if (!wsId) { 
+      this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
+      return; 
+    }
 
     const lockKey = `switch_${wsId}`;
-    if (this._switchLocks.has(lockKey)) { this._safeSend(ws, ["gameLowCardError", "Switch in progress"]); return; }
+    if (this._switchLocks.has(lockKey)) { 
+      this._safeSend(ws, ["gameLowCardError", "Switch in progress"]); 
+      return; 
+    }
     this._switchLocks.set(lockKey, Date.now());
 
     try {
@@ -1627,8 +1688,20 @@ export class GameServer extends CPUProtection {
 
       if (username) {
         let conn = this.userConnections.get(username);
-        if (conn) { conn.room = roomName; conn.wsId = wsId; conn.ws = ws; conn.timestamp = Date.now(); }
-        else { this.userConnections.set(username, { wsId, ws, room: roomName, timestamp: Date.now() }); }
+        if (conn) { 
+          conn.room = roomName; 
+          conn.wsId = wsId; 
+          conn.ws = ws; 
+          conn.timestamp = Date.now();
+          this.userConnections.set(username, conn);
+        } else { 
+          this.userConnections.set(username, { 
+            wsId, 
+            ws, 
+            room: roomName, 
+            timestamp: Date.now() 
+          }); 
+        }
       }
 
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
@@ -1641,48 +1714,65 @@ export class GameServer extends CPUProtection {
           this._switchQuizTimeout = null;
         }
 
-        let country = this.userCountry.get(wsId);
-        if (!country) { const cf = ws._cf || {}; country = cf.country || 'US'; this.userCountry.set(wsId, country); }
-        const lang = this._setUserLanguage(ws, country);
-        this._safeSend(ws, ["userLanguage", lang]);
+        // FIX: Handle error dengan aman
+        try {
+          let country = this.userCountry.get(wsId);
+          if (!country) { 
+            const cf = ws._cf || {}; 
+            country = cf.country || 'US'; 
+            this.userCountry.set(wsId, country); 
+          }
+          const lang = this._setUserLanguage(ws, country);
+          this._safeSend(ws, ["userLanguage", lang]);
 
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-          await this._initQuiz();
-        }
+          if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+            await this._initQuiz();
+          }
 
-        this._sendQuizTimeLeftToUser(ws);
+          this._sendQuizTimeLeftToUser(ws);
 
-        this._switchQuizTimeout = setTimeout(() => {
-          this._isSwitchingToQuiz = false;
-          this._switchQuizTimeout = null;
+          this._switchQuizTimeout = setTimeout(() => {
+            this._isSwitchingToQuiz = false;
+            this._switchQuizTimeout = null;
 
-          if (!this.closing && !this.isDestroyed) {
-            if (this.currentQuestion) {
-              this._sendCurrentQuestionToUser(ws);
+            if (!this.closing && !this.isDestroyed) {
+              if (this.currentQuestion) {
+                this._sendCurrentQuestionToUser(ws);
+              }
+              this._sendQuizTimeLeftToUser(ws);
             }
-            this._sendQuizTimeLeftToUser(ws);
-          }
-        }, 1000);
+          }, 1000);
 
-        this._getLastWeekWinner().then(winner => {
-          if (winner) {
-            this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
-          }
-        });
+          this._getLastWeekWinner().then(winner => {
+            if (winner) {
+              this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
+            }
+          }).catch(() => {});
 
-        this._getQuizPoints().then(points => {
-          const sorted = Object.entries(points)
-            .map(([username, score]) => ({ username, score }))
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 10);
-          const result = sorted.map(item => `${item.username}|${item.score}`);
-          this._safeSend(ws, ["quizLeaderboard", result]);
-        });
+          this._getQuizPoints().then(points => {
+            const sorted = Object.entries(points)
+              .map(([username, score]) => ({ username, score }))
+              .sort((a, b) => b.score - a.score)
+              .slice(0, 10);
+            const result = sorted.map(item => `${item.username}|${item.score}`);
+            this._safeSend(ws, ["quizLeaderboard", result]);
+          }).catch(() => {});
+
+        } catch(e) {
+          // FIX: Jangan biarkan user kehilangan room
+          this._isSwitchingToQuiz = false;
+          this._safeSend(ws, ["quizError", "Error loading quiz data"]);
+        }
       }
 
       this._broadcastToRoom(roomName, ["userJoinedRoom", username, roomName]);
-      if (oldRoom) this._broadcastToRoom(oldRoom, ["userLeftRoom", username, oldRoom]);
+      if (oldRoom) {
+        this._broadcastToRoom(oldRoom, ["userLeftRoom", username, oldRoom]);
+      }
 
+    } catch(e) {
+      // FIX: Jangan biarkan user kehilangan room
+      this._safeSend(ws, ["gameLowCardError", "Failed to switch room"]);
     } finally {
       this._switchLocks.delete(lockKey);
     }
@@ -2361,6 +2451,7 @@ export class GameServer extends CPUProtection {
             this._safeSend(ws, ["gameLowCardError", "You have been eliminated"]);
             return;
           }
+          // FIX: Gunakan _ensureSingleConnection yang sudah diperbaiki
           const finalWsId = this._ensureSingleConnection(room, usernameClean, ws, wsId);
           if (game.numbers.has(usernameClean)) {
             this._safeSend(ws, ["gameLowCardPlayerDraw", usernameClean, game.numbers.get(usernameClean), game.tanda.get(usernameClean) || ""]);
@@ -2527,21 +2618,36 @@ export class GameServer extends CPUProtection {
     }
   }
 
+  // ==================== PERBAIKAN _ensureSingleConnection ====================
   _ensureSingleConnection(room, username, newWs, newWsId) {
     try {
       const game = this.activeGames.get(room);
       if (!game) return newWsId;
+      
       const existingWsId = game.playerWsId?.get(username);
       if (existingWsId && existingWsId !== newWsId) {
-        const oldWs = this.wsMap.get(existingWsId);
-        if (oldWs) {
-          try { oldWs.close(1000, "Duplicate connection"); } catch(e) {}
-          this._removeClient(room, oldWs);
+        // FIX: JANGAN tutup koneksi lama!
+        // Biarkan kedua koneksi tetap aktif, update mapping ke yang baru
+        
+        // Update mapping ke koneksi baru
+        if (game.playerWsId) {
+          game.playerWsId.set(username, newWsId);
         }
-        if (game.playerWsId) game.playerWsId.set(username, newWsId);
+        
+        // Update userConnections
+        const conn = this.userConnections.get(username);
+        if (conn) {
+          conn.wsId = newWsId;
+          conn.ws = newWs;
+          conn.timestamp = Date.now();
+          this.userConnections.set(username, conn);
+        }
       }
+      
       return newWsId;
-    } catch(e) { return newWsId; }
+    } catch(e) { 
+      return newWsId; 
+    }
   }
 
   _shuffleQuestionOptions(question) {
@@ -2730,24 +2836,97 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== PERBAIKAN _cleanupDeadConnections ====================
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
+      const now = Date.now();
+      
       for (const [wsId, ws] of this.wsMap) {
-        if (!ws || ws.readyState !== 1 || ws._closing) toRemove.push(wsId);
+        if (!ws) {
+          toRemove.push(wsId);
+          continue;
+        }
+        
+        // FIX: Deteksi hanya koneksi yang benar-benar mati
+        let isDead = false;
+        try {
+          // readyState:
+          // 0 = CONNECTING
+          // 1 = OPEN (aktif)
+          // 2 = CLOSING
+          // 3 = CLOSED
+          if (ws.readyState === undefined || ws.readyState === null) {
+            isDead = true;
+          } else if (ws.readyState === 3) { // CLOSED
+            isDead = true;
+          } else if (ws.readyState === 2) { // CLOSING
+            isDead = true;
+          } else if (ws.readyState === 0) { // CONNECTING
+            // Jika connecting lebih dari 30 detik, anggap gagal
+            if (ws._createdAt && (now - ws._createdAt) > 30000) {
+              isDead = true;
+            }
+          }
+          // FIX: JANGAN gunakan ws._closing sebagai indikator!
+          // Koneksi dengan readyState 1 (OPEN) tetap dianggap hidup
+        } catch(e) {
+          isDead = true;
+        }
+        
+        if (isDead) {
+          toRemove.push(wsId);
+        }
       }
+      
       for (const wsId of toRemove) {
         const ws = this.wsMap.get(wsId);
         if (ws) {
           const room = this.clientRooms.get(wsId);
-          if (room) this._removeClientFromRoom(room, wsId);
+          const username = ws.username;
+          
+          if (room) {
+            this._removeClientFromRoom(room, wsId);
+          }
+          
           this.clientRooms.delete(wsId);
           this.wsMap.delete(wsId);
           this.userLanguage.delete(wsId);
           this.userCountry.delete(wsId);
-          for (const [username, conn] of this.userConnections) {
-            if (conn?.wsId === wsId) { this.userConnections.delete(username); break; }
+          
+          // FIX: Hapus dari userConnections dengan aman
+          if (username) {
+            let hasOther = false;
+            for (const [otherId, otherWs] of this.wsMap) {
+              if (otherId !== wsId && otherWs && otherWs.username === username) {
+                hasOther = true;
+                break;
+              }
+            }
+            
+            if (!hasOther) {
+              this.userConnections.delete(username);
+            } else {
+              // Update ke koneksi yang masih aktif
+              for (const [otherId, otherWs] of this.wsMap) {
+                if (otherId !== wsId && otherWs && otherWs.username === username) {
+                  const existingConn = this.userConnections.get(username);
+                  if (existingConn) {
+                    existingConn.wsId = otherId;
+                    existingConn.ws = otherWs;
+                    existingConn.timestamp = Date.now();
+                    this.userConnections.set(username, existingConn);
+                  }
+                  break;
+                }
+              }
+            }
           }
+          
+          ws.room = null;
+          ws.roomname = null;
+          ws._wsId = null;
+          ws.username = null;
         }
       }
     } catch(e) {}
