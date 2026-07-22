@@ -951,7 +951,7 @@ export class GameServer extends CPUProtection {
       await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
       this._broadcastToRoom(QUIZ_ROOM, [
         "quizTimeLeft",
-        `📝 Question ${this._totalQuestionsAnswered}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
+        `📝 ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
         false
       ]);
 
@@ -1296,7 +1296,7 @@ export class GameServer extends CPUProtection {
           const elapsed = (Date.now() - this._quizStartTime) / 1000;
           const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
           const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-          message = minutes > 0 ? `📝 Quiz running! ${minutes}m ${seconds}s remaining` : `📝 Quiz running! ${seconds}s remaining`;
+          message = minutes > 0 ? `📝 ${minutes}m ${seconds}s remaining` : `📝 ${seconds}s remaining`;
           canType = false;
         } else if (this.isQuizWaiting) {
           message = `⏳ Preparing next question...`;
@@ -1392,7 +1392,7 @@ export class GameServer extends CPUProtection {
         const elapsed = (Date.now() - this._quizStartTime) / 1000;
         const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
         const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-        message = minutes > 0 ? `📝 Quiz running! ${minutes}m ${seconds}s remaining` : `📝 Quiz running! ${seconds}s remaining`;
+        message = minutes > 0 ? `📝 ${minutes}m ${seconds}s remaining` : `📝 ${seconds}s remaining`;
         canType = false;
       } else if (this.isQuizWaiting) {
         message = `⏳ Preparing next question...`;
