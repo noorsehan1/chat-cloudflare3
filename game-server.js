@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL CLASS WITH QUIZ END NOTIFICATION ONCE) ====================
+// ==================== GAME-SERVER.JS (FULL CLASS WITH QUIZ END NOTIFICATION ONCE - ONLY TIME LEFT) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -986,11 +986,22 @@ export class GameServer extends CPUProtection {
     const diffMs = targetDate - now;
     const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
     const diffMinutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+    const diffSeconds = Math.floor((diffMs % (1000 * 60)) / 1000);
+    
+    let text = "";
+    if (diffHours > 0) {
+      text = `${diffHours}h ${diffMinutes}m ${diffSeconds}s`;
+    } else if (diffMinutes > 0) {
+      text = `${diffMinutes}m ${diffSeconds}s`;
+    } else {
+      text = `${diffSeconds}s`;
+    }
     
     return {
       hours: diffHours,
       minutes: diffMinutes,
-      text: diffHours > 0 ? `${diffHours}h ${diffMinutes}m` : `${diffMinutes}m`,
+      seconds: diffSeconds,
+      text: text,
       totalMs: diffMs
     };
   }
@@ -999,32 +1010,18 @@ export class GameServer extends CPUProtection {
     if (this.quizEndNotified) return;
     
     try {
-      const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
+      const message = `⏱️ ${timeLeft.text}`;
       
-      const message = `Quiz ended for today.\nCurrent time: ${timeInfo.currentTime}\nNext quiz: ${timeInfo.startTime} (WIB)\nTime left: ${timeLeft.text}`;
-      
-      // Send once to all clients in quiz room
       this._broadcastToRoom(QUIZ_ROOM, ["quizEnded", {
-        message: "Quiz ended for today. Come back tomorrow!",
-        nextStart: timeInfo.startTime,
-        currentTime: timeInfo.currentTime,
         timeLeft: timeLeft.text,
-        hours: timeLeft.hours,
-        minutes: timeLeft.minutes,
         status: "ended"
       }]);
       
       this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, true]);
       
-      // Send notification once
       this._broadcastQuizNotification("quizEnded", {
-        message: "Quiz ended for today. Come back tomorrow!",
-        nextStart: timeInfo.startTime,
-        currentTime: timeInfo.currentTime,
-        timeLeft: timeLeft.text,
-        hours: timeLeft.hours,
-        minutes: timeLeft.minutes
+        timeLeft: timeLeft.text
       });
       
       this.quizEndNotified = true;
@@ -1036,7 +1033,6 @@ export class GameServer extends CPUProtection {
     if (!ws || ws.readyState !== 1) return;
     
     try {
-      const timeInfo = this._getTimeLeftUntilNextEvent();
       const remaining = this._getQuestionRemainingTime();
       
       const notification = {
@@ -1044,12 +1040,6 @@ export class GameServer extends CPUProtection {
         timestamp: Date.now(),
         remainingTime: remaining,
         correctAnswer: this.currentQuestion?.correct || null,
-        timeInfo: {
-          isRunning: timeInfo.isRunning,
-          currentTime: timeInfo.currentTime,
-          startTime: timeInfo.startTime,
-          endTime: timeInfo.endTime
-        },
         data: data || {}
       };
 
@@ -1062,19 +1052,12 @@ export class GameServer extends CPUProtection {
     if (!wsIds?.size) return;
     
     const remaining = this._getQuestionRemainingTime();
-    const timeInfo = this._getTimeLeftUntilNextEvent();
     
     const notification = {
       type: type,
       timestamp: Date.now(),
       remainingTime: remaining,
       correctAnswer: this.currentQuestion?.correct || null,
-      timeInfo: {
-        isRunning: timeInfo.isRunning,
-        currentTime: timeInfo.currentTime,
-        startTime: timeInfo.startTime,
-        endTime: timeInfo.endTime
-      },
       data: data || {}
     };
     
@@ -1269,7 +1252,6 @@ export class GameServer extends CPUProtection {
   async _checkQuizAutoStatus() {
     try {
       const isQuizTime = this._isQuizTime();
-      const wibTime = this._getCurrentWIBTime();
       
       if (isQuizTime) {
         this.quizEndedToday = false;
@@ -1278,7 +1260,7 @@ export class GameServer extends CPUProtection {
         
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", `Quiz will start soon! (${wibTime.formatted})`, false]);
+          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz will start soon!", false]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
           if (!this._quizStartTimeout) this.forceStartQuiz();
         } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
@@ -1293,14 +1275,6 @@ export class GameServer extends CPUProtection {
           await this.resetQuiz();
           this._clearQuizData();
           this._sendQuizEndNotificationOnce();
-          
-          const timeInfo = this._getTimeLeftUntilNextEvent();
-          const timeLeft = this._getTimeLeftUntilNextQuiz();
-          const statusMsg = timeInfo.status === 'before' ?
-            `Quiz starts at ${timeInfo.startTime}\nCurrent time: ${timeInfo.currentTime}\nTime left: ${timeLeft.text}` :
-            `Quiz ended for today. Come back tomorrow at ${timeInfo.startTime} (WIB)\nTime left: ${timeLeft.text}`;
-          
-          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", statusMsg, true]);
         }
         return true;
       }
@@ -1422,8 +1396,10 @@ export class GameServer extends CPUProtection {
         if (clients?.size > 0) {
           if (!this.quizEndNotified) {
             this._sendQuizEndNotificationOnce();
+          } else {
+            const timeLeft = this._getTimeLeftUntilNextQuiz();
+            this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", `⏱️ ${timeLeft.text}`, true]);
           }
-          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz ended for today. Come back tomorrow!", true]);
         }
         return;
       }
@@ -1662,29 +1638,13 @@ export class GameServer extends CPUProtection {
           this._showQuestion();
         }
       } else {
-        if (this.quizAutoEnabled) {
+        if (this.quizAutoEnabled && !this.quizEndNotified) {
           this.quizAutoEnabled = false;
           this.quizEndedToday = true;
           this.quizEndMessageShown = false;
           this.resetQuiz();
           this._clearQuizData();
           this._sendQuizEndNotificationOnce();
-          
-          const timeInfo = this._getTimeLeftUntilNextEvent();
-          const timeLeft = this._getTimeLeftUntilNextQuiz();
-          const statusMsg = timeInfo.status === 'before' ?
-            `Quiz starts at ${timeInfo.startTime}\nCurrent time: ${timeInfo.currentTime}\nTime left: ${timeLeft.text}` :
-            `Quiz ended for today. Come back tomorrow at ${timeInfo.startTime} (WIB)\nTime left: ${timeLeft.text}`;
-          
-          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", statusMsg, true]);
-          this._broadcastQuizNotification("quizEnded", {
-            message: "Quiz ended for today. Come back tomorrow!",
-            nextStart: timeInfo.startTime,
-            currentTime: timeInfo.currentTime,
-            timeLeft: timeLeft.text,
-            hours: timeLeft.hours,
-            minutes: timeLeft.minutes
-          });
         }
       }
     }, CONSTANTS.QUIZ_INTERVAL_MS);
@@ -1753,7 +1713,12 @@ export class GameServer extends CPUProtection {
   _startQuizKeepAlive() {
     if (this._quizKeepAliveInterval) clearInterval(this._quizKeepAliveInterval);
     this._quizKeepAliveInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) { clearInterval(this._quizKeepAliveInterval); this._quizKeepAliveInterval = null; return; }
+      if (this.closing || this.isDestroyed) { 
+        clearInterval(this._quizKeepAliveInterval); 
+        this._quizKeepAliveInterval = null; 
+        return; 
+      }
+      
       if (this._isQuizTime()) {
         const now = Date.now();
         if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
@@ -1767,7 +1732,7 @@ export class GameServer extends CPUProtection {
           }
         }
       } else {
-        if (!this.quizEndNotified) {
+        if (!this.quizEndNotified && this.quizAutoEnabled) {
           this._sendQuizEndNotificationOnce();
         }
       }
@@ -1871,10 +1836,7 @@ export class GameServer extends CPUProtection {
         return false;
       } else {
         const timeLeft = this._getTimeLeftUntilNextQuiz();
-        const statusText = timeInfo.status === 'before' ?
-          `Quiz starts ${timeInfo.dayText} at ${timeInfo.startTime} (WIB)` :
-          `Quiz ended for today. Come back ${timeInfo.dayText} at ${timeInfo.startTime} (WIB)`;
-        message = `${statusText}\nCurrent time: ${timeInfo.currentTime}\nTime left: ${timeLeft.text}`;
+        message = `⏱️ ${timeLeft.text}`;
         canType = true;
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
         return true;
@@ -1900,11 +1862,7 @@ export class GameServer extends CPUProtection {
       }
     } else {
       const timeLeft = this._getTimeLeftUntilNextQuiz();
-      if (timeInfo.status === 'before') {
-        message = `Quiz starts ${timeInfo.dayText} at ${timeInfo.startTime}\nTime left: ${timeLeft.text}`;
-      } else {
-        message = `Quiz ended for today. Come back ${timeInfo.dayText} at ${timeInfo.startTime}\nTime left: ${timeLeft.text}`;
-      }
+      message = `⏱️ ${timeLeft.text}`;
       canType = true;
     }
     this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, canType, isQuizTime]);
@@ -1913,28 +1871,24 @@ export class GameServer extends CPUProtection {
   _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
     if (!ws || ws.readyState !== 1) return false;
     try {
-      const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
+      
       let message = "";
       switch(errorType) {
         case "NOT_QUIZ_TIME":
-          if (timeInfo.status === 'before') {
-            message = `Quiz starts at ${timeInfo.startTime} (WIB)\nCurrent time: ${timeInfo.currentTime}\nTime left: ${timeLeft.text}`;
-          } else {
-            message = `Quiz ended for today.\nCurrent time: ${timeInfo.currentTime}\nCome back tomorrow at ${timeInfo.startTime} (WIB)\nTime left: ${timeLeft.text}`;
-          }
+          message = `⏱️ ${timeLeft.text}`;
           break;
         case "QUIZ_DISABLED": 
-          message = `Quiz is currently unavailable\nTime left: ${timeLeft.text}`; 
+          message = `⏱️ ${timeLeft.text}`; 
           break;
         case "QUIZ_ENDED":
-          message = `Quiz ended for today.\nCurrent time: ${timeInfo.currentTime}\nCome back tomorrow at ${timeInfo.startTime} (WIB)\nTime left: ${timeLeft.text}`;
+          message = `⏱️ ${timeLeft.text}`;
           break;
         case "QUIZ_NOT_STARTED": 
-          message = `Quiz starts at ${QUIZ_SCHEDULE.START_HOUR}:00 WIB`; 
+          message = `⏱️ ${timeLeft.text}`; 
           break;
         default: 
-          message = customMessage || `Quiz ended for today.\nTime left: ${timeLeft.text}`;
+          message = customMessage || `⏱️ ${timeLeft.text}`;
       }
       this._safeSend(ws, ["quizError", message]);
       return true;
@@ -3127,7 +3081,6 @@ export class GameServer extends CPUProtection {
 
     if (evt === "getQuizNotification") {
       const remaining = this._getQuestionRemainingTime();
-      const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
       
       const notification = {
@@ -3135,7 +3088,6 @@ export class GameServer extends CPUProtection {
         timestamp: Date.now(),
         remainingTime: remaining,
         correctAnswer: this.currentQuestion?.correct || null,
-        timeInfo: timeInfo,
         data: {
           isQuizTime: this._isQuizTime(),
           isActive: !!this.currentQuestion,
@@ -3143,9 +3095,7 @@ export class GameServer extends CPUProtection {
           winner: this.quizWinner,
           questionNumber: this._questionPointer,
           totalQuestions: this._allQuestions.length,
-          timeLeft: timeLeft.text,
-          hours: timeLeft.hours,
-          minutes: timeLeft.minutes
+          timeLeft: timeLeft.text
         }
       };
       this._safeSend(ws, ["quizNotification", notification]);
@@ -3154,26 +3104,14 @@ export class GameServer extends CPUProtection {
 
     if (evt === "getQuizStatus") {
       const isQuizTime = this._isQuizTime();
-      const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
       
       let status = {
         isQuizTime: isQuizTime,
         isActive: !!this.currentQuestion,
         hasEnded: this.quizEndedToday || !isQuizTime,
-        timeInfo: timeInfo,
-        timeLeft: {
-          hours: timeLeft.hours,
-          minutes: timeLeft.minutes,
-          text: timeLeft.text
-        }
+        timeLeft: timeLeft.text
       };
-      
-      if (!isQuizTime) {
-        status.message = "Quiz ended for today. Come back tomorrow!";
-        status.nextStart = timeInfo.startTime;
-        status.currentTime = timeInfo.currentTime;
-      }
       
       this._safeSend(ws, ["quizStatus", status]);
       return;
