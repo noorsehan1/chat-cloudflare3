@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL COMPLETE CODE) ====================
+// ==================== GAME-SERVER.JS (FULL CLASS WITH AUTO TRANSLATE TO NEW KV) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -54,6 +54,8 @@ const CONSTANTS = {
   ERROR_RECOVERY_DELAY_MS: 5000,
   MAX_UNHANDLED_ERRORS: 5,
   ERROR_RESET_INTERVAL_MS: 60000,
+  AUTO_TRANSLATE_ON_START: true,
+  TRANSLATION_CHECK_INTERVAL_MS: 60000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -63,6 +65,7 @@ const QUIZ_SCHEDULE = {
 };
 
 const QUIZ_ROOM = "Quiz";
+const TRANSLATION_KV_KEY = 'quiz_translations';
 
 const COUNTRY_LANGUAGE_MAP = {
   'ID': { lang: 'id', name: 'Indonesia', flag: '🇮🇩' },
@@ -224,8 +227,6 @@ class TranslationManager extends CPUProtection {
     this.defaultLanguage = 'en';
     this.userLanguageCache = new Map();
     this.translatedQuestionsCache = new Map();
-    this.countryTranslationCache = new Map();
-    this.translationCheckCache = new Map();
   }
 
   resetQuestionCache() {
@@ -286,436 +287,9 @@ class TranslationManager extends CPUProtection {
     } catch(e) { return this.defaultLanguage; }
   }
 
-  async getTranslatedQuestion(questionId, lang, originalQuestion, originalOptions) {
-    try {
-      if (!lang || lang === 'en') {
-        return { question: originalQuestion, options: originalOptions };
-      }
-
-      const cacheKey = `${questionId}_${lang}`;
-      if (this.translatedQuestionsCache.has(cacheKey)) {
-        return this.translatedQuestionsCache.get(cacheKey);
-      }
-
-      const env = this.gameServer?.env;
-      if (env?.QUESTIONS) {
-        const translatedData = await env.QUESTIONS.get('translated_questions', 'json');
-        if (translatedData?.questions) {
-          const found = translatedData.questions.find(q => q.id === questionId);
-          if (found && found.translations && found.translations[lang]) {
-            const result = {
-              question: found.translations[lang].question,
-              options: found.translations[lang].options
-            };
-            this.translatedQuestionsCache.set(cacheKey, result);
-            return result;
-          }
-        }
-      }
-
-      const [translatedQuestion, translatedOptions] = await Promise.all([
-        this._translateText(originalQuestion, lang),
-        this._translateOptions(originalOptions, lang)
-      ]);
-
-      const result = {
-        question: translatedQuestion || originalQuestion,
-        options: translatedOptions || originalOptions
-      };
-
-      this.translatedQuestionsCache.set(cacheKey, result);
-      return result;
-    } catch(e) {
-      return { question: originalQuestion, options: originalOptions };
-    }
-  }
-
-  // ==================== SMART TRANSLATE WITH COUNTRY CHECK ====================
-
-  async translateAllQuestionsWithCheck() {
-    try {
-      const env = this.gameServer.env;
-      if (!env?.QUESTIONS) {
-        return { success: false, message: "KV not available" };
-      }
-
-      const countryCodes = Object.keys(this.countryLanguageMap);
-      const totalCountries = countryCodes.length;
-      
-      let alreadyTranslated = 0;
-      let needTranslation = 0;
-      const translatedCountries = [];
-      const skippedCountries = [];
-      const failedCountries = [];
-
-      // Check which countries already have translations
-      for (const countryCode of countryCodes) {
-        const exists = await this._checkCountryTranslationExists(countryCode);
-        if (exists) {
-          alreadyTranslated++;
-          skippedCountries.push(countryCode);
-        } else {
-          needTranslation++;
-          translatedCountries.push(countryCode);
-        }
-      }
-
-      if (alreadyTranslated === totalCountries) {
-        return {
-          success: true,
-          message: `All ${totalCountries} countries already have translations in KV. Skipping translation.`,
-          alreadyTranslated: alreadyTranslated,
-          needTranslation: 0,
-          skippedCountries: skippedCountries,
-          totalCountries: totalCountries
-        };
-      }
-
-      if (needTranslation > 0) {
-        const languagesNeeded = new Set();
-        for (const countryCode of translatedCountries) {
-          const info = this.countryLanguageMap[countryCode];
-          if (info) {
-            languagesNeeded.add(info.lang);
-          }
-        }
-
-        const cached = await env.QUESTIONS.get('quiz_questions', 'json');
-        if (!cached?.questions?.length) {
-          return { success: false, message: "No questions found in KV" };
-        }
-
-        const questions = cached.questions;
-        let totalTranslated = 0;
-
-        for (const countryCode of translatedCountries) {
-          try {
-            const info = this.countryLanguageMap[countryCode];
-            if (!info) continue;
-
-            const lang = info.lang;
-            const langKey = `quiz_translated_${lang}`;
-            let langData = await env.QUESTIONS.get(langKey, 'json');
-            
-            let translatedQuestions;
-            if (langData?.questions) {
-              translatedQuestions = langData.questions;
-            } else {
-              translatedQuestions = await this._translateQuestionsToLanguage(questions, lang);
-              await env.QUESTIONS.put(langKey, JSON.stringify({
-                language: lang,
-                questions: translatedQuestions,
-                translated_at: new Date().toISOString(),
-                total_questions: translatedQuestions.length
-              }));
-            }
-
-            const countryKey = `quiz_country_${countryCode}`;
-            await env.QUESTIONS.put(countryKey, JSON.stringify({
-              country: countryCode,
-              countryName: info.name,
-              flag: info.flag,
-              language: lang,
-              questions: translatedQuestions,
-              total_questions: translatedQuestions.length,
-              translated_at: new Date().toISOString(),
-              is_cached: !!langData
-            }));
-
-            totalTranslated += translatedQuestions.length;
-            
-            this._broadcastTranslationProgress(
-              translatedCountries.indexOf(countryCode) + 1,
-              needTranslation,
-              countryCode,
-              info.name
-            );
-
-          } catch(e) {
-            failedCountries.push(countryCode);
-          }
-        }
-
-        return {
-          success: true,
-          message: `Translated ${needTranslation} countries. ${alreadyTranslated} already had translations.`,
-          alreadyTranslated: alreadyTranslated,
-          needTranslation: needTranslation,
-          totalTranslated: totalTranslated,
-          translatedCountries: translatedCountries.filter(c => !failedCountries.includes(c)),
-          skippedCountries: skippedCountries,
-          failedCountries: failedCountries,
-          totalCountries: totalCountries
-        };
-      }
-
-      return {
-        success: true,
-        message: `All ${totalCountries} countries already have translations.`,
-        alreadyTranslated: totalCountries,
-        needTranslation: 0
-      };
-    } catch(e) {
-      return { success: false, message: `Translation failed: ${e.message}` };
-    }
-  }
-
-  async _checkCountryTranslationExists(countryCode) {
-    try {
-      if (this.translationCheckCache.has(countryCode)) {
-        return this.translationCheckCache.get(countryCode);
-      }
-
-      const env = this.gameServer.env;
-      if (!env?.QUESTIONS) return false;
-
-      const countryKey = `quiz_country_${countryCode}`;
-      const data = await env.QUESTIONS.get(countryKey);
-      
-      const exists = !!data;
-      this.translationCheckCache.set(countryCode, exists);
-      return exists;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  async _translateQuestionsToLanguage(questions, lang) {
-    try {
-      if (lang === 'en') {
-        return questions.map(q => ({
-          id: q.id,
-          question: q.question,
-          options: q.options,
-          correct: q.correct,
-          category: q.category,
-          difficulty: q.difficulty
-        }));
-      }
-
-      const translated = [];
-      const batchSize = 10;
-      
-      for (let i = 0; i < questions.length; i += batchSize) {
-        const batch = questions.slice(i, i + batchSize);
-        const batchPromises = batch.map(q => this._translateSingleQuestion(q, lang));
-        const results = await Promise.all(batchPromises);
-        translated.push(...results);
-        
-        if (i + batchSize < questions.length) {
-          await this._sleep(500);
-        }
-      }
-      
-      return translated;
-    } catch(e) {
-      return questions.map(q => ({
-        id: q.id,
-        question: q.question,
-        options: q.options,
-        correct: q.correct,
-        category: q.category,
-        difficulty: q.difficulty,
-        translation_failed: true
-      }));
-    }
-  }
-
-  async _translateSingleQuestion(question, lang) {
-    try {
-      if (lang === 'en') {
-        return {
-          id: question.id,
-          question: question.question,
-          options: question.options,
-          correct: question.correct,
-          category: question.category,
-          difficulty: question.difficulty
-        };
-      }
-
-      const [translatedQuestion, translatedOptions] = await Promise.all([
-        this._translateText(question.question, lang),
-        this._translateOptions(question.options, lang)
-      ]);
-
-      return {
-        id: question.id,
-        question: translatedQuestion || question.question,
-        options: translatedOptions || question.options,
-        correct: question.correct,
-        category: question.category,
-        difficulty: question.difficulty
-      };
-    } catch(e) {
-      return {
-        id: question.id,
-        question: question.question,
-        options: question.options,
-        correct: question.correct,
-        category: question.category,
-        difficulty: question.difficulty,
-        translation_failed: true
-      };
-    }
-  }
-
-  async getTranslatedQuestionsForCountry(countryCode) {
-    try {
-      if (!countryCode) return null;
-      
-      const env = this.gameServer.env;
-      if (!env?.QUESTIONS) return null;
-
-      const cacheKey = `country_${countryCode}`;
-      if (this.countryTranslationCache.has(cacheKey)) {
-        return this.countryTranslationCache.get(cacheKey);
-      }
-
-      const countryKey = `quiz_country_${countryCode}`;
-      const data = await env.QUESTIONS.get(countryKey, 'json');
-      
-      if (data?.questions) {
-        this.countryTranslationCache.set(cacheKey, data);
-        return data;
-      }
-
-      const lang = this.getLanguageForCountry(countryCode);
-      const langKey = `quiz_translated_${lang}`;
-      const langData = await env.QUESTIONS.get(langKey, 'json');
-      
-      if (langData?.questions) {
-        this.countryTranslationCache.set(cacheKey, langData);
-        return langData;
-      }
-
-      return null;
-    } catch(e) {
-      return null;
-    }
-  }
-
-  async getOrCreateCountryTranslations(countryCode) {
-    try {
-      let data = await this.getTranslatedQuestionsForCountry(countryCode);
-      if (data) {
-        return { success: true, data, fromCache: true };
-      }
-
-      const env = this.gameServer.env;
-      if (!env?.QUESTIONS) {
-        return { success: false, message: "KV not available" };
-      }
-
-      const cached = await env.QUESTIONS.get('quiz_questions', 'json');
-      if (!cached?.questions?.length) {
-        return { success: false, message: "No questions found" };
-      }
-
-      const info = this.countryLanguageMap[countryCode];
-      if (!info) {
-        return { success: false, message: `Country ${countryCode} not supported` };
-      }
-
-      const lang = info.lang;
-      let langData = await env.QUESTIONS.get(`quiz_translated_${lang}`, 'json');
-      let translatedQuestions;
-
-      if (langData?.questions) {
-        translatedQuestions = langData.questions;
-      } else {
-        translatedQuestions = await this._translateQuestionsToLanguage(cached.questions, lang);
-        await env.QUESTIONS.put(`quiz_translated_${lang}`, JSON.stringify({
-          language: lang,
-          questions: translatedQuestions,
-          translated_at: new Date().toISOString(),
-          total_questions: translatedQuestions.length
-        }));
-      }
-
-      const countryKey = `quiz_country_${countryCode}`;
-      const countryData = {
-        country: countryCode,
-        countryName: info.name,
-        flag: info.flag,
-        language: lang,
-        questions: translatedQuestions,
-        total_questions: translatedQuestions.length,
-        translated_at: new Date().toISOString()
-      };
-      
-      await env.QUESTIONS.put(countryKey, JSON.stringify(countryData));
-      this.countryTranslationCache.set(`country_${countryCode}`, countryData);
-
-      return { success: true, data: countryData, fromCache: false };
-    } catch(e) {
-      return { success: false, message: e.message };
-    }
-  }
-
-  async getAllTranslationStatuses() {
-    try {
-      const env = this.gameServer.env;
-      if (!env?.QUESTIONS) return null;
-
-      const statuses = {};
-      const countryCodes = Object.keys(this.countryLanguageMap);
-
-      for (const countryCode of countryCodes) {
-        const exists = await this._checkCountryTranslationExists(countryCode);
-        const info = this.countryLanguageMap[countryCode];
-        statuses[countryCode] = {
-          country: countryCode,
-          countryName: info?.name || 'Unknown',
-          flag: info?.flag || '🌍',
-          language: info?.lang || 'en',
-          hasTranslation: exists
-        };
-      }
-
-      return statuses;
-    } catch(e) {
-      return null;
-    }
-  }
-
-  _broadcastTranslationProgress(current, total, countryCode, countryName) {
-    const progress = Math.round((current / total) * 100);
-    const message = `Translating ${countryName} (${countryCode}): ${progress}% (${current}/${total})`;
-    
-    if (this.gameServer) {
-      this.gameServer._broadcastToRoom('Quiz', ['translationProgress', {
-        country: countryCode,
-        countryName: countryName,
-        progress: progress,
-        current: current,
-        total: total,
-        message: message
-      }]);
-    }
-  }
-
-  _broadcastLanguageProgress(current, total, lang) {
-    const progress = Math.round((current / total) * 100);
-    const message = `Translating to ${lang}: ${progress}% (${current}/${total})`;
-    
-    if (this.gameServer) {
-      this.gameServer._broadcastToRoom('Quiz', ['languageTranslationProgress', {
-        language: lang,
-        progress: progress,
-        current: current,
-        total: total,
-        message: message
-      }]);
-    }
-  }
-
-  // ==================== EXISTING TRANSLATION METHODS ====================
-
   async translateForUsers(question, options, usersByLang) {
     try {
       const results = new Map();
-      const needTranslate = [];
 
       for (const [lang, users] of usersByLang) {
         if (lang === 'en') {
@@ -723,41 +297,21 @@ class TranslationManager extends CPUProtection {
           continue;
         }
 
-        const cacheKey = this._getCacheKey(question, options, lang);
-        const cached = this.questionCache.get(cacheKey);
-        if (cached) {
-          results.set(lang, { ...cached, users, fromCache: true });
-        } else {
-          needTranslate.push({ lang, users });
-        }
-      }
-
-      if (needTranslate.length === 0) { this._sendResults(results); return; }
-
-      for (const { lang, users } of needTranslate) {
-        try {
-          const translatedData = await this.getTranslatedQuestion(
-            Date.now() + Math.random(),
-            lang,
-            question,
-            options
-          );
-
-          const cacheKey = this._getCacheKey(question, options, lang);
-          this.questionCache.set(cacheKey, {
-            question: translatedData.question,
-            options: translatedData.options,
-            isFallback: false
-          });
-
+        // Try to get from translated questions in NEW KV
+        const translated = await this.gameServer.getQuestionByIdFromNewKV(
+          Date.now() + Math.random(),
+          lang
+        );
+        
+        if (translated) {
           results.set(lang, {
-            question: translatedData.question,
-            options: translatedData.options,
+            question: translated.question,
+            options: translated.options,
             users,
             isFallback: false,
-            fromCache: false
+            fromCache: true
           });
-        } catch(e) {
+        } else {
           results.set(lang, {
             question: question,
             options: options,
@@ -769,64 +323,6 @@ class TranslationManager extends CPUProtection {
       }
       this._sendResults(results);
     } catch(e) {}
-  }
-
-  async _translateWithRetry(question, options, lang) {
-    let lastError = null;
-    for (let i = 0; i < 5; i++) {
-      try {
-        const [translatedQuestion, translatedOptions] = await this._safeExecute(async () => {
-          return await Promise.all([
-            this._translateText(question, lang),
-            this._translateOptions(options, lang)
-          ]);
-        });
-        return { question: translatedQuestion || question, options: translatedOptions || options };
-      } catch(e) {
-        lastError = e;
-        await this._sleep(1000 * (i + 1));
-      }
-    }
-    throw lastError || new Error('All retries failed');
-  }
-
-  async _translateText(text, targetLang, retryCount = 0) {
-    try {
-      if (targetLang === 'en' || !text || typeof text !== 'string') return text;
-      const result = await this._safeExecute(async () => await this._callTranslateAPI(text, targetLang));
-      this.translateCount++;
-      return result;
-    } catch(e) {
-      if (retryCount < 5) {
-        await this._sleep(1000 * (retryCount + 1));
-        return this._translateText(text, targetLang, retryCount + 1);
-      }
-      throw e;
-    }
-  }
-
-  async _translateOptions(options, targetLang) {
-    try {
-      if (targetLang === 'en' || !options) return options;
-      const keys = ['A', 'B', 'C', 'D'];
-      const texts = keys.map(k => options[k]).filter(t => t && typeof t === 'string');
-      if (texts.length === 0) return options;
-      const translatedTexts = await this._safeExecute(async () => {
-        return await Promise.all(texts.map(text => this._translateText(text, targetLang)));
-      });
-      const result = { ...options };
-      let idx = 0;
-      for (const key of keys) {
-        if (options[key] && typeof options[key] === 'string') {
-          result[key] = translatedTexts[idx++] || options[key];
-        }
-      }
-      return result;
-    } catch(e) { return options; }
-  }
-
-  _getCacheKey(question, options, lang) {
-    return `${question}|${Object.values(options).join('|')}|${lang}`;
   }
 
   _sendResults(results) {
@@ -846,6 +342,104 @@ class TranslationManager extends CPUProtection {
         }
       }
     } catch(e) {}
+  }
+
+  resetDailyCounter() {
+    try {
+      const now = new Date().toUTCString();
+      if (now !== this.translateDate) {
+        this.translateDate = now;
+        this.translateCount = 0;
+        this.translateLimitReached = false;
+      }
+    } catch(e) {}
+  }
+
+  _startTranslateReset() {
+    if (this._translateResetInterval) clearInterval(this._translateResetInterval);
+    this._translateResetInterval = setInterval(() => {
+      try {
+        if (this.gameServer?.closing || this.gameServer?.isDestroyed) {
+          clearInterval(this._translateResetInterval);
+          this._translateResetInterval = null;
+          return;
+        }
+        this.resetDailyCounter();
+      } catch(e) {}
+    }, 60000);
+  }
+
+  clearCaches() {
+    try {
+      this.userLanguageCache.clear();
+      this.translatedQuestionsCache.clear();
+      this.questionCache.clear();
+    } catch(e) {}
+  }
+
+  getSupportedLanguages() {
+    try {
+      const languages = {};
+      for (const [code, data] of Object.entries(this.countryLanguageMap)) {
+        if (!languages[data.lang]) {
+          languages[data.lang] = {
+            code: data.lang,
+            name: this.getLanguageName(data.lang),
+            countries: []
+          };
+        }
+        languages[data.lang].countries.push({
+          code: code,
+          name: data.name,
+          flag: data.flag
+        });
+      }
+      return languages;
+    } catch(e) { return {}; }
+  }
+
+  getLanguageName(langCode) {
+    try {
+      const names = {
+        'id': 'Bahasa Indonesia',
+        'fil': 'Filipino',
+        'hi': 'Hindi (India)',
+        'ar': 'العربية (Arab)',
+        'en': 'English'
+      };
+      return names[langCode] || langCode;
+    } catch(e) { return 'English'; }
+  }
+
+  getCountriesByLanguage(langCode) {
+    try {
+      const countries = [];
+      for (const [code, data] of Object.entries(this.countryLanguageMap)) {
+        if (data.lang === langCode) {
+          countries.push({
+            code: code,
+            name: data.name,
+            flag: data.flag
+          });
+        }
+      }
+      return countries;
+    } catch(e) { return []; }
+  }
+
+  async _translateText(text, targetLang, retryCount = 0) {
+    try {
+      if (targetLang === 'en' || !text || typeof text !== 'string') return text;
+      const result = await this._callTranslateAPI(text, targetLang);
+      this.translateCount++;
+      return result;
+    } catch(e) {
+      if (retryCount < 5) {
+        await this._sleep(1000 * (retryCount + 1));
+        return this._translateText(text, targetLang, retryCount + 1);
+      }
+      throw e;
+    }
   }
 
   async _callTranslateAPI(text, targetLang) {
@@ -948,355 +542,30 @@ class TranslationManager extends CPUProtection {
     throw new Error('Invalid response');
   }
 
-  resetDailyCounter() {
-    try {
-      const now = new Date().toUTCString();
-      if (now !== this.translateDate) {
-        this.translateDate = now;
-        this.translateCount = 0;
-        this.translateLimitReached = false;
-      }
-    } catch(e) {}
-  }
-
-  _startTranslateReset() {
-    if (this._translateResetInterval) clearInterval(this._translateResetInterval);
-    this._translateResetInterval = setInterval(() => {
-      try {
-        if (this.gameServer?.closing || this.gameServer?.isDestroyed) {
-          clearInterval(this._translateResetInterval);
-          this._translateResetInterval = null;
-          return;
-        }
-        this.resetDailyCounter();
-      } catch(e) {}
-    }, 60000);
-  }
-
-  clearCaches() {
-    try {
-      this.userLanguageCache.clear();
-      this.translatedQuestionsCache.clear();
-      this.questionCache.clear();
-      this.countryTranslationCache.clear();
-      this.translationCheckCache.clear();
-    } catch(e) {}
-  }
-
-  getSupportedLanguages() {
-    try {
-      const languages = {};
-      for (const [code, data] of Object.entries(this.countryLanguageMap)) {
-        if (!languages[data.lang]) {
-          languages[data.lang] = {
-            code: data.lang,
-            name: this.getLanguageName(data.lang),
-            countries: []
-          };
-        }
-        languages[data.lang].countries.push({
-          code: code,
-          name: data.name,
-          flag: data.flag
-        });
-      }
-      return languages;
-    } catch(e) { return {}; }
-  }
-
-  getLanguageName(langCode) {
-    try {
-      const names = {
-        'id': 'Bahasa Indonesia',
-        'fil': 'Filipino',
-        'hi': 'Hindi (India)',
-        'ar': 'العربية (Arab)',
-        'en': 'English'
-      };
-      return names[langCode] || langCode;
-    } catch(e) { return 'English'; }
-  }
-
-  getCountriesByLanguage(langCode) {
-    try {
-      const countries = [];
-      for (const [code, data] of Object.entries(this.countryLanguageMap)) {
-        if (data.lang === langCode) {
-          countries.push({
-            code: code,
-            name: data.name,
-            flag: data.flag
-          });
-        }
-      }
-      return countries;
-    } catch(e) { return []; }
+  _sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
 
-// ==================== COUNTRY-BASED QUIZ SYSTEM ====================
+// ==================== BULK TRANSLATION NEW KV ====================
 
-class CountryBasedQuizSystem {
+class BulkTranslationNewKV {
   constructor(gameServer) {
     this.gameServer = gameServer;
-    this.env = gameServer.env;
-    this.countryLanguageMap = COUNTRY_LANGUAGE_MAP;
-    this.supportedLanguages = ['id', 'fil', 'hi', 'ar'];
-    this.userCountryCache = new Map();
-    this.questionCache = new Map();
-    this.countryQuestionCache = new Map();
-  }
-
-  /**
-   * Get quiz question for a specific user based on their country
-   */
-  async getQuestionForUser(wsId, questionId, originalQuestion, originalOptions) {
-    try {
-      const countryCode = this.gameServer.userCountry.get(wsId) || 'US';
-      const lang = this.getLanguageForCountry(countryCode);
-      
-      if (lang === 'en') {
-        return {
-          question: originalQuestion,
-          options: originalOptions,
-          language: 'en',
-          country: countryCode,
-          isTranslated: false
-        };
-      }
-
-      const cacheKey = `user_${wsId}_${questionId}`;
-      if (this.questionCache.has(cacheKey)) {
-        return this.questionCache.get(cacheKey);
-      }
-
-      const countryData = await this.getCountryTranslations(countryCode);
-      
-      if (countryData?.questions) {
-        const translatedQuestion = countryData.questions.find(q => q.id === questionId);
-        if (translatedQuestion) {
-          const result = {
-            question: translatedQuestion.question,
-            options: translatedQuestion.options,
-            language: lang,
-            country: countryCode,
-            countryName: countryData.countryName,
-            flag: countryData.flag,
-            isTranslated: true,
-            fromCache: false
-          };
-          this.questionCache.set(cacheKey, result);
-          return result;
-        }
-      }
-
-      const [translatedQuestion, translatedOptions] = await Promise.all([
-        this.translateText(originalQuestion, lang),
-        this.translateOptions(originalOptions, lang)
-      ]);
-
-      const result = {
-        question: translatedQuestion || originalQuestion,
-        options: translatedOptions || originalOptions,
-        language: lang,
-        country: countryCode,
-        isTranslated: true,
-        fromCache: false,
-        isFallback: true
-      };
-      this.questionCache.set(cacheKey, result);
-      return result;
-    } catch(e) {
-      return {
-        question: originalQuestion,
-        options: originalOptions,
-        language: 'en',
-        country: 'US',
-        isTranslated: false,
-        error: e.message
-      };
-    }
-  }
-
-  /**
-   * Get quiz questions for multiple users (batch)
-   */
-  async getQuestionsForUsers(questionId, originalQuestion, originalOptions, wsIds) {
-    try {
-      const results = new Map();
-      const usersByCountry = new Map();
-      
-      for (const wsId of wsIds) {
-        const country = this.gameServer.userCountry.get(wsId) || 'US';
-        if (!usersByCountry.has(country)) {
-          usersByCountry.set(country, []);
-        }
-        usersByCountry.get(country).push(wsId);
-      }
-
-      for (const [country, userWsIds] of usersByCountry) {
-        const lang = this.getLanguageForCountry(country);
-        
-        if (lang === 'en') {
-          for (const wsId of userWsIds) {
-            results.set(wsId, {
-              question: originalQuestion,
-              options: originalOptions,
-              language: 'en',
-              country: country,
-              isTranslated: false
-            });
-          }
-          continue;
-        }
-
-        const countryData = await this.getCountryTranslations(country);
-        let translatedQuestion = null;
-        let translatedOptions = null;
-
-        if (countryData?.questions) {
-          const found = countryData.questions.find(q => q.id === questionId);
-          if (found) {
-            translatedQuestion = found.question;
-            translatedOptions = found.options;
-          }
-        }
-
-        if (!translatedQuestion) {
-          const [q, opts] = await Promise.all([
-            this.translateText(originalQuestion, lang),
-            this.translateOptions(originalOptions, lang)
-          ]);
-          translatedQuestion = q || originalQuestion;
-          translatedOptions = opts || originalOptions;
-        }
-
-        for (const wsId of userWsIds) {
-          results.set(wsId, {
-            question: translatedQuestion,
-            options: translatedOptions,
-            language: lang,
-            country: country,
-            countryName: countryData?.countryName || this.getCountryName(country),
-            flag: countryData?.flag || this.getCountryFlag(country),
-            isTranslated: true
-          });
-        }
-      }
-
-      return results;
-    } catch(e) {
-      const fallback = new Map();
-      for (const wsId of wsIds) {
-        fallback.set(wsId, {
-          question: originalQuestion,
-          options: originalOptions,
-          language: 'en',
-          isTranslated: false,
-          error: e.message
-        });
-      }
-      return fallback;
-    }
-  }
-
-  async getCountryTranslations(countryCode) {
-    try {
-      if (!countryCode) return null;
-
-      const cacheKey = `country_${countryCode}`;
-      if (this.countryQuestionCache.has(cacheKey)) {
-        return this.countryQuestionCache.get(cacheKey);
-      }
-
-      const env = this.env;
-      if (!env?.QUESTIONS) return null;
-
-      const countryKey = `quiz_country_${countryCode}`;
-      const data = await env.QUESTIONS.get(countryKey, 'json');
-      
-      if (data?.questions) {
-        this.countryQuestionCache.set(cacheKey, data);
-        return data;
-      }
-
-      return null;
-    } catch(e) {
-      return null;
-    }
-  }
-
-  getLanguageForCountry(countryCode) {
-    const info = this.countryLanguageMap[countryCode];
-    return info?.lang || 'en';
-  }
-
-  getCountryName(countryCode) {
-    const info = this.countryLanguageMap[countryCode];
-    return info?.name || countryCode;
-  }
-
-  getCountryFlag(countryCode) {
-    const info = this.countryLanguageMap[countryCode];
-    return info?.flag || '🌍';
-  }
-
-  async translateText(text, targetLang) {
-    try {
-      return await this.gameServer.translationManager._translateText(text, targetLang);
-    } catch(e) {
-      return text;
-    }
-  }
-
-  async translateOptions(options, targetLang) {
-    try {
-      return await this.gameServer.translationManager._translateOptions(options, targetLang);
-    } catch(e) {
-      return options;
-    }
-  }
-
-  clearCaches() {
-    this.userCountryCache.clear();
-    this.questionCache.clear();
-    this.countryQuestionCache.clear();
-  }
-
-  getUserCountryInfo(wsId) {
-    const countryCode = this.gameServer.userCountry.get(wsId) || 'US';
-    const info = this.countryLanguageMap[countryCode];
-    return {
-      countryCode: countryCode,
-      countryName: info?.name || 'Unknown',
-      flag: info?.flag || '🌍',
-      language: info?.lang || 'en',
-      hasTranslations: this.countryQuestionCache.has(`country_${countryCode}`)
-    };
-  }
-}
-
-// ==================== BULK TRANSLATION MANAGER ====================
-
-class BulkTranslationManager {
-  constructor(gameServer) {
-    this.gameServer = gameServer;
-    this.translationCache = new Map();
     this.isTranslating = false;
     this.translationProgress = 0;
     this.totalQuestions = 0;
-    this.supportedLanguages = ['id', 'fil', 'hi', 'ar'];
-    this.languageNames = {
-      'id': 'Indonesia',
-      'fil': 'Filipino',
-      'hi': 'Hindi (India)',
-      'ar': 'Arab (Latin)'
-    };
-    this.countryStatus = new Map();
-    this.translationCheckCache = new Map();
+    this.countries = [
+      { code: 'ID', lang: 'id', name: 'Indonesia' },
+      { code: 'PH', lang: 'fil', name: 'Philippines' },
+      { code: 'IN', lang: 'hi', name: 'India' },
+      { code: 'SA', lang: 'ar', name: 'Arab' },
+    ];
+    this.defaultLang = 'en';
+    this.translationStarted = false;
   }
 
-  async translateAllQuestions() {
+  async translateAllQuestionsToNewKV() {
     try {
       if (this.isTranslating) {
         return { success: false, message: "Translation already in progress" };
@@ -1304,205 +573,109 @@ class BulkTranslationManager {
 
       this.isTranslating = true;
       this.translationProgress = 0;
-      this.countryStatus.clear();
+      this.translationStarted = true;
 
-      const env = this.gameServer.env;
-      if (!env?.QUESTIONS) {
-        this.isTranslating = false;
-        return { success: false, message: "KV not available" };
-      }
-
-      const questions = await this.loadQuestionsFromKV();
-      if (!questions || questions.length === 0) {
+      // Load original questions from KV
+      const existingData = await this.loadQuestionsFromKV();
+      if (!existingData?.questions || existingData.questions.length === 0) {
         this.isTranslating = false;
         return { success: false, message: "No questions found in KV" };
       }
 
-      this.totalQuestions = questions.length;
-      
-      const countryCodes = Object.keys(COUNTRY_LANGUAGE_MAP);
-      const totalCountries = countryCodes.length;
-      
-      let alreadyTranslated = 0;
-      let needTranslation = 0;
-      const translatedCountries = [];
-      const skippedCountries = [];
+      const originalQuestions = existingData.questions;
+      this.totalQuestions = originalQuestions.length;
 
-      for (const countryCode of countryCodes) {
-        const exists = await this._checkCountryTranslationExists(countryCode);
-        if (exists) {
-          alreadyTranslated++;
-          skippedCountries.push(countryCode);
-        } else {
-          needTranslation++;
-          translatedCountries.push(countryCode);
-        }
-      }
-
-      if (alreadyTranslated === totalCountries) {
+      // Check if translations already exist in new KV
+      const existingTranslations = await this.loadTranslationsFromKV();
+      if (existingTranslations && existingTranslations.languages && Object.keys(existingTranslations.languages).length > 1) {
         this.isTranslating = false;
-        this.translationProgress = 100;
-        return {
-          success: true,
-          message: `✅ All ${totalCountries} countries already have translations in KV.`,
-          alreadyTranslated: alreadyTranslated,
-          needTranslation: 0,
-          skippedCountries: skippedCountries,
-          totalCountries: totalCountries
+        return { 
+          success: true, 
+          message: "Translations already exist in quiz_translations",
+          languages: Object.keys(existingTranslations.languages),
+          totalQuestions: this.totalQuestions
         };
       }
 
-      let totalTranslated = 0;
-      const successCountries = [];
-      const failedCountries = [];
-
-      for (const countryCode of translatedCountries) {
-        try {
-          const info = COUNTRY_LANGUAGE_MAP[countryCode];
-          if (!info) continue;
-
-          const lang = info.lang;
-          const langKey = `quiz_translated_${lang}`;
-          let langData = await env.QUESTIONS.get(langKey, 'json');
-          let translatedQuestions;
-
-          if (langData?.questions) {
-            translatedQuestions = langData.questions;
-          } else {
-            translatedQuestions = await this.translateQuestionsToLanguage(questions, lang);
-            await env.QUESTIONS.put(langKey, JSON.stringify({
-              language: lang,
-              questions: translatedQuestions,
-              translated_at: new Date().toISOString(),
-              total_questions: translatedQuestions.length
-            }));
+      // Create new translation data
+      const translatedData = {
+        total: originalQuestions.length,
+        source: existingData.source || "OpenTDB",
+        fetchedAt: existingData.fetchedAt || new Date().toISOString(),
+        languages: {
+          en: {
+            name: "English",
+            questions: originalQuestions.map(q => ({
+              id: q.id,
+              question: q.question,
+              options: q.options,
+              correct: q.correct,
+              category: q.category,
+              difficulty: q.difficulty
+            }))
           }
+        },
+        countries: {},
+        translated_at: new Date().toISOString(),
+        version: "1.0"
+      };
 
-          const countryKey = `quiz_country_${countryCode}`;
-          await env.QUESTIONS.put(countryKey, JSON.stringify({
-            country: countryCode,
-            countryName: info.name,
-            flag: info.flag,
-            language: lang,
-            questions: translatedQuestions,
-            total_questions: translatedQuestions.length,
-            translated_at: new Date().toISOString()
-          }));
+      const totalCountries = this.countries.length;
+      let completed = 0;
 
-          successCountries.push(countryCode);
-          totalTranslated += translatedQuestions.length;
-          
-          this.translationProgress = Math.round(
-            ((successCountries.length) / translatedCountries.length) * 100
-          );
-          
-          this.gameServer._broadcastToRoom('Quiz', ['translationCountryProgress', {
-            country: countryCode,
-            countryName: info.name,
-            progress: this.translationProgress,
-            current: successCountries.length,
-            total: translatedCountries.length,
-            message: `✅ ${info.name} (${countryCode}) translated!`
-          }]);
-
-        } catch(e) {
-          failedCountries.push(countryCode);
-        }
+      for (const country of this.countries) {
+        const translated = await this.translateQuestionsBatch(originalQuestions, country);
+        translatedData.languages[country.lang] = {
+          name: country.name,
+          questions: translated
+        };
+        translatedData.countries[country.code] = {
+          lang: country.lang,
+          name: country.name
+        };
+        
+        completed++;
+        this.translationProgress = Math.round((completed / totalCountries) * 100);
+        
+        // Save progress after each country to new KV
+        await this.saveToKV(translatedData);
+        
+        // Broadcast progress
+        this.gameServer._broadcastToRoom(QUIZ_ROOM, ["translationProgress", {
+          country: country.name,
+          completed: completed,
+          total: totalCountries,
+          progress: this.translationProgress
+        }]);
       }
 
       this.isTranslating = false;
       this.translationProgress = 100;
 
+      // Broadcast completion
+      this.gameServer._broadcastToRoom(QUIZ_ROOM, ["translationComplete", {
+        success: true,
+        message: `Successfully translated ${originalQuestions.length} questions to ${this.countries.length} languages`,
+        totalQuestions: originalQuestions.length,
+        languages: this.countries.map(c => ({ code: c.lang, name: c.name })),
+        countries: this.countries.map(c => ({ code: c.code, name: c.name })),
+        kvKey: TRANSLATION_KV_KEY
+      }]);
+
       return {
         success: true,
-        message: `✅ Translated ${successCountries.length} countries. ${alreadyTranslated} already had translations.`,
-        alreadyTranslated: alreadyTranslated,
-        needTranslation: needTranslation,
-        totalTranslated: totalTranslated,
-        translatedCountries: successCountries,
-        skippedCountries: skippedCountries,
-        failedCountries: failedCountries,
-        totalCountries: totalCountries
+        message: `Successfully translated ${originalQuestions.length} questions to ${this.countries.length} languages`,
+        totalQuestions: originalQuestions.length,
+        languages: this.countries.map(c => ({ code: c.lang, name: c.name })),
+        countries: this.countries.map(c => ({ code: c.code, name: c.name })),
+        kvKey: TRANSLATION_KV_KEY
       };
-    } catch(e) {
+
+    } catch (error) {
       this.isTranslating = false;
-      return { success: false, message: `Translation failed: ${e.message}` };
-    }
-  }
-
-  async _checkCountryTranslationExists(countryCode) {
-    try {
-      if (this.translationCheckCache.has(countryCode)) {
-        return this.translationCheckCache.get(countryCode);
-      }
-
-      const env = this.gameServer.env;
-      if (!env?.QUESTIONS) return false;
-
-      const countryKey = `quiz_country_${countryCode}`;
-      const data = await env.QUESTIONS.get(countryKey);
-      
-      const exists = !!data;
-      this.translationCheckCache.set(countryCode, exists);
-      return exists;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  async translateQuestionsToLanguage(questions, lang) {
-    const translated = [];
-    const batchSize = 10;
-    
-    for (let i = 0; i < questions.length; i += batchSize) {
-      const batch = questions.slice(i, i + batchSize);
-      const batchPromises = batch.map(q => this.translateSingleQuestion(q, lang));
-      const results = await Promise.all(batchPromises);
-      translated.push(...results);
-      
-      if (i + batchSize < questions.length) {
-        await this.sleep(500);
-      }
-    }
-    
-    return translated;
-  }
-
-  async translateSingleQuestion(question, lang) {
-    try {
-      if (lang === 'en') {
-        return {
-          id: question.id,
-          question: question.question,
-          options: question.options,
-          correct: question.correct,
-          category: question.category,
-          difficulty: question.difficulty
-        };
-      }
-
-      const [translatedQuestion, translatedOptions] = await Promise.all([
-        this.translateText(question.question, lang),
-        this.translateOptions(question.options, lang)
-      ]);
-
       return {
-        id: question.id,
-        question: translatedQuestion || question.question,
-        options: translatedOptions || question.options,
-        correct: question.correct,
-        category: question.category,
-        difficulty: question.difficulty
-      };
-    } catch(e) {
-      return {
-        id: question.id,
-        question: question.question,
-        options: question.options,
-        correct: question.correct,
-        category: question.category,
-        difficulty: question.difficulty,
-        translation_failed: true
+        success: false,
+        message: `Translation failed: ${error.message}`
       };
     }
   }
@@ -1511,67 +684,238 @@ class BulkTranslationManager {
     try {
       const env = this.gameServer.env;
       if (!env?.QUESTIONS) return null;
-      
       const cached = await env.QUESTIONS.get('quiz_questions', 'json');
       if (cached?.questions?.length > 0) {
-        return cached.questions;
+        return cached;
       }
       return null;
-    } catch(e) {
+    } catch (error) {
       return null;
     }
   }
 
+  async loadTranslationsFromKV() {
+    try {
+      const env = this.gameServer.env;
+      if (!env?.QUESTIONS) return null;
+      const cached = await env.QUESTIONS.get(TRANSLATION_KV_KEY, 'json');
+      return cached || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async translateQuestionsBatch(questions, country) {
+    const translatedQuestions = [];
+    const batchSize = 3;
+    const totalBatches = Math.ceil(questions.length / batchSize);
+
+    for (let i = 0; i < questions.length; i += batchSize) {
+      const batch = questions.slice(i, i + batchSize);
+      const translatedBatch = await this.translateBatchForCountry(batch, country);
+      translatedQuestions.push(...translatedBatch);
+      
+      const progress = Math.round(((i + batch.length) / questions.length) * 100);
+      const countryProgress = Math.round(progress / this.countries.length);
+      this.translationProgress = Math.min(100, countryProgress + 
+        (this.countries.indexOf(country) / this.countries.length * 100));
+
+      if (i + batchSize < questions.length) {
+        await this.sleep(500);
+      }
+    }
+
+    return translatedQuestions;
+  }
+
+  async translateBatchForCountry(questions, country) {
+    const translatedBatch = [];
+
+    for (const question of questions) {
+      try {
+        const translated = await this.translateSingleQuestion(question, country);
+        translatedBatch.push(translated);
+      } catch (error) {
+        translatedBatch.push({
+          id: question.id,
+          question: question.question,
+          options: question.options,
+          correct: question.correct,
+          category: question.category,
+          difficulty: question.difficulty,
+          isFallback: true
+        });
+      }
+    }
+
+    return translatedBatch;
+  }
+
+  async translateSingleQuestion(originalQuestion, country) {
+    const { id, question, options, correct, category, difficulty } = originalQuestion;
+
+    const translatedQuestion = await this.translateText(question, country.lang);
+    const translatedOptions = await this.translateOptions(options, country.lang);
+
+    return {
+      id: id,
+      question: translatedQuestion || question,
+      options: translatedOptions || options,
+      correct: correct,
+      category: category,
+      difficulty: difficulty,
+      original_question: question,
+      isFallback: false
+    };
+  }
+
   async translateText(text, targetLang) {
     try {
-      return await this.gameServer.translationManager._translateText(text, targetLang);
-    } catch(e) {
+      const langMap = {
+        'id': 'id',
+        'fil': 'tl',
+        'hi': 'hi',
+        'ar': 'ar'
+      };
+      const target = langMap[targetLang] || 'en';
+      const result = await this.gameServer.translationManager._translateText(text, target);
+      return result;
+    } catch (error) {
       return text;
     }
   }
 
   async translateOptions(options, targetLang) {
     try {
-      return await this.gameServer.translationManager._translateOptions(options, targetLang);
-    } catch(e) {
+      if (!options) return options;
+      const keys = ['A', 'B', 'C', 'D'];
+      const translatedOptions = { ...options };
+      for (const key of keys) {
+        if (options[key]) {
+          try {
+            const translated = await this.translateText(options[key], targetLang);
+            translatedOptions[key] = translated || options[key];
+          } catch (error) {
+            translatedOptions[key] = options[key];
+          }
+        }
+      }
+      return translatedOptions;
+    } catch (error) {
       return options;
     }
   }
 
-  async getCountryQuestions(countryCode) {
+  async saveToKV(data) {
+    try {
+      const env = this.gameServer.env;
+      if (!env?.QUESTIONS) return;
+      await env.QUESTIONS.put(TRANSLATION_KV_KEY, JSON.stringify(data));
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async getQuestionsByLanguage(lang = 'en') {
     try {
       const env = this.gameServer.env;
       if (!env?.QUESTIONS) return null;
-      
-      const data = await env.QUESTIONS.get(`quiz_country_${countryCode}`, 'json');
-      return data || null;
-    } catch(e) {
+      const data = await env.QUESTIONS.get(TRANSLATION_KV_KEY, 'json');
+      if (!data) return null;
+
+      if (lang === 'en' || !data.languages || !data.languages[lang]) {
+        return data.languages?.en?.questions || null;
+      }
+
+      return data.languages[lang].questions || null;
+    } catch (error) {
       return null;
     }
   }
 
-  async getCountryTranslationStatus(countryCode) {
+  async getQuestionById(id, lang = 'en') {
     try {
-      if (this.countryStatus.has(countryCode)) {
-        return this.countryStatus.get(countryCode);
-      }
-      
+      const questions = await this.getQuestionsByLanguage(lang);
+      if (!questions) return null;
+      return questions.find(q => q.id === id) || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async getAllLanguages() {
+    try {
       const env = this.gameServer.env;
       if (!env?.QUESTIONS) return null;
+      const data = await env.QUESTIONS.get(TRANSLATION_KV_KEY, 'json');
+      if (!data?.languages) return null;
       
-      const data = await env.QUESTIONS.get(`quiz_country_${countryCode}`);
-      if (data) {
-        const parsed = JSON.parse(data);
-        return {
-          language: parsed.language,
-          countryName: parsed.countryName,
-          translated: true,
-          count: parsed.total_questions
+      const languages = {};
+      for (const [key, value] of Object.entries(data.languages)) {
+        languages[key] = {
+          name: value.name,
+          total: value.questions?.length || 0
         };
       }
-      return { translated: false };
-    } catch(e) {
-      return { translated: false, error: e.message };
+      return languages;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async getTranslationStatus() {
+    return {
+      isTranslating: this.isTranslating,
+      progress: this.translationProgress,
+      totalQuestions: this.totalQuestions,
+      countries: this.countries,
+      kvKey: TRANSLATION_KV_KEY,
+      translationStarted: this.translationStarted
+    };
+  }
+
+  async checkTranslationExists() {
+    try {
+      const env = this.gameServer.env;
+      if (!env?.QUESTIONS) return false;
+      const data = await env.QUESTIONS.get(TRANSLATION_KV_KEY, 'json');
+      return data && data.languages && Object.keys(data.languages).length > 1;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async autoTranslateOnStart() {
+    try {
+      // Check if translation already exists
+      const exists = await this.checkTranslationExists();
+      if (exists) {
+        console.log('[AutoTranslate] Translation already exists in KV');
+        return { success: true, message: "Translation already exists", exists: true };
+      }
+
+      // Check if questions exist
+      const questions = await this.loadQuestionsFromKV();
+      if (!questions || questions.questions.length === 0) {
+        console.log('[AutoTranslate] No questions found in KV');
+        return { success: false, message: "No questions found" };
+      }
+
+      console.log(`[AutoTranslate] Starting auto translation for ${questions.questions.length} questions...`);
+      
+      // Start translation
+      const result = await this.translateAllQuestionsToNewKV();
+      
+      if (result.success) {
+        console.log(`[AutoTranslate] Successfully translated ${result.totalQuestions} questions`);
+      } else {
+        console.log(`[AutoTranslate] Translation failed: ${result.message}`);
+      }
+      
+      return result;
+    } catch (error) {
+      console.log(`[AutoTranslate] Error: ${error.message}`);
+      return { success: false, message: error.message };
     }
   }
 
@@ -1656,152 +1000,69 @@ export class GameServer extends CPUProtection {
       this.quizEndMessageShown = false;
       this.quizEndNotified = false;
 
-      // Initialize translation systems
       this.translationManager = new TranslationManager(this);
-      this.bulkTranslation = new BulkTranslationManager(this);
-      this.countryQuizSystem = new CountryBasedQuizSystem(this);
+      this.bulkTranslationNewKV = new BulkTranslationNewKV(this);
 
       this._initAsync();
       setTimeout(() => this.forceStartQuiz(), 3000);
       this._startCPUMonitor();
       this._startHealthCheck();
-
-      // Auto-check translations on deploy
-      setTimeout(async () => {
-        try {
-          await this._checkAndTranslateOnDeploy();
-        } catch(e) {
-          console.error("Deploy translation check failed:", e.message);
-        }
-      }, 5000);
+      this._startAutoTranslateCheck();
 
     } catch(e) {
       setTimeout(() => this._forceRecovery(), 1000);
     }
   }
 
-  // ==================== AUTO-DEPLOYMENT CHECK ====================
+  // ==================== AUTO TRANSLATE ON START ====================
 
-  async _checkAndTranslateOnDeploy() {
-    try {
-      console.log("🔍 Checking country translations on deploy...");
-      
-      const status = await this.bulkTranslation.getCountryTranslationStatus('ID');
-      const translatedCountries = await this.bulkTranslation.getCountryQuestions('ID');
-      
-      if (!translatedCountries) {
-        console.log("📝 No country translations found. Starting translation...");
-        const result = await this.translateAllQuestionsToCountries();
-        console.log(`✅ Translation result: ${result.message}`);
-        return result;
-      } else {
-        console.log(`✅ Found translations for countries.`);
+  _startAutoTranslateCheck() {
+    // Check if auto translate is enabled
+    if (!CONSTANTS.AUTO_TRANSLATE_ON_START) return;
+
+    // Check after 5 seconds to allow server to initialize
+    setTimeout(async () => {
+      try {
+        if (this.closing || this.isDestroyed) return;
         
-        // Check if all 45 countries are translated
-        const allCountries = Object.keys(COUNTRY_LANGUAGE_MAP);
-        let translatedCount = 0;
-        for (const country of allCountries) {
-          const exists = await this.translationManager._checkCountryTranslationExists(country);
-          if (exists) translatedCount++;
+        console.log('[AutoTranslate] Checking if translation needed...');
+        const exists = await this.bulkTranslationNewKV.checkTranslationExists();
+        
+        if (!exists) {
+          console.log('[AutoTranslate] No translation found. Starting auto translation...');
+          const result = await this.bulkTranslationNewKV.autoTranslateOnStart();
+          if (result.success) {
+            console.log('[AutoTranslate] Auto translation completed successfully');
+          } else {
+            console.log('[AutoTranslate] Auto translation failed, will retry later');
+            // Retry after 5 minutes
+            setTimeout(() => {
+              if (!this.closing && !this.isDestroyed) {
+                this._retryAutoTranslate();
+              }
+            }, 300000);
+          }
+        } else {
+          console.log('[AutoTranslate] Translation already exists, skipping auto translation');
         }
-        
-        if (translatedCount < allCountries.length) {
-          console.log(`⚠️ Only ${translatedCount} countries translated. Need ${allCountries.length - translatedCount} more.`);
-          console.log("📝 Starting translation for remaining countries...");
-          const result = await this.translateAllQuestionsToCountries();
-          console.log(`✅ Translation result: ${result.message}`);
-          return result;
-        }
-        
-        return {
-          success: true,
-          message: `✅ All ${translatedCount} countries already have translations.`,
-          alreadyTranslated: translatedCount,
-          totalCountries: allCountries.length
-        };
+      } catch (error) {
+        console.log(`[AutoTranslate] Error: ${error.message}`);
       }
-    } catch(e) {
-      console.error("❌ Translation check failed:", e.message);
-      return { success: false, message: e.message };
-    }
+    }, 5000);
   }
 
-  // ==================== TRANSLATION METHODS ====================
-
-  async translateAllQuestionsToCountries() {
+  async _retryAutoTranslate() {
     try {
-      if (this.isDestroyed || this.closing) {
-        return { success: false, message: "Server is shutting down" };
-      }
-
-      this.translationManager.clearCaches();
-      const result = await this.bulkTranslation.translateAllQuestions();
+      if (this.closing || this.isDestroyed) return;
       
-      if (result.success) {
-        this._broadcastToRoom(QUIZ_ROOM, ['translationComplete', {
-          message: result.message,
-          totalTranslated: result.totalTranslated,
-          languages: ['id', 'fil', 'hi', 'ar'],
-          countries: result.totalCountries
-        }]);
+      const exists = await this.bulkTranslationNewKV.checkTranslationExists();
+      if (!exists) {
+        console.log('[AutoTranslate] Retrying auto translation...');
+        await this.bulkTranslationNewKV.autoTranslateOnStart();
       }
-      
-      return result;
-    } catch(e) {
-      return { success: false, message: `Translation failed: ${e.message}` };
+    } catch (error) {
+      console.log(`[AutoTranslate] Retry failed: ${error.message}`);
     }
-  }
-
-  async getCountryQuestions(countryCode) {
-    try {
-      if (this.isDestroyed || this.closing) return null;
-      return await this.bulkTranslation.getCountryQuestions(countryCode);
-    } catch(e) {
-      return null;
-    }
-  }
-
-  async getCountryTranslationStatus(countryCode) {
-    try {
-      if (this.isDestroyed || this.closing) return null;
-      return await this.bulkTranslation.getCountryTranslationStatus(countryCode);
-    } catch(e) {
-      return null;
-    }
-  }
-
-  // ==================== ERROR HANDLING ====================
-
-  _setupErrorHandlers() {
-    try {
-      const self = this;
-      if (typeof process !== 'undefined' && process.on) {
-        process.on('unhandledRejection', (reason) => {
-          self._handleError('unhandledRejection', reason);
-        });
-        process.on('uncaughtException', (error) => {
-          self._handleError('uncaughtException', error);
-        });
-      }
-    } catch(e) {}
-  }
-
-  _handleError(type, error) {
-    try {
-      const now = Date.now();
-      if (now - this._lastErrorReset > CONSTANTS.ERROR_RESET_INTERVAL_MS) {
-        this._errorCount = 0;
-        this._lastErrorReset = now;
-      }
-      this._errorCount++;
-      if (this._errorCount > CONSTANTS.MAX_UNHANDLED_ERRORS && !this._isRecovering) {
-        this._isRecovering = true;
-        setTimeout(() => {
-          this._forceRecovery();
-          this._isRecovering = false;
-        }, CONSTANTS.ERROR_RECOVERY_DELAY_MS);
-      }
-    } catch(e) {}
   }
 
   // ==================== HEALTH CHECK ====================
@@ -1864,33 +1125,9 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== RECOVERY ====================
-
   _forceRecovery() {
     try {
       if (this.closing || this.isDestroyed) return;
-      this._resetCriticalState();
-      this._cleanupResources();
-      if (!this._initialized) {
-        this._initAsync();
-      }
-      if (this._isQuizTime()) {
-        this.quizAutoEnabled = true;
-        setTimeout(() => {
-          if (!this.closing && !this.isDestroyed) {
-            this.forceStartQuiz();
-          }
-        }, 2000);
-      }
-      this._broadcastToRoom(QUIZ_ROOM, ["serverRecovered", {
-        timestamp: Date.now(),
-        message: "Server has recovered"
-      }]);
-    } catch(e) {}
-  }
-
-  _resetCriticalState() {
-    try {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this.quizHasWinner = false;
@@ -1902,6 +1139,18 @@ export class GameServer extends CPUProtection {
       }
       if (this._rateLimitMap) {
         this._rateLimitMap.clear();
+      }
+      this._cleanupResources();
+      if (!this._initialized) {
+        this._initAsync();
+      }
+      if (this._isQuizTime()) {
+        this.quizAutoEnabled = true;
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed) {
+            this.forceStartQuiz();
+          }
+        }, 2000);
       }
     } catch(e) {}
   }
@@ -2000,22 +1249,6 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  _sendQuizNotification(ws, type, data) {
-    try {
-      if (!ws || ws.readyState !== 1) return;
-      const remaining = this._getQuestionRemainingTime();
-      const remainingText = `${remaining}s remaining`;
-      const notification = {
-        type: type,
-        timestamp: Date.now(),
-        remainingTime: remainingText,
-        correctAnswer: this.currentQuestion?.correct || null,
-        data: data || {}
-      };
-      this._safeSend(ws, ["quizNotification", notification]);
-    } catch(e) {}
-  }
-
   _broadcastQuizNotification(type, data) {
     try {
       const wsIds = this.wsClients.get(QUIZ_ROOM);
@@ -2063,7 +1296,6 @@ export class GameServer extends CPUProtection {
       this._errorCount = 0;
       this._isRecovering = false;
     } catch(e) {
-      this._handleError('initAsync', e);
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) {
           this._initAsync();
@@ -2437,76 +1669,85 @@ export class GameServer extends CPUProtection {
     } catch(e) { return false; }
   }
 
-  // ==================== QUIZ BROADCAST WITH COUNTRY-BASED TRANSLATIONS ====================
+  // ==================== TRANSLATION METHODS FOR NEW KV ====================
 
-  async _broadcastQuizQuestion(question, options) {
+  async translateAllQuestionsToNewKV() {
     try {
-      const wsIds = this.wsClients.get(QUIZ_ROOM);
-      if (!wsIds?.size) return;
-
-      // Get all user IDs
-      const userWsIds = Array.from(wsIds);
+      if (this.isDestroyed || this.closing) {
+        return { success: false, message: "Server is shutting down" };
+      }
       
-      // Get country-based translations for all users
-      const translatedResults = await this.countryQuizSystem.getQuestionsForUsers(
-        this._questionPointer,
-        question,
-        options,
-        userWsIds
-      );
-
-      // Send to each user with their country's translation
-      const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
-      this._startCPUTimer();
-
-      for (let i = 0; i < userWsIds.length; i += batchSize) {
-        const batch = userWsIds.slice(i, i + batchSize);
-        for (const wsId of batch) {
-          try {
-            const ws = this.wsMap.get(wsId);
-            if (!ws || ws.readyState !== 1) continue;
-
-            const userQuestion = translatedResults.get(wsId);
-            if (userQuestion) {
-              const message = ["quizQuestion", {
-                question: userQuestion.question,
-                options: userQuestion.options,
-                language: userQuestion.language,
-                country: userQuestion.country,
-                countryName: userQuestion.countryName,
-                flag: userQuestion.flag,
-                isTranslated: userQuestion.isTranslated,
-                questionId: this._questionPointer,
-                totalQuestions: this._allQuestions.length
-              }];
-              this._safeSend(ws, message);
-            }
-          } catch(e) {}
-        }
-        if (this._checkCPULimit()) {
-          await this._cpuYield();
-          this._startCPUTimer();
+      const result = await this.bulkTranslationNewKV.translateAllQuestionsToNewKV();
+      
+      if (result.success) {
+        this._broadcastToRoom(QUIZ_ROOM, ["translationNewKVComplete", result]);
+        
+        const languages = await this.bulkTranslationNewKV.getAllLanguages();
+        if (languages) {
+          this._broadcastToRoom(QUIZ_ROOM, ["translationLanguagesInfo", {
+            kvKey: TRANSLATION_KV_KEY,
+            languages: languages
+          }]);
         }
       }
-
-      // Log translation stats
-      const translatedCount = Array.from(translatedResults.values()).filter(r => r.isTranslated).length;
-      const totalCount = translatedResults.size;
-
-    } catch(e) {
-      // Fallback: send original to all
-      const msgStr = JSON.stringify(["quizQuestion", { question, options }]);
-      const wsIdArray = Array.from(this.wsClients.get(QUIZ_ROOM) || []);
-      for (const wsId of wsIdArray) {
-        try {
-          const ws = this.wsMap.get(wsId);
-          if (ws && ws.readyState === 1) {
-            ws.send(msgStr);
-          }
-        } catch(e) {}
-      }
+      
+      return result;
+    } catch (error) {
+      return {
+        success: false,
+        message: `Translation failed: ${error.message}`
+      };
     }
   }
+
+  async getQuestionsByLanguageFromNewKV(lang = 'en') {
+    try {
+      if (this.isDestroyed || this.closing) return null;
+      return await this.bulkTranslationNewKV.getQuestionsByLanguage(lang);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async getQuestionByIdFromNewKV(id, lang = 'en') {
+    try {
+      if (this.isDestroyed || this.closing) return null;
+      return await this.bulkTranslationNewKV.getQuestionById(id, lang);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async getAllLanguagesFromNewKV() {
+    try {
+      if (this.isDestroyed || this.closing) return null;
+      return await this.bulkTranslationNewKV.getAllLanguages();
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async getTranslationNewKVStatus() {
+    try {
+      if (this.isDestroyed || this.closing) {
+        return { isTranslating: false, error: "Server is shutting down" };
+      }
+      return await this.bulkTranslationNewKV.getTranslationStatus();
+    } catch (error) {
+      return { isTranslating: false, error: error.message };
+    }
+  }
+
+  async checkTranslationExists() {
+    try {
+      if (this.isDestroyed || this.closing) return false;
+      return await this.bulkTranslationNewKV.checkTranslationExists();
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // ==================== UPDATE SHOW QUESTION ====================
 
   async _showQuestion() {
     try {
@@ -2532,104 +1773,184 @@ export class GameServer extends CPUProtection {
 
       if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) return;
 
-      this._checkAndLoadNextBatch();
-      const questions = this.quizQuestionCache['en'] || [];
-      if (questions.length === 0) {
-        if (!this._loadNextBatch()) {
+      const wsIds = this.wsClients.get(QUIZ_ROOM);
+      if (wsIds?.size > 0) {
+        const usersByLang = new Map();
+        for (const wsId of wsIds) {
+          try {
+            const ws = this.wsMap.get(wsId);
+            if (!ws || ws.readyState !== 1) continue;
+            const lang = this.userLanguage.get(wsId) || 'en';
+            if (!usersByLang.has(lang)) usersByLang.set(lang, []);
+            usersByLang.get(lang).push(ws);
+          } catch(e) {}
+        }
+
+        // Load English questions from original KV
+        const enQuestions = await this._loadAllQuestionsFromKV();
+        if (!enQuestions || enQuestions.length === 0) {
           this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
           return;
         }
-      }
 
-      const q = questions[this._questionPointer];
-      if (!q?.options) { this._questionPointer++; this._showQuestion(); return; }
-
-      const shuffled = this._shuffleQuestionOptions(q);
-      this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
-      this._quizStartTime = Date.now();
-      this.quizAnswered = new Set();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this._questionPointer++;
-      this._totalQuestionsAnswered++;
-
-      // Broadcast with country-based translations
-      await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
-      
-      const remainingTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
-      this._broadcastQuizNotification("quizUpdate", {
-        questionNumber: this._questionPointer,
-        totalQuestions: this._allQuestions.length,
-        hasWinner: false,
-        remainingTime: `${remainingTime}s remaining`
-      });
-
-      this._broadcastToRoom(QUIZ_ROOM, [
-        "quizTimeLeft",
-        `Question ${this._questionPointer}/${this._allQuestions.length} - ${remainingTime}s remaining`,
-        false
-      ]);
-
-      if (this._quizTimeout) clearTimeout(this._quizTimeout);
-      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
-
-      this._quizTimeout = setTimeout(async () => {
-        try {
-          if (this.closing || this.isDestroyed) { this._quizTimeout = null; return; }
-          const currentClients = this.wsClients.get(QUIZ_ROOM);
-          if (!currentClients?.size) { this._quizTimeout = null; this.currentQuestion = null; return; }
-
-          const correctAnswer = this.currentQuestion.correct;
-          const question = this.currentQuestion.question;
-          const options = this.currentQuestion.options;
-
-          this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
-
-          if (this.quizHasWinner && this.quizWinner) {
-            const points = await this._getQuizPoints();
-            points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-            if (this.env?.QUESTIONS) {
-              this._incrementSubRequest();
-              await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
-            }
-            this._broadcastQuizNotification("quizWinner", {
-              username: this.quizWinner,
-              totalPoints: points[this.quizWinner] || 0
-            });
-            this._broadcastQuizResult("quizWinner", {
-              username: this.quizWinner,
-              totalPoints: points[this.quizWinner] || 0,
-              correctAnswer
-            });
-          } else {
-            this._broadcastQuizNotification("quizTimeout", { noWinner: true });
-            this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
-          }
-
-          this._quizTimeout = null;
-          this.isQuizWaiting = true;
-
-          this._quizBreakTimeout = setTimeout(() => {
-            if (this.closing || this.isDestroyed) { this._quizBreakTimeout = null; return; }
-            this.isQuizWaiting = false;
-            this._quizBreakTimeout = null;
-            this.currentQuestion = null;
-            this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "5"]);
-            setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "3"]), 2000);
-            setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "1"]), 4000);
-            if (!this.closing && !this.isDestroyed) this.ensureQuizRunning();
-          }, CONSTANTS.QUIZ_BREAK_MS);
-        } catch(e) {
-          this._quizTimeout = null;
-          this.currentQuestion = null;
-          this.isQuizWaiting = false;
+        // Use cached questions
+        if (!this.quizQuestionCache['en']) {
+          this.quizQuestionCache['en'] = enQuestions;
         }
-      }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
+
+        const questions = this.quizQuestionCache['en'];
+        if (this._questionPointer >= questions.length) {
+          this._questionPointer = 0;
+        }
+
+        const q = questions[this._questionPointer];
+        if (!q?.options) { this._questionPointer++; this._showQuestion(); return; }
+
+        const shuffled = this._shuffleQuestionOptions(q);
+        this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
+        this._quizStartTime = Date.now();
+        this.quizAnswered = new Set();
+        this.quizHasWinner = false;
+        this.quizWinner = null;
+        this._questionPointer++;
+        this._totalQuestionsAnswered++;
+
+        // Send to each language group using NEW KV (quiz_translations)
+        for (const [lang, users] of usersByLang) {
+          if (lang === 'en') {
+            this._sendQuestionToUsers(users, this.currentQuestion);
+          } else {
+            // Try to get translated question from NEW KV
+            const translated = await this.getQuestionByIdFromNewKV(
+              this.currentQuestion.id || this._questionPointer,
+              lang
+            );
+            if (translated && !translated.isFallback) {
+              this._sendQuestionToUsers(users, {
+                question: translated.question,
+                options: translated.options,
+                correct: translated.correct
+              });
+            } else {
+              // Fallback to English
+              this._sendQuestionToUsers(users, this.currentQuestion);
+            }
+          }
+        }
+
+        const remainingTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+        this._broadcastQuizNotification("quizUpdate", {
+          questionNumber: this._questionPointer,
+          totalQuestions: this._allQuestions.length,
+          hasWinner: false,
+          remainingTime: `${remainingTime}s remaining`
+        });
+
+        this._broadcastToRoom(QUIZ_ROOM, [
+          "quizTimeLeft",
+          `Question ${this._questionPointer}/${this._allQuestions.length} - ${remainingTime}s remaining`,
+          false
+        ]);
+
+        if (this._quizTimeout) clearTimeout(this._quizTimeout);
+        if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
+
+        this._quizTimeout = setTimeout(async () => {
+          try {
+            if (this.closing || this.isDestroyed) { this._quizTimeout = null; return; }
+            const currentClients = this.wsClients.get(QUIZ_ROOM);
+            if (!currentClients?.size) { this._quizTimeout = null; this.currentQuestion = null; return; }
+
+            const correctAnswer = this.currentQuestion.correct;
+            const question = this.currentQuestion.question;
+            const options = this.currentQuestion.options;
+
+            this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
+
+            if (this.quizHasWinner && this.quizWinner) {
+              const points = await this._getQuizPoints();
+              points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
+              if (this.env?.QUESTIONS) {
+                this._incrementSubRequest();
+                await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
+              }
+              this._broadcastQuizNotification("quizWinner", {
+                username: this.quizWinner,
+                totalPoints: points[this.quizWinner] || 0
+              });
+              this._broadcastQuizResult("quizWinner", {
+                username: this.quizWinner,
+                totalPoints: points[this.quizWinner] || 0,
+                correctAnswer
+              });
+            } else {
+              this._broadcastQuizNotification("quizTimeout", { noWinner: true });
+              this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
+            }
+
+            this._quizTimeout = null;
+            this.isQuizWaiting = true;
+
+            this._quizBreakTimeout = setTimeout(() => {
+              if (this.closing || this.isDestroyed) { this._quizBreakTimeout = null; return; }
+              this.isQuizWaiting = false;
+              this._quizBreakTimeout = null;
+              this.currentQuestion = null;
+              this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "5"]);
+              setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "3"]), 2000);
+              setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "1"]), 4000);
+              if (!this.closing && !this.isDestroyed) this.ensureQuizRunning();
+            }, CONSTANTS.QUIZ_BREAK_MS);
+          } catch(e) {
+            this._quizTimeout = null;
+            this.currentQuestion = null;
+            this.isQuizWaiting = false;
+          }
+        }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
+      }
     } catch(e) {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
     }
+  }
+
+  _sendQuestionToUsers(users, question) {
+    try {
+      if (!users || users.length === 0 || !question) return;
+      const message = ["quizQuestion", {
+        question: question.question || '',
+        options: question.options || { A: '', B: '', C: '', D: '' },
+        isFallback: false
+      }];
+      const msgStr = JSON.stringify(message);
+      for (const ws of users) {
+        if (ws && ws.readyState === 1) {
+          try { ws.send(msgStr); } catch(e) {}
+        }
+      }
+    } catch(e) {}
+  }
+
+  async _broadcastQuizResult(type, data) {
+    try {
+      const wsIds = this.wsClients.get(QUIZ_ROOM);
+      if (!wsIds?.size) return;
+      const msgStr = JSON.stringify([type, data]);
+      const wsIdArray = Array.from(wsIds);
+      const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
+      this._startCPUTimer();
+      for (let i = 0; i < wsIdArray.length; i += batchSize) {
+        const batch = wsIdArray.slice(i, i + batchSize);
+        for (const wsId of batch) {
+          try {
+            const ws = this.wsMap.get(wsId);
+            if (ws && ws.readyState === 1) ws.send(msgStr);
+          } catch(e) {}
+        }
+        if (this._checkCPULimit()) { await this._cpuYield(); this._startCPUTimer(); }
+      }
+    } catch(e) {}
   }
 
   async _forceEvaluateQuiz() {
@@ -2682,50 +2003,22 @@ export class GameServer extends CPUProtection {
 
   async submitQuizAnswer(ws, username, answer) {
     try {
-      if (!ws || !username) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request");
-        return;
-      }
-
+      if (!ws || !username) { this._sendQuizErrorWithTime(ws, "ERROR", "Invalid request"); return; }
       const room = this._ensureRoomConsistency(ws);
-      if (room !== QUIZ_ROOM) {
-        this._safeSend(ws, ["quizError", "Quiz only available in Quiz room"]);
-        return;
-      }
-
-      if (!this._isQuizTime()) {
-        this._sendQuizErrorWithTime(ws, "NOT_QUIZ_TIME");
-        return;
-      }
-
-      if (!this.quizAutoEnabled) {
-        this._sendQuizErrorWithTime(ws, "QUIZ_DISABLED");
-        return;
-      }
+      if (room !== QUIZ_ROOM) { this._safeSend(ws, ["quizError", "Quiz only available in Quiz room"]); return; }
+      if (!this._isQuizTime()) { this._sendQuizErrorWithTime(ws, "NOT_QUIZ_TIME"); return; }
+      if (!this.quizAutoEnabled) { this._sendQuizErrorWithTime(ws, "QUIZ_DISABLED"); return; }
 
       const clients = this.wsClients.get(QUIZ_ROOM);
-      if (!clients?.size) {
-        this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused");
-        return;
-      }
+      if (!clients?.size) { this._sendQuizErrorWithTime(ws, "ERROR", "Quiz is paused"); return; }
 
       if (!this.currentQuestion) {
         this._startQuizIfNeeded();
-        if (!this.currentQuestion) {
-          this._sendQuizErrorWithTime(ws, "QUIZ_NOT_STARTED");
-          return;
-        }
+        if (!this.currentQuestion) { this._sendQuizErrorWithTime(ws, "QUIZ_NOT_STARTED"); return; }
       }
 
-      if (this.quizHasWinner) {
-        this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
-        return;
-      }
-
-      if (this.quizAnswered.has(username)) {
-        this._safeSend(ws, ["quizError", "You already answered!"]);
-        return;
-      }
+      if (this.quizHasWinner) { this._safeSend(ws, ["quizError", "Someone already answered correctly!"]); return; }
+      if (this.quizAnswered.has(username)) { this._safeSend(ws, ["quizError", "You already answered!"]); return; }
 
       const answerKey = answer ? answer.toUpperCase().trim() : '';
       const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
@@ -2734,19 +2027,11 @@ export class GameServer extends CPUProtection {
       const remaining = this._getQuestionRemainingTime();
       const remainingText = `${remaining}s remaining`;
 
-      // Get user's country info
-      const wsId = this._getWsId(ws);
-      const countryInfo = this.countryQuizSystem.getUserCountryInfo(wsId);
-
-      // Broadcast answer with country info
       this._broadcastQuizNotification("quizAnswer", {
         username: username,
         answer: isValidAnswer ? answerKey : "?",
         isCorrect: isCorrect,
-        remainingTime: remainingText,
-        country: countryInfo.countryCode,
-        countryFlag: countryInfo.flag,
-        countryName: countryInfo.countryName
+        remainingTime: remainingText
       });
 
       this._broadcastQuizResult("quizAnswerResult", {
@@ -2754,10 +2039,7 @@ export class GameServer extends CPUProtection {
         answer: isValidAnswer ? answerKey : "?",
         isCorrect,
         correctAnswer: this.currentQuestion.correct,
-        remainingTime: remainingText,
-        country: countryInfo.countryCode,
-        countryFlag: countryInfo.flag,
-        countryName: countryInfo.countryName
+        remainingTime: remainingText
       });
       
       this.quizAnswered.add(username);
@@ -2765,13 +2047,6 @@ export class GameServer extends CPUProtection {
       if (isCorrect && !this.quizHasWinner) {
         this.quizHasWinner = true;
         this.quizWinner = username;
-        
-        this._broadcastQuizNotification("quizWinnerWithCountry", {
-          username: username,
-          country: countryInfo.countryCode,
-          countryFlag: countryInfo.flag,
-          countryName: countryInfo.countryName
-        });
       }
     } catch(e) {
       this._safeSend(ws, ["quizError", e.message]);
@@ -2958,27 +2233,6 @@ export class GameServer extends CPUProtection {
   }
 
   // ==================== QUIZ BROADCAST HELPERS ====================
-
-  async _broadcastQuizResult(type, data) {
-    try {
-      const wsIds = this.wsClients.get(QUIZ_ROOM);
-      if (!wsIds?.size) return;
-      const msgStr = JSON.stringify([type, data]);
-      const wsIdArray = Array.from(wsIds);
-      const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
-      this._startCPUTimer();
-      for (let i = 0; i < wsIdArray.length; i += batchSize) {
-        const batch = wsIdArray.slice(i, i + batchSize);
-        for (const wsId of batch) {
-          try {
-            const ws = this.wsMap.get(wsId);
-            if (ws && ws.readyState === 1) ws.send(msgStr);
-          } catch(e) {}
-        }
-        if (this._checkCPULimit()) { await this._cpuYield(); this._startCPUTimer(); }
-      }
-    } catch(e) {}
-  }
 
   _sendQuizTimeLeftToUser(ws) {
     try {
@@ -3266,6 +2520,22 @@ export class GameServer extends CPUProtection {
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Switch failed"]);
     }
+  }
+
+  _sendQuizNotification(ws, type, data) {
+    try {
+      if (!ws || ws.readyState !== 1) return;
+      const remaining = this._getQuestionRemainingTime();
+      const remainingText = `${remaining}s remaining`;
+      const notification = {
+        type: type,
+        timestamp: Date.now(),
+        remainingTime: remainingText,
+        correctAnswer: this.currentQuestion?.correct || null,
+        data: data || {}
+      };
+      this._safeSend(ws, ["quizNotification", notification]);
+    } catch(e) {}
   }
 
   // ==================== BROADCAST ====================
@@ -4218,9 +3488,7 @@ export class GameServer extends CPUProtection {
       for (const item of batch) {
         try {
           await this._processEventItem(item.ws, item.data);
-        } catch(e) {
-          this._handleError('processEvent', e);
-        }
+        } catch(e) {}
         if (this._checkCPULimit()) {
           await this._cpuYield();
           this._startCPUTimer();
@@ -4233,9 +3501,7 @@ export class GameServer extends CPUProtection {
           }
         }, CONSTANTS.CPU_YIELD_DELAY_MS);
       }
-    } catch(e) {
-      this._handleError('processQueue', e);
-    } finally {
+    } catch(e) {} finally {
       this._isProcessingQueue = false;
     }
   }
@@ -4260,79 +3526,6 @@ export class GameServer extends CPUProtection {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
-      // ==================== COUNTRY-BASED QUIZ EVENTS ====================
-
-      if (evt === "getUserCountryInfo") {
-        const wsId = this._getWsId(ws);
-        const info = this.countryQuizSystem.getUserCountryInfo(wsId);
-        this._safeSend(ws, ["userCountryInfo", info]);
-        return;
-      }
-
-      if (evt === "getCountryQuestions") {
-        const countryCode = data[1] || 'ID';
-        const result = await this.getCountryQuestions(countryCode);
-        this._safeSend(ws, ["countryQuestions", {
-          country: countryCode,
-          hasTranslations: !!result,
-          data: result
-        }]);
-        return;
-      }
-
-      if (evt === "getCountryQuizStatus") {
-        const countryCode = data[1] || 'ID';
-        const hasTranslations = await this.translationManager._checkCountryTranslationExists(countryCode);
-        const info = COUNTRY_LANGUAGE_MAP[countryCode];
-        this._safeSend(ws, ["countryQuizStatus", {
-          country: countryCode,
-          countryName: info?.name || 'Unknown',
-          flag: info?.flag || '🌍',
-          language: info?.lang || 'en',
-          hasTranslations: hasTranslations,
-          totalQuestions: 1000,
-          lastUpdated: new Date().toISOString()
-        }]);
-        return;
-      }
-
-      // ==================== TRANSLATION EVENTS ====================
-
-      if (evt === "translateAllQuestions") {
-        const result = await this.translateAllQuestionsToCountries();
-        this._safeSend(ws, ["translationResult", result]);
-        return;
-      }
-
-      if (evt === "getAllTranslationStatuses") {
-        const statuses = await this.translationManager.getAllTranslationStatuses();
-        this._safeSend(ws, ["allTranslationStatuses", statuses]);
-        return;
-      }
-
-      if (evt === "checkCountryTranslation") {
-        const countryCode = data[1] || 'ID';
-        const exists = await this.translationManager._checkCountryTranslationExists(countryCode);
-        const info = COUNTRY_LANGUAGE_MAP[countryCode];
-        this._safeSend(ws, ["countryTranslationExists", {
-          country: countryCode,
-          countryName: info?.name || 'Unknown',
-          flag: info?.flag || '🌍',
-          exists: exists,
-          language: info?.lang || 'en'
-        }]);
-        return;
-      }
-
-      if (evt === "getOrCreateCountryTranslations") {
-        const countryCode = data[1] || 'ID';
-        const result = await this.translationManager.getOrCreateCountryTranslations(countryCode);
-        this._safeSend(ws, ["countryTranslationsResult", result]);
-        return;
-      }
-
-      // ==================== QUIZ EVENTS ====================
-
       if (evt === "switchRoom") {
         const [_, room, username] = data;
         await this.switchRoom(ws, room, username);
@@ -4355,32 +3548,9 @@ export class GameServer extends CPUProtection {
       if (evt === "getQuizLeaderboard") {
         let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
         const points = await this._getQuizPoints();
-        
-        const userCountries = new Map();
-        for (const [username] of Object.entries(points)) {
-          const conn = this.userConnections.get(username);
-          if (conn) {
-            const wsId = conn.wsId;
-            const country = this.userCountry.get(wsId) || 'US';
-            userCountries.set(username, country);
-          }
-        }
-
-        const sorted = Object.entries(points).map(([username, score]) => {
-          const country = userCountries.get(username) || 'US';
-          const info = COUNTRY_LANGUAGE_MAP[country];
-          return {
-            username,
-            score,
-            country: country,
-            countryFlag: info?.flag || '🌍',
-            countryName: info?.name || 'Unknown'
-          };
-        }).sort((a, b) => b.score - a.score).slice(0, limit);
-
-        const result = sorted.map(item => 
-          `${item.countryFlag} ${item.username}|${item.score}`
-        );
+        const sorted = Object.entries(points).map(([username, score]) => ({ username, score }))
+          .sort((a, b) => b.score - a.score).slice(0, limit);
+        const result = sorted.map(item => `${item.username}|${item.score}`);
         this._safeSend(ws, ["quizLeaderboard", result]);
         return;
       }
@@ -4397,6 +3567,48 @@ export class GameServer extends CPUProtection {
         } catch(e) {
           this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
         }
+        return;
+      }
+
+      if (evt === "translateAllQuestionsToNewKV") {
+        const result = await this.translateAllQuestionsToNewKV();
+        this._safeSend(ws, ["translationNewKVStatus", result]);
+        return;
+      }
+
+      if (evt === "getQuestionsByLanguageFromNewKV") {
+        const lang = data[1] || 'en';
+        const questions = await this.getQuestionsByLanguageFromNewKV(lang);
+        this._safeSend(ws, ["questionsByLanguageNewKV", { 
+          language: lang, 
+          questions: questions,
+          total: questions?.length || 0,
+          kvKey: TRANSLATION_KV_KEY
+        }]);
+        return;
+      }
+
+      if (evt === "getAllLanguagesFromNewKV") {
+        const languages = await this.getAllLanguagesFromNewKV();
+        this._safeSend(ws, ["allLanguagesNewKV", {
+          kvKey: TRANSLATION_KV_KEY,
+          languages: languages
+        }]);
+        return;
+      }
+
+      if (evt === "getTranslationNewKVStatus") {
+        const status = await this.getTranslationNewKVStatus();
+        this._safeSend(ws, ["translationNewKVStatus", status]);
+        return;
+      }
+
+      if (evt === "checkTranslationExists") {
+        const exists = await this.checkTranslationExists();
+        this._safeSend(ws, ["translationExists", {
+          exists: exists,
+          kvKey: TRANSLATION_KV_KEY
+        }]);
         return;
       }
 
@@ -4460,8 +3672,6 @@ export class GameServer extends CPUProtection {
         this._safeSend(ws, ["quizStatus", status]);
         return;
       }
-
-      // ==================== GAME EVENTS ====================
 
       const room = this._ensureRoomConsistency(ws);
       if (!room) { this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]); return; }
@@ -4620,11 +3830,9 @@ export class GameServer extends CPUProtection {
 
           const cf = req.cf || {};
           const country = cf?.country || 'US';
-          const lang = this._countryToLanguage(country);
-          
           this.userCountry.set(wsId, country);
+          const lang = this._countryToLanguage(country);
           this.userLanguage.set(wsId, lang);
-          this.countryQuizSystem.userCountryCache.set(wsId, country);
           server._cf = cf;
           server._country = country;
           server._language = lang;
@@ -4647,7 +3855,6 @@ export class GameServer extends CPUProtection {
                 this._removeClient(room, server);
                 this.userLanguage.delete(wsId);
                 this.userCountry.delete(wsId);
-                this.countryQuizSystem.userCountryCache.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -4667,7 +3874,6 @@ export class GameServer extends CPUProtection {
                 this._removeClient(room, server);
                 this.userLanguage.delete(wsId);
                 this.userCountry.delete(wsId);
-                this.countryQuizSystem.userCountryCache.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -4684,7 +3890,6 @@ export class GameServer extends CPUProtection {
 
       return new Response("Game Server", { status: 200 });
     } catch(e) {
-      this._handleError('fetch', e);
       return new Response("Internal Server Error", { status: 500 });
     }
   }
@@ -4697,7 +3902,6 @@ export class GameServer extends CPUProtection {
         await this.handleEvent(ws, data);
       }
     } catch(e) {
-      this._handleError('webSocketMessage', e);
       this._safeSend(ws, ["gameLowCardError", "Server is recovering"]);
     }
   }
@@ -4713,7 +3917,6 @@ export class GameServer extends CPUProtection {
       }
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
-      this.countryQuizSystem.userCountryCache.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -4739,7 +3942,6 @@ export class GameServer extends CPUProtection {
       }
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
-      this.countryQuizSystem.userCountryCache.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
