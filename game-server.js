@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL CLASS WITH QUIZ END NOTIFICATION ONCE - ONLY TIME LEFT) ====================
+// ==================== GAME-SERVER.JS (FULL CLASS) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -951,7 +951,6 @@ export class GameServer extends CPUProtection {
     this._lastActivityTime = Date.now();
     this._isQuizIdle = false;
 
-    // Quiz end notification flags
     this.quizEndedToday = false;
     this.quizEndMessageShown = false;
     this.quizEndNotified = false;
@@ -976,10 +975,23 @@ export class GameServer extends CPUProtection {
 
   _getTimeLeftUntilNextQuiz() {
     const now = new Date();
-    const targetDate = new Date(now);
+    let targetDate = new Date(now);
     targetDate.setUTCHours(QUIZ_SCHEDULE.START_HOUR - QUIZ_SCHEDULE.TIMEZONE_OFFSET, 0, 0, 0);
     
-    if (now > targetDate) {
+    const isOvernight = QUIZ_SCHEDULE.START_HOUR > QUIZ_SCHEDULE.END_HOUR;
+    const wibHour = this._getCurrentWIBHour();
+    const isQuizTime = isOvernight ? 
+      (wibHour >= QUIZ_SCHEDULE.START_HOUR || wibHour < QUIZ_SCHEDULE.END_HOUR) : 
+      (wibHour >= QUIZ_SCHEDULE.START_HOUR && wibHour < QUIZ_SCHEDULE.END_HOUR);
+    
+    if (isQuizTime) {
+      targetDate.setDate(targetDate.getDate() + 1);
+    } else if (wibHour >= QUIZ_SCHEDULE.END_HOUR && wibHour < QUIZ_SCHEDULE.START_HOUR) {
+      if (wibHour < QUIZ_SCHEDULE.START_HOUR) {
+      } else {
+        targetDate.setDate(targetDate.getDate() + 1);
+      }
+    } else {
       targetDate.setDate(targetDate.getDate() + 1);
     }
     
@@ -1123,9 +1135,17 @@ export class GameServer extends CPUProtection {
     const wibHour = this._getCurrentWIBHour();
     const wibMinutes = this._getCurrentWIBMinutes();
     const currentTotal = (wibHour * 60) + wibMinutes;
+    
     const startTotal = QUIZ_SCHEDULE.START_HOUR * 60;
     const endTotal = QUIZ_SCHEDULE.END_HOUR * 60;
-    return currentTotal >= startTotal && currentTotal < endTotal;
+    
+    const isOvernight = startTotal > endTotal;
+    
+    if (isOvernight) {
+      return currentTotal >= startTotal || currentTotal < endTotal;
+    } else {
+      return currentTotal >= startTotal && currentTotal < endTotal;
+    }
   }
 
   _getTimeLeftUntilNextEvent() {
@@ -1133,32 +1153,71 @@ export class GameServer extends CPUProtection {
     const currentTotal = wibTime.totalMinutes;
     const startTotal = QUIZ_SCHEDULE.START_HOUR * 60;
     const endTotal = QUIZ_SCHEDULE.END_HOUR * 60;
+    
+    const isOvernight = startTotal > endTotal;
+    const isQuizTime = isOvernight ? 
+      (currentTotal >= startTotal || currentTotal < endTotal) : 
+      (currentTotal >= startTotal && currentTotal < endTotal);
 
-    if (currentTotal >= startTotal && currentTotal < endTotal) {
+    if (isQuizTime) {
+      let remainingMinutes;
+      if (currentTotal >= startTotal) {
+        remainingMinutes = (24 * 60) - currentTotal + endTotal;
+      } else {
+        remainingMinutes = endTotal - currentTotal;
+      }
+      
+      const hours = Math.floor(remainingMinutes / 60);
+      const minutes = Math.floor(remainingMinutes % 60);
+      
       return {
-        minutes: 0, seconds: 0, isRunning: true, hours: 0, totalMinutes: 0,
-        status: 'running', currentTime: wibTime.formatted,
+        minutes: remainingMinutes,
+        seconds: 0,
+        isRunning: true,
+        hours: hours,
+        totalMinutes: remainingMinutes,
+        status: 'running',
+        currentTime: wibTime.formatted,
         startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
         endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
-        startHour: QUIZ_SCHEDULE.START_HOUR, endHour: QUIZ_SCHEDULE.END_HOUR
+        startHour: QUIZ_SCHEDULE.START_HOUR,
+        endHour: QUIZ_SCHEDULE.END_HOUR,
+        remainingText: `${hours}h ${minutes}m`,
+        isOvernight: isOvernight
       };
     }
 
     let targetTotal, status, dayText = "";
-    if (currentTotal < startTotal) {
-      targetTotal = startTotal;
-      status = 'before';
-      dayText = "today";
+    
+    if (isOvernight) {
+      if (currentTotal < startTotal) {
+        targetTotal = startTotal;
+        status = 'before';
+        dayText = "today";
+      } else {
+        targetTotal = startTotal + (24 * 60);
+        status = 'after';
+        dayText = "tomorrow";
+      }
     } else {
-      targetTotal = startTotal + 1440;
-      status = 'after';
-      dayText = "tomorrow";
+      if (currentTotal < startTotal) {
+        targetTotal = startTotal;
+        status = 'before';
+        dayText = "today";
+      } else {
+        targetTotal = startTotal + (24 * 60);
+        status = 'after';
+        dayText = "tomorrow";
+      }
     }
 
     const diffMinutes = targetTotal - currentTotal;
+    const hours = Math.floor(diffMinutes / 60);
+    const minutes = Math.floor(diffMinutes % 60);
+    
     return {
-      hours: Math.floor(diffMinutes / 60),
-      minutes: Math.floor(diffMinutes % 60),
+      hours: hours,
+      minutes: minutes,
       seconds: 0,
       totalMinutes: diffMinutes,
       totalSeconds: diffMinutes * 60,
@@ -1169,7 +1228,9 @@ export class GameServer extends CPUProtection {
       startTime: this._formatWIBTime(QUIZ_SCHEDULE.START_HOUR, 0),
       endTime: this._formatWIBTime(QUIZ_SCHEDULE.END_HOUR, 0),
       currentTime: wibTime.formatted,
-      dayText
+      dayText,
+      remainingText: `${hours}h ${minutes}m`,
+      isOvernight: isOvernight
     };
   }
 
@@ -1268,7 +1329,7 @@ export class GameServer extends CPUProtection {
         }
         return false;
       } else {
-        if (this.quizAutoEnabled) {
+        if (this.quizAutoEnabled && !this.quizEndNotified) {
           this.quizAutoEnabled = false;
           this.quizEndedToday = true;
           this.quizEndMessageShown = false;
@@ -1396,9 +1457,6 @@ export class GameServer extends CPUProtection {
         if (clients?.size > 0) {
           if (!this.quizEndNotified) {
             this._sendQuizEndNotificationOnce();
-          } else {
-            const timeLeft = this._getTimeLeftUntilNextQuiz();
-            this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", `⏱️ ${timeLeft.text}`, true]);
           }
         }
         return;
@@ -1820,7 +1878,9 @@ export class GameServer extends CPUProtection {
     if (!ws || ws.readyState !== 1) return false;
     try {
       const timeInfo = this._getTimeLeftUntilNextEvent();
+      const timeLeft = this._getTimeLeftUntilNextQuiz();
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
+      
       if (isQuizTime) {
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (Date.now() - this._quizStartTime) / 1000;
@@ -1835,7 +1895,6 @@ export class GameServer extends CPUProtection {
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
         return false;
       } else {
-        const timeLeft = this._getTimeLeftUntilNextQuiz();
         message = `⏱️ ${timeLeft.text}`;
         canType = true;
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
@@ -1848,7 +1907,9 @@ export class GameServer extends CPUProtection {
     const wsIds = this.wsClients.get(QUIZ_ROOM);
     if (!wsIds?.size) return;
     const timeInfo = this._getTimeLeftUntilNextEvent();
+    const timeLeft = this._getTimeLeftUntilNextQuiz();
     let message = "", canType = true, isQuizTime = timeInfo.isRunning;
+    
     if (isQuizTime) {
       if (this.currentQuestion && this._quizStartTime) {
         const elapsed = (Date.now() - this._quizStartTime) / 1000;
@@ -1861,7 +1922,6 @@ export class GameServer extends CPUProtection {
         canType = true;
       }
     } else {
-      const timeLeft = this._getTimeLeftUntilNextQuiz();
       message = `⏱️ ${timeLeft.text}`;
       canType = true;
     }
