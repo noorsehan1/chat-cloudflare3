@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FIXED TIME UP POSITION) ====================
+// ==================== GAME-SERVER.JS (REMOVED TIME UP NOTIFICATION) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -594,8 +594,6 @@ export class GameServer extends CPUProtection {
       this._isShowingQuestion = false;
       this._quizInitAttempts = 0;
       this._maxQuizInitAttempts = 3;
-      this._timeUpNotified = false;
-      this._timeUpTimer = null; // Timer untuk notifikasi time up 5 detik
 
       this.quizEndedToday = false;
       this.quizEndMessageShown = false;
@@ -712,11 +710,6 @@ export class GameServer extends CPUProtection {
           this.currentQuestion = null;
           this._quizTimeout = null;
           this._isShowingQuestion = false;
-          this._timeUpNotified = false;
-          if (this._timeUpTimer) {
-            clearTimeout(this._timeUpTimer);
-            this._timeUpTimer = null;
-          }
         }
       }
 
@@ -777,11 +770,6 @@ export class GameServer extends CPUProtection {
       this.quizAnswered = new Set();
       this._quizStartTime = null;
       this._isShowingQuestion = false;
-      this._timeUpNotified = false;
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
-      }
       if (this._eventQueue) {
         this._eventQueue = [];
       }
@@ -804,10 +792,6 @@ export class GameServer extends CPUProtection {
       if (this._quizStartTimeout) {
         clearTimeout(this._quizStartTimeout);
         this._quizStartTimeout = null;
-      }
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
       }
       if (this.quizTimer) {
         clearInterval(this.quizTimer);
@@ -1487,11 +1471,6 @@ export class GameServer extends CPUProtection {
       if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) return;
 
       this._isShowingQuestion = true;
-      this._timeUpNotified = false;
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
-      }
 
       try {
         this._checkAndLoadNextBatch();
@@ -1551,57 +1530,11 @@ export class GameServer extends CPUProtection {
         if (this._quizTimeout) clearTimeout(this._quizTimeout);
         if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
 
-        // ==================== TIME UP NOTIFICATION 5 DETIK SEBELUM HABIS ====================
-        // Kirim notifikasi "Time is up!" 5 detik sebelum waktu habis
-        const timeUpDelay = CONSTANTS.QUIZ_TIME_LIMIT_MS - 5000; // 5 detik sebelum habis
-        if (this._timeUpTimer) {
-          clearTimeout(this._timeUpTimer);
-          this._timeUpTimer = null;
-        }
-        
-        this._timeUpTimer = setTimeout(() => {
-          try {
-            if (this.closing || this.isDestroyed || !this.currentQuestion) {
-              this._timeUpTimer = null;
-              return;
-            }
-            
-            // Kirim notifikasi time up di atas pertanyaan
-            if (!this._timeUpNotified && !this.quizHasWinner) {
-              this._timeUpNotified = true;
-              const correctAnswer = this.currentQuestion.correct;
-              const question = this.currentQuestion.question;
-              const options = this.currentQuestion.options;
-              
-              // Broadcast time up notification ke semua user
-              this._broadcastQuizNotification("quizTimeUp", {
-                message: "⏰ Time is up!",
-                correctAnswer: correctAnswer,
-                question: question,
-                options: options
-              });
-              
-              // Kirim ke room sebagai peringatan
-              this._broadcastToRoom(QUIZ_ROOM, ["quizTimeUp", {
-                message: "⏰ Time is up!",
-                correctAnswer: correctAnswer
-              }]);
-            }
-            this._timeUpTimer = null;
-          } catch(e) {
-            this._timeUpTimer = null;
-          }
-        }, timeUpDelay);
-
         this._quizTimeout = setTimeout(async () => {
           try {
             if (this.closing || this.isDestroyed) { 
               this._quizTimeout = null; 
               this._isShowingQuestion = false;
-              if (this._timeUpTimer) {
-                clearTimeout(this._timeUpTimer);
-                this._timeUpTimer = null;
-              }
               return; 
             }
             const currentClients = this.wsClients.get(QUIZ_ROOM);
@@ -1609,10 +1542,6 @@ export class GameServer extends CPUProtection {
               this._quizTimeout = null; 
               this.currentQuestion = null;
               this._isShowingQuestion = false;
-              if (this._timeUpTimer) {
-                clearTimeout(this._timeUpTimer);
-                this._timeUpTimer = null;
-              }
               return; 
             }
 
@@ -1620,11 +1549,8 @@ export class GameServer extends CPUProtection {
             const question = this.currentQuestion.question;
             const options = this.currentQuestion.options;
 
-            // Jangan kirim ulang time up disini, sudah dikirim 5 detik sebelumnya
-            if (!this._timeUpNotified) {
-              this._timeUpNotified = true;
-              this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
-            }
+            // TIDAK ADA NOTIFIKASI TIME UP DISINI - LANGSUNG TAMPILKAN JAWABAN BENAR
+            this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
 
             if (this.quizHasWinner && this.quizWinner) {
               const points = await this._getQuizPoints();
@@ -1643,20 +1569,17 @@ export class GameServer extends CPUProtection {
                 correctAnswer
               });
             } else {
-              // Hanya kirim jika belum ada winner dan belum pernah dikirim
-              if (!this._timeUpNotified) {
-                this._broadcastQuizNotification("quizTimeout", { noWinner: true });
-                this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
-              }
+              // TIDAK ADA NOTIFIKASI TIME UP - LANGSUNG TAMPILKAN JAWABAN BENAR
+              // TANPA PESAN "Time is up!"
+              this._broadcastQuizResult("quizNoWinner", { 
+                message: "", 
+                correctAnswer 
+              });
             }
 
             this._quizTimeout = null;
             this.isQuizWaiting = true;
             this._isShowingQuestion = false;
-            if (this._timeUpTimer) {
-              clearTimeout(this._timeUpTimer);
-              this._timeUpTimer = null;
-            }
 
             this._quizBreakTimeout = setTimeout(() => {
               if (this.closing || this.isDestroyed) { 
@@ -1666,18 +1589,12 @@ export class GameServer extends CPUProtection {
               this.isQuizWaiting = false;
               this._quizBreakTimeout = null;
               this.currentQuestion = null;
-              this._timeUpNotified = false;
             }, CONSTANTS.QUIZ_BREAK_MS);
           } catch(e) {
             this._quizTimeout = null;
             this.currentQuestion = null;
             this.isQuizWaiting = false;
             this._isShowingQuestion = false;
-            this._timeUpNotified = false;
-            if (this._timeUpTimer) {
-              clearTimeout(this._timeUpTimer);
-              this._timeUpTimer = null;
-            }
           }
         }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
       } catch(e) {
@@ -1685,22 +1602,12 @@ export class GameServer extends CPUProtection {
         this.currentQuestion = null;
         this.isQuizWaiting = false;
         this._quizTimeout = null;
-        this._timeUpNotified = false;
-        if (this._timeUpTimer) {
-          clearTimeout(this._timeUpTimer);
-          this._timeUpTimer = null;
-        }
       }
     } catch(e) {
       this._isShowingQuestion = false;
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
-      this._timeUpNotified = false;
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
-      }
     }
   }
 
@@ -1711,11 +1618,6 @@ export class GameServer extends CPUProtection {
       if (!currentClients?.size) { 
         this.currentQuestion = null;
         this._isShowingQuestion = false;
-        this._timeUpNotified = false;
-        if (this._timeUpTimer) {
-          clearTimeout(this._timeUpTimer);
-          this._timeUpTimer = null;
-        }
         return; 
       }
 
@@ -1723,10 +1625,8 @@ export class GameServer extends CPUProtection {
       const question = this.currentQuestion.question;
       const options = this.currentQuestion.options;
 
-      if (!this._timeUpNotified) {
-        this._timeUpNotified = true;
-        this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
-      }
+      // TIDAK ADA NOTIFIKASI TIME UP DISINI
+      this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
 
       if (this.quizHasWinner && this.quizWinner) {
         const points = await this._getQuizPoints();
@@ -1745,19 +1645,16 @@ export class GameServer extends CPUProtection {
           correctAnswer
         });
       } else {
-        if (!this._timeUpNotified) {
-          this._broadcastQuizNotification("quizTimeout", { noWinner: true });
-          this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
-        }
+        // TIDAK ADA NOTIFIKASI TIME UP
+        this._broadcastQuizResult("quizNoWinner", { 
+          message: "", 
+          correctAnswer 
+        });
       }
 
       this.currentQuestion = null;
       this.isQuizWaiting = true;
       this._isShowingQuestion = false;
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
-      }
 
       this._quizBreakTimeout = setTimeout(() => {
         if (this.closing || this.isDestroyed) { 
@@ -1766,17 +1663,11 @@ export class GameServer extends CPUProtection {
         }
         this.isQuizWaiting = false;
         this._quizBreakTimeout = null;
-        this._timeUpNotified = false;
       }, CONSTANTS.QUIZ_BREAK_MS);
     } catch(e) {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._isShowingQuestion = false;
-      this._timeUpNotified = false;
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
-      }
     }
   }
 
@@ -1920,10 +1811,6 @@ export class GameServer extends CPUProtection {
       if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
       if (this._quizStartTimeout) clearTimeout(this._quizStartTimeout);
       if (this._quizKeepAliveInterval) clearInterval(this._quizKeepAliveInterval);
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
-      }
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this.quizHasWinner = false;
@@ -1932,7 +1819,6 @@ export class GameServer extends CPUProtection {
       this._quizStartTime = null;
       this.quizEndNotified = false;
       this._isShowingQuestion = false;
-      this._timeUpNotified = false;
       this._startQuizKeepAlive();
     } catch(e) {}
   }
@@ -2024,10 +1910,6 @@ export class GameServer extends CPUProtection {
                 this.currentQuestion = null;
                 this._quizTimeout = null;
                 this._isShowingQuestion = false;
-                if (this._timeUpTimer) {
-                  clearTimeout(this._timeUpTimer);
-                  this._timeUpTimer = null;
-                }
               }
             }
           } else {
@@ -2049,11 +1931,6 @@ export class GameServer extends CPUProtection {
       this.quizWinner = null;
       this.isQuizWaiting = false;
       this._isShowingQuestion = false;
-      this._timeUpNotified = false;
-      if (this._timeUpTimer) {
-        clearTimeout(this._timeUpTimer);
-        this._timeUpTimer = null;
-      }
       
       if (this._quizTimeout) {
         clearTimeout(this._quizTimeout);
