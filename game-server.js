@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (OPTIMIZED FOR EXISTING KV QUESTIONS) ====================
+// ==================== GAME-SERVER.JS (FIXED INFINITE RESTART) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -67,23 +67,16 @@ const QUIZ_ROOM = "Quiz";
 // ==================== COUNTRY TO LANGUAGE MAPPING ====================
 
 const COUNTRY_LANGUAGE_MAP = {
-  // Bahasa Indonesia (id)
   'ID': { lang: 'id', name: 'Indonesia', flag: '🇮🇩', kvKey: 'trivia_id' },
   'MY': { lang: 'id', name: 'Malaysia', flag: '🇲🇾', kvKey: 'trivia_id' },
   'SG': { lang: 'id', name: 'Singapore', flag: '🇸🇬', kvKey: 'trivia_id' },
   'BN': { lang: 'id', name: 'Brunei', flag: '🇧🇳', kvKey: 'trivia_id' },
-  
-  // Filipino (fil)
   'PH': { lang: 'fil', name: 'Philippines', flag: '🇵🇭', kvKey: 'trivia_fil' },
-  
-  // Hindi (hi)
   'IN': { lang: 'hi', name: 'India', flag: '🇮🇳', kvKey: 'trivia_hi' },
   'NP': { lang: 'hi', name: 'Nepal', flag: '🇳🇵', kvKey: 'trivia_hi' },
   'LK': { lang: 'hi', name: 'Sri Lanka', flag: '🇱🇰', kvKey: 'trivia_hi' },
   'BD': { lang: 'hi', name: 'Bangladesh', flag: '🇧🇩', kvKey: 'trivia_hi' },
   'PK': { lang: 'hi', name: 'Pakistan', flag: '🇵🇰', kvKey: 'trivia_hi' },
-  
-  // Arab (ar)
   'SA': { lang: 'ar', name: 'Saudi Arabia', flag: '🇸🇦', kvKey: 'trivia_ar' },
   'AE': { lang: 'ar', name: 'UAE', flag: '🇦🇪', kvKey: 'trivia_ar' },
   'QA': { lang: 'ar', name: 'Qatar', flag: '🇶🇦', kvKey: 'trivia_ar' },
@@ -230,21 +223,30 @@ class CountryBasedQuizSystem {
     this.countryQuestionCache = new Map();
     this.questionsByLanguage = new Map();
     this._isLoaded = false;
+    this._usedQuestions = new Set();
+    this._loading = false;
+    this._loadAttempts = 0;
+    this._maxLoadAttempts = 3;
   }
 
-  /**
-   * Load questions for all languages from KV
-   * Uses existing trivia_id, trivia_en, trivia_fil, trivia_hi, trivia_ar
-   */
   async loadAllQuestions() {
     try {
+      // Prevent multiple simultaneous loads
+      if (this._loading) {
+        return this._isLoaded;
+      }
+      
       if (this._isLoaded && this.questionsByLanguage.size > 0) {
         return true;
       }
 
+      this._loading = true;
+      this._loadAttempts++;
+
       const env = this.env;
       if (!env?.QUESTIONS) {
         console.log("❌ KV not available!");
+        this._loading = false;
         return false;
       }
 
@@ -262,14 +264,15 @@ class CountryBasedQuizSystem {
         try {
           const data = await env.QUESTIONS.get(lang.key, 'json');
           if (data?.questions?.length > 0) {
+            const shuffledQuestions = this._shuffleArray([...data.questions]);
             this.questionsByLanguage.set(lang.code, {
-              questions: data.questions,
-              total: data.total || data.questions.length,
+              questions: shuffledQuestions,
+              total: data.total || shuffledQuestions.length,
               language: lang.code,
               languageName: lang.name,
               fetchedAt: data.fetchedAt || new Date().toISOString()
             });
-            console.log(`✅ Loaded ${data.questions.length} questions for ${lang.name} (${lang.code})`);
+            console.log(`✅ Loaded ${shuffledQuestions.length} questions for ${lang.name} (${lang.code})`);
           } else {
             console.log(`⚠️ No questions found for ${lang.name} (${lang.code})`);
           }
@@ -278,36 +281,40 @@ class CountryBasedQuizSystem {
         }
       }
 
-      this._isLoaded = true;
-      return this.questionsByLanguage.size > 0;
+      this._isLoaded = this.questionsByLanguage.size > 0;
+      this._loading = false;
+      return this._isLoaded;
     } catch(e) {
       console.error("❌ Failed to load questions:", e.message);
+      this._loading = false;
       return false;
     }
   }
 
-  /**
-   * Get questions for a specific language
-   */
+  _shuffleArray(array) {
+    if (!array || array.length === 0) return array;
+    const arr = [...array];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
   getQuestionsByLanguage(langCode) {
     const data = this.questionsByLanguage.get(langCode);
     return data?.questions || null;
   }
 
-  /**
-   * Get questions for a specific country
-   */
   async getQuestionsForCountry(countryCode) {
     try {
       if (!countryCode) return null;
 
-      // Check cache
       const cacheKey = `country_${countryCode}`;
       if (this.countryQuestionCache.has(cacheKey)) {
         return this.countryQuestionCache.get(cacheKey);
       }
 
-      // Get language for this country
       const info = this.countryLanguageMap[countryCode];
       if (!info) return null;
 
@@ -328,7 +335,6 @@ class CountryBasedQuizSystem {
         return result;
       }
 
-      // Fallback: try to load from KV directly
       const env = this.env;
       if (!env?.QUESTIONS) return null;
 
@@ -354,16 +360,37 @@ class CountryBasedQuizSystem {
     }
   }
 
-  /**
-   * Get quiz questions for multiple users (batch)
-   */
+  getRandomQuestion(langCode) {
+    try {
+      const questions = this.getQuestionsByLanguage(langCode);
+      if (!questions || questions.length === 0) return null;
+      
+      const availableQuestions = questions.filter((_, index) => 
+        !this._usedQuestions.has(`${langCode}_${index}`)
+      );
+      
+      if (availableQuestions.length === 0) {
+        this._usedQuestions.clear();
+        const randomIndex = Math.floor(Math.random() * questions.length);
+        this._usedQuestions.add(`${langCode}_${randomIndex}`);
+        return { question: questions[randomIndex], index: randomIndex };
+      }
+      
+      const randomIndex = Math.floor(Math.random() * availableQuestions.length);
+      const originalIndex = questions.indexOf(availableQuestions[randomIndex]);
+      this._usedQuestions.add(`${langCode}_${originalIndex}`);
+      return { question: availableQuestions[randomIndex], index: originalIndex };
+    } catch(e) {
+      return null;
+    }
+  }
+
   async getQuestionsForUsers(questionId, originalQuestion, originalOptions, wsIds) {
     try {
       const results = new Map();
       const usersByCountry = new Map();
       
-      // Ensure questions are loaded
-      if (!this._isLoaded) {
+      if (!this._isLoaded && !this._loading) {
         await this.loadAllQuestions();
       }
 
@@ -379,49 +406,40 @@ class CountryBasedQuizSystem {
         const info = this.countryLanguageMap[country];
         const lang = info?.lang || 'en';
         
-        // Get questions for this language
-        const questions = this.getQuestionsByLanguage(lang);
+        const randomResult = this.getRandomQuestion(lang);
         
-        if (questions && questions.length > 0) {
-          // Find the question by ID (or use index)
-          let foundQuestion = null;
-          let foundOptions = null;
+        if (randomResult) {
+          const q = randomResult.question;
+          const foundQuestion = q.question || q.text;
+          const foundOptions = q.options || q.choices || { A: '', B: '', C: '', D: '' };
           
-          // Try to find by id
-          for (const q of questions) {
-            if (q.id === questionId || q.id === parseInt(questionId)) {
-              foundQuestion = q.question;
-              foundOptions = q.options;
-              break;
-            }
+          const optionKeys = ['A', 'B', 'C', 'D'];
+          const formattedOptions = {};
+          if (Array.isArray(foundOptions)) {
+            optionKeys.forEach((key, index) => {
+              formattedOptions[key] = foundOptions[index] || '';
+            });
+          } else {
+            optionKeys.forEach((key) => {
+              formattedOptions[key] = foundOptions[key] || '';
+            });
           }
           
-          // If not found by ID, use index
-          if (!foundQuestion) {
-            const index = (questionId - 1) % questions.length;
-            if (questions[index]) {
-              foundQuestion = questions[index].question;
-              foundOptions = questions[index].options;
-            }
+          for (const wsId of userWsIds) {
+            results.set(wsId, {
+              question: foundQuestion,
+              options: formattedOptions,
+              language: lang,
+              country: country,
+              countryName: info?.name || 'Unknown',
+              flag: info?.flag || '🌍',
+              isTranslated: lang !== 'en',
+              questionIndex: randomResult.index
+            });
           }
-
-          if (foundQuestion) {
-            for (const wsId of userWsIds) {
-              results.set(wsId, {
-                question: foundQuestion,
-                options: foundOptions || { A: '', B: '', C: '', D: '' },
-                language: lang,
-                country: country,
-                countryName: info?.name || 'Unknown',
-                flag: info?.flag || '🌍',
-                isTranslated: lang !== 'en'
-              });
-            }
-            continue;
-          }
+          continue;
         }
 
-        // Fallback: use original
         for (const wsId of userWsIds) {
           results.set(wsId, {
             question: originalQuestion,
@@ -478,11 +496,9 @@ class CountryBasedQuizSystem {
     this.userCountryCache.clear();
     this.questionCache.clear();
     this.countryQuestionCache.clear();
+    this._usedQuestions.clear();
   }
 
-  /**
-   * Get translation status
-   */
   getTranslationStatus() {
     const status = {};
     for (const [lang, data] of this.questionsByLanguage) {
@@ -512,6 +528,7 @@ export class GameServer extends CPUProtection {
       this.closing = false;
       this.isDestroyed = false;
       this._initialized = false;
+      this._initializing = false;
 
       this._restartCount = 0;
       this._lastRestartTime = 0;
@@ -522,6 +539,9 @@ export class GameServer extends CPUProtection {
       this._errorCount = 0;
       this._lastErrorReset = Date.now();
       this._isRecovering = false;
+      this._recoveryAttempts = 0;
+      this._maxRecoveryAttempts = 3;
+      this._lastRecoveryTime = 0;
 
       this.activeGames = new Map();
       this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
@@ -572,40 +592,50 @@ export class GameServer extends CPUProtection {
       this._quizKeepAliveInterval = null;
       this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
+      this._isShowingQuestion = false;
+      this._quizInitAttempts = 0;
+      this._maxQuizInitAttempts = 3;
 
       this.quizEndedToday = false;
       this.quizEndMessageShown = false;
       this.quizEndNotified = false;
 
-      // Initialize country quiz system
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
 
-      // Load questions on startup
+      // Initialize with a single attempt
       this._initAsync();
-      setTimeout(() => this.forceStartQuiz(), 3000);
+
       this._startCPUMonitor();
       this._startHealthCheck();
 
-      // Auto-load questions from KV on deploy
+      // Single delayed load attempt
       setTimeout(async () => {
         try {
-          console.log("🔍 Loading questions from KV on deploy...");
-          const loaded = await this.countryQuizSystem.loadAllQuestions();
-          if (loaded) {
-            console.log("✅ Questions loaded successfully!");
-            const status = this.countryQuizSystem.getTranslationStatus();
-            console.log(`📊 Loaded ${status.totalLanguages} languages:`, Object.keys(status.languages));
-          } else {
-            console.log("⚠️ No questions loaded from KV");
+          if (!this.closing && !this.isDestroyed) {
+            console.log("🔍 Loading questions from KV on deploy...");
+            const loaded = await this.countryQuizSystem.loadAllQuestions();
+            if (loaded) {
+              console.log("✅ Questions loaded successfully!");
+              const status = this.countryQuizSystem.getTranslationStatus();
+              console.log(`📊 Loaded ${status.totalLanguages} languages:`, Object.keys(status.languages));
+            } else {
+              console.log("⚠️ No questions loaded from KV");
+            }
           }
         } catch(e) {
           console.error("❌ Failed to load questions:", e.message);
         }
-      }, 3000);
+      }, 5000);
+
+      // Single force start after initialization
+      setTimeout(() => {
+        if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
+          this.forceStartQuiz();
+        }
+      }, 8000);
 
     } catch(e) {
       console.error("Constructor error:", e);
-      setTimeout(() => this._forceRecovery(), 1000);
     }
   }
 
@@ -633,8 +663,15 @@ export class GameServer extends CPUProtection {
         this._lastErrorReset = now;
       }
       this._errorCount++;
-      if (this._errorCount > CONSTANTS.MAX_UNHANDLED_ERRORS && !this._isRecovering) {
+      
+      // Only attempt recovery if not already recovering and under max attempts
+      if (this._errorCount > CONSTANTS.MAX_UNHANDLED_ERRORS && 
+          !this._isRecovering && 
+          this._recoveryAttempts < this._maxRecoveryAttempts) {
         this._isRecovering = true;
+        this._recoveryAttempts++;
+        this._lastRecoveryTime = now;
+        
         setTimeout(() => {
           this._forceRecovery();
           this._isRecovering = false;
@@ -672,14 +709,13 @@ export class GameServer extends CPUProtection {
         }
       }
 
+      // Don't auto-restart quiz in health check - let the scheduler handle it
       if (this._isQuizTime() && this.currentQuestion && this._quizStartTime) {
         const elapsed = (now - this._quizStartTime) / 1000;
         if (elapsed > (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) + 30) {
           this.currentQuestion = null;
           this._quizTimeout = null;
-          if (!this.closing && !this.isDestroyed) {
-            this._showQuestion();
-          }
+          this._isShowingQuestion = false;
         }
       }
 
@@ -708,19 +744,24 @@ export class GameServer extends CPUProtection {
   _forceRecovery() {
     try {
       if (this.closing || this.isDestroyed) return;
+      if (this._recoveryAttempts >= this._maxRecoveryAttempts) {
+        console.log("⚠️ Max recovery attempts reached, entering stable state");
+        return;
+      }
+      
       this._resetCriticalState();
       this._cleanupResources();
-      if (!this._initialized) {
+      
+      // Don't re-initialize if already initialized
+      if (!this._initialized && !this._initializing) {
         this._initAsync();
       }
+      
+      // Don't force start quiz - let scheduler handle it
       if (this._isQuizTime()) {
         this.quizAutoEnabled = true;
-        setTimeout(() => {
-          if (!this.closing && !this.isDestroyed) {
-            this.forceStartQuiz();
-          }
-        }, 2000);
       }
+      
       this._broadcastToRoom(QUIZ_ROOM, ["serverRecovered", {
         timestamp: Date.now(),
         message: "Server has recovered"
@@ -736,6 +777,7 @@ export class GameServer extends CPUProtection {
       this.quizWinner = null;
       this.quizAnswered = new Set();
       this._quizStartTime = null;
+      this._isShowingQuestion = false;
       if (this._eventQueue) {
         this._eventQueue = [];
       }
@@ -889,30 +931,43 @@ export class GameServer extends CPUProtection {
 
   async _initAsync() {
     try {
-      if (this._initialized && !this._isRecovering) return;
-      this._initialized = true;
+      // Prevent multiple simultaneous initializations
+      if (this._initializing) {
+        return;
+      }
       
-      // Load questions from KV
+      if (this._initialized && !this._isRecovering) {
+        return;
+      }
+      
+      this._initializing = true;
+      
+      // Load questions from KV (only once)
       await this.countryQuizSystem.loadAllQuestions();
       
       // Initialize quiz with loaded questions
       await this._initQuiz();
       this._startQuizScheduler();
       await this._checkAndResetWeeklyPoints();
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed) {
-          this.ensureQuizRunning();
-        }
-      }, 2000);
+      
+      this._initialized = true;
+      this._initializing = false;
       this._errorCount = 0;
       this._isRecovering = false;
+      this._quizInitAttempts = 0;
     } catch(e) {
+      this._initializing = false;
       this._handleError('initAsync', e);
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed) {
-          this._initAsync();
-        }
-      }, 5000);
+      
+      // Only retry if under max attempts
+      if (this._quizInitAttempts < this._maxQuizInitAttempts && !this.closing && !this.isDestroyed) {
+        this._quizInitAttempts++;
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed) {
+            this._initAsync();
+          }
+        }, 5000 * this._quizInitAttempts);
+      }
     }
   }
 
@@ -1148,8 +1203,10 @@ export class GameServer extends CPUProtection {
           this.quizAutoEnabled = true;
           this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz will start soon!", false]);
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
-          if (!this._quizStartTimeout) this.forceStartQuiz();
-        } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+          if (!this._quizStartTimeout && !this._isShowingQuestion) {
+            this.forceStartQuiz();
+          }
+        } else if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout && !this._isShowingQuestion) {
           await this._showQuestion();
         }
         return false;
@@ -1169,13 +1226,24 @@ export class GameServer extends CPUProtection {
 
   forceStartQuiz() {
     try {
+      // Prevent multiple simultaneous starts
+      if (this._isShowingQuestion) {
+        return false;
+      }
+      
       if (!this._isQuizTime() || this.currentQuestion || this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
         return false;
       }
+      
       if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        this._initQuiz().then(() => this._showQuestion());
+        this._initQuiz().then(() => {
+          if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
+            this._showQuestion();
+          }
+        });
         return false;
       }
+      
       this.quizAutoEnabled = true;
       this._showQuestion();
       return true;
@@ -1185,7 +1253,7 @@ export class GameServer extends CPUProtection {
   _checkAndRestartQuiz() {
     try {
       if (!this._isQuizTime()) return;
-      if (!this.currentQuestion && !this.isQuizWaiting && !this._quizTimeout && !this._quizBreakTimeout) {
+      if (!this.currentQuestion && !this.isQuizWaiting && !this._quizTimeout && !this._quizBreakTimeout && !this._isShowingQuestion) {
         this.quizAutoEnabled = true;
         this._showQuestion();
       }
@@ -1194,21 +1262,42 @@ export class GameServer extends CPUProtection {
 
   ensureQuizRunning() {
     try {
-      this._forceStartQuizIfTime();
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        this._initQuiz().then(() => { if (!this.closing && !this.isDestroyed) this.forceStartQuiz(); });
+      // Only attempt if not already showing and initialized
+      if (this._isShowingQuestion) {
         return;
       }
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+      
+      this._forceStartQuizIfTime();
+      
+      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
+        this._initQuiz().then(() => { 
+          if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
+            this.forceStartQuiz();
+          }
+        });
+        return;
+      }
+      
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout && !this._isShowingQuestion) {
         this.forceStartQuiz();
       }
-      if (!this._quizKeepAliveInterval) this._startQuizKeepAlive();
+      
+      if (!this._quizKeepAliveInterval) {
+        this._startQuizKeepAlive();
+      }
     } catch(e) {}
   }
 
   _forceStartQuizIfTime() {
     try {
-      if (!this._isQuizTime() || this.currentQuestion || this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) return;
+      if (this._isShowingQuestion) {
+        return;
+      }
+      
+      if (!this._isQuizTime() || this.currentQuestion || this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
+        return;
+      }
+      
       this.quizAutoEnabled = true;
       this._showQuestion();
     } catch(e) {}
@@ -1218,7 +1307,6 @@ export class GameServer extends CPUProtection {
 
   async _loadAllQuestionsFromKV() {
     try {
-      // Try to load from country quiz system first
       if (this.countryQuizSystem._isLoaded) {
         const enQuestions = this.countryQuizSystem.getQuestionsByLanguage('en');
         if (enQuestions && enQuestions.length > 0) {
@@ -1236,12 +1324,12 @@ export class GameServer extends CPUProtection {
           this._questionPointer = 0;
           this._totalQuestionsAnswered = 0;
           this._currentBatchIndex = 0;
+          this.countryQuizSystem._usedQuestions.clear();
           this._loadNextBatch();
           return true;
         }
       }
 
-      // Fallback: load from KV directly
       if (!this.env?.QUESTIONS) return false;
       this._incrementSubRequest();
       const cached = await this.env.QUESTIONS.get('trivia_en', 'json');
@@ -1260,6 +1348,7 @@ export class GameServer extends CPUProtection {
         this._questionPointer = 0;
         this._totalQuestionsAnswered = 0;
         this._currentBatchIndex = 0;
+        this.countryQuizSystem._usedQuestions.clear();
         this._loadNextBatch();
         return true;
       }
@@ -1279,6 +1368,7 @@ export class GameServer extends CPUProtection {
         this._questionPointer = 0;
         this._totalQuestionsAnswered = 0;
         this._currentBatchIndex = 0;
+        this.countryQuizSystem._usedQuestions.clear();
       }
       const endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
       this.quizQuestionCache['en'] = this._allQuestions.slice(startIndex, endIndex);
@@ -1369,6 +1459,11 @@ export class GameServer extends CPUProtection {
 
   async _showQuestion() {
     try {
+      // Prevent duplicate question display
+      if (this._isShowingQuestion) {
+        return;
+      }
+      
       this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
 
@@ -1391,99 +1486,141 @@ export class GameServer extends CPUProtection {
 
       if (this.isDestroyed || this.isQuizWaiting || this._quizStartTimeout || this.currentQuestion) return;
 
-      this._checkAndLoadNextBatch();
-      const questions = this.quizQuestionCache['en'] || [];
-      if (questions.length === 0) {
-        if (!this._loadNextBatch()) {
-          this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
+      this._isShowingQuestion = true;
+
+      try {
+        this._checkAndLoadNextBatch();
+        const questions = this.quizQuestionCache['en'] || [];
+        if (questions.length === 0) {
+          if (!this._loadNextBatch()) {
+            this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
+            this._isShowingQuestion = false;
+            return;
+          }
+        }
+
+        const totalQuestions = this._allQuestions.length;
+        if (totalQuestions === 0) {
+          this._isShowingQuestion = false;
           return;
         }
-      }
-
-      const q = questions[this._questionPointer];
-      if (!q?.options) { this._questionPointer++; this._showQuestion(); return; }
-
-      const shuffled = this._shuffleQuestionOptions(q);
-      this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
-      this._quizStartTime = Date.now();
-      this.quizAnswered = new Set();
-      this.quizHasWinner = false;
-      this.quizWinner = null;
-      this._questionPointer++;
-      this._totalQuestionsAnswered++;
-
-      await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
-      
-      const remainingTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
-      this._broadcastQuizNotification("quizUpdate", {
-        questionNumber: this._questionPointer,
-        totalQuestions: this._allQuestions.length,
-        hasWinner: false,
-        remainingTime: `${remainingTime}s remaining`
-      });
-
-      this._broadcastToRoom(QUIZ_ROOM, [
-        "quizTimeLeft",
-        `Question ${this._questionPointer}/${this._allQuestions.length} - ${remainingTime}s remaining`,
-        false
-      ]);
-
-      if (this._quizTimeout) clearTimeout(this._quizTimeout);
-      if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
-
-      this._quizTimeout = setTimeout(async () => {
-        try {
-          if (this.closing || this.isDestroyed) { this._quizTimeout = null; return; }
-          const currentClients = this.wsClients.get(QUIZ_ROOM);
-          if (!currentClients?.size) { this._quizTimeout = null; this.currentQuestion = null; return; }
-
-          const correctAnswer = this.currentQuestion.correct;
-          const question = this.currentQuestion.question;
-          const options = this.currentQuestion.options;
-
-          this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
-
-          if (this.quizHasWinner && this.quizWinner) {
-            const points = await this._getQuizPoints();
-            points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-            if (this.env?.QUESTIONS) {
-              this._incrementSubRequest();
-              await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
+        
+        // Pick a random question
+        const randomIndex = Math.floor(Math.random() * totalQuestions);
+        const q = this._allQuestions[randomIndex];
+        
+        if (!q?.options) {
+          this._isShowingQuestion = false;
+          setTimeout(() => {
+            if (!this.closing && !this.isDestroyed) {
+              this._showQuestion();
             }
-            this._broadcastQuizNotification("quizWinner", {
-              username: this.quizWinner,
-              totalPoints: points[this.quizWinner] || 0
-            });
-            this._broadcastQuizResult("quizWinner", {
-              username: this.quizWinner,
-              totalPoints: points[this.quizWinner] || 0,
-              correctAnswer
-            });
-          } else {
-            this._broadcastQuizNotification("quizTimeout", { noWinner: true });
-            this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
-          }
-
-          this._quizTimeout = null;
-          this.isQuizWaiting = true;
-
-          this._quizBreakTimeout = setTimeout(() => {
-            if (this.closing || this.isDestroyed) { this._quizBreakTimeout = null; return; }
-            this.isQuizWaiting = false;
-            this._quizBreakTimeout = null;
-            this.currentQuestion = null;
-            this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "5"]);
-            setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "3"]), 2000);
-            setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "1"]), 4000);
-            if (!this.closing && !this.isDestroyed) this.ensureQuizRunning();
-          }, CONSTANTS.QUIZ_BREAK_MS);
-        } catch(e) {
-          this._quizTimeout = null;
-          this.currentQuestion = null;
-          this.isQuizWaiting = false;
+          }, 1000);
+          return;
         }
-      }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
+
+        const shuffled = this._shuffleQuestionOptions(q);
+        this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
+        this._quizStartTime = Date.now();
+        this.quizAnswered = new Set();
+        this.quizHasWinner = false;
+        this.quizWinner = null;
+        this._questionPointer = randomIndex + 1;
+        this._totalQuestionsAnswered++;
+
+        await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
+        
+        const remainingTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
+        this._broadcastQuizNotification("quizUpdate", {
+          questionNumber: this._questionPointer,
+          totalQuestions: this._allQuestions.length,
+          hasWinner: false,
+          remainingTime: `${remainingTime}s remaining`
+        });
+
+        this._broadcastToRoom(QUIZ_ROOM, [
+          "quizTimeLeft",
+          `Question ${this._questionPointer}/${this._allQuestions.length} - ${remainingTime}s remaining`,
+          false
+        ]);
+
+        if (this._quizTimeout) clearTimeout(this._quizTimeout);
+        if (this._quizBreakTimeout) clearTimeout(this._quizBreakTimeout);
+
+        this._quizTimeout = setTimeout(async () => {
+          try {
+            if (this.closing || this.isDestroyed) { 
+              this._quizTimeout = null; 
+              this._isShowingQuestion = false;
+              return; 
+            }
+            const currentClients = this.wsClients.get(QUIZ_ROOM);
+            if (!currentClients?.size) { 
+              this._quizTimeout = null; 
+              this.currentQuestion = null;
+              this._isShowingQuestion = false;
+              return; 
+            }
+
+            const correctAnswer = this.currentQuestion.correct;
+            const question = this.currentQuestion.question;
+            const options = this.currentQuestion.options;
+
+            this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
+
+            if (this.quizHasWinner && this.quizWinner) {
+              const points = await this._getQuizPoints();
+              points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
+              if (this.env?.QUESTIONS) {
+                this._incrementSubRequest();
+                await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
+              }
+              this._broadcastQuizNotification("quizWinner", {
+                username: this.quizWinner,
+                totalPoints: points[this.quizWinner] || 0
+              });
+              this._broadcastQuizResult("quizWinner", {
+                username: this.quizWinner,
+                totalPoints: points[this.quizWinner] || 0,
+                correctAnswer
+              });
+            } else {
+              this._broadcastQuizNotification("quizTimeout", { noWinner: true });
+              this._broadcastQuizResult("quizNoWinner", { message: "⏰ Time is up!", correctAnswer });
+            }
+
+            this._quizTimeout = null;
+            this.isQuizWaiting = true;
+            this._isShowingQuestion = false;
+
+            this._quizBreakTimeout = setTimeout(() => {
+              if (this.closing || this.isDestroyed) { 
+                this._quizBreakTimeout = null; 
+                return; 
+              }
+              this.isQuizWaiting = false;
+              this._quizBreakTimeout = null;
+              this.currentQuestion = null;
+              this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "5"]);
+              setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "3"]), 2000);
+              setTimeout(() => this._broadcastToRoom(QUIZ_ROOM, ["quizNextQuestionIn", "1"]), 4000);
+              // Don't auto-restart here - let scheduler handle it
+            }, CONSTANTS.QUIZ_BREAK_MS);
+          } catch(e) {
+            this._quizTimeout = null;
+            this.currentQuestion = null;
+            this.isQuizWaiting = false;
+            this._isShowingQuestion = false;
+          }
+        }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
+      } catch(e) {
+        this._isShowingQuestion = false;
+        this.currentQuestion = null;
+        this.isQuizWaiting = false;
+        this._quizTimeout = null;
+      }
     } catch(e) {
+      this._isShowingQuestion = false;
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
@@ -1494,7 +1631,11 @@ export class GameServer extends CPUProtection {
     try {
       if (!this.currentQuestion || this._quizTimeout) return;
       const currentClients = this.wsClients.get(QUIZ_ROOM);
-      if (!currentClients?.size) { this.currentQuestion = null; return; }
+      if (!currentClients?.size) { 
+        this.currentQuestion = null;
+        this._isShowingQuestion = false;
+        return; 
+      }
 
       const correctAnswer = this.currentQuestion.correct;
       const question = this.currentQuestion.question;
@@ -1525,16 +1666,21 @@ export class GameServer extends CPUProtection {
 
       this.currentQuestion = null;
       this.isQuizWaiting = true;
+      this._isShowingQuestion = false;
 
       this._quizBreakTimeout = setTimeout(() => {
-        if (this.closing || this.isDestroyed) { this._quizBreakTimeout = null; return; }
+        if (this.closing || this.isDestroyed) { 
+          this._quizBreakTimeout = null; 
+          return; 
+        }
         this.isQuizWaiting = false;
         this._quizBreakTimeout = null;
-        if (!this.closing && !this.isDestroyed) this.ensureQuizRunning();
+        // Don't auto-restart here - let scheduler handle it
       }, CONSTANTS.QUIZ_BREAK_MS);
     } catch(e) {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
+      this._isShowingQuestion = false;
     }
   }
 
@@ -1654,7 +1800,7 @@ export class GameServer extends CPUProtection {
               this.quizAutoEnabled = true;
               this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz will start soon!", true]);
             }
-            if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+            if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout && !this._isShowingQuestion) {
               this._showQuestion();
             }
           } else {
@@ -1685,6 +1831,7 @@ export class GameServer extends CPUProtection {
       this.quizAnswered = new Set();
       this._quizStartTime = null;
       this.quizEndNotified = false;
+      this._isShowingQuestion = false;
       this._startQuizKeepAlive();
     } catch(e) {}
   }
@@ -1694,9 +1841,14 @@ export class GameServer extends CPUProtection {
       if (this._quizStartTimeout) return;
       this._quizStartTimeout = setTimeout(() => {
         try {
-          if (this.closing || this.isDestroyed) { this._quizStartTimeout = null; return; }
+          if (this.closing || this.isDestroyed) { 
+            this._quizStartTimeout = null; 
+            return; 
+          }
           this._quizStartTimeout = null;
-          if (!this.currentQuestion && this.quizAutoEnabled) this.forceStartQuiz();
+          if (!this.currentQuestion && this.quizAutoEnabled && !this._isShowingQuestion) {
+            this.forceStartQuiz();
+          }
         } catch(e) {}
       }, delayMs);
     } catch(e) {}
@@ -1706,9 +1858,13 @@ export class GameServer extends CPUProtection {
     try {
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients?.size) return;
-      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
+      if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout && !this._isShowingQuestion) {
         if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-          this._initQuiz().then(() => { if (!this.closing && !this.isDestroyed) this._showQuestion(); });
+          this._initQuiz().then(() => { 
+            if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
+              this._showQuestion(); 
+            }
+          });
           return;
         }
         this._showQuestion();
@@ -1750,9 +1906,13 @@ export class GameServer extends CPUProtection {
           
           if (this._isQuizTime()) {
             const now = Date.now();
-            if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout) {
-              if (this.quizAutoEnabled) this._showQuestion();
-              else { this.quizAutoEnabled = true; this._showQuestion(); }
+            if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout && !this._isShowingQuestion) {
+              if (this.quizAutoEnabled) {
+                this._showQuestion();
+              } else { 
+                this.quizAutoEnabled = true; 
+                this._showQuestion(); 
+              }
             }
             if (this.currentQuestion && this._quizStartTime) {
               const elapsed = (now - this._quizStartTime) / 1000;
@@ -1762,7 +1922,8 @@ export class GameServer extends CPUProtection {
               if (elapsed > (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) + 10) {
                 this.currentQuestion = null;
                 this._quizTimeout = null;
-                this._showQuestion();
+                this._isShowingQuestion = false;
+                // Don't auto-show here - let scheduler handle it
               }
             }
           } else {
@@ -1783,6 +1944,7 @@ export class GameServer extends CPUProtection {
       this.quizHasWinner = false;
       this.quizWinner = null;
       this.isQuizWaiting = false;
+      this._isShowingQuestion = false;
       
       if (this._quizTimeout) {
         clearTimeout(this._quizTimeout);
