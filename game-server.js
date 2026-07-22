@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (FULL CLEAN - FIXED) ====================
+// ==================== GAME-SERVER.JS (FULL CLEAN - RANDOM QUESTIONS) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -543,6 +543,8 @@ export class GameServer extends CPUProtection {
       lastEvaluationResult: null
     };
 
+    this._usedQuestionIndices = new Set();
+
     this.translationManager = new TranslationManager(this);
 
     this._initAsync();
@@ -804,12 +806,17 @@ export class GameServer extends CPUProtection {
           category: q.category || 'General',
           difficulty: q.difficulty || 'medium'
         }));
+        
+        // SHUFFLE SAAT LOAD
+        this._allQuestions = this._shuffleArray(this._allQuestions);
+        
         this._isAllQuestionsLoaded = true;
         this._currentBatchStart = 0;
         this._currentBatchEnd = 0;
         this._questionPointer = 0;
         this._totalQuestionsAnswered = 0;
         this._currentBatchIndex = 0;
+        this._usedQuestionIndices = new Set();
         this._loadNextBatch();
         return true;
       }
@@ -820,15 +827,26 @@ export class GameServer extends CPUProtection {
   _loadNextBatch() {
     if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) return false;
     const totalQuestions = this._allQuestions.length;
-    let startIndex = this._currentBatchEnd;
-    if (startIndex >= totalQuestions) {
-      startIndex = 0;
+    
+    // Jika semua soal sudah digunakan, reset dan reshuffle
+    if (this._usedQuestionIndices.size >= totalQuestions) {
+      this._usedQuestionIndices = new Set();
+      this._allQuestions = this._shuffleArray(this._allQuestions);
       this._currentBatchStart = 0;
       this._currentBatchEnd = 0;
       this._questionPointer = 0;
       this._totalQuestionsAnswered = 0;
       this._currentBatchIndex = 0;
     }
+    
+    let startIndex = this._currentBatchEnd;
+    if (startIndex >= totalQuestions) {
+      startIndex = 0;
+      this._currentBatchStart = 0;
+      this._currentBatchEnd = 0;
+      this._questionPointer = 0;
+    }
+    
     const endIndex = Math.min(startIndex + CONSTANTS.QUIZ_BATCH_SIZE, totalQuestions);
     this.quizQuestionCache['en'] = this._allQuestions.slice(startIndex, endIndex);
     this._currentQuestions = this.quizQuestionCache['en'];
@@ -848,6 +866,56 @@ export class GameServer extends CPUProtection {
       return true;
     }
     return false;
+  }
+
+  _getRandomQuestion() {
+    const questions = this.quizQuestionCache['en'] || [];
+    if (questions.length === 0) return null;
+    
+    const totalQuestions = this._allQuestions.length;
+    
+    // Jika semua soal sudah digunakan, reset
+    if (this._usedQuestionIndices.size >= totalQuestions) {
+      this._usedQuestionIndices = new Set();
+      this._allQuestions = this._shuffleArray(this._allQuestions);
+      this._loadNextBatch();
+    }
+    
+    // Cari soal yang belum digunakan dari batch saat ini
+    const availableIndices = [];
+    const batchStart = this._currentBatchStart;
+    const batchEnd = this._currentBatchEnd;
+    
+    for (let i = batchStart; i < batchEnd && i < totalQuestions; i++) {
+      if (!this._usedQuestionIndices.has(i)) {
+        availableIndices.push(i);
+      }
+    }
+    
+    // Jika tidak ada yang tersedia di batch, ambil dari semua yang belum digunakan
+    if (availableIndices.length === 0) {
+      for (let i = 0; i < totalQuestions; i++) {
+        if (!this._usedQuestionIndices.has(i)) {
+          availableIndices.push(i);
+        }
+      }
+    }
+    
+    // Jika masih tidak ada, reset dan coba lagi
+    if (availableIndices.length === 0) {
+      this._usedQuestionIndices = new Set();
+      this._allQuestions = this._shuffleArray(this._allQuestions);
+      this._loadNextBatch();
+      return this._getRandomQuestion();
+    }
+    
+    // Pilih random dari yang tersedia
+    const randomIndex = availableIndices[Math.floor(Math.random() * availableIndices.length)];
+    this._usedQuestionIndices.add(randomIndex);
+    this._questionPointer++;
+    this._totalQuestionsAnswered++;
+    
+    return this._allQuestions[randomIndex];
   }
 
   async _showQuestion() {
@@ -876,27 +944,22 @@ export class GameServer extends CPUProtection {
       this.quizAnswered = new Set();
 
       this._checkAndLoadNextBatch();
-      const questions = this.quizQuestionCache['en'] || [];
-      if (questions.length === 0) {
-        if (!this._loadNextBatch()) {
-          this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
-          return;
-        }
+      
+      // AMBIL SOAL RANDOM
+      const q = this._getRandomQuestion();
+      if (!q || !q.options) {
+        this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
+        return;
       }
-
-      const q = questions[this._questionPointer];
-      if (!q?.options) { this._questionPointer++; this._showQuestion(); return; }
 
       const shuffled = this._shuffleQuestionOptions(q);
       this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
       this._quizStartTime = Date.now();
-      this._questionPointer++;
-      this._totalQuestionsAnswered++;
 
       await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
       this._broadcastToRoom(QUIZ_ROOM, [
         "quizTimeLeft",
-        `📝 Question ${this._questionPointer}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
+        `📝 Question ${this._totalQuestionsAnswered}/${this._allQuestions.length} - ${CONSTANTS.QUIZ_TIME_LIMIT_MS/1000}s remaining`,
         false
       ]);
 
@@ -1115,6 +1178,7 @@ export class GameServer extends CPUProtection {
       this.quizAnswered = new Set();
       this._quizStartTime = null;
       this._resetQuizState();
+      this._usedQuestionIndices = new Set();
     } catch(e) {}
   }
 
@@ -1254,7 +1318,7 @@ export class GameServer extends CPUProtection {
           timeLeft: this.currentQuestion && this._quizStartTime ?
             Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS - (Date.now() - this._quizStartTime)) / 1000) : 0,
           totalQuestions: this._allQuestions.length || 0,
-          answeredQuestions: this._questionPointer || 0
+          answeredQuestions: this._totalQuestionsAnswered || 0
         }]);
         return false;
       } else {
