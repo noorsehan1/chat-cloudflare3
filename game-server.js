@@ -29,7 +29,6 @@ const CONSTANTS = {
   MAX_ARRAY_SIZE: 50,
   QUIZ_SWITCH_DELAY_MS: 5000,
   QUIZ_POINT_KEY: 'quiz_points',
-  QUIZ_WEEK_KEY: 'quiz_current_week',
   QUIZ_LAST_WEEK_WINNER: 'quiz_last_week_winner',
   SCHEDULER_INTERVAL_MS: 60000,
   QUIZ_BATCH_SIZE: 100,
@@ -60,7 +59,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 8, end: 9 },
-    { start: 0, end: 2 }
+    { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
 };
@@ -701,6 +700,7 @@ export class GameServer extends CPUProtection {
     }
   }
 
+  // ✅ GET 1 PEMENANG DARI KV
   async _getLastWeekWinner() {
     try {
       if (!this.env?.QUESTIONS) return null;
@@ -711,6 +711,7 @@ export class GameServer extends CPUProtection {
     }
   }
 
+  // ✅ SET 1 PEMENANG KE KV
   async _setLastWeekWinner(winner) {
     try {
       if (!this.env?.QUESTIONS) return false;
@@ -718,16 +719,6 @@ export class GameServer extends CPUProtection {
       return true;
     } catch(e) {
       return false;
-    }
-  }
-
-  async _getCurrentWeek() {
-    try {
-      if (!this.env?.QUESTIONS) return this._generateCurrentWeek();
-      const week = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
-      return week || this._generateCurrentWeek();
-    } catch(e) { 
-      return this._generateCurrentWeek(); 
     }
   }
 
@@ -1128,7 +1119,6 @@ export class GameServer extends CPUProtection {
       await this.countryQuizSystem.loadAllQuestions();
       await this._initQuiz();
       this._startQuizScheduler();
-      await this._checkAndResetWeeklyPoints();
       
       this._initialized = true;
       this._initializing = false;
@@ -1157,36 +1147,47 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  async _checkAndResetWeeklyPoints() {
+  // ✅ CEK DAN RESET POINTS (TANPA WEEK)
+  async _checkAndResetPoints() {
     try {
       if (!this.env?.QUESTIONS) return false;
       
-      // LANGSUNG KE KV (TANPA CACHE)
-      const currentWeek = await this._getCurrentWeek();
-      const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
+      const points = await this._getQuizPoints();
       
-      if (savedWeek !== currentWeek) {
-        // LANGSUNG KE KV (TANPA CACHE)
-        const points = await this._getQuizPoints();
-        let winner = null, highestScore = 0;
-        for (const [username, score] of Object.entries(points)) {
-          if (score > highestScore) { highestScore = score; winner = username; }
-        }
-        if (winner) {
-          const winnerData = {
-            username: winner,
-            score: highestScore,
-            week: savedWeek || currentWeek
-          };
-          await this._setLastWeekWinner(winnerData);
-          this._broadcastToRoom(QUIZ_ROOM, ["quizLastWeekWinner", winner, highestScore, savedWeek || currentWeek]);
-        }
-        await this._setQuizPoints({});
-        await this.env.QUESTIONS.put(CONSTANTS.QUIZ_WEEK_KEY, currentWeek);
-        return true;
+      if (Object.keys(points).length === 0) {
+        return false;
       }
-      return false;
-    } catch(e) { return false; }
+      
+      // CARI 1 PEMENANG (POINT TERTINGGI)
+      let winner = null;
+      let highestScore = 0;
+      
+      for (const [username, score] of Object.entries(points)) {
+        if (score > highestScore) {
+          highestScore = score;
+          winner = username;
+        }
+      }
+      
+      if (winner) {
+        const winnerData = {
+          username: winner,
+          score: highestScore,
+          week: this._generateCurrentWeek()
+        };
+        
+        // SIMPAN 1 PEMENANG KE QUIZ_LAST_WEEK_WINNER
+        await this._setLastWeekWinner(winnerData);
+        this._broadcastToRoom(QUIZ_ROOM, ["quizLastWeekWinner", winner, highestScore, this._generateCurrentWeek()]);
+      }
+      
+      // RESET POINTS
+      await this._setQuizPoints({});
+      return true;
+      
+    } catch(e) { 
+      return false; 
+    }
   }
 
   _startQuizScheduler() {
@@ -3469,9 +3470,9 @@ export class GameServer extends CPUProtection {
         return;
       }
 
+      // ✅ GET 1 PEMENANG DARI KV
       if (evt === "getQuizLastWeekWinner") {
         try {
-          // ✅ LANGSUNG BACA DARI KV (TANPA CACHE)
           const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
           
           if (winner && winner.username) {
@@ -3485,19 +3486,17 @@ export class GameServer extends CPUProtection {
         return;
       }
 
+      // ✅ GET LEADERBOARD DARI KV
       if (evt === "getQuizLeaderboard") {
         try {
           let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
           
-          // ✅ LANGSUNG BACA DARI KV (TANPA CACHE)
           const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json') || {};
           
-          // Sort berdasarkan score tertinggi
           const sorted = Object.entries(points)
             .sort((a, b) => b[1] - a[1])
             .slice(0, limit);
           
-          // Format: ["username|score", ...]
           const result = sorted.map(([username, score]) => 
             `${username}|${score}`
           );
@@ -3509,14 +3508,14 @@ export class GameServer extends CPUProtection {
         return;
       }
 
+      // ✅ DELETE 1 PEMENANG DARI KV
       if (evt === "deleteQuizLastWeekWinner") {
         try {
           if (this.env?.QUESTIONS) {
             this._incrementSubRequest();
-            // ✅ BENAR-BENAR HAPUS DARI KV
+            
             await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
             
-            // ✅ VERIFIKASI: Cek apakah sudah terhapus
             const check = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
             if (!check) {
               this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
