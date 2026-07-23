@@ -57,10 +57,10 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 11, end: 12 },
-    { start: 21, end: 22 },
     { start: 0, end: 1 },
     { start: 5, end: 6 },
+    { start: 11, end: 12 },
+    { start: 21, end: 22 },
   ],
   TIMEZONE_OFFSET: 8,
 };
@@ -437,6 +437,9 @@ export class GameServer extends CPUProtection {
       // Flag to prevent duplicate winner processing
       this._winnerProcessed = false;
 
+      // User activity tracking
+      this._lastActivityTime = new Map();
+
       this._questionsCache = {
         en: [],
         id: [],
@@ -496,7 +499,6 @@ export class GameServer extends CPUProtection {
       this.quizAutoEnabled = false;
       this.quizAutoTimer = null;
       this._quizKeepAliveInterval = null;
-      this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
       this._isShowingQuestion = false;
       this._quizInitAttempts = 0;
@@ -514,6 +516,9 @@ export class GameServer extends CPUProtection {
       this._lastQuizTimeLeftBroadcast = 0;
 
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
+
+      // Validate schedule
+      this._validateSchedule();
 
       this._loadAllQuestionsToMemory();
 
@@ -536,6 +541,41 @@ export class GameServer extends CPUProtection {
         }
       }, 8000);
 
+    } catch(e) {}
+  }
+
+  // ===== VALIDATE SCHEDULE =====
+  _validateSchedule() {
+    try {
+      console.log('[SCHEDULE] Quiz sessions:');
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        console.log(`  ${session.start}:00 - ${session.end}:00 WITA`);
+        
+        // Validate hours
+        if (session.start < 0 || session.start > 23) {
+          console.error(`Invalid start hour: ${session.start}`);
+        }
+        if (session.end < 0 || session.end > 24) {
+          console.error(`Invalid end hour: ${session.end}`);
+        }
+        if (session.start === session.end) {
+          console.error(`Start and end cannot be same: ${session.start}`);
+        }
+      }
+      
+      // Check for overlaps
+      const sorted = [...QUIZ_SCHEDULE.SESSIONS].sort((a, b) => a.start - b.start);
+      for (let i = 0; i < sorted.length - 1; i++) {
+        const current = sorted[i];
+        const next = sorted[i + 1];
+        if (current.end > next.start) {
+          console.warn(`[SCHEDULE] Overlap detected: ${current.start}-${current.end} and ${next.start}-${next.end}`);
+        }
+        const gap = next.start - current.end;
+        if (gap < 1) {
+          console.warn(`[SCHEDULE] Small gap: ${gap}h between sessions`);
+        }
+      }
     } catch(e) {}
   }
 
@@ -574,7 +614,7 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ===== NEW: Room verification method =====
+  // ===== FIXED: Room verification method =====
   _startRoomVerification() {
     setInterval(() => {
       try {
@@ -834,6 +874,9 @@ export class GameServer extends CPUProtection {
       
       const wsId = this._getWsId(ws);
       
+      // Update activity
+      if (wsId) this._lastActivityTime.set(wsId, Date.now());
+      
       let room = this._ensureRoomConsistency(ws);
       
       // AUTO-FIX: If user should be in Quiz room but isn't, fix it
@@ -906,8 +949,7 @@ export class GameServer extends CPUProtection {
       const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
       const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
       const remainingText = `${remaining}s remaining`;
-      const wsId2 = this._getWsId(ws);
-      const countryInfo = this.countryQuizSystem.getUserCountryInfo(wsId2);
+      const countryInfo = this.countryQuizSystem.getUserCountryInfo(wsId);
       
       this._broadcastQuizNotification("quizAnswer", {
         username: username,
@@ -1011,6 +1053,7 @@ export class GameServer extends CPUProtection {
       
       this._quizTimeLeftNotified.delete(wsId);
       this._nextQuizNotified.delete(wsId);
+      this._lastActivityTime.delete(wsId);
       
       this._removeClientFromRoom(room, wsId);
       this.clientRooms.delete(wsId);
@@ -1047,12 +1090,18 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ===== FIXED: _cleanupDeadConnections with switching protection =====
+  // ===== FIXED: _cleanupDeadConnections with switching and activity protection =====
   _cleanupDeadConnections() {
     try {
+      const now = Date.now();
       const toRemove = [];
       for (const [wsId, ws] of this.wsMap) {
         if (ws && ws._switching) continue;
+        
+        // Check activity - don't remove active users
+        const lastActivity = this._lastActivityTime.get(wsId) || 0;
+        if (now - lastActivity < 60000) continue; // Active within 1 minute
+        
         if (!ws || ws.readyState !== 1 || ws._closing) toRemove.push(wsId);
       }
       for (const wsId of toRemove) {
@@ -1066,9 +1115,34 @@ export class GameServer extends CPUProtection {
           this.userCountry.delete(wsId);
           this._quizTimeLeftNotified.delete(wsId);
           this._nextQuizNotified.delete(wsId);
+          this._lastActivityTime.delete(wsId);
           for (const [username, conn] of this.userConnections) {
             if (conn?.wsId === wsId) { this.userConnections.delete(username); break; }
           }
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ===== FIXED: _cleanupStaleGames with Quiz room protection =====
+  _cleanupStaleGames() {
+    try {
+      const now = Date.now();
+      for (const [room, game] of this.activeGames) {
+        // Skip Quiz room
+        if (room === QUIZ_ROOM) continue;
+        
+        if (!game) continue;
+        if (game._isActive && !game._gameEnded) continue;
+        if (game._gameEnded) {
+          const endTime = game._endTime || game._createdAt || now;
+          if ((now - endTime) > CONSTANTS.STALE_GAME_TIMEOUT_MS) this._scheduleGameCleanup(room, game);
+          continue;
+        }
+        if (!game._isActive && !game._gameEnded && game._createdAt && (now - game._createdAt) > 300000) {
+          game._gameEnded = true;
+          game._endTime = now;
+          this._scheduleGameCleanup(room, game);
         }
       }
     } catch(e) {}
@@ -1078,7 +1152,6 @@ export class GameServer extends CPUProtection {
   async _showQuestion() {
     try {
       if (this._isShowingQuestion) return;
-      this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
       
       if (!this._isQuizTime()) {
@@ -1452,6 +1525,65 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ===== FIXED: _isQuizTime with multi-session support =====
+  _isQuizTime() {
+    try {
+      const witaTime = this._getCurrentWITATime();
+      const currentTotal = witaTime.totalMinutes;
+      
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        let startTotal = session.start * 60;
+        let endTotal = session.end * 60;
+        
+        // Handle session that crosses midnight
+        if (startTotal > endTotal) {
+          if (currentTotal >= startTotal || currentTotal < endTotal) {
+            return true;
+          }
+        } else {
+          if (currentTotal >= startTotal && currentTotal < endTotal) {
+            return true;
+          }
+        }
+      }
+      return false;
+    } catch(e) { 
+      return false; 
+    }
+  }
+
+  // ===== FIXED: _getTimeLeftUntilNextQuiz with multi-session =====
+  _getTimeLeftUntilNextQuiz() {
+    try {
+      const witaTime = this._getCurrentWITATime();
+      const currentTotal = witaTime.totalMinutes;
+      let minDiff = Infinity;
+      
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        let startTotal = session.start * 60;
+        let diff = startTotal - currentTotal;
+        if (diff < 0) diff += 24 * 60;
+        if (diff < minDiff) {
+          minDiff = diff;
+        }
+      }
+      
+      const hours = Math.floor(minDiff / 60);
+      const minutes = Math.floor(minDiff % 60);
+      const isRunning = this._isQuizTime();
+      
+      return { 
+        hours, 
+        minutes, 
+        totalMs: minDiff * 60 * 1000,
+        text: `${hours}h ${minutes}m`,
+        isRunning: isRunning
+      };
+    } catch(e) {
+      return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false };
+    }
+  }
+
   // ===== FIXED: checkGameRunning =====
   async checkGameRunning(ws, roomname) {
     try {
@@ -1488,6 +1620,9 @@ export class GameServer extends CPUProtection {
   async _forceCleanupGame(room, game) {
     try {
       if (!game) return;
+      // Skip Quiz room
+      if (room === QUIZ_ROOM) return;
+      
       const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
       for (const key of timers) {
         if (game[key]) { clearTimeout(game[key]); clearInterval(game[key]); game[key] = null; }
@@ -1509,6 +1644,9 @@ export class GameServer extends CPUProtection {
   _deleteGame(room, game) {
     try {
       if (!room || !game) return;
+      // Skip Quiz room
+      if (room === QUIZ_ROOM) return;
+      
       if (game?._isActive && !game._gameEnded) return;
       if (this._cleanupTimers.has(room)) { clearTimeout(this._cleanupTimers.get(room)); this._cleanupTimers.delete(room); }
       this._roomBroadcastCount.delete(room);
@@ -1556,6 +1694,9 @@ export class GameServer extends CPUProtection {
   _scheduleGameCleanup(room, game) {
     try {
       if (!room || !game) return;
+      // Skip Quiz room
+      if (room === QUIZ_ROOM) return;
+      
       if (this._cleanupTimers.has(room)) {
         const oldTimer = this._cleanupTimers.get(room);
         if (oldTimer) clearTimeout(oldTimer);
@@ -1579,7 +1720,7 @@ export class GameServer extends CPUProtection {
   }
 
   // ===== All other game methods remain the same =====
-  // ... (keep all other methods from original file)
+  // (kept from original file)
 
   // ===== FETCH HANDLER =====
   async fetch(req) {
@@ -1602,7 +1743,7 @@ export class GameServer extends CPUProtection {
             eventQueueSize: this._eventQueue?.length || 0,
             errorCount: this._errorCount,
             timestamp: Date.now(),
-            quizSchedule: QUIZ_SCHEDULE.SESSIONS.map(s => `${s.start}:00-${s.end}:00`),
+            quizSchedule: QUIZ_SCHEDULE.SESSIONS.map(s => `${s.start}:00-${s.end}:00 WITA`),
             currentWITATime: this._getCurrentWITATime().formatted,
             questionsLoaded: this._questionsCache.loaded,
             questionsCount: {
@@ -1649,6 +1790,9 @@ export class GameServer extends CPUProtection {
           server._country = country;
           server._language = lang;
           
+          // Track activity
+          this._lastActivityTime.set(wsId, Date.now());
+          
           try { this.state.acceptWebSocket(server); } catch(e) { 
             return new Response("WebSocket acceptance failed", { status: 500 }); 
           }
@@ -1657,6 +1801,9 @@ export class GameServer extends CPUProtection {
             try {
               const data = JSON.parse(event.data);
               if (Array.isArray(data) && data.length > 0) {
+                // Update activity
+                const wsId2 = this._getWsId(server);
+                if (wsId2) this._lastActivityTime.set(wsId2, Date.now());
                 await this.handleEvent(server, data);
               }
             } catch(e) { 
@@ -1676,6 +1823,7 @@ export class GameServer extends CPUProtection {
                 this.countryQuizSystem.userCountryCache.delete(wsId2);
                 this._quizTimeLeftNotified.delete(wsId2);
                 this._nextQuizNotified.delete(wsId2);
+                this._lastActivityTime.delete(wsId2);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId2) this.userConnections.delete(username);
@@ -1698,6 +1846,7 @@ export class GameServer extends CPUProtection {
                 this.countryQuizSystem.userCountryCache.delete(wsId2);
                 this._quizTimeLeftNotified.delete(wsId2);
                 this._nextQuizNotified.delete(wsId2);
+                this._lastActivityTime.delete(wsId2);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId2) this.userConnections.delete(username);
@@ -1745,6 +1894,7 @@ export class GameServer extends CPUProtection {
       this.countryQuizSystem.userCountryCache.delete(wsId);
       this._quizTimeLeftNotified.delete(wsId);
       this._nextQuizNotified.delete(wsId);
+      this._lastActivityTime.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -1774,6 +1924,7 @@ export class GameServer extends CPUProtection {
       this.countryQuizSystem.userCountryCache.delete(wsId);
       this._quizTimeLeftNotified.delete(wsId);
       this._nextQuizNotified.delete(wsId);
+      this._lastActivityTime.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
