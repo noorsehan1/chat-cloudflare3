@@ -57,14 +57,14 @@ const CONSTANTS = {
 };
 
 // QUIZ_SCHEDULE untuk WITA (UTC+8)
-// Sesi 1: 08:00 - 09:00 WITA (00:00 - 01:00 UTC)
-// Sesi 2: 21:00 - 22:00 WITA (13:00 - 14:00 UTC)
+// Sesi 1: 08:00 - 09:00 WITA
+// Sesi 2: 21:00 - 22:00 WITA
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 8, end: 9 },   // 08:00 - 09:00 WITA
-    { start: 21, end: 22 }  // 21:00 - 22:00 WITA
+    { start: 8, end: 9 },
+    { start: 21, end: 22 }
   ],
-  TIMEZONE_OFFSET: 8, // WITA = UTC+8
+  TIMEZONE_OFFSET: 8,
 };
 
 const QUIZ_ROOM = "Quiz";
@@ -535,7 +535,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== QUIZ SCHEDULE METHODS (WITA) ====================
+  // ==================== QUIZ SCHEDULE METHODS ====================
 
   _getCurrentWITATime() {
     try {
@@ -546,10 +546,10 @@ export class GameServer extends CPUProtection {
         hours,
         minutes,
         totalMinutes: (hours * 60) + minutes,
-        formatted: `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')} WITA`
+        formatted: `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`
       };
     } catch(e) {
-      return { hours: 0, minutes: 0, totalMinutes: 0, formatted: '00:00 WITA' };
+      return { hours: 0, minutes: 0, totalMinutes: 0, formatted: '00:00' };
     }
   }
 
@@ -568,8 +568,8 @@ export class GameServer extends CPUProtection {
   _formatWITATime(hours, minutes) {
     try {
       const h = hours % 24;
-      return `${String(h).padStart(2, '0')}:${String(minutes).padStart(2, '0')} WITA`;
-    } catch(e) { return '00:00 WITA'; }
+      return `${String(h).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+    } catch(e) { return '00:00'; }
   }
 
   _isQuizTime() {
@@ -590,66 +590,11 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  _getCurrentSession() {
-    try {
-      const witaTime = this._getCurrentWITATime();
-      const currentTotal = witaTime.totalMinutes;
-      
-      for (const session of QUIZ_SCHEDULE.SESSIONS) {
-        const startTotal = session.start * 60;
-        const endTotal = session.end * 60;
-        if (currentTotal >= startTotal && currentTotal < endTotal) {
-          return {
-            isActive: true,
-            start: session.start,
-            end: session.end,
-            startFormatted: `${String(session.start).padStart(2, '0')}:00 WITA`,
-            endFormatted: `${String(session.end).padStart(2, '0')}:00 WITA`,
-            label: session.start === 8 ? 'Sesi Pagi' : 'Sesi Malam'
-          };
-        }
-      }
-      
-      // Cari sesi berikutnya
-      let nextSession = null;
-      let minDiff = Infinity;
-      
-      for (const session of QUIZ_SCHEDULE.SESSIONS) {
-        let startTotal = session.start * 60;
-        let diff = startTotal - currentTotal;
-        if (diff < 0) diff += 24 * 60;
-        if (diff < minDiff) {
-          minDiff = diff;
-          nextSession = session;
-        }
-      }
-      
-      if (nextSession) {
-        return {
-          isActive: false,
-          start: nextSession.start,
-          end: nextSession.end,
-          startFormatted: `${String(nextSession.start).padStart(2, '0')}:00 WITA`,
-          endFormatted: `${String(nextSession.end).padStart(2, '0')}:00 WITA`,
-          label: nextSession.start === 8 ? 'Sesi Pagi' : 'Sesi Malam',
-          nextInMinutes: minDiff
-        };
-      }
-      
-      return null;
-    } catch(e) {
-      return null;
-    }
-  }
-
   _getTimeLeftUntilNextQuiz() {
     try {
       const witaTime = this._getCurrentWITATime();
       const currentTotal = witaTime.totalMinutes;
       
-      // Cek sesi berikutnya
-      let nextStart = null;
-      let nextLabel = '';
       let minDiff = Infinity;
       
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
@@ -658,8 +603,6 @@ export class GameServer extends CPUProtection {
         if (diff < 0) diff += 24 * 60;
         if (diff < minDiff) {
           minDiff = diff;
-          nextStart = startTotal;
-          nextLabel = session.start === 8 ? 'Sesi Pagi (08:00 WITA)' : 'Sesi Malam (21:00 WITA)';
         }
       }
       
@@ -672,11 +615,10 @@ export class GameServer extends CPUProtection {
         minutes, 
         totalMs: minDiff * 60 * 1000,
         text: `${hours}h ${minutes}m`,
-        session: nextLabel,
         isRunning: isRunning
       };
     } catch(e) {
-      return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', session: '', isRunning: false };
+      return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false };
     }
   }
 
@@ -685,74 +627,53 @@ export class GameServer extends CPUProtection {
       const witaTime = this._getCurrentWITATime();
       const currentTotal = witaTime.totalMinutes;
       
-      const session = this._getCurrentSession();
-      
-      if (session && session.isActive) {
+      // Cek apakah sedang dalam sesi
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        const startTotal = session.start * 60;
         const endTotal = session.end * 60;
-        const remaining = endTotal - currentTotal;
-        const hours = Math.floor(remaining / 60);
-        const minutes = Math.floor(remaining % 60);
-        return {
-          minutes: remaining,
-          seconds: 0,
-          isRunning: true,
-          hours: hours,
-          totalMinutes: remaining,
-          status: 'running',
-          currentTime: witaTime.formatted,
-          startTime: session.startFormatted,
-          endTime: session.endFormatted,
-          startHour: session.start,
-          endHour: session.end,
-          remainingText: `${hours}h ${minutes}m`,
-          isOvernight: false,
-          session: session.label
-        };
+        if (currentTotal >= startTotal && currentTotal < endTotal) {
+          const remaining = endTotal - currentTotal;
+          const hours = Math.floor(remaining / 60);
+          const minutes = Math.floor(remaining % 60);
+          return {
+            minutes: remaining,
+            seconds: 0,
+            isRunning: true,
+            hours: hours,
+            totalMinutes: remaining,
+            status: 'running',
+            remainingText: `${hours}h ${minutes}m`
+          };
+        }
       }
       
-      // Tidak dalam sesi quiz - cari sesi berikutnya
-      let nextSession = null;
+      // Cari sesi berikutnya
       let minDiff = Infinity;
       
-      for (const s of QUIZ_SCHEDULE.SESSIONS) {
-        let startTotal = s.start * 60;
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        let startTotal = session.start * 60;
         let diff = startTotal - currentTotal;
         if (diff < 0) diff += 24 * 60;
         if (diff < minDiff) {
           minDiff = diff;
-          nextSession = s;
         }
       }
       
-      if (nextSession) {
-        const hours = Math.floor(minDiff / 60);
-        const minutes = Math.floor(minDiff % 60);
-        const dayText = minDiff < 24 * 60 ? 'hari ini' : 'besok';
-        const label = nextSession.start === 8 ? 'Sesi Pagi' : 'Sesi Malam';
-        
-        return {
-          hours: hours,
-          minutes: minutes,
-          seconds: 0,
-          totalMinutes: minDiff,
-          totalSeconds: minDiff * 60,
-          isRunning: false,
-          status: 'waiting',
-          startHour: nextSession.start,
-          endHour: nextSession.end,
-          startTime: `${String(nextSession.start).padStart(2, '0')}:00 WITA`,
-          endTime: `${String(nextSession.end).padStart(2, '0')}:00 WITA`,
-          currentTime: witaTime.formatted,
-          dayText: dayText,
-          remainingText: `${hours}h ${minutes}m`,
-          isOvernight: false,
-          session: label
-        };
-      }
+      const hours = Math.floor(minDiff / 60);
+      const minutes = Math.floor(minDiff % 60);
       
-      return { hours: 0, minutes: 0, isRunning: false, status: 'unknown', currentTime: witaTime.formatted };
+      return {
+        hours: hours,
+        minutes: minutes,
+        seconds: 0,
+        totalMinutes: minDiff,
+        totalSeconds: minDiff * 60,
+        isRunning: false,
+        status: 'waiting',
+        remainingText: `${hours}h ${minutes}m`
+      };
     } catch(e) {
-      return { hours: 0, minutes: 0, isRunning: false, status: 'unknown', currentTime: '00:00 WITA' };
+      return { hours: 0, minutes: 0, isRunning: false, status: 'unknown' };
     }
   }
 
@@ -934,19 +855,15 @@ export class GameServer extends CPUProtection {
     try {
       if (this.quizEndNotified) return;
       const timeLeft = this._getTimeLeftUntilNextQuiz();
-      const session = this._getCurrentSession();
-      const nextSession = session && !session.isActive ? session.label : 'Sesi berikutnya';
       
-      const message = `⏱️ ${timeLeft.text} (${nextSession})`;
+      const message = `⏱️ ${timeLeft.text}`;
       this._broadcastToRoom(QUIZ_ROOM, ["quizEnded", { 
         timeLeft: timeLeft.text, 
-        status: "ended",
-        nextSession: nextSession
+        status: "ended"
       }]);
       this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, true]);
       this._broadcastQuizNotification("quizEnded", { 
-        timeLeft: timeLeft.text,
-        nextSession: nextSession
+        timeLeft: timeLeft.text
       });
       this.quizEndNotified = true;
     } catch(e) {}
@@ -1438,7 +1355,7 @@ export class GameServer extends CPUProtection {
       if (!this.quizAutoEnabled) {
         this.quizAutoEnabled = true;
         const clients = this.wsClients.get(QUIZ_ROOM);
-        if (clients?.size > 0) this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz will start soon!", true]);
+        if (clients?.size > 0) this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz akan segera dimulai!", true]);
         return;
       }
 
@@ -1490,7 +1407,7 @@ export class GameServer extends CPUProtection {
 
         this._broadcastToRoom(QUIZ_ROOM, [
           "quizTimeLeft",
-          `${remainingTime}s remaining`,
+          `${remainingTime}s tersisa`,
           false
         ]);
 
@@ -1737,7 +1654,7 @@ export class GameServer extends CPUProtection {
             this.quizEndNotified = false;
             if (!this.quizAutoEnabled) {
               this.quizAutoEnabled = true;
-              this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz will start soon!", true]);
+              this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz akan segera dimulai!", true]);
             }
             if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout && !this._isShowingQuestion) {
               this._showQuestion();
@@ -1906,11 +1823,11 @@ export class GameServer extends CPUProtection {
       this._totalQuestionsAnswered = 0;
       
       this._broadcastToRoom(QUIZ_ROOM, ["quizClear", {
-        message: "Quiz has ended. Come back tomorrow!",
+        message: "Quiz telah berakhir. Kembali besok!",
         timestamp: Date.now()
       }]);
       this._broadcastQuizNotification("quizCleared", {
-        message: "Quiz has ended. Come back tomorrow!",
+        message: "Quiz telah berakhir. Kembali besok!",
         clearUI: true
       });
     } catch(e) {}
@@ -1949,27 +1866,22 @@ export class GameServer extends CPUProtection {
       
       const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
-      const witaTime = this._getCurrentWITATime();
-      const session = this._getCurrentSession();
       
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
       
       if (isQuizTime) {
-        const sessionLabel = session ? session.label : 'Quiz';
-        
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (Date.now() - this._quizStartTime) / 1000;
           const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
           const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-          message = `📝 ${sessionLabel} - ${minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`} tersisa`;
+          message = `${minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`} tersisa`;
           canType = false;
         } else {
-          message = `📝 ${sessionLabel} dimulai! (${witaTime.formatted})`;
+          message = `Quiz akan segera dimulai!`;
           canType = true;
         }
       } else {
-        const nextSession = session && !session.isActive ? session.label : 'Sesi berikutnya';
-        message = `⏱️ ${timeLeft.text} (${nextSession})`;
+        message = `⏱️ ${timeLeft.text}`;
         canType = true;
       }
       
@@ -2022,27 +1934,22 @@ export class GameServer extends CPUProtection {
       
       const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
-      const witaTime = this._getCurrentWITATime();
-      const session = this._getCurrentSession();
       
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
       
       if (isQuizTime) {
-        const sessionLabel = session ? session.label : 'Quiz';
-        
         if (this.currentQuestion && this._quizStartTime) {
           const elapsed = (Date.now() - this._quizStartTime) / 1000;
           const left = Math.max(0, (CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000) - elapsed);
           const minutes = Math.floor(left / 60), seconds = Math.floor(left % 60);
-          message = minutes > 0 ? `📝 ${sessionLabel} - ${minutes}m ${seconds}s tersisa` : `📝 ${sessionLabel} - ${seconds}s tersisa`;
+          message = minutes > 0 ? `${minutes}m ${seconds}s tersisa` : `${seconds}s tersisa`;
           canType = false;
         } else {
-          message = `📝 ${sessionLabel} dimulai! (${witaTime.formatted})`;
+          message = `Quiz akan segera dimulai!`;
           canType = true;
         }
       } else {
-        const nextSession = session && !session.isActive ? session.label : 'Sesi berikutnya';
-        message = `⏱️ ${timeLeft.text} (${nextSession})`;
+        message = `⏱️ ${timeLeft.text}`;
         canType = true;
       }
       
@@ -2057,25 +1964,23 @@ export class GameServer extends CPUProtection {
     try {
       if (!ws || ws.readyState !== 1) return false;
       const timeLeft = this._getTimeLeftUntilNextQuiz();
-      const session = this._getCurrentSession();
-      const nextSession = session && !session.isActive ? session.label : 'Sesi berikutnya';
       
       let message = "";
       switch(errorType) {
         case "NOT_QUIZ_TIME":
-          message = `⏱️ ${timeLeft.text} (${nextSession})`;
+          message = `⏱️ ${timeLeft.text}`;
           break;
         case "QUIZ_DISABLED": 
-          message = `⏱️ ${timeLeft.text} (${nextSession})`; 
+          message = `⏱️ ${timeLeft.text}`; 
           break;
         case "QUIZ_ENDED":
-          message = `⏱️ ${timeLeft.text} (${nextSession})`;
+          message = `⏱️ ${timeLeft.text}`;
           break;
         case "QUIZ_NOT_STARTED": 
-          message = `⏱️ ${timeLeft.text} (${nextSession})`; 
+          message = `⏱️ ${timeLeft.text}`; 
           break;
         default: 
-          message = customMessage || `⏱️ ${timeLeft.text} (${nextSession})`;
+          message = customMessage || `⏱️ ${timeLeft.text}`;
       }
       this._safeSend(ws, ["quizError", message]);
       return true;
@@ -3393,8 +3298,6 @@ export class GameServer extends CPUProtection {
         const remaining = this._getQuestionRemainingTime();
         const remainingText = `${remaining}s remaining`;
         const timeLeft = this._getTimeLeftUntilNextQuiz();
-        const session = this._getCurrentSession();
-        const nextSession = session && !session.isActive ? session.label : 'Sesi berikutnya';
         
         const notification = {
           type: "quizStatus",
@@ -3408,8 +3311,7 @@ export class GameServer extends CPUProtection {
             winner: this.quizWinner,
             questionNumber: this._questionPointer,
             totalQuestions: this._allQuestions.length,
-            timeLeft: timeLeft.text,
-            nextSession: nextSession
+            timeLeft: timeLeft.text
           }
         };
         this._safeSend(ws, ["quizNotification", notification]);
@@ -3419,16 +3321,12 @@ export class GameServer extends CPUProtection {
       if (evt === "getQuizStatus") {
         const isQuizTime = this._isQuizTime();
         const timeLeft = this._getTimeLeftUntilNextQuiz();
-        const session = this._getCurrentSession();
-        const nextSession = session && !session.isActive ? session.label : 'Sesi berikutnya';
         
         let status = {
           isQuizTime: isQuizTime,
           isActive: !!this.currentQuestion,
           hasEnded: this.quizEndedToday || !isQuizTime,
-          timeLeft: timeLeft.text,
-          nextSession: nextSession,
-          currentSession: session ? session.label : null
+          timeLeft: timeLeft.text
         };
         this._safeSend(ws, ["quizStatus", status]);
         return;
@@ -3561,7 +3459,7 @@ export class GameServer extends CPUProtection {
             eventQueueSize: this._eventQueue?.length || 0,
             errorCount: this._errorCount,
             timestamp: Date.now(),
-            quizSchedule: QUIZ_SCHEDULE.SESSIONS.map(s => `${s.start}:00-${s.end}:00 WITA`),
+            quizSchedule: QUIZ_SCHEDULE.SESSIONS.map(s => `${s.start}:00-${s.end}:00`),
             currentWITATime: this._getCurrentWITATime().formatted
           };
           return new Response(JSON.stringify(status), {
