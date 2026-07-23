@@ -57,8 +57,8 @@ const CONSTANTS = {
 };
 
 const QUIZ_SCHEDULE = {
-  START_HOUR: 23,
-  END_HOUR: 4,
+  START_HOUR: 13,
+  END_HOUR: 16,
   TIMEZONE_OFFSET: 7,
 };
 
