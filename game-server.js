@@ -57,8 +57,6 @@ const CONSTANTS = {
 };
 
 // QUIZ_SCHEDULE untuk WITA (UTC+8)
-// Sesi 1: 08:00 - 09:00 WITA
-// Sesi 2: 21:00 - 22:00 WITA
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 8, end: 9 },
@@ -228,11 +226,42 @@ class CountryBasedQuizSystem {
     this._maxLoadAttempts = 3;
   }
 
+  getQuestionsByLanguage(langCode) {
+    if (this.gameServer._questionsCache?.loaded) {
+      const questions = this.gameServer._questionsCache[langCode];
+      if (questions && questions.length > 0) {
+        return questions;
+      }
+    }
+    
+    const data = this.questionsByLanguage.get(langCode);
+    return data?.questions || null;
+  }
+
   async loadAllQuestions() {
     try {
       if (this._loading) return this._isLoaded;
-      if (this._isLoaded && this.questionsByLanguage.size > 0) return true;
-
+      
+      if (this.gameServer._questionsCache?.loaded) {
+        this._isLoaded = true;
+        
+        const languages = ['en', 'id', 'fil', 'hi', 'ar'];
+        for (const lang of languages) {
+          const questions = this.gameServer._questionsCache[lang];
+          if (questions && questions.length > 0) {
+            this.questionsByLanguage.set(lang, {
+              questions: questions,
+              total: questions.length,
+              language: lang,
+              languageName: this.getLanguageName(lang),
+              fetchedAt: new Date().toISOString()
+            });
+          }
+        }
+        
+        return true;
+      }
+      
       this._loading = true;
       this._loadAttempts++;
 
@@ -283,11 +312,6 @@ class CountryBasedQuizSystem {
       [arr[i], arr[j]] = [arr[j], arr[i]];
     }
     return arr;
-  }
-
-  getQuestionsByLanguage(langCode) {
-    const data = this.questionsByLanguage.get(langCode);
-    return data?.questions || null;
   }
 
   async getQuestionsForCountry(countryCode) {
@@ -448,6 +472,20 @@ export class GameServer extends CPUProtection {
       this._maxRecoveryAttempts = 3;
       this._lastRecoveryTime = 0;
 
+      // ========== CACHE UNTUK QUESTIONS (HANYA INI YANG DI CACHE) ==========
+      this._questionsCache = {
+        en: [],
+        id: [],
+        fil: [],
+        hi: [],
+        ar: [],
+        loaded: false,
+        loading: false,
+        loadTime: null,
+        loadError: null
+      };
+
+      // ========== GAME STATE ==========
       this.activeGames = new Map();
       this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
       this._gameLocks = new Map();
@@ -466,6 +504,7 @@ export class GameServer extends CPUProtection {
       this._tikCounter = 0;
       this._gameStartFlags = new Map();
 
+      // ========== QUIZ STATE ==========
       this.quizAnswered = new Set();
       this.quizHasWinner = false;
       this.quizWinner = null;
@@ -514,6 +553,9 @@ export class GameServer extends CPUProtection {
 
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
 
+      // ========== LOAD SEMUA QUESTIONS KE MEMORY SAAT START ==========
+      this._loadAllQuestionsToMemory();
+
       this._initAsync();
       this._startCPUMonitor();
       this._startHealthCheck();
@@ -533,6 +575,169 @@ export class GameServer extends CPUProtection {
       }, 8000);
 
     } catch(e) {}
+  }
+
+  // ==================== LOAD QUESTIONS KE MEMORY ====================
+
+  async _loadAllQuestionsToMemory() {
+    try {
+      if (this._questionsCache.loading) return;
+      if (this._questionsCache.loaded) return;
+      
+      this._questionsCache.loading = true;
+      
+      console.log('🚀 Loading all quiz questions to memory...');
+      
+      const languages = [
+        { code: 'en', key: 'trivia_en' },
+        { code: 'id', key: 'trivia_id' },
+        { code: 'fil', key: 'trivia_fil' },
+        { code: 'hi', key: 'trivia_hi' },
+        { code: 'ar', key: 'trivia_ar' }
+      ];
+      
+      const results = await Promise.all(
+        languages.map(async (lang) => {
+          try {
+            const data = await this.env.QUESTIONS.get(lang.key, 'json');
+            return { code: lang.code, data: data?.questions || [] };
+          } catch(e) {
+            console.error(`❌ Failed to load ${lang.code}:`, e.message);
+            return { code: lang.code, data: [] };
+          }
+        })
+      );
+      
+      for (const result of results) {
+        this._questionsCache[result.code] = result.data;
+      }
+      
+      this._questionsCache.loaded = true;
+      this._questionsCache.loadTime = Date.now();
+      this._questionsCache.loading = false;
+      
+      const totalQuestions = results.reduce((sum, r) => sum + r.data.length, 0);
+      console.log(`✅ Loaded ${totalQuestions} questions to memory`);
+      console.log(`   - EN: ${this._questionsCache.en.length}`);
+      console.log(`   - ID: ${this._questionsCache.id.length}`);
+      console.log(`   - FIL: ${this._questionsCache.fil.length}`);
+      console.log(`   - HI: ${this._questionsCache.hi.length}`);
+      console.log(`   - AR: ${this._questionsCache.ar.length}`);
+      
+      if (this.countryQuizSystem) {
+        const langs = ['en', 'id', 'fil', 'hi', 'ar'];
+        for (const lang of langs) {
+          const questions = this._questionsCache[lang];
+          if (questions && questions.length > 0) {
+            this.countryQuizSystem.questionsByLanguage.set(lang, {
+              questions: questions,
+              total: questions.length,
+              language: lang,
+              languageName: this.countryQuizSystem.getLanguageName(lang),
+              fetchedAt: new Date().toISOString()
+            });
+          }
+        }
+        this.countryQuizSystem._isLoaded = true;
+      }
+      
+      if (this._questionsCache.en && this._questionsCache.en.length > 0) {
+        this._allQuestions = this._questionsCache.en.map((q, index) => ({
+          id: q.id || index + 1,
+          question: q.question || '',
+          options: q.options || { A: '', B: '', C: '', D: '' },
+          correct: q.correct || 'A',
+          category: q.category || 'General',
+          difficulty: q.difficulty || 'medium'
+        }));
+        this._isAllQuestionsLoaded = true;
+        this._currentBatchStart = 0;
+        this._currentBatchEnd = 0;
+        this._questionPointer = 0;
+        this._totalQuestionsAnswered = 0;
+        this._currentBatchIndex = 0;
+        this.countryQuizSystem._usedQuestions.clear();
+        this._loadNextBatch();
+      }
+      
+      return true;
+    } catch(e) {
+      console.error('❌ Failed to load questions to memory:', e);
+      this._questionsCache.loading = false;
+      this._questionsCache.loadError = e.message;
+      return false;
+    }
+  }
+
+  _getQuestionsFromMemory(langCode = 'en') {
+    if (!this._questionsCache.loaded) {
+      this._loadAllQuestionsToMemory();
+      return [];
+    }
+    
+    const questions = this._questionsCache[langCode] || [];
+    return questions;
+  }
+
+  // ==================== QUIZ POINTS & WINNER METHODS (LANGSUNG KE KV) ====================
+
+  async _getQuizPoints() {
+    try {
+      if (!this.env?.QUESTIONS) return {};
+      const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json');
+      return points || {};
+    } catch(e) { 
+      return {}; 
+    }
+  }
+
+  async _setQuizPoints(points) {
+    try {
+      if (!this.env?.QUESTIONS) return false;
+      await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _getLastWeekWinner() {
+    try {
+      if (!this.env?.QUESTIONS) return null;
+      const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
+      return winner || null;
+    } catch(e) { 
+      return null; 
+    }
+  }
+
+  async _setLastWeekWinner(winner) {
+    try {
+      if (!this.env?.QUESTIONS) return false;
+      await this.env.QUESTIONS.put(CONSTANTS.QUIZ_LAST_WEEK_WINNER, JSON.stringify(winner));
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _getCurrentWeek() {
+    try {
+      if (!this.env?.QUESTIONS) return this._generateCurrentWeek();
+      const week = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
+      return week || this._generateCurrentWeek();
+    } catch(e) { 
+      return this._generateCurrentWeek(); 
+    }
+  }
+
+  _generateCurrentWeek() {
+    const now = new Date();
+    const year = now.getUTCFullYear();
+    const startOfYear = new Date(year, 0, 1);
+    const diff = now - startOfYear;
+    const week = Math.ceil((diff / 86400000 + startOfYear.getUTCDay() + 1) / 7);
+    return `${year}-W${String(week).padStart(2, '0')}`;
   }
 
   // ==================== QUIZ SCHEDULE METHODS ====================
@@ -627,7 +832,6 @@ export class GameServer extends CPUProtection {
       const witaTime = this._getCurrentWITATime();
       const currentTotal = witaTime.totalMinutes;
       
-      // Cek apakah sedang dalam sesi
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotal = session.start * 60;
         const endTotal = session.end * 60;
@@ -647,7 +851,6 @@ export class GameServer extends CPUProtection {
         }
       }
       
-      // Cari sesi berikutnya
       let minDiff = Infinity;
       
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
@@ -954,50 +1157,31 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  _getCurrentWeek() {
-    try {
-      const now = new Date();
-      const year = now.getUTCFullYear();
-      const startOfYear = new Date(year, 0, 1);
-      const diff = now - startOfYear;
-      const week = Math.ceil((diff / 86400000 + startOfYear.getUTCDay() + 1) / 7);
-      return `${year}-W${String(week).padStart(2, '0')}`;
-    } catch(e) { return '2026-W01'; }
-  }
-
-  async _getQuizPoints() {
-    try {
-      if (!this.env?.QUESTIONS) return {};
-      const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json');
-      return points || {};
-    } catch(e) { return {}; }
-  }
-
-  async _getLastWeekWinner() {
-    try {
-      if (!this.env?.QUESTIONS) return null;
-      const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
-      return winner || null;
-    } catch(e) { return null; }
-  }
-
   async _checkAndResetWeeklyPoints() {
     try {
       if (!this.env?.QUESTIONS) return false;
-      const currentWeek = this._getCurrentWeek();
+      
+      // LANGSUNG KE KV (TANPA CACHE)
+      const currentWeek = await this._getCurrentWeek();
       const savedWeek = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_WEEK_KEY);
+      
       if (savedWeek !== currentWeek) {
+        // LANGSUNG KE KV (TANPA CACHE)
         const points = await this._getQuizPoints();
         let winner = null, highestScore = 0;
         for (const [username, score] of Object.entries(points)) {
           if (score > highestScore) { highestScore = score; winner = username; }
         }
         if (winner) {
-          await this.env.QUESTIONS.put(CONSTANTS.QUIZ_LAST_WEEK_WINNER,
-            JSON.stringify({ username: winner, score: highestScore, week: savedWeek || currentWeek }));
+          const winnerData = {
+            username: winner,
+            score: highestScore,
+            week: savedWeek || currentWeek
+          };
+          await this._setLastWeekWinner(winnerData);
           this._broadcastToRoom(QUIZ_ROOM, ["quizLastWeekWinner", winner, highestScore, savedWeek || currentWeek]);
         }
-        await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify({}));
+        await this._setQuizPoints({});
         await this.env.QUESTIONS.put(CONSTANTS.QUIZ_WEEK_KEY, currentWeek);
         return true;
       }
@@ -1085,8 +1269,9 @@ export class GameServer extends CPUProtection {
         return false;
       }
       
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        this._initQuiz().then(() => {
+      const enQuestions = this._getQuestionsFromMemory('en');
+      if (!enQuestions || enQuestions.length === 0) {
+        this._loadAllQuestionsToMemory().then(() => {
           if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
             this._showQuestion();
           }
@@ -1116,8 +1301,9 @@ export class GameServer extends CPUProtection {
       
       this._forceStartQuizIfTime();
       
-      if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-        this._initQuiz().then(() => { 
+      const enQuestions = this._getQuestionsFromMemory('en');
+      if (!enQuestions || enQuestions.length === 0) {
+        this._loadAllQuestionsToMemory().then(() => { 
           if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
             this.forceStartQuiz();
           }
@@ -1150,27 +1336,25 @@ export class GameServer extends CPUProtection {
 
   async _loadAllQuestionsFromKV() {
     try {
-      if (this.countryQuizSystem._isLoaded) {
-        const enQuestions = this.countryQuizSystem.getQuestionsByLanguage('en');
-        if (enQuestions && enQuestions.length > 0) {
-          this._allQuestions = enQuestions.map((q, index) => ({
-            id: q.id || index + 1,
-            question: q.question || '',
-            options: q.options || { A: '', B: '', C: '', D: '' },
-            correct: q.correct || 'A',
-            category: q.category || 'General',
-            difficulty: q.difficulty || 'medium'
-          }));
-          this._isAllQuestionsLoaded = true;
-          this._currentBatchStart = 0;
-          this._currentBatchEnd = 0;
-          this._questionPointer = 0;
-          this._totalQuestionsAnswered = 0;
-          this._currentBatchIndex = 0;
-          this.countryQuizSystem._usedQuestions.clear();
-          this._loadNextBatch();
-          return true;
-        }
+      const enQuestions = this._getQuestionsFromMemory('en');
+      if (enQuestions && enQuestions.length > 0) {
+        this._allQuestions = enQuestions.map((q, index) => ({
+          id: q.id || index + 1,
+          question: q.question || '',
+          options: q.options || { A: '', B: '', C: '', D: '' },
+          correct: q.correct || 'A',
+          category: q.category || 'General',
+          difficulty: q.difficulty || 'medium'
+        }));
+        this._isAllQuestionsLoaded = true;
+        this._currentBatchStart = 0;
+        this._currentBatchEnd = 0;
+        this._questionPointer = 0;
+        this._totalQuestionsAnswered = 0;
+        this._currentBatchIndex = 0;
+        this.countryQuizSystem._usedQuestions.clear();
+        this._loadNextBatch();
+        return true;
       }
 
       if (!this.env?.QUESTIONS) return false;
@@ -1364,15 +1548,21 @@ export class GameServer extends CPUProtection {
       this._isShowingQuestion = true;
 
       try {
-        const enQuestions = this.countryQuizSystem.getQuestionsByLanguage('en');
+        const enQuestions = this._getQuestionsFromMemory('en');
+        
         if (!enQuestions || enQuestions.length === 0) {
-          this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
-          this._isShowingQuestion = false;
-          return;
+          await this._loadAllQuestionsToMemory();
+          const retryQuestions = this._getQuestionsFromMemory('en');
+          if (!retryQuestions || retryQuestions.length === 0) {
+            this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
+            this._isShowingQuestion = false;
+            return;
+          }
         }
         
-        const randomIndex = Math.floor(Math.random() * enQuestions.length);
-        const q = enQuestions[randomIndex];
+        const questions = this._getQuestionsFromMemory('en');
+        const randomIndex = Math.floor(Math.random() * questions.length);
+        const q = questions[randomIndex];
         
         if (!q) {
           this._isShowingQuestion = false;
@@ -1432,12 +1622,10 @@ export class GameServer extends CPUProtection {
             const correctAnswer = this.currentQuestion.correct;
 
             if (this.quizHasWinner && this.quizWinner) {
+              // LANGSUNG KE KV (TANPA CACHE)
               const points = await this._getQuizPoints();
               points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-              if (this.env?.QUESTIONS) {
-                this._incrementSubRequest();
-                await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
-              }
+              await this._setQuizPoints(points);
               
               this._broadcastQuizNotification("quizWinner", {
                 username: this.quizWinner,
@@ -1497,12 +1685,10 @@ export class GameServer extends CPUProtection {
       const correctAnswer = this.currentQuestion.correct;
 
       if (this.quizHasWinner && this.quizWinner) {
+        // LANGSUNG KE KV (TANPA CACHE)
         const points = await this._getQuizPoints();
         points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
-        if (this.env?.QUESTIONS) {
-          this._incrementSubRequest();
-          await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
-        }
+        await this._setQuizPoints(points);
         
         this._broadcastQuizNotification("quizWinner", {
           username: this.quizWinner,
@@ -1719,8 +1905,9 @@ export class GameServer extends CPUProtection {
       const clients = this.wsClients.get(QUIZ_ROOM);
       if (!clients?.size) return;
       if (!this.currentQuestion && !this._quizTimeout && !this.isQuizWaiting && !this._quizStartTimeout && !this._isShowingQuestion) {
-        if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) {
-          this._initQuiz().then(() => { 
+        const enQuestions = this._getQuestionsFromMemory('en');
+        if (!enQuestions || enQuestions.length === 0) {
+          this._loadAllQuestionsToMemory().then(() => { 
             if (!this.closing && !this.isDestroyed && !this._isShowingQuestion) {
               this._showQuestion(); 
             }
@@ -1734,6 +1921,22 @@ export class GameServer extends CPUProtection {
 
   async _initQuiz(retryCount = 0) {
     try {
+      const enQuestions = this._getQuestionsFromMemory('en');
+      if (enQuestions && enQuestions.length > 0) {
+        this._allQuestions = enQuestions.map((q, index) => ({
+          id: q.id || index + 1,
+          question: q.question || '',
+          options: q.options || { A: '', B: '', C: '', D: '' },
+          correct: q.correct || 'A',
+          category: q.category || 'General',
+          difficulty: q.difficulty || 'medium'
+        }));
+        this._isAllQuestionsLoaded = true;
+        this._startQuizLoop();
+        this._startQuizKeepAlive();
+        return true;
+      }
+      
       const loaded = await this._loadAllQuestionsFromKV();
       if (loaded) {
         this._startQuizLoop();
@@ -2145,9 +2348,30 @@ export class GameServer extends CPUProtection {
           if (roomName === QUIZ_ROOM) {
             this._quizTimeLeftNotified.delete(wsId);
             this._nextQuizNotified.delete(wsId);
-            if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) await this._initQuiz();
-            if (this._isQuizTime() && !this.quizAutoEnabled) { this.quizAutoEnabled = true; this.forceStartQuiz(); }
-            setTimeout(() => { if (!this.closing && !this.isDestroyed) this._sendQuizTimeLeftToUser(ws); }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
+            
+            if (!this._questionsCache.loaded) {
+              await this._loadAllQuestionsToMemory();
+            }
+            
+            if (this._isQuizTime() && !this.quizAutoEnabled) { 
+              this.quizAutoEnabled = true; 
+              this.forceStartQuiz(); 
+            }
+            setTimeout(() => { 
+              if (!this.closing && !this.isDestroyed) {
+                this._sendQuizTimeLeftToUser(ws);
+                this._sendQuizNotification(ws, "quizStatus", {
+                  isQuizTime: this._isQuizTime(),
+                  isActive: !!this.currentQuestion,
+                  remainingTime: `${this._getQuestionRemainingTime()}s remaining`,
+                  hasWinner: this.quizHasWinner,
+                  winner: this.quizWinner,
+                  correctAnswer: this.currentQuestion?.correct || null,
+                  questionNumber: this._questionPointer,
+                  totalQuestions: this._allQuestions.length
+                });
+              }
+            }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
           }
           this._safeSend(ws, ["switchRoomSuccess", roomName]);
           return;
@@ -2173,22 +2397,30 @@ export class GameServer extends CPUProtection {
           let country = this.userCountry.get(wsId);
           if (!country) { const cf = ws._cf || {}; country = cf.country || 'US'; this.userCountry.set(wsId, country); }
           this._setUserLanguage(ws, country);
-          if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) await this._initQuiz();
-          if (this._isQuizTime()) { if (!this.quizAutoEnabled) this.quizAutoEnabled = true; this.forceStartQuiz(); }
-          setTimeout(() => { if (!this.closing && !this.isDestroyed) this._sendQuizTimeLeftToUser(ws); }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
           
-          const remaining = this._getQuestionRemainingTime();
-          const remainingText = `${remaining}s remaining`;
-          this._sendQuizNotification(ws, "quizStatus", {
-            isQuizTime: this._isQuizTime(),
-            isActive: !!this.currentQuestion,
-            remainingTime: remainingText,
-            hasWinner: this.quizHasWinner,
-            winner: this.quizWinner,
-            correctAnswer: this.currentQuestion?.correct || null,
-            questionNumber: this._questionPointer,
-            totalQuestions: this._allQuestions.length
-          });
+          if (!this._questionsCache.loaded) {
+            await this._loadAllQuestionsToMemory();
+          }
+          
+          if (this._isQuizTime()) { 
+            if (!this.quizAutoEnabled) this.quizAutoEnabled = true; 
+            this.forceStartQuiz(); 
+          }
+          setTimeout(() => { 
+            if (!this.closing && !this.isDestroyed) {
+              this._sendQuizTimeLeftToUser(ws);
+              this._sendQuizNotification(ws, "quizStatus", {
+                isQuizTime: this._isQuizTime(),
+                isActive: !!this.currentQuestion,
+                remainingTime: `${this._getQuestionRemainingTime()}s remaining`,
+                hasWinner: this.quizHasWinner,
+                winner: this.quizWinner,
+                correctAnswer: this.currentQuestion?.correct || null,
+                questionNumber: this._questionPointer,
+                totalQuestions: this._allQuestions.length
+              });
+            }
+          }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
         }
 
         this._broadcastToRoom(roomName, ["userJoinedRoom", username, roomName]);
@@ -2250,7 +2482,7 @@ export class GameServer extends CPUProtection {
 
   _getActivePlayerIds(game) {
     try {
-      if (!game?._isActive || game?._gameEnded || !game?.players) return [];
+      if (!game?._isActive || game._gameEnded || !game?.players) return [];
       return Array.from(game.players.keys()).filter(id => !game.eliminated?.has(id));
     } catch(e) { return []; }
   }
@@ -3238,6 +3470,7 @@ export class GameServer extends CPUProtection {
       }
 
       if (evt === "getQuizLastWeekWinner") {
+        // LANGSUNG KE KV (TANPA CACHE)
         const winner = await this._getLastWeekWinner();
         if (winner) this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
         else this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
@@ -3246,6 +3479,7 @@ export class GameServer extends CPUProtection {
 
       if (evt === "getQuizLeaderboard") {
         let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
+        // LANGSUNG KE KV (TANPA CACHE)
         const points = await this._getQuizPoints();
         
         const sorted = Object.entries(points)
@@ -3261,20 +3495,20 @@ export class GameServer extends CPUProtection {
       }
 
       if (evt === "deleteQuizLastWeekWinner") {
-  try {
-    if (this.env?.QUESTIONS) {
-      this._incrementSubRequest();
-      // HANYA HAPUS DATA PEMENANG MINGGU LALU, TIDAK MENYENTUH POINTS
-      await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
-      this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner data deleted successfully"]);
-    } else {
-      this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
-    }
-  } catch(e) {
-    this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
-  }
-  return;
-}
+        try {
+          if (this.env?.QUESTIONS) {
+            this._incrementSubRequest();
+            // HANYA HAPUS DATA PEMENANG MINGGU LALU, TIDAK MENYENTUH POINTS
+            await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner data deleted successfully"]);
+          } else {
+            this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
+        }
+        return;
+      }
 
       if (evt === "getSupportedLanguages") {
         const languages = this.countryQuizSystem.getTranslationStatus();
@@ -3461,7 +3695,15 @@ export class GameServer extends CPUProtection {
             errorCount: this._errorCount,
             timestamp: Date.now(),
             quizSchedule: QUIZ_SCHEDULE.SESSIONS.map(s => `${s.start}:00-${s.end}:00`),
-            currentWITATime: this._getCurrentWITATime().formatted
+            currentWITATime: this._getCurrentWITATime().formatted,
+            questionsLoaded: this._questionsCache.loaded,
+            questionsCount: {
+              en: this._questionsCache.en?.length || 0,
+              id: this._questionsCache.id?.length || 0,
+              fil: this._questionsCache.fil?.length || 0,
+              hi: this._questionsCache.hi?.length || 0,
+              ar: this._questionsCache.ar?.length || 0
+            }
           };
           return new Response(JSON.stringify(status), {
             headers: { 'Content-Type': 'application/json' }
