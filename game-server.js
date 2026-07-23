@@ -76,10 +76,7 @@ const COUNTRY_LANGUAGE_MAP = {
   'LK': { lang: 'hi', name: 'Sri Lanka', kvKey: 'trivia_hi' },
   'BD': { lang: 'hi', name: 'Bangladesh', kvKey: 'trivia_hi' },
   'PK': { lang: 'hi', name: 'Pakistan', kvKey: 'trivia_hi' },
-  'SA': { lang: 'ar', name: 'Saudi Arabia', kvKey: 'trivia_ar' },
-  'AE': { lang: 'ar', name: 'UAE', kvKey: 'trivia_ar' },
-  'QA': { lang: 'ar', name: 'Qatar', kvKey: 'trivia_ar' },
- 
+
 };
 
 class CPUProtection {
@@ -1480,10 +1477,7 @@ export class GameServer extends CPUProtection {
               const points = await this._getQuizPoints();
               points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
               await this._setQuizPoints(points);
-              this._broadcastQuizNotification("quizWinner", {
-                username: this.quizWinner,
-                totalPoints: points[this.quizWinner] || 0
-              });
+              // ✅ DUPLIKASI DIHAPUS - HANYA PAKAI _broadcastQuizResult
               this._broadcastQuizResult("quizWinner", {
                 username: this.quizWinner,
                 totalPoints: points[this.quizWinner] || 0,
@@ -1537,10 +1531,7 @@ export class GameServer extends CPUProtection {
         const points = await this._getQuizPoints();
         points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
         await this._setQuizPoints(points);
-        this._broadcastQuizNotification("quizWinner", {
-          username: this.quizWinner,
-          totalPoints: points[this.quizWinner] || 0
-        });
+        // ✅ DUPLIKASI DIHAPUS - HANYA PAKAI _broadcastQuizResult
         this._broadcastQuizResult("quizWinner", {
           username: this.quizWinner,
           totalPoints: points[this.quizWinner] || 0,
@@ -3603,4 +3594,4 @@ export class GameServer extends CPUProtection {
       ws.username = null;
     } catch(e) {}
   }
-} 
+}
