@@ -3261,19 +3261,20 @@ export class GameServer extends CPUProtection {
       }
 
       if (evt === "deleteQuizLastWeekWinner") {
-        try {
-          if (this.env?.QUESTIONS) {
-            this._incrementSubRequest();
-            await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
-            this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Deleted successfully"]);
-          } else {
-            this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
-          }
-        } catch(e) {
-          this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
-        }
-        return;
-      }
+  try {
+    if (this.env?.QUESTIONS) {
+      this._incrementSubRequest();
+      // HANYA HAPUS DATA PEMENANG MINGGU LALU, TIDAK MENYENTUH POINTS
+      await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
+      this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner data deleted successfully"]);
+    } else {
+      this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
+    }
+  } catch(e) {
+    this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, e.message]);
+  }
+  return;
+}
 
       if (evt === "getSupportedLanguages") {
         const languages = this.countryQuizSystem.getTranslationStatus();
