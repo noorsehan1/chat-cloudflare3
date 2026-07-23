@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS (REMOVED TIME UP NOTIFICATION) ====================
+// ==================== GAME-SERVER.JS ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -64,42 +64,38 @@ const QUIZ_SCHEDULE = {
 
 const QUIZ_ROOM = "Quiz";
 
-// ==================== COUNTRY TO LANGUAGE MAPPING ====================
-
 const COUNTRY_LANGUAGE_MAP = {
-  'ID': { lang: 'id', name: 'Indonesia', flag: '🇮🇩', kvKey: 'trivia_id' },
-  'MY': { lang: 'id', name: 'Malaysia', flag: '🇲🇾', kvKey: 'trivia_id' },
-  'SG': { lang: 'id', name: 'Singapore', flag: '🇸🇬', kvKey: 'trivia_id' },
-  'BN': { lang: 'id', name: 'Brunei', flag: '🇧🇳', kvKey: 'trivia_id' },
-  'PH': { lang: 'fil', name: 'Philippines', flag: '🇵🇭', kvKey: 'trivia_fil' },
-  'IN': { lang: 'hi', name: 'India', flag: '🇮🇳', kvKey: 'trivia_hi' },
-  'NP': { lang: 'hi', name: 'Nepal', flag: '🇳🇵', kvKey: 'trivia_hi' },
-  'LK': { lang: 'hi', name: 'Sri Lanka', flag: '🇱🇰', kvKey: 'trivia_hi' },
-  'BD': { lang: 'hi', name: 'Bangladesh', flag: '🇧🇩', kvKey: 'trivia_hi' },
-  'PK': { lang: 'hi', name: 'Pakistan', flag: '🇵🇰', kvKey: 'trivia_hi' },
-  'SA': { lang: 'ar', name: 'Saudi Arabia', flag: '🇸🇦', kvKey: 'trivia_ar' },
-  'AE': { lang: 'ar', name: 'UAE', flag: '🇦🇪', kvKey: 'trivia_ar' },
-  'QA': { lang: 'ar', name: 'Qatar', flag: '🇶🇦', kvKey: 'trivia_ar' },
-  'KW': { lang: 'ar', name: 'Kuwait', flag: '🇰🇼', kvKey: 'trivia_ar' },
-  'BH': { lang: 'ar', name: 'Bahrain', flag: '🇧🇭', kvKey: 'trivia_ar' },
-  'OM': { lang: 'ar', name: 'Oman', flag: '🇴🇲', kvKey: 'trivia_ar' },
-  'YE': { lang: 'ar', name: 'Yemen', flag: '🇾🇪', kvKey: 'trivia_ar' },
-  'SY': { lang: 'ar', name: 'Syria', flag: '🇸🇾', kvKey: 'trivia_ar' },
-  'LB': { lang: 'ar', name: 'Lebanon', flag: '🇱🇧', kvKey: 'trivia_ar' },
-  'JO': { lang: 'ar', name: 'Jordan', flag: '🇯🇴', kvKey: 'trivia_ar' },
-  'IQ': { lang: 'ar', name: 'Iraq', flag: '🇮🇶', kvKey: 'trivia_ar' },
-  'EG': { lang: 'ar', name: 'Egypt', flag: '🇪🇬', kvKey: 'trivia_ar' },
-  'DZ': { lang: 'ar', name: 'Algeria', flag: '🇩🇿', kvKey: 'trivia_ar' },
-  'MA': { lang: 'ar', name: 'Morocco', flag: '🇲🇦', kvKey: 'trivia_ar' },
-  'TN': { lang: 'ar', name: 'Tunisia', flag: '🇹🇳', kvKey: 'trivia_ar' },
-  'LY': { lang: 'ar', name: 'Libya', flag: '🇱🇾', kvKey: 'trivia_ar' },
-  'SD': { lang: 'ar', name: 'Sudan', flag: '🇸🇩', kvKey: 'trivia_ar' },
-  'MR': { lang: 'ar', name: 'Mauritania', flag: '🇲🇷', kvKey: 'trivia_ar' },
-  'SO': { lang: 'ar', name: 'Somalia', flag: '🇸🇴', kvKey: 'trivia_ar' },
-  'PS': { lang: 'ar', name: 'Palestine', flag: '🇵🇸', kvKey: 'trivia_ar' },
+  'ID': { lang: 'id', name: 'Indonesia', kvKey: 'trivia_id' },
+  'MY': { lang: 'id', name: 'Malaysia', kvKey: 'trivia_id' },
+  'SG': { lang: 'id', name: 'Singapore', kvKey: 'trivia_id' },
+  'BN': { lang: 'id', name: 'Brunei', kvKey: 'trivia_id' },
+  'PH': { lang: 'fil', name: 'Philippines', kvKey: 'trivia_fil' },
+  'IN': { lang: 'hi', name: 'India', kvKey: 'trivia_hi' },
+  'NP': { lang: 'hi', name: 'Nepal', kvKey: 'trivia_hi' },
+  'LK': { lang: 'hi', name: 'Sri Lanka', kvKey: 'trivia_hi' },
+  'BD': { lang: 'hi', name: 'Bangladesh', kvKey: 'trivia_hi' },
+  'PK': { lang: 'hi', name: 'Pakistan', kvKey: 'trivia_hi' },
+  'SA': { lang: 'ar', name: 'Saudi Arabia', kvKey: 'trivia_ar' },
+  'AE': { lang: 'ar', name: 'UAE', kvKey: 'trivia_ar' },
+  'QA': { lang: 'ar', name: 'Qatar', kvKey: 'trivia_ar' },
+  'KW': { lang: 'ar', name: 'Kuwait', kvKey: 'trivia_ar' },
+  'BH': { lang: 'ar', name: 'Bahrain', kvKey: 'trivia_ar' },
+  'OM': { lang: 'ar', name: 'Oman', kvKey: 'trivia_ar' },
+  'YE': { lang: 'ar', name: 'Yemen', kvKey: 'trivia_ar' },
+  'SY': { lang: 'ar', name: 'Syria', kvKey: 'trivia_ar' },
+  'LB': { lang: 'ar', name: 'Lebanon', kvKey: 'trivia_ar' },
+  'JO': { lang: 'ar', name: 'Jordan', kvKey: 'trivia_ar' },
+  'IQ': { lang: 'ar', name: 'Iraq', kvKey: 'trivia_ar' },
+  'EG': { lang: 'ar', name: 'Egypt', kvKey: 'trivia_ar' },
+  'DZ': { lang: 'ar', name: 'Algeria', kvKey: 'trivia_ar' },
+  'MA': { lang: 'ar', name: 'Morocco', kvKey: 'trivia_ar' },
+  'TN': { lang: 'ar', name: 'Tunisia', kvKey: 'trivia_ar' },
+  'LY': { lang: 'ar', name: 'Libya', kvKey: 'trivia_ar' },
+  'SD': { lang: 'ar', name: 'Sudan', kvKey: 'trivia_ar' },
+  'MR': { lang: 'ar', name: 'Mauritania', kvKey: 'trivia_ar' },
+  'SO': { lang: 'ar', name: 'Somalia', kvKey: 'trivia_ar' },
+  'PS': { lang: 'ar', name: 'Palestine', kvKey: 'trivia_ar' },
 };
-
-// ==================== CPU PROTECTION MIXIN ====================
 
 class CPUProtection {
   constructor() {
@@ -210,8 +206,6 @@ class CPUProtection {
   }
 }
 
-// ==================== COUNTRY-BASED QUIZ SYSTEM ====================
-
 class CountryBasedQuizSystem {
   constructor(gameServer) {
     this.gameServer = gameServer;
@@ -231,20 +225,14 @@ class CountryBasedQuizSystem {
 
   async loadAllQuestions() {
     try {
-      if (this._loading) {
-        return this._isLoaded;
-      }
-      
-      if (this._isLoaded && this.questionsByLanguage.size > 0) {
-        return true;
-      }
+      if (this._loading) return this._isLoaded;
+      if (this._isLoaded && this.questionsByLanguage.size > 0) return true;
 
       this._loading = true;
       this._loadAttempts++;
 
       const env = this.env;
       if (!env?.QUESTIONS) {
-        console.log("❌ KV not available!");
         this._loading = false;
         return false;
       }
@@ -256,8 +244,6 @@ class CountryBasedQuizSystem {
         { code: 'hi', key: 'trivia_hi', name: 'Hindi' },
         { code: 'ar', key: 'trivia_ar', name: 'Arab' }
       ];
-
-      console.log("📚 Loading questions from KV...");
 
       for (const lang of languages) {
         try {
@@ -271,20 +257,14 @@ class CountryBasedQuizSystem {
               languageName: lang.name,
               fetchedAt: data.fetchedAt || new Date().toISOString()
             });
-            console.log(`✅ Loaded ${shuffledQuestions.length} questions for ${lang.name} (${lang.code})`);
-          } else {
-            console.log(`⚠️ No questions found for ${lang.name} (${lang.code})`);
           }
-        } catch(e) {
-          console.error(`❌ Failed to load ${lang.name}:`, e.message);
-        }
+        } catch(e) {}
       }
 
       this._isLoaded = this.questionsByLanguage.size > 0;
       this._loading = false;
       return this._isLoaded;
     } catch(e) {
-      console.error("❌ Failed to load questions:", e.message);
       this._loading = false;
       return false;
     }
@@ -308,7 +288,6 @@ class CountryBasedQuizSystem {
   async getQuestionsForCountry(countryCode) {
     try {
       if (!countryCode) return null;
-
       const cacheKey = `country_${countryCode}`;
       if (this.countryQuestionCache.has(cacheKey)) {
         return this.countryQuestionCache.get(cacheKey);
@@ -324,7 +303,6 @@ class CountryBasedQuizSystem {
         const result = {
           country: countryCode,
           countryName: info.name,
-          flag: info.flag,
           language: lang,
           languageName: this.getLanguageName(lang),
           questions: questions,
@@ -343,7 +321,6 @@ class CountryBasedQuizSystem {
         const result = {
           country: countryCode,
           countryName: info.name,
-          flag: info.flag,
           language: lang,
           languageName: this.getLanguageName(lang),
           questions: data.questions,
@@ -431,7 +408,6 @@ class CountryBasedQuizSystem {
               language: lang,
               country: country,
               countryName: info?.name || 'Unknown',
-              flag: info?.flag || '🌍',
               isTranslated: lang !== 'en',
               questionIndex: randomResult.index
             });
@@ -446,7 +422,6 @@ class CountryBasedQuizSystem {
             language: 'en',
             country: country,
             countryName: info?.name || 'Unknown',
-            flag: info?.flag || '🌍',
             isTranslated: false
           });
         }
@@ -485,7 +460,6 @@ class CountryBasedQuizSystem {
     return {
       countryCode: countryCode,
       countryName: info?.name || 'Unknown',
-      flag: info?.flag || '🌍',
       language: info?.lang || 'en',
       hasTranslations: this.questionsByLanguage.has(info?.lang || 'en')
     };
@@ -515,8 +489,6 @@ class CountryBasedQuizSystem {
     };
   }
 }
-
-// ==================== GAME SERVER CLASS ====================
 
 export class GameServer extends CPUProtection {
   constructor(state, env) {
@@ -599,29 +571,22 @@ export class GameServer extends CPUProtection {
       this.quizEndMessageShown = false;
       this.quizEndNotified = false;
 
+      this._quizTimeLeftNotified = new Map();
+      this._quizTimeLeftBroadcastCooldown = 30000;
+      this._lastQuizTimeLeftBroadcast = 0;
+
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
 
       this._initAsync();
-
       this._startCPUMonitor();
       this._startHealthCheck();
 
       setTimeout(async () => {
         try {
           if (!this.closing && !this.isDestroyed) {
-            console.log("🔍 Loading questions from KV on deploy...");
-            const loaded = await this.countryQuizSystem.loadAllQuestions();
-            if (loaded) {
-              console.log("✅ Questions loaded successfully!");
-              const status = this.countryQuizSystem.getTranslationStatus();
-              console.log(`📊 Loaded ${status.totalLanguages} languages:`, Object.keys(status.languages));
-            } else {
-              console.log("⚠️ No questions loaded from KV");
-            }
+            await this.countryQuizSystem.loadAllQuestions();
           }
-        } catch(e) {
-          console.error("❌ Failed to load questions:", e.message);
-        }
+        } catch(e) {}
       }, 5000);
 
       setTimeout(() => {
@@ -630,12 +595,8 @@ export class GameServer extends CPUProtection {
         }
       }, 8000);
 
-    } catch(e) {
-      console.error("Constructor error:", e);
-    }
+    } catch(e) {}
   }
-
-  // ==================== ERROR HANDLING ====================
 
   _setupErrorHandlers() {
     try {
@@ -674,8 +635,6 @@ export class GameServer extends CPUProtection {
       }
     } catch(e) {}
   }
-
-  // ==================== HEALTH CHECK ====================
 
   _startHealthCheck() {
     if (this._healthCheckInterval) clearInterval(this._healthCheckInterval);
@@ -733,15 +692,10 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== RECOVERY ====================
-
   _forceRecovery() {
     try {
       if (this.closing || this.isDestroyed) return;
-      if (this._recoveryAttempts >= this._maxRecoveryAttempts) {
-        console.log("⚠️ Max recovery attempts reached, entering stable state");
-        return;
-      }
+      if (this._recoveryAttempts >= this._maxRecoveryAttempts) return;
       
       this._resetCriticalState();
       this._cleanupResources();
@@ -807,8 +761,6 @@ export class GameServer extends CPUProtection {
       }
     } catch(e) {}
   }
-
-  // ==================== QUIZ NOTIFICATION ====================
 
   _getQuestionRemainingTime() {
     try {
@@ -919,22 +871,14 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== INIT ====================
-
   async _initAsync() {
     try {
-      if (this._initializing) {
-        return;
-      }
-      
-      if (this._initialized && !this._isRecovering) {
-        return;
-      }
+      if (this._initializing) return;
+      if (this._initialized && !this._isRecovering) return;
       
       this._initializing = true;
       
       await this.countryQuizSystem.loadAllQuestions();
-      
       await this._initQuiz();
       this._startQuizScheduler();
       await this._checkAndResetWeeklyPoints();
@@ -965,8 +909,6 @@ export class GameServer extends CPUProtection {
       this._requestCount++;
     } catch(e) {}
   }
-
-  // ==================== TIME UTILITIES ====================
 
   _getCurrentWIBHour() {
     try {
@@ -1112,8 +1054,6 @@ export class GameServer extends CPUProtection {
     } catch(e) { return '2026-W01'; }
   }
 
-  // ==================== KV HELPERS ====================
-
   async _getQuizPoints() {
     try {
       if (!this.env?.QUESTIONS) return {};
@@ -1154,8 +1094,6 @@ export class GameServer extends CPUProtection {
     } catch(e) { return false; }
   }
 
-  // ==================== QUIZ SCHEDULER ====================
-
   _startQuizScheduler() {
     try {
       if (this.quizAutoTimer) clearInterval(this.quizAutoTimer);
@@ -1189,7 +1127,19 @@ export class GameServer extends CPUProtection {
         this.quizEndNotified = false;
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
-          this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", "Quiz will start soon!", false]);
+          const wsIds = this.wsClients.get(QUIZ_ROOM);
+          if (wsIds?.size > 0) {
+            let hasUnnotified = false;
+            for (const wsId of wsIds) {
+              if (!this._quizTimeLeftNotified.has(wsId)) {
+                hasUnnotified = true;
+                break;
+              }
+            }
+            if (hasUnnotified) {
+              this._broadcastQuizTimeLeft();
+            }
+          }
           await this.startQuizWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
           if (!this._quizStartTimeout && !this._isShowingQuestion) {
             this.forceStartQuiz();
@@ -1205,6 +1155,7 @@ export class GameServer extends CPUProtection {
           this.quizEndMessageShown = false;
           await this.resetQuiz();
           this._clearQuizData();
+          this._quizTimeLeftNotified.clear();
           this._sendQuizEndNotificationOnce();
         }
         return true;
@@ -1214,9 +1165,7 @@ export class GameServer extends CPUProtection {
 
   forceStartQuiz() {
     try {
-      if (this._isShowingQuestion) {
-        return false;
-      }
+      if (this._isShowingQuestion) return false;
       
       if (!this._isQuizTime() || this.currentQuestion || this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
         return false;
@@ -1249,9 +1198,7 @@ export class GameServer extends CPUProtection {
 
   ensureQuizRunning() {
     try {
-      if (this._isShowingQuestion) {
-        return;
-      }
+      if (this._isShowingQuestion) return;
       
       this._forceStartQuizIfTime();
       
@@ -1276,9 +1223,7 @@ export class GameServer extends CPUProtection {
 
   _forceStartQuizIfTime() {
     try {
-      if (this._isShowingQuestion) {
-        return;
-      }
+      if (this._isShowingQuestion) return;
       
       if (!this._isQuizTime() || this.currentQuestion || this._quizTimeout || this.isQuizWaiting || this._quizStartTimeout) {
         return;
@@ -1288,8 +1233,6 @@ export class GameServer extends CPUProtection {
       this._showQuestion();
     } catch(e) {}
   }
-
-  // ==================== QUIZ CORE ====================
 
   async _loadAllQuestionsFromKV() {
     try {
@@ -1380,8 +1323,6 @@ export class GameServer extends CPUProtection {
     } catch(e) { return false; }
   }
 
-  // ==================== QUIZ BROADCAST WITH COUNTRY-BASED TRANSLATIONS ====================
-
   async _broadcastQuizQuestion(question, options) {
     try {
       const wsIds = this.wsClients.get(QUIZ_ROOM);
@@ -1414,7 +1355,6 @@ export class GameServer extends CPUProtection {
                 language: userQuestion.language,
                 country: userQuestion.country,
                 countryName: userQuestion.countryName,
-                flag: userQuestion.flag,
                 isTranslated: userQuestion.isTranslated,
                 questionId: this._questionPointer
               }];
@@ -1444,9 +1384,7 @@ export class GameServer extends CPUProtection {
 
   async _showQuestion() {
     try {
-      if (this._isShowingQuestion) {
-        return;
-      }
+      if (this._isShowingQuestion) return;
       
       this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
@@ -1546,11 +1484,6 @@ export class GameServer extends CPUProtection {
             }
 
             const correctAnswer = this.currentQuestion.correct;
-            const question = this.currentQuestion.question;
-            const options = this.currentQuestion.options;
-
-            // TIDAK ADA NOTIFIKASI TIME UP DISINI - LANGSUNG TAMPILKAN JAWABAN BENAR
-            this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
 
             if (this.quizHasWinner && this.quizWinner) {
               const points = await this._getQuizPoints();
@@ -1559,6 +1492,7 @@ export class GameServer extends CPUProtection {
                 this._incrementSubRequest();
                 await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
               }
+              
               this._broadcastQuizNotification("quizWinner", {
                 username: this.quizWinner,
                 totalPoints: points[this.quizWinner] || 0
@@ -1566,14 +1500,7 @@ export class GameServer extends CPUProtection {
               this._broadcastQuizResult("quizWinner", {
                 username: this.quizWinner,
                 totalPoints: points[this.quizWinner] || 0,
-                correctAnswer
-              });
-            } else {
-              // TIDAK ADA NOTIFIKASI TIME UP - LANGSUNG TAMPILKAN JAWABAN BENAR
-              // TANPA PESAN "Time is up!"
-              this._broadcastQuizResult("quizNoWinner", { 
-                message: "", 
-                correctAnswer 
+                correctAnswer: correctAnswer
               });
             }
 
@@ -1622,11 +1549,6 @@ export class GameServer extends CPUProtection {
       }
 
       const correctAnswer = this.currentQuestion.correct;
-      const question = this.currentQuestion.question;
-      const options = this.currentQuestion.options;
-
-      // TIDAK ADA NOTIFIKASI TIME UP DISINI
-      this._broadcastQuizResult("quizCorrectAnswer", { question, options, correctAnswer });
 
       if (this.quizHasWinner && this.quizWinner) {
         const points = await this._getQuizPoints();
@@ -1635,6 +1557,7 @@ export class GameServer extends CPUProtection {
           this._incrementSubRequest();
           await this.env.QUESTIONS.put(CONSTANTS.QUIZ_POINT_KEY, JSON.stringify(points));
         }
+        
         this._broadcastQuizNotification("quizWinner", {
           username: this.quizWinner,
           totalPoints: points[this.quizWinner] || 0
@@ -1642,13 +1565,7 @@ export class GameServer extends CPUProtection {
         this._broadcastQuizResult("quizWinner", {
           username: this.quizWinner,
           totalPoints: points[this.quizWinner] || 0,
-          correctAnswer
-        });
-      } else {
-        // TIDAK ADA NOTIFIKASI TIME UP
-        this._broadcastQuizResult("quizNoWinner", { 
-          message: "", 
-          correctAnswer 
+          correctAnswer: correctAnswer
         });
       }
 
@@ -1708,6 +1625,16 @@ export class GameServer extends CPUProtection {
         }
       }
 
+      const remaining = this._getQuestionRemainingTime();
+      if (remaining <= 0) {
+        if (this.quizHasWinner && this.quizWinner) {
+          this._safeSend(ws, ["quizError", "Time is up! Winner: " + this.quizWinner]);
+        } else {
+          this._safeSend(ws, ["quizError", "Time is up!"]);
+        }
+        return;
+      }
+
       if (this.quizHasWinner) {
         this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
         return;
@@ -1722,7 +1649,6 @@ export class GameServer extends CPUProtection {
       const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
       const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
 
-      const remaining = this._getQuestionRemainingTime();
       const remainingText = `${remaining}s remaining`;
 
       const wsId = this._getWsId(ws);
@@ -1734,7 +1660,6 @@ export class GameServer extends CPUProtection {
         isCorrect: isCorrect,
         remainingTime: remainingText,
         country: countryInfo.countryCode,
-        countryFlag: countryInfo.flag,
         countryName: countryInfo.countryName
       });
 
@@ -1745,7 +1670,6 @@ export class GameServer extends CPUProtection {
         correctAnswer: this.currentQuestion.correct,
         remainingTime: remainingText,
         country: countryInfo.countryCode,
-        countryFlag: countryInfo.flag,
         countryName: countryInfo.countryName
       });
       
@@ -1758,7 +1682,6 @@ export class GameServer extends CPUProtection {
         this._broadcastQuizNotification("quizWinnerWithCountry", {
           username: username,
           country: countryInfo.countryCode,
-          countryFlag: countryInfo.flag,
           countryName: countryInfo.countryName
         });
       }
@@ -1797,6 +1720,7 @@ export class GameServer extends CPUProtection {
               this.quizEndMessageShown = false;
               this.resetQuiz();
               this._clearQuizData();
+              this._quizTimeLeftNotified.clear();
               this._sendQuizEndNotificationOnce();
             }
           }
@@ -1819,6 +1743,7 @@ export class GameServer extends CPUProtection {
       this._quizStartTime = null;
       this.quizEndNotified = false;
       this._isShowingQuestion = false;
+      this._quizTimeLeftNotified.clear();
       this._startQuizKeepAlive();
     } catch(e) {}
   }
@@ -1960,8 +1885,6 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== QUIZ BROADCAST HELPERS ====================
-
   async _broadcastQuizResult(type, data) {
     try {
       const wsIds = this.wsClients.get(QUIZ_ROOM);
@@ -1986,6 +1909,14 @@ export class GameServer extends CPUProtection {
   _sendQuizTimeLeftToUser(ws) {
     try {
       if (!ws || ws.readyState !== 1) return false;
+      
+      const wsId = this._getWsId(ws);
+      if (!wsId) return false;
+      
+      if (this._quizTimeLeftNotified.has(wsId)) {
+        return false;
+      }
+      
       const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
@@ -2002,20 +1933,28 @@ export class GameServer extends CPUProtection {
           canType = true;
         }
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
-        return false;
       } else {
-        message = `⏱️ ${timeLeft.text}`;
+        message = `⏱️ Next quiz in ${timeLeft.text}`;
         canType = true;
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
-        return true;
       }
-    } catch(e) { return true; }
+      
+      this._quizTimeLeftNotified.set(wsId, Date.now());
+      
+      return true;
+    } catch(e) { return false; }
   }
 
   _broadcastQuizTimeLeft() {
     try {
       const wsIds = this.wsClients.get(QUIZ_ROOM);
       if (!wsIds?.size) return;
+      
+      const now = Date.now();
+      if (now - this._lastQuizTimeLeftBroadcast < this._quizTimeLeftBroadcastCooldown) {
+        return;
+      }
+      
       const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
@@ -2032,10 +1971,36 @@ export class GameServer extends CPUProtection {
           canType = true;
         }
       } else {
-        message = `⏱️ ${timeLeft.text}`;
+        message = `⏱️ Next quiz in ${timeLeft.text}`;
         canType = true;
       }
-      this._broadcastToRoom(QUIZ_ROOM, ["quizTimeLeft", message, canType, isQuizTime]);
+      
+      const wsIdArray = Array.from(wsIds);
+      let hasUnnotified = false;
+      
+      for (const wsId of wsIdArray) {
+        if (!this._quizTimeLeftNotified.has(wsId)) {
+          hasUnnotified = true;
+          break;
+        }
+      }
+      
+      if (!hasUnnotified) return;
+      
+      const msgStr = JSON.stringify(["quizTimeLeft", message, canType, isQuizTime]);
+      for (const wsId of wsIdArray) {
+        if (!this._quizTimeLeftNotified.has(wsId)) {
+          try {
+            const ws = this.wsMap.get(wsId);
+            if (ws && ws.readyState === 1) {
+              ws.send(msgStr);
+              this._quizTimeLeftNotified.set(wsId, now);
+            }
+          } catch(e) {}
+        }
+      }
+      
+      this._lastQuizTimeLeftBroadcast = now;
     } catch(e) {}
   }
 
@@ -2064,8 +2029,6 @@ export class GameServer extends CPUProtection {
       return true;
     } catch(e) { return false; }
   }
-
-  // ==================== WEB SOCKET CORE ====================
 
   _getWsId(ws) { return ws?._wsId || null; }
 
@@ -2156,6 +2119,9 @@ export class GameServer extends CPUProtection {
       const wsId = this._getWsId(ws);
       if (!wsId) return;
       const username = ws.username;
+      
+      this._quizTimeLeftNotified.delete(wsId);
+      
       this._removeClientFromRoom(room, wsId);
       this.clientRooms.delete(wsId);
       this.wsMap.delete(wsId);
@@ -2197,8 +2163,6 @@ export class GameServer extends CPUProtection {
     } catch(e) { return 'en'; }
   }
 
-  // ==================== SWITCH ROOM ====================
-
   async switchRoom(ws, room, username = null) {
     try {
       if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
@@ -2219,6 +2183,7 @@ export class GameServer extends CPUProtection {
           ws.room = roomName;
           ws.roomname = roomName;
           if (roomName === QUIZ_ROOM) {
+            this._quizTimeLeftNotified.delete(wsId);
             if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) await this._initQuiz();
             if (this._isQuizTime() && !this.quizAutoEnabled) { this.quizAutoEnabled = true; this.forceStartQuiz(); }
             setTimeout(() => { if (!this.closing && !this.isDestroyed) this._sendQuizTimeLeftToUser(ws); }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
@@ -2242,6 +2207,7 @@ export class GameServer extends CPUProtection {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
 
         if (roomName === QUIZ_ROOM) {
+          this._quizTimeLeftNotified.delete(wsId);
           let country = this.userCountry.get(wsId);
           if (!country) { const cf = ws._cf || {}; country = cf.country || 'US'; this.userCountry.set(wsId, country); }
           this._setUserLanguage(ws, country);
@@ -2272,8 +2238,6 @@ export class GameServer extends CPUProtection {
       this._safeSend(ws, ["gameLowCardError", "Switch failed"]);
     }
   }
-
-  // ==================== BROADCAST ====================
 
   async _broadcastToRoom(room, message) {
     try {
@@ -2306,8 +2270,6 @@ export class GameServer extends CPUProtection {
       return true;
     } catch(e) { return false; }
   }
-
-  // ==================== GAME LOWCARD HELPERS ====================
 
   _isGameActuallyRunning(game) { try { return game?._isActive === true && !game?._gameEnded; } catch(e) { return false; } }
 
@@ -2845,8 +2807,6 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ==================== GAME PUBLIC METHODS ====================
-
   async startGame(ws, bet, username) {
     try {
       if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
@@ -3158,8 +3118,6 @@ export class GameServer extends CPUProtection {
     } catch(e) { return newWsId; }
   }
 
-  // ==================== SHUFFLE ====================
-
   _shuffleQuestionOptions(question) {
     try {
       if (!question?.options) return { options: { A: '', B: '', C: '', D: '' }, correct: 'A' };
@@ -3192,8 +3150,6 @@ export class GameServer extends CPUProtection {
       return arr;
     } catch(e) { return array || []; }
   }
-
-  // ==================== EVENT HANDLER ====================
 
   async handleEvent(ws, data) {
     try {
@@ -3265,8 +3221,6 @@ export class GameServer extends CPUProtection {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
-      // ==================== COUNTRY-BASED QUIZ EVENTS ====================
-
       if (evt === "getUserCountryInfo") {
         const wsId = this._getWsId(ws);
         const info = this.countryQuizSystem.getUserCountryInfo(wsId);
@@ -3292,7 +3246,6 @@ export class GameServer extends CPUProtection {
         this._safeSend(ws, ["countryQuizStatus", {
           country: countryCode,
           countryName: info?.name || 'Unknown',
-          flag: info?.flag || '🌍',
           language: info?.lang || 'en',
           hasQuestions: !!questions,
           totalQuestions: questions?.total_questions || 0
@@ -3305,8 +3258,6 @@ export class GameServer extends CPUProtection {
         this._safeSend(ws, ["translationStatus", status]);
         return;
       }
-
-      // ==================== QUIZ EVENTS ====================
 
       if (evt === "switchRoom") {
         const [_, room, username] = data;
@@ -3331,31 +3282,14 @@ export class GameServer extends CPUProtection {
         let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
         const points = await this._getQuizPoints();
         
-        const userCountries = new Map();
-        for (const [username] of Object.entries(points)) {
-          const conn = this.userConnections.get(username);
-          if (conn) {
-            const wsId = conn.wsId;
-            const country = this.userCountry.get(wsId) || 'US';
-            userCountries.set(username, country);
-          }
-        }
-
-        const sorted = Object.entries(points).map(([username, score]) => {
-          const country = userCountries.get(username) || 'US';
-          const info = COUNTRY_LANGUAGE_MAP[country];
-          return {
-            username,
-            score,
-            country: country,
-            countryFlag: info?.flag || '🌍',
-            countryName: info?.name || 'Unknown'
-          };
-        }).sort((a, b) => b.score - a.score).slice(0, limit);
-
-        const result = sorted.map(item => 
-          `${item.countryFlag} ${item.username}|${item.score}`
+        const sorted = Object.entries(points)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, limit);
+        
+        const result = sorted.map(([username, score]) => 
+          `${username}|${score}`
         );
+        
         this._safeSend(ws, ["quizLeaderboard", result]);
         return;
       }
@@ -3389,8 +3323,7 @@ export class GameServer extends CPUProtection {
           language: info?.lang || 'en',
           languageName: this.countryQuizSystem.getLanguageName(info?.lang),
           country: country,
-          countryName: info?.name || 'Unknown',
-          flag: info?.flag || '🌍'
+          countryName: info?.name || 'Unknown'
         }]);
         return;
       }
@@ -3431,8 +3364,6 @@ export class GameServer extends CPUProtection {
         return;
       }
 
-      // ==================== GAME EVENTS ====================
-
       const room = this._ensureRoomConsistency(ws);
       if (!room) { this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]); return; }
       if (room === QUIZ_ROOM) { this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]); return; }
@@ -3461,8 +3392,6 @@ export class GameServer extends CPUProtection {
       this._safeSend(ws, ["gameLowCardError", "Error processing event"]);
     }
   }
-
-  // ==================== CLEANUP ====================
 
   _checkStuckGames() {
     try {
@@ -3528,6 +3457,7 @@ export class GameServer extends CPUProtection {
           this.wsMap.delete(wsId);
           this.userLanguage.delete(wsId);
           this.userCountry.delete(wsId);
+          this._quizTimeLeftNotified.delete(wsId);
           for (const [username, conn] of this.userConnections) {
             if (conn?.wsId === wsId) { this.userConnections.delete(username); break; }
           }
@@ -3535,8 +3465,6 @@ export class GameServer extends CPUProtection {
       }
     } catch(e) {}
   }
-
-  // ==================== FETCH ====================
 
   async fetch(req) {
     try {
@@ -3619,6 +3547,7 @@ export class GameServer extends CPUProtection {
                 this.userLanguage.delete(wsId);
                 this.userCountry.delete(wsId);
                 this.countryQuizSystem.userCountryCache.delete(wsId);
+                this._quizTimeLeftNotified.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -3639,6 +3568,7 @@ export class GameServer extends CPUProtection {
                 this.userLanguage.delete(wsId);
                 this.userCountry.delete(wsId);
                 this.countryQuizSystem.userCountryCache.delete(wsId);
+                this._quizTimeLeftNotified.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -3685,6 +3615,7 @@ export class GameServer extends CPUProtection {
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
       this.countryQuizSystem.userCountryCache.delete(wsId);
+      this._quizTimeLeftNotified.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -3711,6 +3642,7 @@ export class GameServer extends CPUProtection {
       this.userLanguage.delete(wsId);
       this.userCountry.delete(wsId);
       this.countryQuizSystem.userCountryCache.delete(wsId);
+      this._quizTimeLeftNotified.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
