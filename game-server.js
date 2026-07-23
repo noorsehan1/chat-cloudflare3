@@ -57,8 +57,8 @@
 };
 
 const QUIZ_SCHEDULE = {
-  START_HOUR: 23,
-  END_HOUR: 4,
+  START_HOUR: 12,
+  END_HOUR: 20,
   TIMEZONE_OFFSET: 7,
 };
 
