@@ -58,7 +58,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 8, end: 9 },
-    { start: 1, end: 4 }
+    { start: 3, end: 6 }
   ],
   TIMEZONE_OFFSET: 8,
 };
@@ -79,23 +79,7 @@ const COUNTRY_LANGUAGE_MAP = {
   'SA': { lang: 'ar', name: 'Saudi Arabia', kvKey: 'trivia_ar' },
   'AE': { lang: 'ar', name: 'UAE', kvKey: 'trivia_ar' },
   'QA': { lang: 'ar', name: 'Qatar', kvKey: 'trivia_ar' },
-  'KW': { lang: 'ar', name: 'Kuwait', kvKey: 'trivia_ar' },
-  'BH': { lang: 'ar', name: 'Bahrain', kvKey: 'trivia_ar' },
-  'OM': { lang: 'ar', name: 'Oman', kvKey: 'trivia_ar' },
-  'YE': { lang: 'ar', name: 'Yemen', kvKey: 'trivia_ar' },
-  'SY': { lang: 'ar', name: 'Syria', kvKey: 'trivia_ar' },
-  'LB': { lang: 'ar', name: 'Lebanon', kvKey: 'trivia_ar' },
-  'JO': { lang: 'ar', name: 'Jordan', kvKey: 'trivia_ar' },
-  'IQ': { lang: 'ar', name: 'Iraq', kvKey: 'trivia_ar' },
-  'EG': { lang: 'ar', name: 'Egypt', kvKey: 'trivia_ar' },
-  'DZ': { lang: 'ar', name: 'Algeria', kvKey: 'trivia_ar' },
-  'MA': { lang: 'ar', name: 'Morocco', kvKey: 'trivia_ar' },
-  'TN': { lang: 'ar', name: 'Tunisia', kvKey: 'trivia_ar' },
-  'LY': { lang: 'ar', name: 'Libya', kvKey: 'trivia_ar' },
-  'SD': { lang: 'ar', name: 'Sudan', kvKey: 'trivia_ar' },
-  'MR': { lang: 'ar', name: 'Mauritania', kvKey: 'trivia_ar' },
-  'SO': { lang: 'ar', name: 'Somalia', kvKey: 'trivia_ar' },
-  'PS': { lang: 'ar', name: 'Palestine', kvKey: 'trivia_ar' },
+
 };
 
 class CPUProtection {
@@ -1498,12 +1482,13 @@ export class GameServer extends CPUProtection {
               await this._setQuizPoints(points);
               this._broadcastQuizNotification("quizWinner", {
                 username: this.quizWinner,
-                totalPoints: points[this.quizWinner] || 0
-              });
-              this._broadcastQuizResult("quizWinner", {
-                username: this.quizWinner,
                 totalPoints: points[this.quizWinner] || 0,
                 correctAnswer: correctAnswer
+              });
+            } else {
+              this._broadcastQuizNotification("quizTimeUp", {
+                correctAnswer: correctAnswer,
+                message: "Time's up! No winner this round."
               });
             }
             this._quizTimeout = null;
@@ -1555,12 +1540,13 @@ export class GameServer extends CPUProtection {
         await this._setQuizPoints(points);
         this._broadcastQuizNotification("quizWinner", {
           username: this.quizWinner,
-          totalPoints: points[this.quizWinner] || 0
-        });
-        this._broadcastQuizResult("quizWinner", {
-          username: this.quizWinner,
           totalPoints: points[this.quizWinner] || 0,
           correctAnswer: correctAnswer
+        });
+      } else {
+        this._broadcastQuizNotification("quizTimeUp", {
+          correctAnswer: correctAnswer,
+          message: "Time's up! No winner this round."
         });
       }
       this.currentQuestion = null;
@@ -1639,15 +1625,6 @@ export class GameServer extends CPUProtection {
         username: username,
         answer: isValidAnswer ? answerKey : "?",
         isCorrect: isCorrect,
-        remainingTime: remainingText,
-        country: countryInfo.countryCode,
-        countryName: countryInfo.countryName
-      });
-      this._broadcastQuizResult("quizAnswerResult", {
-        username,
-        answer: isValidAnswer ? answerKey : "?",
-        isCorrect,
-        correctAnswer: this.currentQuestion.correct,
         remainingTime: remainingText,
         country: countryInfo.countryCode,
         countryName: countryInfo.countryName
@@ -1872,27 +1849,6 @@ export class GameServer extends CPUProtection {
         message: "Quiz telah berakhir. Kembali besok!",
         clearUI: true
       });
-    } catch(e) {}
-  }
-
-  async _broadcastQuizResult(type, data) {
-    try {
-      const wsIds = this.wsClients.get(QUIZ_ROOM);
-      if (!wsIds?.size) return;
-      const msgStr = JSON.stringify([type, data]);
-      const wsIdArray = Array.from(wsIds);
-      const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
-      this._startCPUTimer();
-      for (let i = 0; i < wsIdArray.length; i += batchSize) {
-        const batch = wsIdArray.slice(i, i + batchSize);
-        for (const wsId of batch) {
-          try {
-            const ws = this.wsMap.get(wsId);
-            if (ws && ws.readyState === 1) ws.send(msgStr);
-          } catch(e) {}
-        }
-        if (this._checkCPULimit()) { await this._cpuYield(); this._startCPUTimer(); }
-      }
     } catch(e) {}
   }
 
