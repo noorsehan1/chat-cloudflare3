@@ -509,6 +509,9 @@ export class GameServer extends CPUProtection {
       this._quizTimeLeftBroadcastCooldown = 30000;
       this._lastQuizTimeLeftBroadcast = 0;
 
+      // ✅ FLAG UNTUK CEGAH DOUBLE BROADCAST WINNER
+      this._winnerBroadcasted = false;
+
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
 
       this._loadAllQuestionsToMemory();
@@ -907,6 +910,7 @@ export class GameServer extends CPUProtection {
       this.quizAnswered = new Set();
       this._quizStartTime = null;
       this._isShowingQuestion = false;
+      this._winnerBroadcasted = false;
       if (this._eventQueue) {
         this._eventQueue = [];
       }
@@ -1394,6 +1398,10 @@ export class GameServer extends CPUProtection {
       if (this._isShowingQuestion) return;
       this._lastActivityTime = Date.now();
       this._isQuizIdle = false;
+      
+      // ✅ RESET FLAG UNTUK PERTANYAAN BARU
+      this._winnerBroadcasted = false;
+      
       if (!this._isQuizTime()) {
         const clients = this.wsClients.get(QUIZ_ROOM);
         if (clients?.size > 0) {
@@ -1442,6 +1450,7 @@ export class GameServer extends CPUProtection {
         this.quizAnswered = new Set();
         this.quizHasWinner = false;
         this.quizWinner = null;
+        this._winnerBroadcasted = false;
         this._totalQuestionsAnswered++;
         await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
         const remainingTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
@@ -1473,20 +1482,33 @@ export class GameServer extends CPUProtection {
               return; 
             }
             const correctAnswer = this.currentQuestion.correct;
+            
+            // ✅ CEK APAKAH SUDAH ADA WINNER DARI SUBMIT
             if (this.quizHasWinner && this.quizWinner) {
               const points = await this._getQuizPoints();
               points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
               await this._setQuizPoints(points);
-              // ✅ DUPLIKASI DIHAPUS - HANYA PAKAI _broadcastQuizResult
-              this._broadcastQuizResult("quizWinner", {
-                username: this.quizWinner,
-                totalPoints: points[this.quizWinner] || 0,
+              
+              // ✅ KIRIM WINNER DENGAN POINT (HANYA SEKALI)
+              if (!this._winnerBroadcasted) {
+                this._winnerBroadcasted = true;
+                this._broadcastQuizResult("quizWinner", {
+                  username: this.quizWinner,
+                  totalPoints: points[this.quizWinner] || 0,
+                  correctAnswer: correctAnswer
+                });
+              }
+            } else {
+              // ✅ TIDAK ADA WINNER, KIRIM JAWABAN BENAR
+              this._broadcastQuizResult("quizCorrectAnswer", {
                 correctAnswer: correctAnswer
               });
             }
+            
             this._quizTimeout = null;
             this.isQuizWaiting = true;
             this._isShowingQuestion = false;
+            
             this._quizBreakTimeout = setTimeout(() => {
               if (this.closing || this.isDestroyed) { 
                 this._quizBreakTimeout = null; 
@@ -1495,12 +1517,16 @@ export class GameServer extends CPUProtection {
               this.isQuizWaiting = false;
               this._quizBreakTimeout = null;
               this.currentQuestion = null;
+              // ✅ RESET FLAG UNTUK PERTANYAAN BERIKUTNYA
+              this._winnerBroadcasted = false;
             }, CONSTANTS.QUIZ_BREAK_MS);
+            
           } catch(e) {
             this._quizTimeout = null;
             this.currentQuestion = null;
             this.isQuizWaiting = false;
             this._isShowingQuestion = false;
+            this._winnerBroadcasted = false;
           }
         }, CONSTANTS.QUIZ_TIME_LIMIT_MS);
       } catch(e) {
@@ -1508,12 +1534,14 @@ export class GameServer extends CPUProtection {
         this.currentQuestion = null;
         this.isQuizWaiting = false;
         this._quizTimeout = null;
+        this._winnerBroadcasted = false;
       }
     } catch(e) {
       this._isShowingQuestion = false;
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._quizTimeout = null;
+      this._winnerBroadcasted = false;
     }
   }
 
@@ -1527,20 +1555,31 @@ export class GameServer extends CPUProtection {
         return; 
       }
       const correctAnswer = this.currentQuestion.correct;
+      
       if (this.quizHasWinner && this.quizWinner) {
         const points = await this._getQuizPoints();
         points[this.quizWinner] = (points[this.quizWinner] || 0) + 1;
         await this._setQuizPoints(points);
-        // ✅ DUPLIKASI DIHAPUS - HANYA PAKAI _broadcastQuizResult
-        this._broadcastQuizResult("quizWinner", {
-          username: this.quizWinner,
-          totalPoints: points[this.quizWinner] || 0,
+        
+        // ✅ CEK APAKAH SUDAH PERNAH DIKIRIM
+        if (!this._winnerBroadcasted) {
+          this._winnerBroadcasted = true;
+          this._broadcastQuizResult("quizWinner", {
+            username: this.quizWinner,
+            totalPoints: points[this.quizWinner] || 0,
+            correctAnswer: correctAnswer
+          });
+        }
+      } else {
+        this._broadcastQuizResult("quizCorrectAnswer", {
           correctAnswer: correctAnswer
         });
       }
+      
       this.currentQuestion = null;
       this.isQuizWaiting = true;
       this._isShowingQuestion = false;
+      
       this._quizBreakTimeout = setTimeout(() => {
         if (this.closing || this.isDestroyed) { 
           this._quizBreakTimeout = null; 
@@ -1548,11 +1587,14 @@ export class GameServer extends CPUProtection {
         }
         this.isQuizWaiting = false;
         this._quizBreakTimeout = null;
+        this._winnerBroadcasted = false;
       }, CONSTANTS.QUIZ_BREAK_MS);
+      
     } catch(e) {
       this.currentQuestion = null;
       this.isQuizWaiting = false;
       this._isShowingQuestion = false;
+      this._winnerBroadcasted = false;
     }
   }
 
@@ -1596,20 +1638,30 @@ export class GameServer extends CPUProtection {
         }
         return;
       }
+      
+      // ✅ CEK APAKAH SUDAH ADA WINNER
       if (this.quizHasWinner) {
         this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
         return;
       }
+      
+      // ✅ CEK APAKAH USER SUDAH MENJAWAB
       if (this.quizAnswered.has(username)) {
         this._safeSend(ws, ["quizError", "You already answered!"]);
         return;
       }
+      
       const answerKey = answer ? answer.toUpperCase().trim() : '';
       const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
       const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
       const remainingText = `${remaining}s remaining`;
       const wsId = this._getWsId(ws);
       const countryInfo = this.countryQuizSystem.getUserCountryInfo(wsId);
+      
+      // ✅ TANDAI USER SUDAH MENJAWAB (SEBELUM CEK KEBENARAN)
+      this.quizAnswered.add(username);
+      
+      // ✅ KIRIM NOTIFIKASI JAWABAN
       this._broadcastQuizNotification("quizAnswer", {
         username: username,
         answer: isValidAnswer ? answerKey : "?",
@@ -1618,6 +1670,7 @@ export class GameServer extends CPUProtection {
         country: countryInfo.countryCode,
         countryName: countryInfo.countryName
       });
+      
       this._broadcastQuizResult("quizAnswerResult", {
         username,
         answer: isValidAnswer ? answerKey : "?",
@@ -1627,12 +1680,25 @@ export class GameServer extends CPUProtection {
         country: countryInfo.countryCode,
         countryName: countryInfo.countryName
       });
-      this.quizAnswered.add(username);
+      
+      // ✅ JIKA BENAR DAN BELUM ADA WINNER
       if (isCorrect && !this.quizHasWinner) {
+        // ✅ SET WINNER SECARA ATOMIS
         this.quizHasWinner = true;
         this.quizWinner = username;
+        
+        // ✅ KIRIM NOTIFIKASI WINNER DENGAN COUNTRY
         this._broadcastQuizNotification("quizWinnerWithCountry", {
           username: username,
+          country: countryInfo.countryCode,
+          countryName: countryInfo.countryName
+        });
+        
+        // ✅ KIRIM WINNER RESMI (HANYA SEKALI)
+        this._broadcastQuizResult("quizWinner", {
+          username: username,
+          totalPoints: 0, // Points akan ditambahkan saat timeout
+          correctAnswer: this.currentQuestion.correct,
           country: countryInfo.countryCode,
           countryName: countryInfo.countryName
         });
@@ -1695,6 +1761,7 @@ export class GameServer extends CPUProtection {
       this._quizStartTime = null;
       this.quizEndNotified = false;
       this._isShowingQuestion = false;
+      this._winnerBroadcasted = false;
       this._quizTimeLeftNotified.clear();
       this._nextQuizNotified.clear();
       this._startQuizKeepAlive();
@@ -1803,6 +1870,7 @@ export class GameServer extends CPUProtection {
                 this.currentQuestion = null;
                 this._quizTimeout = null;
                 this._isShowingQuestion = false;
+                this._winnerBroadcasted = false;
               }
             }
           } else {
@@ -1824,6 +1892,7 @@ export class GameServer extends CPUProtection {
       this.quizWinner = null;
       this.isQuizWaiting = false;
       this._isShowingQuestion = false;
+      this._winnerBroadcasted = false;
       if (this._quizTimeout) {
         clearTimeout(this._quizTimeout);
         this._quizTimeout = null;
