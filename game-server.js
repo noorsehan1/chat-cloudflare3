@@ -3470,27 +3470,42 @@ export class GameServer extends CPUProtection {
       }
 
       if (evt === "getQuizLastWeekWinner") {
-        // LANGSUNG KE KV (TANPA CACHE)
-        const winner = await this._getLastWeekWinner();
-        if (winner) this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score, winner.week]);
-        else this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
+        try {
+          // ✅ LANGSUNG BACA DARI KV (TANPA CACHE)
+          const winner = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
+          
+          if (winner && winner.username) {
+            this._safeSend(ws, ["quizLastWeekWinner", winner.username, winner.score || 0, winner.week || ""]);
+          } else {
+            this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["quizLastWeekWinner", "", 0, ""]);
+        }
         return;
       }
 
       if (evt === "getQuizLeaderboard") {
-        let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
-        // LANGSUNG KE KV (TANPA CACHE)
-        const points = await this._getQuizPoints();
-        
-        const sorted = Object.entries(points)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, limit);
-        
-        const result = sorted.map(([username, score]) => 
-          `${username}|${score}`
-        );
-        
-        this._safeSend(ws, ["quizLeaderboard", result]);
+        try {
+          let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
+          
+          // ✅ LANGSUNG BACA DARI KV (TANPA CACHE)
+          const points = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_POINT_KEY, 'json') || {};
+          
+          // Sort berdasarkan score tertinggi
+          const sorted = Object.entries(points)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, limit);
+          
+          // Format: ["username|score", ...]
+          const result = sorted.map(([username, score]) => 
+            `${username}|${score}`
+          );
+          
+          this._safeSend(ws, ["quizLeaderboard", result]);
+        } catch(e) {
+          this._safeSend(ws, ["quizLeaderboard", []]);
+        }
         return;
       }
 
@@ -3498,9 +3513,16 @@ export class GameServer extends CPUProtection {
         try {
           if (this.env?.QUESTIONS) {
             this._incrementSubRequest();
-            // HANYA HAPUS DATA PEMENANG MINGGU LALU, TIDAK MENYENTUH POINTS
+            // ✅ BENAR-BENAR HAPUS DARI KV
             await this.env.QUESTIONS.delete(CONSTANTS.QUIZ_LAST_WEEK_WINNER);
-            this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner data deleted successfully"]);
+            
+            // ✅ VERIFIKASI: Cek apakah sudah terhapus
+            const check = await this.env.QUESTIONS.get(CONSTANTS.QUIZ_LAST_WEEK_WINNER, 'json');
+            if (!check) {
+              this._safeSend(ws, ["quizLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
+            } else {
+              this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "Failed to delete"]);
+            }
           } else {
             this._safeSend(ws, ["quizLastWeekWinnerDeleted", false, "KV not available"]);
           }
