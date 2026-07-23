@@ -57,8 +57,8 @@ const CONSTANTS = {
 };
 
 const QUIZ_SCHEDULE = {
-  START_HOUR: 13,
-  END_HOUR: 16,
+  START_HOUR: 23,
+  END_HOUR: 4,
   TIMEZONE_OFFSET: 7,
 };
 
@@ -336,6 +336,17 @@ class CountryBasedQuizSystem {
     }
   }
 
+  getQuestionByIndex(langCode, index) {
+    try {
+      const questions = this.getQuestionsByLanguage(langCode);
+      if (!questions || questions.length === 0) return null;
+      const safeIndex = index % questions.length;
+      return questions[safeIndex] || null;
+    } catch(e) {
+      return null;
+    }
+  }
+
   getRandomQuestion(langCode) {
     try {
       const questions = this.getQuestionsByLanguage(langCode);
@@ -358,88 +369,6 @@ class CountryBasedQuizSystem {
       return { question: availableQuestions[randomIndex], index: originalIndex };
     } catch(e) {
       return null;
-    }
-  }
-
-  async getQuestionsForUsers(questionId, originalQuestion, originalOptions, wsIds) {
-    try {
-      const results = new Map();
-      const usersByCountry = new Map();
-      
-      if (!this._isLoaded && !this._loading) {
-        await this.loadAllQuestions();
-      }
-
-      for (const wsId of wsIds) {
-        const country = this.gameServer.userCountry.get(wsId) || 'US';
-        if (!usersByCountry.has(country)) {
-          usersByCountry.set(country, []);
-        }
-        usersByCountry.get(country).push(wsId);
-      }
-
-      for (const [country, userWsIds] of usersByCountry) {
-        const info = this.countryLanguageMap[country];
-        const lang = info?.lang || 'en';
-        
-        const randomResult = this.getRandomQuestion(lang);
-        
-        if (randomResult) {
-          const q = randomResult.question;
-          const foundQuestion = q.question || q.text;
-          const foundOptions = q.options || q.choices || { A: '', B: '', C: '', D: '' };
-          
-          const optionKeys = ['A', 'B', 'C', 'D'];
-          const formattedOptions = {};
-          if (Array.isArray(foundOptions)) {
-            optionKeys.forEach((key, index) => {
-              formattedOptions[key] = foundOptions[index] || '';
-            });
-          } else {
-            optionKeys.forEach((key) => {
-              formattedOptions[key] = foundOptions[key] || '';
-            });
-          }
-          
-          for (const wsId of userWsIds) {
-            results.set(wsId, {
-              question: foundQuestion,
-              options: formattedOptions,
-              language: lang,
-              country: country,
-              countryName: info?.name || 'Unknown',
-              isTranslated: lang !== 'en',
-              questionIndex: randomResult.index
-            });
-          }
-          continue;
-        }
-
-        for (const wsId of userWsIds) {
-          results.set(wsId, {
-            question: originalQuestion,
-            options: originalOptions,
-            language: 'en',
-            country: country,
-            countryName: info?.name || 'Unknown',
-            isTranslated: false
-          });
-        }
-      }
-
-      return results;
-    } catch(e) {
-      const fallback = new Map();
-      for (const wsId of wsIds) {
-        fallback.set(wsId, {
-          question: originalQuestion,
-          options: originalOptions,
-          language: 'en',
-          isTranslated: false,
-          error: e.message
-        });
-      }
-      return fallback;
     }
   }
 
@@ -570,6 +499,9 @@ export class GameServer extends CPUProtection {
       this.quizEndedToday = false;
       this.quizEndMessageShown = false;
       this.quizEndNotified = false;
+
+      // Global question index yang SAMA untuk semua user
+      this._globalQuestionIndex = 0;
 
       this._quizTimeLeftNotified = new Map();
       this._quizTimeLeftBroadcastCooldown = 30000;
@@ -1323,6 +1255,8 @@ export class GameServer extends CPUProtection {
     } catch(e) { return false; }
   }
 
+  // ==================== BROADCAST QUIZ QUESTION - SAME FOR ALL USERS ====================
+
   async _broadcastQuizQuestion(question, options) {
     try {
       const wsIds = this.wsClients.get(QUIZ_ROOM);
@@ -1330,12 +1264,53 @@ export class GameServer extends CPUProtection {
 
       const userWsIds = Array.from(wsIds);
       
-      const translatedResults = await this.countryQuizSystem.getQuestionsForUsers(
-        this._questionPointer,
-        question,
-        options,
-        userWsIds
-      );
+      // Gunakan index global yang SAMA untuk semua user
+      const globalIndex = this._globalQuestionIndex;
+      
+      const results = new Map();
+      
+      for (const wsId of userWsIds) {
+        const country = this.userCountry.get(wsId) || 'US';
+        const info = COUNTRY_LANGUAGE_MAP[country];
+        const lang = info?.lang || 'en';
+        
+        let translatedQuestion = question;
+        let translatedOptions = options;
+        let isTranslated = false;
+        
+        // Jika bahasa bukan English, ambil pertanyaan dengan nomor YANG SAMA
+        if (lang !== 'en') {
+          const translatedQ = this.countryQuizSystem.getQuestionByIndex(lang, globalIndex);
+          
+          if (translatedQ) {
+            translatedQuestion = translatedQ.question || translatedQ.text || question;
+            const foundOptions = translatedQ.options || translatedQ.choices || { A: '', B: '', C: '', D: '' };
+            translatedOptions = {};
+            const optionKeys = ['A', 'B', 'C', 'D'];
+            if (Array.isArray(foundOptions)) {
+              optionKeys.forEach((key, index) => {
+                translatedOptions[key] = foundOptions[index] || '';
+              });
+            } else {
+              optionKeys.forEach((key) => {
+                translatedOptions[key] = foundOptions[key] || '';
+              });
+            }
+            isTranslated = true;
+          }
+        }
+        
+        results.set(wsId, {
+          question: translatedQuestion,
+          options: translatedOptions,
+          language: lang,
+          country: country,
+          countryName: info?.name || 'Unknown',
+          isTranslated: isTranslated,
+          questionId: globalIndex + 1,
+          questionNumber: globalIndex + 1
+        });
+      }
 
       const batchSize = CONSTANTS.BROADCAST_BATCH_SIZE;
       this._startCPUTimer();
@@ -1347,7 +1322,7 @@ export class GameServer extends CPUProtection {
             const ws = this.wsMap.get(wsId);
             if (!ws || ws.readyState !== 1) continue;
 
-            const userQuestion = translatedResults.get(wsId);
+            const userQuestion = results.get(wsId);
             if (userQuestion) {
               const message = ["quizQuestion", {
                 question: userQuestion.question,
@@ -1356,7 +1331,8 @@ export class GameServer extends CPUProtection {
                 country: userQuestion.country,
                 countryName: userQuestion.countryName,
                 isTranslated: userQuestion.isTranslated,
-                questionId: this._questionPointer
+                questionId: userQuestion.questionId,
+                questionNumber: userQuestion.questionNumber
               }];
               this._safeSend(ws, message);
             }
@@ -1381,6 +1357,8 @@ export class GameServer extends CPUProtection {
       }
     }
   }
+
+  // ==================== SHOW QUESTION - MODIFIED ====================
 
   async _showQuestion() {
     try {
@@ -1411,26 +1389,19 @@ export class GameServer extends CPUProtection {
       this._isShowingQuestion = true;
 
       try {
-        this._checkAndLoadNextBatch();
-        const questions = this.quizQuestionCache['en'] || [];
-        if (questions.length === 0) {
-          if (!this._loadNextBatch()) {
-            this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
-            this._isShowingQuestion = false;
-            return;
-          }
-        }
-
-        const totalQuestions = this._allQuestions.length;
-        if (totalQuestions === 0) {
+        // Pastikan pertanyaan English sudah dimuat
+        const enQuestions = this.countryQuizSystem.getQuestionsByLanguage('en');
+        if (!enQuestions || enQuestions.length === 0) {
+          this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
           this._isShowingQuestion = false;
           return;
         }
         
-        const randomIndex = Math.floor(Math.random() * totalQuestions);
-        const q = this._allQuestions[randomIndex];
+        // Pilih 1 nomor RANDOM dari pertanyaan English
+        const randomIndex = Math.floor(Math.random() * enQuestions.length);
+        const q = enQuestions[randomIndex];
         
-        if (!q?.options) {
+        if (!q) {
           this._isShowingQuestion = false;
           setTimeout(() => {
             if (!this.closing && !this.isDestroyed) {
@@ -1440,15 +1411,20 @@ export class GameServer extends CPUProtection {
           return;
         }
 
+        // SIMPAN NOMOR GLOBAL yang SAMA untuk semua user
+        this._globalQuestionIndex = randomIndex;
+        this._questionPointer = randomIndex + 1;
+
+        // Shuffle options
         const shuffled = this._shuffleQuestionOptions(q);
         this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
         this._quizStartTime = Date.now();
         this.quizAnswered = new Set();
         this.quizHasWinner = false;
         this.quizWinner = null;
-        this._questionPointer = randomIndex + 1;
         this._totalQuestionsAnswered++;
 
+        // Kirim pertanyaan dengan nomor yang SAMA ke semua user
         await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
         
         const remainingTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
