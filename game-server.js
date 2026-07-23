@@ -500,10 +500,10 @@ export class GameServer extends CPUProtection {
       this.quizEndMessageShown = false;
       this.quizEndNotified = false;
 
-      // Global question index yang SAMA untuk semua user
       this._globalQuestionIndex = 0;
 
       this._quizTimeLeftNotified = new Map();
+      this._nextQuizNotified = new Map();
       this._quizTimeLeftBroadcastCooldown = 30000;
       this._lastQuizTimeLeftBroadcast = 0;
 
@@ -1057,13 +1057,15 @@ export class GameServer extends CPUProtection {
         this.quizEndedToday = false;
         this.quizEndMessageShown = false;
         this.quizEndNotified = false;
+        this._nextQuizNotified.clear();
+        
         if (!this.quizAutoEnabled) {
           this.quizAutoEnabled = true;
           const wsIds = this.wsClients.get(QUIZ_ROOM);
           if (wsIds?.size > 0) {
             let hasUnnotified = false;
             for (const wsId of wsIds) {
-              if (!this._quizTimeLeftNotified.has(wsId)) {
+              if (!this._quizTimeLeftNotified.has(wsId) && !this._nextQuizNotified.has(wsId)) {
                 hasUnnotified = true;
                 break;
               }
@@ -1088,6 +1090,7 @@ export class GameServer extends CPUProtection {
           await this.resetQuiz();
           this._clearQuizData();
           this._quizTimeLeftNotified.clear();
+          this._nextQuizNotified.clear();
           this._sendQuizEndNotificationOnce();
         }
         return true;
@@ -1255,16 +1258,12 @@ export class GameServer extends CPUProtection {
     } catch(e) { return false; }
   }
 
-  // ==================== BROADCAST QUIZ QUESTION - SAME FOR ALL USERS ====================
-
   async _broadcastQuizQuestion(question, options) {
     try {
       const wsIds = this.wsClients.get(QUIZ_ROOM);
       if (!wsIds?.size) return;
 
       const userWsIds = Array.from(wsIds);
-      
-      // Gunakan index global yang SAMA untuk semua user
       const globalIndex = this._globalQuestionIndex;
       
       const results = new Map();
@@ -1278,7 +1277,6 @@ export class GameServer extends CPUProtection {
         let translatedOptions = options;
         let isTranslated = false;
         
-        // Jika bahasa bukan English, ambil pertanyaan dengan nomor YANG SAMA
         if (lang !== 'en') {
           const translatedQ = this.countryQuizSystem.getQuestionByIndex(lang, globalIndex);
           
@@ -1358,8 +1356,6 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ==================== SHOW QUESTION - MODIFIED ====================
-
   async _showQuestion() {
     try {
       if (this._isShowingQuestion) return;
@@ -1389,7 +1385,6 @@ export class GameServer extends CPUProtection {
       this._isShowingQuestion = true;
 
       try {
-        // Pastikan pertanyaan English sudah dimuat
         const enQuestions = this.countryQuizSystem.getQuestionsByLanguage('en');
         if (!enQuestions || enQuestions.length === 0) {
           this._broadcastToRoom(QUIZ_ROOM, ["quizError", "No questions available!"]);
@@ -1397,7 +1392,6 @@ export class GameServer extends CPUProtection {
           return;
         }
         
-        // Pilih 1 nomor RANDOM dari pertanyaan English
         const randomIndex = Math.floor(Math.random() * enQuestions.length);
         const q = enQuestions[randomIndex];
         
@@ -1411,11 +1405,9 @@ export class GameServer extends CPUProtection {
           return;
         }
 
-        // SIMPAN NOMOR GLOBAL yang SAMA untuk semua user
         this._globalQuestionIndex = randomIndex;
         this._questionPointer = randomIndex + 1;
 
-        // Shuffle options
         const shuffled = this._shuffleQuestionOptions(q);
         this.currentQuestion = { ...q, options: shuffled.options, correct: shuffled.correct };
         this._quizStartTime = Date.now();
@@ -1424,7 +1416,6 @@ export class GameServer extends CPUProtection {
         this.quizWinner = null;
         this._totalQuestionsAnswered++;
 
-        // Kirim pertanyaan dengan nomor yang SAMA ke semua user
         await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
         
         const remainingTime = CONSTANTS.QUIZ_TIME_LIMIT_MS / 1000;
@@ -1697,6 +1688,7 @@ export class GameServer extends CPUProtection {
               this.resetQuiz();
               this._clearQuizData();
               this._quizTimeLeftNotified.clear();
+              this._nextQuizNotified.clear();
               this._sendQuizEndNotificationOnce();
             }
           }
@@ -1720,6 +1712,7 @@ export class GameServer extends CPUProtection {
       this.quizEndNotified = false;
       this._isShowingQuestion = false;
       this._quizTimeLeftNotified.clear();
+      this._nextQuizNotified.clear();
       this._startQuizKeepAlive();
     } catch(e) {}
   }
@@ -1893,6 +1886,10 @@ export class GameServer extends CPUProtection {
         return false;
       }
       
+      if (this._nextQuizNotified.has(wsId)) {
+        return false;
+      }
+      
       const timeInfo = this._getTimeLeftUntilNextEvent();
       const timeLeft = this._getTimeLeftUntilNextQuiz();
       let message = "", canType = true, isQuizTime = timeInfo.isRunning;
@@ -1913,6 +1910,7 @@ export class GameServer extends CPUProtection {
         message = `⏱️ Next quiz in ${timeLeft.text}`;
         canType = true;
         this._safeSend(ws, ["quizTimeLeft", message, canType, isQuizTime]);
+        this._nextQuizNotified.set(wsId, Date.now());
       }
       
       this._quizTimeLeftNotified.set(wsId, Date.now());
@@ -1955,7 +1953,7 @@ export class GameServer extends CPUProtection {
       let hasUnnotified = false;
       
       for (const wsId of wsIdArray) {
-        if (!this._quizTimeLeftNotified.has(wsId)) {
+        if (!this._quizTimeLeftNotified.has(wsId) && !this._nextQuizNotified.has(wsId)) {
           hasUnnotified = true;
           break;
         }
@@ -1965,12 +1963,15 @@ export class GameServer extends CPUProtection {
       
       const msgStr = JSON.stringify(["quizTimeLeft", message, canType, isQuizTime]);
       for (const wsId of wsIdArray) {
-        if (!this._quizTimeLeftNotified.has(wsId)) {
+        if (!this._quizTimeLeftNotified.has(wsId) && !this._nextQuizNotified.has(wsId)) {
           try {
             const ws = this.wsMap.get(wsId);
             if (ws && ws.readyState === 1) {
               ws.send(msgStr);
               this._quizTimeLeftNotified.set(wsId, now);
+              if (!isQuizTime) {
+                this._nextQuizNotified.set(wsId, now);
+              }
             }
           } catch(e) {}
         }
@@ -2097,6 +2098,7 @@ export class GameServer extends CPUProtection {
       const username = ws.username;
       
       this._quizTimeLeftNotified.delete(wsId);
+      this._nextQuizNotified.delete(wsId);
       
       this._removeClientFromRoom(room, wsId);
       this.clientRooms.delete(wsId);
@@ -2160,6 +2162,7 @@ export class GameServer extends CPUProtection {
           ws.roomname = roomName;
           if (roomName === QUIZ_ROOM) {
             this._quizTimeLeftNotified.delete(wsId);
+            this._nextQuizNotified.delete(wsId);
             if (!this._isAllQuestionsLoaded || this._allQuestions.length === 0) await this._initQuiz();
             if (this._isQuizTime() && !this.quizAutoEnabled) { this.quizAutoEnabled = true; this.forceStartQuiz(); }
             setTimeout(() => { if (!this.closing && !this.isDestroyed) this._sendQuizTimeLeftToUser(ws); }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
@@ -2184,6 +2187,7 @@ export class GameServer extends CPUProtection {
 
         if (roomName === QUIZ_ROOM) {
           this._quizTimeLeftNotified.delete(wsId);
+          this._nextQuizNotified.delete(wsId);
           let country = this.userCountry.get(wsId);
           if (!country) { const cf = ws._cf || {}; country = cf.country || 'US'; this.userCountry.set(wsId, country); }
           this._setUserLanguage(ws, country);
@@ -3434,6 +3438,7 @@ export class GameServer extends CPUProtection {
           this.userLanguage.delete(wsId);
           this.userCountry.delete(wsId);
           this._quizTimeLeftNotified.delete(wsId);
+          this._nextQuizNotified.delete(wsId);
           for (const [username, conn] of this.userConnections) {
             if (conn?.wsId === wsId) { this.userConnections.delete(username); break; }
           }
@@ -3524,6 +3529,7 @@ export class GameServer extends CPUProtection {
                 this.userCountry.delete(wsId);
                 this.countryQuizSystem.userCountryCache.delete(wsId);
                 this._quizTimeLeftNotified.delete(wsId);
+                this._nextQuizNotified.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -3545,6 +3551,7 @@ export class GameServer extends CPUProtection {
                 this.userCountry.delete(wsId);
                 this.countryQuizSystem.userCountryCache.delete(wsId);
                 this._quizTimeLeftNotified.delete(wsId);
+                this._nextQuizNotified.delete(wsId);
                 if (username) {
                   const conn = this.userConnections.get(username);
                   if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -3592,6 +3599,7 @@ export class GameServer extends CPUProtection {
       this.userCountry.delete(wsId);
       this.countryQuizSystem.userCountryCache.delete(wsId);
       this._quizTimeLeftNotified.delete(wsId);
+      this._nextQuizNotified.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
@@ -3619,6 +3627,7 @@ export class GameServer extends CPUProtection {
       this.userCountry.delete(wsId);
       this.countryQuizSystem.userCountryCache.delete(wsId);
       this._quizTimeLeftNotified.delete(wsId);
+      this._nextQuizNotified.delete(wsId);
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
