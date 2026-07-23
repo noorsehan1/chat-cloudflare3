@@ -434,10 +434,8 @@ export class GameServer extends CPUProtection {
       this._maxRecoveryAttempts = 3;
       this._lastRecoveryTime = 0;
 
-      // Flag to prevent duplicate winner processing
       this._winnerProcessed = false;
 
-      // User activity tracking
       this._lastActivityTime = new Map();
 
       this._questionsCache = {
@@ -517,9 +515,6 @@ export class GameServer extends CPUProtection {
 
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
 
-      // Validate schedule
-      this._validateSchedule();
-
       this._loadAllQuestionsToMemory();
 
       this._initAsync();
@@ -544,49 +539,10 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ===== VALIDATE SCHEDULE =====
-  _validateSchedule() {
-    try {
-      console.log('[SCHEDULE] Quiz sessions:');
-      for (const session of QUIZ_SCHEDULE.SESSIONS) {
-        console.log(`  ${session.start}:00 - ${session.end}:00 WITA`);
-        
-        // Validate hours
-        if (session.start < 0 || session.start > 23) {
-          console.error(`Invalid start hour: ${session.start}`);
-        }
-        if (session.end < 0 || session.end > 24) {
-          console.error(`Invalid end hour: ${session.end}`);
-        }
-        if (session.start === session.end) {
-          console.error(`Start and end cannot be same: ${session.start}`);
-        }
-      }
-      
-      // Check for overlaps
-      const sorted = [...QUIZ_SCHEDULE.SESSIONS].sort((a, b) => a.start - b.start);
-      for (let i = 0; i < sorted.length - 1; i++) {
-        const current = sorted[i];
-        const next = sorted[i + 1];
-        if (current.end > next.start) {
-          console.warn(`[SCHEDULE] Overlap detected: ${current.start}-${current.end} and ${next.start}-${next.end}`);
-        }
-        const gap = next.start - current.end;
-        if (gap < 1) {
-          console.warn(`[SCHEDULE] Small gap: ${gap}h between sessions`);
-        }
-      }
-    } catch(e) {}
-  }
-
   // ===== FIXED: Centralized winner handler =====
   async _handleQuizWinner(username, correctAnswer) {
     try {
-      if (this._winnerProcessed) {
-        console.log(`[QUIZ] Winner ${username} already processed, skipping duplicate`);
-        return;
-      }
-      
+      if (this._winnerProcessed) return;
       this._winnerProcessed = true;
       
       const points = await this._getQuizPoints();
@@ -609,7 +565,6 @@ export class GameServer extends CPUProtection {
       }, 5000);
       
     } catch(e) {
-      console.error('[QUIZ] Error handling winner:', e);
       this._winnerProcessed = false;
     }
   }
@@ -629,9 +584,6 @@ export class GameServer extends CPUProtection {
           const connRoom = username ? this.userConnections.get(username)?.room : null;
           
           if (clientRoom !== wsRoom || (connRoom && clientRoom !== connRoom)) {
-            console.log(`[VERIFY] Fixing inconsistency for ${wsId}:`);
-            console.log(`  clientRooms: ${clientRoom}, ws.room: ${wsRoom}, conn.room: ${connRoom}`);
-            
             if (clientRoom) {
               ws.room = clientRoom;
               ws.roomname = clientRoom;
@@ -646,9 +598,7 @@ export class GameServer extends CPUProtection {
             }
           }
         }
-      } catch(e) {
-        console.error('[VERIFY] Error:', e);
-      }
+      } catch(e) {}
     }, 30000);
   }
 
@@ -695,7 +645,6 @@ export class GameServer extends CPUProtection {
       this._verifyRoomConsistency(wsId, room);
       return room;
     } catch(e) { 
-      console.error('_ensureRoomConsistency error:', e);
       return null; 
     }
   }
@@ -710,11 +659,6 @@ export class GameServer extends CPUProtection {
       const room3 = conn?.room;
       
       if (room1 !== expectedRoom || room2 !== expectedRoom || room3 !== expectedRoom) {
-        console.warn(`[VERIFY] Inconsistency detected for ${wsId}:`);
-        console.warn(`  clientRooms: ${room1}, expected: ${expectedRoom}`);
-        console.warn(`  ws.room: ${room2}, expected: ${expectedRoom}`);
-        console.warn(`  userConnections: ${room3}, expected: ${expectedRoom}`);
-        
         this.clientRooms.set(wsId, expectedRoom);
         if (ws) { ws.room = expectedRoom; ws.roomname = expectedRoom; }
         if (conn) conn.room = expectedRoom;
@@ -766,7 +710,6 @@ export class GameServer extends CPUProtection {
           return;
         }
         
-        // ATOMIC SWITCH: Add to new room first, then remove from old
         this._addClient(roomName, ws, username, false);
         
         ws.room = roomName;
@@ -811,7 +754,6 @@ export class GameServer extends CPUProtection {
         }, 100);
       }
     } catch(e) {
-      console.error('[SWITCH] Error:', e);
       this._safeSend(ws, ["gameLowCardError", "Switch failed"]);
       const wsId = this._getWsId(ws);
       if (wsId) this._switchLocks.delete(`switch_${wsId}`);
@@ -859,9 +801,7 @@ export class GameServer extends CPUProtection {
           }
         }
       }, CONSTANTS.QUIZ_SWITCH_DELAY_MS);
-    } catch(e) {
-      console.error('[QUIZ SWITCH] Error:', e);
-    }
+    } catch(e) {}
   }
 
   // ===== FIXED: submitQuizAnswer with auto-fix =====
@@ -874,12 +814,10 @@ export class GameServer extends CPUProtection {
       
       const wsId = this._getWsId(ws);
       
-      // Update activity
       if (wsId) this._lastActivityTime.set(wsId, Date.now());
       
       let room = this._ensureRoomConsistency(ws);
       
-      // AUTO-FIX: If user should be in Quiz room but isn't, fix it
       if (room !== QUIZ_ROOM) {
         if (ws.username) {
           const conn = this.userConnections.get(ws.username);
@@ -890,7 +828,6 @@ export class GameServer extends CPUProtection {
             if (!this.wsClients.has(QUIZ_ROOM)) this.wsClients.set(QUIZ_ROOM, new Set());
             this.wsClients.get(QUIZ_ROOM).add(wsId);
             room = QUIZ_ROOM;
-            console.log(`[QUIZ] Auto-fixed room for ${username} to Quiz`);
           } else {
             this._safeSend(ws, ["quizError", "Quiz only available in Quiz room"]);
             return;
@@ -1037,9 +974,7 @@ export class GameServer extends CPUProtection {
       
       this._verifyRoomConsistency(wsId, room);
       
-    } catch(e) {
-      console.error('[ADD CLIENT] Error:', e);
-    }
+    } catch(e) {}
   }
 
   // ===== FIXED: _removeClient with cleanup =====
@@ -1098,9 +1033,8 @@ export class GameServer extends CPUProtection {
       for (const [wsId, ws] of this.wsMap) {
         if (ws && ws._switching) continue;
         
-        // Check activity - don't remove active users
         const lastActivity = this._lastActivityTime.get(wsId) || 0;
-        if (now - lastActivity < 60000) continue; // Active within 1 minute
+        if (now - lastActivity < 60000) continue;
         
         if (!ws || ws.readyState !== 1 || ws._closing) toRemove.push(wsId);
       }
@@ -1129,7 +1063,6 @@ export class GameServer extends CPUProtection {
     try {
       const now = Date.now();
       for (const [room, game] of this.activeGames) {
-        // Skip Quiz room
         if (room === QUIZ_ROOM) continue;
         
         if (!game) continue;
@@ -1389,7 +1322,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ===== FIXED: _sendQuizEndNotificationOnce with English =====
+  // ===== FIXED: _sendQuizEndNotificationOnce =====
   _sendQuizEndNotificationOnce() {
     try {
       if (this.quizEndNotified) return;
@@ -1407,7 +1340,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ===== FIXED: _sendQuizErrorWithTime with English =====
+  // ===== FIXED: _sendQuizErrorWithTime =====
   _sendQuizErrorWithTime(ws, errorType, customMessage = null) {
     try {
       if (!ws || ws.readyState !== 1) return false;
@@ -1434,7 +1367,7 @@ export class GameServer extends CPUProtection {
     } catch(e) { return false; }
   }
 
-  // ===== FIXED: _sendQuizTimeLeftToUser with English =====
+  // ===== FIXED: _sendQuizTimeLeftToUser =====
   _sendQuizTimeLeftToUser(ws) {
     try {
       if (!ws || ws.readyState !== 1) return false;
@@ -1470,7 +1403,7 @@ export class GameServer extends CPUProtection {
     } catch(e) { return false; }
   }
 
-  // ===== FIXED: _broadcastQuizTimeLeft with English =====
+  // ===== FIXED: _broadcastQuizTimeLeft =====
   _broadcastQuizTimeLeft() {
     try {
       const wsIds = this.wsClients.get(QUIZ_ROOM);
@@ -1535,7 +1468,6 @@ export class GameServer extends CPUProtection {
         let startTotal = session.start * 60;
         let endTotal = session.end * 60;
         
-        // Handle session that crosses midnight
         if (startTotal > endTotal) {
           if (currentTotal >= startTotal || currentTotal < endTotal) {
             return true;
@@ -1605,12 +1537,12 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ===== NEW: getWsId method =====
+  // ===== getWsId method =====
   _getWsId(ws) { 
     return ws?._wsId || null; 
   }
 
-  // ===== NEW: getRoomForWs method =====
+  // ===== getRoomForWs method =====
   _getRoomForWs(ws) {
     if (!ws) return null;
     return ws.room || ws.roomname || null;
@@ -1620,7 +1552,6 @@ export class GameServer extends CPUProtection {
   async _forceCleanupGame(room, game) {
     try {
       if (!game) return;
-      // Skip Quiz room
       if (room === QUIZ_ROOM) return;
       
       const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
@@ -1644,7 +1575,6 @@ export class GameServer extends CPUProtection {
   _deleteGame(room, game) {
     try {
       if (!room || !game) return;
-      // Skip Quiz room
       if (room === QUIZ_ROOM) return;
       
       if (game?._isActive && !game._gameEnded) return;
@@ -1694,7 +1624,6 @@ export class GameServer extends CPUProtection {
   _scheduleGameCleanup(room, game) {
     try {
       if (!room || !game) return;
-      // Skip Quiz room
       if (room === QUIZ_ROOM) return;
       
       if (this._cleanupTimers.has(room)) {
@@ -1720,7 +1649,6 @@ export class GameServer extends CPUProtection {
   }
 
   // ===== All other game methods remain the same =====
-  // (kept from original file)
 
   // ===== FETCH HANDLER =====
   async fetch(req) {
@@ -1790,7 +1718,6 @@ export class GameServer extends CPUProtection {
           server._country = country;
           server._language = lang;
           
-          // Track activity
           this._lastActivityTime.set(wsId, Date.now());
           
           try { this.state.acceptWebSocket(server); } catch(e) { 
@@ -1801,7 +1728,6 @@ export class GameServer extends CPUProtection {
             try {
               const data = JSON.parse(event.data);
               if (Array.isArray(data) && data.length > 0) {
-                // Update activity
                 const wsId2 = this._getWsId(server);
                 if (wsId2) this._lastActivityTime.set(wsId2, Date.now());
                 await this.handleEvent(server, data);
