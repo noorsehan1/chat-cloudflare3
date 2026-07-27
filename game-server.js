@@ -20,9 +20,9 @@ const CONSTANTS = {
   STUCK_DRAW_TIMEOUT_MS: 60000,
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
   QUIZ_INTERVAL_MS: 30000,
-  QUIZ_READING_TIME_MS: 5000,
+  QUIZ_READING_TIME_MS: 10000,
   QUIZ_ANSWER_TIME_MS: 10000,
-  QUIZ_TOTAL_TIME_MS: 30000,
+  QUIZ_TOTAL_TIME_MS: 20000,
   QUIZ_BREAK_MS: 2000,
   QUIZ_START_DELAY_MS: 5000,
   MAX_RETRY_INIT_QUIZ: 2,
@@ -1969,7 +1969,7 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ==================== submitQuizAnswer - SATU KALI SUBMIT ====================
+  // ==================== submitQuizAnswer - JAWABAN TETAP TERLIHAT ====================
   async submitQuizAnswer(ws, username, answer) {
     try {
       if (!ws || !username) {
@@ -2023,26 +2023,40 @@ export class GameServer extends CPUProtection {
       
       const answerRemaining = this._getAnswerRemainingTime();
       
-      // ⭐ CEK APAKAH WAKTU ANSWER SUDAH HABIS
-      if (!isReadingTime && answerRemaining <= 0) {
-        if (this.quizHasWinner && this.quizWinner) {
-          this._safeSend(ws, ["quizError", "Time's up! Winner: " + this.quizWinner]);
-        } else {
-          this._safeSend(ws, ["quizError", "Time's up!"]);
-        }
-        return;
-      }
-      
-      if (this.quizHasWinner) {
-        this._safeSend(ws, ["quizError", "Someone already answered correctly!"]);
-        return;
-      }
-      
       const answerKey = answer ? answer.toUpperCase().trim() : '';
       const isValidAnswer = ['A', 'B', 'C', 'D'].includes(answerKey);
       const wsId = this._getWsId(ws);
       const countryInfo = this.countryQuizSystem.getUserCountryInfo(wsId);
       const answerDisplay = isValidAnswer ? answerKey : "?";
+      
+      // ⭐ CEK JIKA SUDAH ADA WINNER
+      const hasWinner = this.quizHasWinner && this.quizWinner;
+      
+      // ⭐ CEK APAKAH WAKTU ANSWER SUDAH HABIS
+      if (!isReadingTime && answerRemaining <= 0) {
+        // ⭐ TETAP TAMPILKAN JAWABAN WALAUPUN TIME UP
+        this._broadcastQuizNotification("quizAnswerLate", {
+          username: username,
+          answer: answerDisplay,
+          isCorrect: false,
+          remainingTime: "0s (Time's up!)",
+          country: countryInfo.countryCode,
+          countryName: countryInfo.countryName,
+          message: "⏰ Time's up! Jawaban terlihat tapi tidak dihitung.",
+          hasWinner: hasWinner,
+          winner: hasWinner ? this.quizWinner : null
+        });
+        
+        // ⭐ TAMBAHKAN KE quizAnswered AGAR TIDAK BISA SUBMIT LAGI
+        this.quizAnswered.add(username);
+        
+        if (hasWinner) {
+          this._safeSend(ws, ["quizError", `Time's up! Winner: ${this.quizWinner}`]);
+        } else {
+          this._safeSend(ws, ["quizError", "Time's up!"]);
+        }
+        return;
+      }
       
       // ⭐ ============================================================
       // ⭐ JIKA READING TIME - TAMPILKAN TAPI TIDAK DIVALIDASI
@@ -2056,23 +2070,24 @@ export class GameServer extends CPUProtection {
           status: "reading",
           country: countryInfo.countryCode,
           countryName: countryInfo.countryName,
-          message: "⏳ Jawaban saat membaca TIDAK dihitung. Kirim ulang saat waktu menjawab!"
+          message: hasWinner ? `⏳ Jawaban terlihat, tapi sudah ada winner: ${this.quizWinner}` : "⏳ Jawaban saat membaca TIDAK dihitung. Kirim ulang saat waktu menjawab!",
+          hasWinner: hasWinner,
+          winner: hasWinner ? this.quizWinner : null
         });
         
         this._safeSend(ws, ["quizAnswerReading", {
           username: username,
           answer: answerDisplay,
           readingTimeLeft: readingTimeLeft,
-          message: `⏳ "${answerDisplay}" TIDAK dihitung! Kirim ulang saat waktu menjawab (${CONSTANTS.QUIZ_ANSWER_TIME_MS / 1000}s).`,
+          message: hasWinner ? 
+            `⏳ "${answerDisplay}" terlihat! Tapi sudah ada winner: ${this.quizWinner}` :
+            `⏳ "${answerDisplay}" TIDAK dihitung! Kirim ulang saat waktu menjawab (${CONSTANTS.QUIZ_ANSWER_TIME_MS / 1000}s).`,
           status: "waiting",
           notCounted: true
         }]);
         
         // ⭐ TAMBAHKAN KE quizAnswered (TIDAK BISA SUBMIT LAGI DI READING TIME)
         this.quizAnswered.add(username);
-        
-        // ⭐ JANGAN SIMPAN - JAWABAN DIABAIKAN
-        // User HARUS submit ulang di answer time
         
         return;
       }
@@ -2084,6 +2099,41 @@ export class GameServer extends CPUProtection {
       // ⭐ VALIDASI NORMAL (ANSWER TIME)
       const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
       const remainingText = `${answerRemaining}s remaining`;
+      
+      // ⭐ JIKA SUDAH ADA WINNER, JAWABAN TETAP DITAMPILKAN TAPI TIDAK DAPAT POIN
+      if (hasWinner) {
+        // Tampilkan jawaban user tapi tidak dapat poin
+        this._broadcastQuizNotification("quizAnswer", {
+          username: username,
+          answer: answerDisplay,
+          isCorrect: isCorrect,
+          remainingTime: remainingText,
+          country: countryInfo.countryCode,
+          countryName: countryInfo.countryName,
+          gotPoint: false,
+          hasWinner: true,
+          winner: this.quizWinner,
+          message: `⚠️ Jawaban terlihat, tapi sudah ada winner: ${this.quizWinner}`
+        });
+        
+        this._broadcastQuizResult("quizAnswerResult", {
+          username,
+          answer: answerDisplay,
+          isCorrect,
+          correctAnswer: this.currentQuestion.correct,
+          remainingTime: remainingText,
+          country: countryInfo.countryCode,
+          countryName: countryInfo.countryName,
+          gotPoint: false,
+          hasWinner: true,
+          winner: this.quizWinner
+        });
+        
+        // ⭐ TAMBAHKAN KE quizAnswered (TIDAK BISA SUBMIT LAGI)
+        this.quizAnswered.add(username);
+        
+        return;
+      }
       
       // ⭐ JIKA JAWABAN BENAR, BERI POIN
       if (isCorrect && !this.quizHasWinner) {
