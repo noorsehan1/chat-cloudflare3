@@ -61,7 +61,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 1, end: 2 },
+    { start: 1, end: 3 },
     { start: 11, end: 12 },
     { start: 22, end: 23 }
   ],
@@ -507,9 +507,6 @@ export class GameServer extends CPUProtection {
 
       this._weeklyResetTimer = null;
       this._lastResetWeek = null;
-
-      // ⭐ UNTUK MENYIMPAN JAWABAN SAAT READING TIME
-      this._readingAnswers = new Map();
 
       this.countryQuizSystem = new CountryBasedQuizSystem(this);
 
@@ -1264,10 +1261,6 @@ export class GameServer extends CPUProtection {
       this._canSubmitAnswer = false;
       this._questionStartTime = null;
       
-      if (this._readingAnswers) {
-        this._readingAnswers.clear();
-      }
-      
       if (this._eventQueue) {
         this._eventQueue = [];
       }
@@ -1838,10 +1831,6 @@ export class GameServer extends CPUProtection {
         this._winnerProcessed = false;
         this._totalQuestionsAnswered++;
         
-        if (this._readingAnswers) {
-          this._readingAnswers.clear();
-        }
-        
         await this._broadcastQuizQuestion(this.currentQuestion.question, this.currentQuestion.options);
         
         this._broadcastQuizNotification("quizError", `Read the question... ${CONSTANTS.QUIZ_READING_TIME_MS / 1000}s`);
@@ -1853,10 +1842,6 @@ export class GameServer extends CPUProtection {
           }
           
           this._canSubmitAnswer = true;
-          
-          if (this._readingAnswers && this._readingAnswers.size > 0) {
-            this._processPendingReadingAnswers();
-          }
           
           this._broadcastQuizNotification("quizCanAnswer", {
             answerTime: CONSTANTS.QUIZ_ANSWER_TIME_MS / 1000,
@@ -1907,10 +1892,6 @@ export class GameServer extends CPUProtection {
             this._isShowingQuestion = false;
             this._canSubmitAnswer = false;
             
-            if (this._readingAnswers) {
-              this._readingAnswers.clear();
-            }
-            
             this._quizBreakTimeout = setTimeout(() => {
               if (this.closing || this.isDestroyed) { 
                 this._quizBreakTimeout = null; 
@@ -1946,68 +1927,6 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  // ==================== _processPendingReadingAnswers ====================
-  _processPendingReadingAnswers() {
-    try {
-      if (!this._readingAnswers || this._readingAnswers.size === 0) return;
-      if (!this.currentQuestion) return;
-      
-      const correctAnswer = this.currentQuestion.correct;
-      
-      for (const [username, data] of this._readingAnswers) {
-        const isCorrect = data.isValid && (data.answer === correctAnswer);
-        
-        data.isCorrect = isCorrect;
-        data.isPending = false;
-        
-        if (isCorrect && !this.quizHasWinner) {
-          this.quizHasWinner = true;
-          this.quizWinner = username;
-          
-          const pointsPromise = this._getQuizPoints();
-          pointsPromise.then(async (points) => {
-            points[username] = (points[username] || 0) + 1;
-            await this._setQuizPoints(points);
-          });
-          
-          const countryInfo = this.countryQuizSystem.getUserCountryInfo(data.wsId);
-          this._broadcastQuizNotification("quizWinnerWithCountry", {
-            username: username,
-            country: countryInfo.countryCode,
-            countryName: countryInfo.countryName
-          });
-          
-          this._broadcastQuizNotification("quizWinner", {
-            username: username,
-            totalPoints: 1
-          });
-        }
-        
-        this._broadcastQuizNotification("quizAnswer", {
-          username: username,
-          answer: data.display || data.answer,
-          isCorrect: isCorrect,
-          remainingTime: `${this._getAnswerRemainingTime()}s remaining`,
-          fromPending: true,
-          gotPoint: isCorrect && this.quizWinner === username
-        });
-        
-        this._broadcastQuizResult("quizAnswerResult", {
-          username,
-          answer: data.display || data.answer,
-          isCorrect,
-          correctAnswer: correctAnswer,
-          remainingTime: `${this._getAnswerRemainingTime()}s remaining`,
-          fromPending: true,
-          gotPoint: isCorrect && this.quizWinner === username
-        });
-      }
-      
-      this._readingAnswers.clear();
-      
-    } catch(e) {}
-  }
-
   async _forceEvaluateQuiz() {
     try {
       if (!this.currentQuestion || this._quizTimeout) return;
@@ -2032,10 +1951,6 @@ export class GameServer extends CPUProtection {
       this.isQuizWaiting = true;
       this._isShowingQuestion = false;
       this._canSubmitAnswer = false;
-      
-      if (this._readingAnswers) {
-        this._readingAnswers.clear();
-      }
       
       this._quizBreakTimeout = setTimeout(() => {
         if (this.closing || this.isDestroyed) { 
@@ -2129,115 +2044,44 @@ export class GameServer extends CPUProtection {
       const countryInfo = this.countryQuizSystem.getUserCountryInfo(wsId);
       const answerDisplay = isValidAnswer ? answerKey : "?";
       
-      // ⭐ CEK APAKAH ADA JAWABAN DARI READING TIME YANG BELUM DIVALIDASI
-      const hasPendingAnswer = this._readingAnswers && this._readingAnswers.has(username);
-      
-      // ⭐ JIKA SUDAH ADA PENDING ANSWER, VALIDASI SEKARANG (ANSWER TIME)
-      if (hasPendingAnswer) {
-        const pending = this._readingAnswers.get(username);
-        
-        // ⭐ VALIDASI JAWABAN YANG TERTUNDA
-        const isCorrect = pending.isValid && (pending.answer === this.currentQuestion.correct);
-        
-        // ⭐ JIKA JAWABAN BENAR, BERI POIN
-        if (isCorrect && !this.quizHasWinner) {
-          this.quizHasWinner = true;
-          this.quizWinner = username;
-          
-          const points = await this._getQuizPoints();
-          points[username] = (points[username] || 0) + 1;
-          await this._setQuizPoints(points);
-          
-          this._broadcastQuizNotification("quizWinnerWithCountry", {
-            username: username,
-            country: countryInfo.countryCode,
-            countryName: countryInfo.countryName
-          });
-          
-          this._broadcastQuizNotification("quizWinner", {
-            username: username,
-            totalPoints: points[username] || 0
-          });
-        }
-        
-        // ⭐ TAMBAHKAN KE quizAnswered (SUDAH SUBMIT)
-        this.quizAnswered.add(username);
-        
-        // ⭐ HAPUS DARI PENDING
-        this._readingAnswers.delete(username);
-        
-        // Broadcast hasil validasi
-        this._broadcastQuizNotification("quizAnswer", {
-          username: username,
-          answer: pending.display || pending.answer,
-          isCorrect: isCorrect,
-          remainingTime: `${answerRemaining}s remaining`,
-          country: countryInfo.countryCode,
-          countryName: countryInfo.countryName,
-          fromPending: true,
-          gotPoint: isCorrect
-        });
-        
-        this._broadcastQuizResult("quizAnswerResult", {
-          username,
-          answer: pending.display || pending.answer,
-          isCorrect,
-          correctAnswer: this.currentQuestion.correct,
-          remainingTime: `${answerRemaining}s remaining`,
-          country: countryInfo.countryCode,
-          countryName: countryInfo.countryName,
-          fromPending: true,
-          gotPoint: isCorrect
-        });
-        
-        return;
-      }
-      
-      // ⭐ JIKA DALAM READING TIME - TAMPILKAN DAN SIMPAN (BELUM DIVALIDASI)
+      // ⭐ ============================================================
+      // ⭐ JIKA READING TIME - TAMPILKAN TAPI TIDAK DIVALIDASI
+      // ⭐ ============================================================
       if (isReadingTime) {
-        // Tampilkan jawaban user
+        // Tampilkan jawaban user, TANPA status benar/salah
         this._broadcastQuizNotification("quizAnswerReading", {
           username: username,
           answer: answerDisplay,
-          isCorrect: false,
           remainingTime: `${readingTimeLeft}s reading time left`,
           status: "reading",
           country: countryInfo.countryCode,
           countryName: countryInfo.countryName,
-          message: "Jawaban tercatat, akan divalidasi saat waktu menjawab"
+          message: "⏳ Jawaban saat membaca TIDAK dihitung. Kirim ulang saat waktu menjawab!"
         });
         
         this._safeSend(ws, ["quizAnswerReading", {
           username: username,
           answer: answerDisplay,
           readingTimeLeft: readingTimeLeft,
-          message: `⏳ "${answerDisplay}" tercatat! Akan divalidasi saat waktu menjawab (${CONSTANTS.QUIZ_ANSWER_TIME_MS / 1000}s).`,
-          status: "waiting"
+          message: `⏳ "${answerDisplay}" TIDAK dihitung! Kirim ulang saat waktu menjawab (${CONSTANTS.QUIZ_ANSWER_TIME_MS / 1000}s).`,
+          status: "waiting",
+          notCounted: true
         }]);
         
-        // ⭐ TAMBAHKAN KE quizAnswered (SUDAH SUBMIT, TAPI BELUM DIVALIDASI)
+        // ⭐ TAMBAHKAN KE quizAnswered (TIDAK BISA SUBMIT LAGI DI READING TIME)
         this.quizAnswered.add(username);
         
-        // ⭐ SIMPAN JAWABAN UNTUK DIVALIDASI NANTI
-        if (!this._readingAnswers) {
-          this._readingAnswers = new Map();
-        }
-        this._readingAnswers.set(username, {
-          answer: answerKey,
-          isValid: isValidAnswer,
-          isCorrect: false,
-          timestamp: Date.now(),
-          wsId: wsId,
-          display: answerDisplay,
-          isPending: true
-        });
+        // ⭐ JANGAN SIMPAN - JAWABAN DIABAIKAN
+        // User HARUS submit ulang di answer time
         
         return;
       }
       
       // ⭐ ============================================================
-      // ⭐ VALIDASI NORMAL (ANSWER TIME - SUBMIT LANGSUNG)
+      // ⭐ ANSWER TIME - VALIDASI DAN DIBERI POIN
       // ⭐ ============================================================
+      
+      // ⭐ VALIDASI NORMAL (ANSWER TIME)
       const isCorrect = isValidAnswer && (answerKey === this.currentQuestion.correct);
       const remainingText = `${answerRemaining}s remaining`;
       
@@ -2262,7 +2106,7 @@ export class GameServer extends CPUProtection {
         });
       }
       
-      // ⭐ TAMBAHKAN KE quizAnswered
+      // ⭐ TAMBAHKAN KE quizAnswered (TIDAK BISA SUBMIT LAGI)
       this.quizAnswered.add(username);
       
       this._broadcastQuizNotification("quizAnswer", {
@@ -2271,7 +2115,8 @@ export class GameServer extends CPUProtection {
         isCorrect: isCorrect,
         remainingTime: remainingText,
         country: countryInfo.countryCode,
-        countryName: countryInfo.countryName
+        countryName: countryInfo.countryName,
+        gotPoint: isCorrect
       });
       
       this._broadcastQuizResult("quizAnswerResult", {
@@ -2281,7 +2126,8 @@ export class GameServer extends CPUProtection {
         correctAnswer: this.currentQuestion.correct,
         remainingTime: remainingText,
         country: countryInfo.countryCode,
-        countryName: countryInfo.countryName
+        countryName: countryInfo.countryName,
+        gotPoint: isCorrect
       });
       
     } catch(e) {
@@ -2345,10 +2191,6 @@ export class GameServer extends CPUProtection {
       this._winnerProcessed = false;
       this._canSubmitAnswer = false;
       this._questionStartTime = null;
-      
-      if (this._readingAnswers) {
-        this._readingAnswers.clear();
-      }
       
       this._quizTimeLeftNotified.clear();
       this._nextQuizNotified.clear();
@@ -2483,10 +2325,6 @@ export class GameServer extends CPUProtection {
       this._winnerProcessed = false;
       this._canSubmitAnswer = false;
       this._questionStartTime = null;
-      
-      if (this._readingAnswers) {
-        this._readingAnswers.clear();
-      }
       
       if (this._quizTimeout) {
         clearTimeout(this._quizTimeout);
