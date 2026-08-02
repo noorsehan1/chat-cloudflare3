@@ -2242,6 +2242,7 @@ export class GameServer extends CPUProtection {
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
         
+        // HANYA BROADCAST UNTUK UPDATE ANSWER (TANPA NOTIFIKASI "username submitted X")
         this._broadcastToRoom(DICE_ROOM, ["diceAnswer", {
           username: username,
           guess: guessValue,
@@ -2249,12 +2250,13 @@ export class GameServer extends CPUProtection {
           tieBreakerRound: this._tieRound
         }]);
         
-        this._broadcastDiceNotification("diceError", {
-          message: `${username} submitted ${guessValue}`,
-          remaining: -1,
-          isTieBreaker: true,
-          round: this._tieRound
-        });
+        // HAPUS BROADCAST NOTIFIKASI INI:
+        // this._broadcastDiceNotification("diceError", {
+        //   message: `${username} submitted ${guessValue}`,
+        //   remaining: -1,
+        //   isTieBreaker: true,
+        //   round: this._tieRound
+        // });
         
         if (this._tieAnswers.size === this._tiePlayers.length) {
           if (this._tieTimer) {
