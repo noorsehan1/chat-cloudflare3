@@ -74,7 +74,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 11, end: 15 },
+    { start: 11, end: 17 },
     { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
