@@ -74,7 +74,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 11, end: 18 },
+    { start: 11, end: 12 },
     { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
@@ -1992,8 +1992,7 @@ export class GameServer extends CPUProtection {
     data.round = this._tieRound;
     data.status = 'running';
     
-    // TIDAK ADA diceRoll broadcast!
-    // Langsung notifikasi submit
+    // LANGSUNG NOTIFIKASI SUBMIT - TANPA diceRoll
     this._broadcastDiceNotification("diceError", {
       message: `tie breaker round ${this._tieRound} submit 1-6 players: ${players.join(', ')}`,
       remaining: 20,
@@ -2020,7 +2019,7 @@ export class GameServer extends CPUProtection {
     let notified10 = false;
     let notified5 = false;
     
-    // Interval untuk notifikasi waktu
+    // INTERVAL NOTIFIKASI WAKTU
     const interval = setInterval(() => {
       left--;
       
