@@ -74,7 +74,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 11, end: 23 },
+    { start: 11, end: 12 },
     { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
@@ -944,6 +944,7 @@ export class GameServer extends CPUProtection {
         return true;
       }
       
+      // ===== SIMPAN LANGSUNG KE KV TANPA DELAY =====
       this._recordingEnabled.set(roomName, true);
       this._kvCache.delete(`recording_${roomName}`);
       this._kvCache.delete(`winners_${roomName}`);
@@ -975,6 +976,7 @@ export class GameServer extends CPUProtection {
         return true;
       }
       
+      // ===== HAPUS LANGSUNG DARI KV TANPA DELAY =====
       this._recordingEnabled.set(room, false);
       this._kvCache.delete(`recording_${room}`);
       this._kvCache.delete(`winners_${room}`);
@@ -1214,6 +1216,7 @@ export class GameServer extends CPUProtection {
     }
   }
 
+  // ===== SIMPAN WINNER LANGSUNG KE KV TANPA DELAY =====
   async _addLowCardWinner(room, username) {
     try {
       if (!room || !username) return false;
@@ -1231,6 +1234,7 @@ export class GameServer extends CPUProtection {
       
       const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
       
+      // ===== BACA LANGSUNG DARI KV =====
       let roomWinners = await this.env.QUESTIONS.get(key, 'json') || {};
       
       let currentCount = 0;
@@ -1242,6 +1246,7 @@ export class GameServer extends CPUProtection {
       
       roomWinners[username] = newCount + "x";
       
+      // ===== SIMPAN LANGSUNG KE KV =====
       await this.env.QUESTIONS.put(key, JSON.stringify(roomWinners));
       
       this._kvCache.delete(`winners_${room}`);
