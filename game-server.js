@@ -74,7 +74,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 11, end: 12 },
+    { start: 11, end: 18 },
     { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
@@ -2708,7 +2708,7 @@ export class GameServer extends CPUProtection {
         timestamp: Date.now(),
         answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
         canAnswerNow: true,
-        message: "go go go cheers catch",
+        message: "go go go cheers catch, click draw",
         round: this._diceRound || 1,
         timerNotifications: [20, 10]
       };
