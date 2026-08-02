@@ -74,7 +74,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 11, end: 17 },
+    { start: 11, end: 18 },
     { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
@@ -1972,13 +1972,7 @@ export class GameServer extends CPUProtection {
       status: 'waiting'
     });
     
-    this._broadcastDiceNotification("diceError", {
-      message: `tie breaker started players: ${players.join(', ')}`,
-      remaining: -1,
-      isTieBreaker: true,
-      players: players
-    });
-    
+    // LANGSUNG JALANKAN ROUND PERTAMA - TANPA BROADCAST START
     await this._runTieRound(room, id, players);
   }
 
@@ -1992,7 +1986,7 @@ export class GameServer extends CPUProtection {
     data.round = this._tieRound;
     data.status = 'running';
     
-    // LANGSUNG NOTIFIKASI SUBMIT - TANPA diceRoll
+    // HANYA NOTIFIKASI SUBMIT
     this._broadcastDiceNotification("diceError", {
       message: `tie breaker round ${this._tieRound} submit 1-6 players: ${players.join(', ')}`,
       remaining: 20,
@@ -2005,6 +1999,7 @@ export class GameServer extends CPUProtection {
     this._diceQuestionStartTime = Date.now();
     this.diceAnswered = new Set();
     this._isShowingDice = true;
+    this.currentDiceRoll = null;
     
     this._startTieTimer(room, id, players);
   }
@@ -2019,11 +2014,9 @@ export class GameServer extends CPUProtection {
     let notified10 = false;
     let notified5 = false;
     
-    // INTERVAL NOTIFIKASI WAKTU
     const interval = setInterval(() => {
       left--;
       
-      // NOTIFIKASI 10 DETIK
       if (left === 10 && !notified10) {
         notified10 = true;
         this._broadcastDiceNotification("diceError", {
@@ -2034,7 +2027,6 @@ export class GameServer extends CPUProtection {
         });
       }
       
-      // NOTIFIKASI 5 DETIK
       if (left === 5 && !notified5) {
         notified5 = true;
         this._broadcastDiceNotification("diceError", {
@@ -2050,13 +2042,11 @@ export class GameServer extends CPUProtection {
       }
     }, 1000);
     
-    // TIMEOUT 20 DETIK
     this._tieTimer = setTimeout(async () => {
       clearInterval(interval);
       this._canSubmitDiceAnswer = false;
       this._isShowingDice = false;
       
-      // NOTIFIKASI TIME UP
       this._broadcastDiceNotification("diceError", {
         message: `time up`,
         remaining: -1,
@@ -2064,7 +2054,6 @@ export class GameServer extends CPUProtection {
         round: this._tieRound
       });
       
-      // JIKA TIDAK ADA YANG JAWAB
       if (this._tieAnswers.size === 0) {
         this._broadcastDiceNotification("diceError", {
           message: `no one answered tie breaker cancelled`,
@@ -2098,7 +2087,6 @@ export class GameServer extends CPUProtection {
     let highest = 0;
     let highestPlayers = [];
     
-    // KUMPULKAN SEMUA JAWABAN
     for (const player of players) {
       const answer = this._tieAnswers.get(player);
       if (answer !== undefined && answer >= 1 && answer <= 6) {
@@ -2122,7 +2110,6 @@ export class GameServer extends CPUProtection {
       round: this._tieRound
     });
     
-    // KONDISI 1: ADA 1 PEMENANG
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
       data.winner = winner;
@@ -2162,7 +2149,6 @@ export class GameServer extends CPUProtection {
         tieBreakerRound: this._tieRound
       }]);
       
-      // RESET TIE BREAKER
       this._tieBreakers.delete(id);
       this._tieActive = false;
       this._tiePlayers = [];
@@ -2174,9 +2160,7 @@ export class GameServer extends CPUProtection {
       
       this._startTimeUpCooldown();
       
-    } 
-    // KONDISI 2: MASIH ADA YANG SAMA (DRAW)
-    else if (highestPlayers.length > 1) {
+    } else if (highestPlayers.length > 1) {
       const eliminated = players.filter(p => !highestPlayers.includes(p));
       if (eliminated.length > 0) {
         this._broadcastDiceNotification("diceError", {
@@ -2195,15 +2179,12 @@ export class GameServer extends CPUProtection {
         players: highestPlayers
       });
       
-      // LANJUT ROUND BERIKUTNYA
       setTimeout(() => {
         if (!this._tieActive) return;
         this._runTieRound(room, id, highestPlayers);
       }, 3000);
       
-    } 
-    // KONDISI 3: TIDAK ADA YANG VALID
-    else {
+    } else {
       this._broadcastDiceNotification("diceError", {
         message: `no valid answers tie breaker ended`,
         remaining: -1,
@@ -2260,7 +2241,6 @@ export class GameServer extends CPUProtection {
       const isTie = this._tieActive && this._tiePlayers.length > 0;
       
       if (isTie) {
-        // CEK APAKAH PLAYER TERMASUK DALAM TIE BREAKER
         if (!this._tiePlayers.includes(username)) {
           this._safeSend(ws, ["diceError", {
             message: "not in tie breaker",
@@ -2269,7 +2249,6 @@ export class GameServer extends CPUProtection {
           return;
         }
         
-        // CEK SUDAH MENJAWAB
         if (this._tieAnswers.has(username)) {
           this._safeSend(ws, ["diceError", {
             message: "already submitted",
@@ -2278,7 +2257,6 @@ export class GameServer extends CPUProtection {
           return;
         }
         
-        // CEK WAKTU
         if (!this._canSubmitDiceAnswer) {
           this._safeSend(ws, ["diceError", {
             message: "time is up",
@@ -2287,11 +2265,9 @@ export class GameServer extends CPUProtection {
           return;
         }
         
-        // SIMPAN JAWABAN
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
         
-        // BROADCAST JAWABAN
         this._broadcastToRoom(DICE_ROOM, ["diceAnswer", {
           username: username,
           guess: guessValue,
@@ -2299,7 +2275,6 @@ export class GameServer extends CPUProtection {
           tieBreakerRound: this._tieRound
         }]);
         
-        // NOTIFIKASI SINGKAT
         this._broadcastDiceNotification("diceError", {
           message: `${username} submitted ${guessValue}`,
           remaining: -1,
@@ -2307,7 +2282,6 @@ export class GameServer extends CPUProtection {
           round: this._tieRound
         });
         
-        // JIKA SEMUA SUDAH MENJAWAB
         if (this._tieAnswers.size === this._tiePlayers.length) {
           if (this._tieTimer) {
             clearTimeout(this._tieTimer);
@@ -2316,7 +2290,6 @@ export class GameServer extends CPUProtection {
           this._canSubmitDiceAnswer = false;
           this._isShowingDice = false;
           
-          // BROADCAST TIME UP KARENA SEMUA SUDAH JAWAB
           this._broadcastDiceNotification("diceError", {
             message: `time up`,
             remaining: -1,
