@@ -74,7 +74,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 11, end: 21 },
+    { start: 11, end: 20 },
     { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
@@ -1707,6 +1707,7 @@ export class GameServer extends CPUProtection {
     
     this._diceTimeUpCooldown = true;
     
+    // BROADCAST SEKALI SAJA - TANPA COUNTDOWN
     this._broadcastDiceNotification("diceError", {
       message: "wait 15 seconds",
       remaining: 15,
@@ -1715,19 +1716,14 @@ export class GameServer extends CPUProtection {
       cooldown: true
     });
     
-    let timeLeft = 15;
-    
-    this._diceTimeUpCooldownTimer = setInterval(() => {
-      timeLeft--;
+    // LANGSUNG START SETELAH 15 DETIK - TANPA NOTIFIKASI TAMBAHAN
+    this._diceTimeUpCooldownTimer = setTimeout(() => {
+      this._diceTimeUpCooldownTimer = null;
+      this._diceTimeUpCooldown = false;
       
-      if (timeLeft <= 0) {
-        clearInterval(this._diceTimeUpCooldownTimer);
-        this._diceTimeUpCooldownTimer = null;
-        this._diceTimeUpCooldown = false;
-        
-        this._showDiceQuestion();
-      }
-    }, 1000);
+      // LANGSUNG SHOW DICE QUESTION TANPA BROADCAST TAMBAHAN
+      this._showDiceQuestion();
+    }, 15000);
   }
 
   _stopDiceTimerNotifications() {
@@ -1832,7 +1828,7 @@ export class GameServer extends CPUProtection {
           answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
           remainingTime: `30 seconds remaining`,
           remaining: 30,
-          message: "Go! Go! Cheers! Catch",
+          message: "Go! Cheers! Catch draw",
           round: this._diceRound
         });
         
@@ -1975,7 +1971,7 @@ export class GameServer extends CPUProtection {
     data.status = 'running';
     
     this._broadcastDiceNotification("diceError", {
-      message: `tie breaker round ${this._tieRound} submit 1-6 players: ${players.join(', ')}`,
+      message: `tie breaker round ${this._tieRound} draw players: ${players.join(', ')}`,
       remaining: 20,
       isTieBreaker: true,
       round: this._tieRound,
@@ -2088,46 +2084,15 @@ export class GameServer extends CPUProtection {
       }
     }
     
-    // HAPUS BROADCAST RESULTS
-    // const msg = results.map(r => `${r.player}:${r.answer}`).join(', ');
-    // this._broadcastDiceNotification("diceError", {
-    //   message: `results: ${msg}`,
-    //   remaining: -1,
-    //   isTieBreaker: true,
-    //   round: this._tieRound
-    // });
-    
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
       data.winner = winner;
       data.status = 'completed';
       
-      // HAPUS BROADCAST ELIMINATED
-      // const eliminated = players.filter(p => !highestPlayers.includes(p));
-      // if (eliminated.length > 0) {
-      //   this._broadcastDiceNotification("diceError", {
-      //     message: `eliminated: ${eliminated.join(', ')}`,
-      //     remaining: -1,
-      //     isTieBreaker: true,
-      //     round: this._tieRound
-      //   });
-      // }
-      
       const points = await this._getDicePoints();
       points[winner] = (points[winner] || 0) + 1;
       await this.diceGameSystem.setPoints(points);
       this._kvCache.delete('dice_points');
-      
-      // HAPUS BROADCAST "username wins tie breaker with value X"
-      // this._broadcastDiceNotification("diceError", {
-      //   username: winner,
-      //   totalPoints: points[winner] || 0,
-      //   value: highest,
-      //   round: this._tieRound,
-      //   remaining: -1,
-      //   isTieBreaker: true,
-      //   message: `${winner} wins tie breaker with value ${highest}`
-      // });
       
       this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
         username: winner,
@@ -2150,17 +2115,6 @@ export class GameServer extends CPUProtection {
       this._startTimeUpCooldown();
       
     } else if (highestPlayers.length > 1) {
-      // HAPUS BROADCAST ELIMINATED
-      // const eliminated = players.filter(p => !highestPlayers.includes(p));
-      // if (eliminated.length > 0) {
-      //   this._broadcastDiceNotification("diceError", {
-      //     message: `eliminated: ${eliminated.join(', ')}`,
-      //     remaining: -1,
-      //     isTieBreaker: true,
-      //     round: this._tieRound
-      //   });
-      // }
-      
       this._broadcastDiceNotification("diceError", {
         message: `still tied between ${highestPlayers.join(', ')} value ${highest} next round`,
         remaining: -1,
@@ -2246,21 +2200,12 @@ export class GameServer extends CPUProtection {
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
         
-        // HANYA BROADCAST UNTUK UPDATE ANSWER (TANPA NOTIFIKASI "username submitted X")
         this._broadcastToRoom(DICE_ROOM, ["diceAnswer", {
           username: username,
           guess: guessValue,
           isTieBreaker: true,
           tieBreakerRound: this._tieRound
         }]);
-        
-        // HAPUS BROADCAST NOTIFIKASI INI:
-        // this._broadcastDiceNotification("diceError", {
-        //   message: `${username} submitted ${guessValue}`,
-        //   remaining: -1,
-        //   isTieBreaker: true,
-        //   round: this._tieRound
-        // });
         
         if (this._tieAnswers.size === this._tiePlayers.length) {
           if (this._tieTimer) {
@@ -2334,7 +2279,7 @@ export class GameServer extends CPUProtection {
       }
       
       if (this._diceTimeUpCooldownTimer) {
-        clearInterval(this._diceTimeUpCooldownTimer);
+        clearTimeout(this._diceTimeUpCooldownTimer);
         this._diceTimeUpCooldownTimer = null;
       }
       
@@ -2427,7 +2372,7 @@ export class GameServer extends CPUProtection {
   _clearDiceData() {
     try {
       if (this._diceTimeUpCooldownTimer) {
-        clearInterval(this._diceTimeUpCooldownTimer);
+        clearTimeout(this._diceTimeUpCooldownTimer);
         this._diceTimeUpCooldownTimer = null;
       }
       
@@ -2686,7 +2631,7 @@ export class GameServer extends CPUProtection {
         timestamp: Date.now(),
         answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
         canAnswerNow: true,
-        message: "Go! Go! Cheers! Catch",
+        message: "Go! Cheers! Catch draw",
         round: this._diceRound || 1,
         timerNotifications: [20, 10]
       };
@@ -4674,7 +4619,7 @@ export class GameServer extends CPUProtection {
         this._diceAutoCheckInterval = null;
       }
       if (this._diceTimeUpCooldownTimer) {
-        clearInterval(this._diceTimeUpCooldownTimer);
+        clearTimeout(this._diceTimeUpCooldownTimer);
         this._diceTimeUpCooldownTimer = null;
       }
       this._stopDiceTimerNotifications();
@@ -4710,7 +4655,7 @@ export class GameServer extends CPUProtection {
         this._healthCheckInterval = null;
       }
       if (this._diceTimeUpCooldownTimer) {
-        clearInterval(this._diceTimeUpCooldownTimer);
+        clearTimeout(this._diceTimeUpCooldownTimer);
         this._diceTimeUpCooldownTimer = null;
       }
       
