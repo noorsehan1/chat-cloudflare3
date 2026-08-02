@@ -1891,11 +1891,15 @@ export class GameServer extends CPUProtection {
               
               // JIKA ADA >1 PLAYER DENGAN JAWABAN SAMA DAN BENAR
               if (correctPlayers.length > 1 && !this._tieActive) {
-                await this._startTieBreaker(DICE_ROOM, correctPlayers);
+                // ===== RESET STATE DULU SEBELUM TIE BREAKER =====
                 this._diceTimeout = null;
                 this.currentDiceRoll = null;
                 this._isShowingDice = false;
                 this._canSubmitDiceAnswer = false;
+                this._stopDiceTimerNotifications();
+                
+                // BARU MULAI TIE BREAKER
+                await this._startTieBreaker(DICE_ROOM, correctPlayers);
                 return;
               }
               
