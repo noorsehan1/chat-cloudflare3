@@ -2088,43 +2088,46 @@ export class GameServer extends CPUProtection {
       }
     }
     
-    const msg = results.map(r => `${r.player}:${r.answer}`).join(', ');
-    this._broadcastDiceNotification("diceError", {
-      message: `results: ${msg}`,
-      remaining: -1,
-      isTieBreaker: true,
-      round: this._tieRound
-    });
+    // HAPUS BROADCAST RESULTS
+    // const msg = results.map(r => `${r.player}:${r.answer}`).join(', ');
+    // this._broadcastDiceNotification("diceError", {
+    //   message: `results: ${msg}`,
+    //   remaining: -1,
+    //   isTieBreaker: true,
+    //   round: this._tieRound
+    // });
     
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
       data.winner = winner;
       data.status = 'completed';
       
-      const eliminated = players.filter(p => !highestPlayers.includes(p));
-      if (eliminated.length > 0) {
-        this._broadcastDiceNotification("diceError", {
-          message: `eliminated: ${eliminated.join(', ')}`,
-          remaining: -1,
-          isTieBreaker: true,
-          round: this._tieRound
-        });
-      }
+      // HAPUS BROADCAST ELIMINATED
+      // const eliminated = players.filter(p => !highestPlayers.includes(p));
+      // if (eliminated.length > 0) {
+      //   this._broadcastDiceNotification("diceError", {
+      //     message: `eliminated: ${eliminated.join(', ')}`,
+      //     remaining: -1,
+      //     isTieBreaker: true,
+      //     round: this._tieRound
+      //   });
+      // }
       
       const points = await this._getDicePoints();
       points[winner] = (points[winner] || 0) + 1;
       await this.diceGameSystem.setPoints(points);
       this._kvCache.delete('dice_points');
       
-      this._broadcastDiceNotification("diceError", {
-        username: winner,
-        totalPoints: points[winner] || 0,
-        value: highest,
-        round: this._tieRound,
-        remaining: -1,
-        isTieBreaker: true,
-        message: `${winner} wins tie breaker with value ${highest}`
-      });
+      // HAPUS BROADCAST "username wins tie breaker with value X"
+      // this._broadcastDiceNotification("diceError", {
+      //   username: winner,
+      //   totalPoints: points[winner] || 0,
+      //   value: highest,
+      //   round: this._tieRound,
+      //   remaining: -1,
+      //   isTieBreaker: true,
+      //   message: `${winner} wins tie breaker with value ${highest}`
+      // });
       
       this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
         username: winner,
@@ -2147,15 +2150,16 @@ export class GameServer extends CPUProtection {
       this._startTimeUpCooldown();
       
     } else if (highestPlayers.length > 1) {
-      const eliminated = players.filter(p => !highestPlayers.includes(p));
-      if (eliminated.length > 0) {
-        this._broadcastDiceNotification("diceError", {
-          message: `eliminated: ${eliminated.join(', ')}`,
-          remaining: -1,
-          isTieBreaker: true,
-          round: this._tieRound
-        });
-      }
+      // HAPUS BROADCAST ELIMINATED
+      // const eliminated = players.filter(p => !highestPlayers.includes(p));
+      // if (eliminated.length > 0) {
+      //   this._broadcastDiceNotification("diceError", {
+      //     message: `eliminated: ${eliminated.join(', ')}`,
+      //     remaining: -1,
+      //     isTieBreaker: true,
+      //     round: this._tieRound
+      //   });
+      // }
       
       this._broadcastDiceNotification("diceError", {
         message: `still tied between ${highestPlayers.join(', ')} value ${highest} next round`,
