@@ -2326,13 +2326,7 @@ export class GameServer extends CPUProtection {
       this._startTimeUpCooldown();
       
     } else if (highestPlayers.length > 1) {
-      this._broadcastDiceNotification("diceError", {
-        message: `still tied between ${highestPlayers.join(', ')} value ${highest} next round`,
-        remaining: -1,
-        isTieBreaker: true,
-        round: this._tieRound,
-        players: highestPlayers
-      });
+      
       
       setTimeout(() => {
         if (!this._tieActive) return;
