@@ -74,7 +74,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 11, end: 18 },
+    { start: 11, end: 12 },
     { start: 21, end: 22 }
   ],
   TIMEZONE_OFFSET: 8,
@@ -568,6 +568,7 @@ export class GameServer extends CPUProtection {
       this._tieTimer = null;
       this._playerAnswers = new Map();
       this._diceRollBroadcasted = false;
+      this._diceRollBroadcastTimeout = null;
 
       this._initAsync();
       this._startHealthCheck();
@@ -1770,6 +1771,11 @@ export class GameServer extends CPUProtection {
     try {
       await this._checkAndResetWeeklyDice();
 
+      // CEK APAKAH TIE BREAKER SEDANG AKTIF
+      if (this._tieActive) {
+        return; // SKIP JIKA TIE BREAKER AKTIF
+      }
+
       if (this._isShowingDice) return;
       if (this._diceTimeUpCooldown) return;
       this._lastActivityTime = Date.now();
@@ -1840,6 +1846,7 @@ export class GameServer extends CPUProtection {
           timeup: false
         };
         
+        // HANYA BROADCAST DICE ROLL JIKA BUKAN TIE BREAKER
         await this._broadcastDiceRoll(diceValue);
         
         this._broadcastDiceNotification("diceError", {
@@ -1973,6 +1980,17 @@ export class GameServer extends CPUProtection {
       status: 'waiting'
     });
     
+    // HAPUS SEMUA BROADCAST DICE ROLL YANG TERTUNDA
+    this._diceRollBroadcasted = false;
+    
+    // PASTIKAN TIDAK ADA DICE ROLL
+    this.currentDiceRoll = null;
+    
+    if (this._diceRollBroadcastTimeout) {
+      clearTimeout(this._diceRollBroadcastTimeout);
+      this._diceRollBroadcastTimeout = null;
+    }
+    
     await this._runTieRound(room, id, players);
   }
 
@@ -1986,6 +2004,7 @@ export class GameServer extends CPUProtection {
     data.round = this._tieRound;
     data.status = 'running';
     
+    // BROADCAST TIE BREAKER STARTER - TANPA DICE NUMBER
     this._broadcastDiceNotification("diceError", {
       message: `tie breaker round ${this._tieRound} submit number 1-6 players: ${players.join(', ')}`,
       remaining: 20,
@@ -1998,8 +2017,16 @@ export class GameServer extends CPUProtection {
     this._diceQuestionStartTime = Date.now();
     this.diceAnswered = new Set();
     this._isShowingDice = true;
+    
+    // PASTIKAN TIDAK ADA DICE ROLL
     this.currentDiceRoll = null;
     this._diceRollBroadcasted = false;
+    
+    // HAPUS BROADCAST DICE ROLL YANG TERTUNDA
+    if (this._diceRollBroadcastTimeout) {
+      clearTimeout(this._diceRollBroadcastTimeout);
+      this._diceRollBroadcastTimeout = null;
+    }
     
     this._startTieTimer(room, id, players);
   }
@@ -2398,6 +2425,11 @@ export class GameServer extends CPUProtection {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
       }
+      this._diceRollBroadcasted = false;
+      if (this._diceRollBroadcastTimeout) {
+        clearTimeout(this._diceRollBroadcastTimeout);
+        this._diceRollBroadcastTimeout = null;
+      }
     } catch(e) {}
   }
 
@@ -2498,6 +2530,11 @@ export class GameServer extends CPUProtection {
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
+      }
+      this._diceRollBroadcasted = false;
+      if (this._diceRollBroadcastTimeout) {
+        clearTimeout(this._diceRollBroadcastTimeout);
+        this._diceRollBroadcastTimeout = null;
       }
       
       this._broadcastDiceNotification("diceError", {
@@ -2699,6 +2736,11 @@ export class GameServer extends CPUProtection {
 
   // ==================== OPTIMIZED BROADCAST DICE ROLL ====================
   async _broadcastDiceRoll(diceValue) {
+    // JANGAN BROADCAST JIKA TIE BREAKER AKTIF
+    if (this._tieActive) {
+      return;
+    }
+    
     try {
       const wsIds = this.wsClients.get(DICE_ROOM);
       if (!wsIds?.size) return;
@@ -2708,7 +2750,7 @@ export class GameServer extends CPUProtection {
         timestamp: Date.now(),
         answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
         canAnswerNow: true,
-        message: "go go go cheers catch, click draw",
+        message: "go go go cheers catch",
         round: this._diceRound || 1,
         timerNotifications: [20, 10]
       };
@@ -4655,6 +4697,11 @@ export class GameServer extends CPUProtection {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
       }
+      this._diceRollBroadcasted = false;
+      if (this._diceRollBroadcastTimeout) {
+        clearTimeout(this._diceRollBroadcastTimeout);
+        this._diceRollBroadcastTimeout = null;
+      }
       
       if (this._eventQueue) {
         this._eventQueue = [];
@@ -4705,6 +4752,11 @@ export class GameServer extends CPUProtection {
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
+      }
+      this._diceRollBroadcasted = false;
+      if (this._diceRollBroadcastTimeout) {
+        clearTimeout(this._diceRollBroadcastTimeout);
+        this._diceRollBroadcastTimeout = null;
       }
     } catch(e) {}
   }
