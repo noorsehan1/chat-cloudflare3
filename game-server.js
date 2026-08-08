@@ -76,7 +76,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 1, end: 5 },
+    { start: 1, end: 2 },
     { start: 14, end: 15 },
     { start: 21, end: 22 }
   ],
@@ -740,7 +740,7 @@ export class GameServer extends CPUProtection {
     this._scheduler.start(CONSTANTS.SCHEDULER_LOOP_INTERVAL_MS || 50);
   }
 
-  // ==================== CHECK AND RESET WEEKLY DICE ====================
+  // ==================== CHECK AND RESET WEEKLY DICE (SILENT) ====================
   async _checkAndResetWeeklyDice() {
     try {
       if (!this.env?.QUESTIONS) return false;
@@ -795,21 +795,6 @@ export class GameServer extends CPUProtection {
             CONSTANTS.DICE_LAST_WEEK_WINNER,
             JSON.stringify(winnerData)
           );
-          
-          this._broadcastToRoom(DICE_ROOM, [
-            "diceLastWeekWinner",
-            winner,
-            highestScore,
-            lastResetWeek
-          ]);
-          
-          this._broadcastDiceNotification("diceError", {
-            message: `Weekly Winner: ${winner} with ${highestScore} points (Week ${lastResetWeek})`,
-            winner: winner,
-            score: highestScore,
-            week: lastResetWeek,
-            remaining: -1
-          });
         } else {
           await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
           this._kvCache.delete('dice_last_week_winner');
@@ -824,26 +809,7 @@ export class GameServer extends CPUProtection {
         this._kvCache.delete('dice_last_week_winner');
         this.diceGameSystem.userScores.clear();
         
-        this._broadcastDiceNotification("diceError", {
-          message: `Weekly points reset New week: ${currentWeek}`,
-          week: currentWeek,
-          remaining: -1
-        });
-        
         return true;
-      }
-      
-      if (weekChanged && !isMonday) {
-        const notificationKey = `week_change_${currentWeek}`;
-        if (!this._kvCache.get(notificationKey)) {
-          this._kvCache.set(notificationKey, true, 3600000);
-          
-          this._broadcastDiceNotification("diceError", {
-            message: `New week: ${currentWeek}. Reset on Monday 00:00 UTC`,
-            week: currentWeek,
-            remaining: -1
-          });
-        }
       }
       
       return false;
@@ -2104,12 +2070,6 @@ export class GameServer extends CPUProtection {
     }
     
     if (answeredPlayers.length === 0) {
-      this._broadcastDiceNotification("diceError", {
-        message: `No answer - cancelled`,
-        remaining: -1,
-        isTieBreaker: true
-      });
-      
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
@@ -2166,12 +2126,6 @@ export class GameServer extends CPUProtection {
       
       return;
     }
-    
-    this._broadcastDiceNotification("diceError", {
-      message: `Tie ended`,
-      remaining: -1,
-      isTieBreaker: true
-    });
     
     this._resetTieBreakerState(id);
     this._startCooldownAfterTieBreaker();
@@ -2454,17 +2408,14 @@ export class GameServer extends CPUProtection {
       const isTie = this._tieActive && this._tiePlayers.length > 0;
       
       if (isTie) {
-        // CEK APAKAH SUDAH PERNAH MENJAWAB
         if (this._tieAnswers.has(username)) {
           return;
         }
         
-        // CEK APAKAH MASIH BISA MENJAWAB
         if (!this._canSubmitDiceAnswer) {
           return;
         }
         
-        // CEK APAKAH USER ADA DI TIE BREAKER
         if (!this._tiePlayers.includes(username)) {
           return;
         }
