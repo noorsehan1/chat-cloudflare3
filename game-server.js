@@ -544,9 +544,12 @@ class TieBreakerSystem {
   }
 
   startTimer(room) {
+    this.clearTimers();
+    
     let timeLeft = 20;
     let notified10 = false;
     let notified5 = false;
+    let isProcessed = false;
 
     this.interval = setInterval(() => {
       timeLeft--;
@@ -567,16 +570,56 @@ class TieBreakerSystem {
         ]);
       }
 
-      if (timeLeft <= 0) {
-        this.clearTimers();
-        this.processResults(room);
+      if (timeLeft <= 0 && !isProcessed) {
+        isProcessed = true;
+        clearInterval(this.interval);
+        this.interval = null;
+        
+        this.gameServer._canSubmitDiceAnswer = false;
+        this.gameServer._isShowingDice = false;
+        
+        this.gameServer._broadcastDiceNotification('diceError', {
+          message: 'Time up',
+          remaining: -1,
+          isTieBreaker: true
+        });
+        
+        const tieId = this.gameServer._getActiveTieBreakerId();
+        if (tieId) {
+          this.gameServer._processTieResults(room, tieId, this.players);
+        } else {
+          this.gameServer._resetTieBreakerState(null);
+          this.gameServer._startCooldownAfterTieBreaker();
+        }
       }
     }, 1000);
 
     this.timer = setTimeout(() => {
-      this.clearTimers();
-      this.processResults(room);
-    }, 21000);
+      if (!isProcessed) {
+        isProcessed = true;
+        if (this.interval) {
+          clearInterval(this.interval);
+          this.interval = null;
+        }
+        
+        this.gameServer._canSubmitDiceAnswer = false;
+        this.gameServer._isShowingDice = false;
+        
+        this.gameServer._broadcastDiceNotification('diceError', {
+          message: 'Time up',
+          remaining: -1,
+          isTieBreaker: true
+        });
+        
+        const tieId = this.gameServer._getActiveTieBreakerId();
+        if (tieId) {
+          this.gameServer._processTieResults(room, tieId, this.players);
+        } else {
+          this.gameServer._resetTieBreakerState(null);
+          this.gameServer._startCooldownAfterTieBreaker();
+        }
+      }
+    }, 22000);
   }
 
   submitAnswer(username, guess) {
@@ -932,6 +975,7 @@ export class GameServer extends CPUProtection {
       this._tiePlayers = [];
       this._tieAnswers = new Map();
       this._tieTimer = null;
+      this._tieInterval = null;
       this._playerAnswers = new Map();
       this._processingTieResults = false;
       this._lastTieLog = '';
@@ -2261,6 +2305,10 @@ export class GameServer extends CPUProtection {
       clearTimeout(this._tieTimer);
       this._tieTimer = null;
     }
+    if (this._tieInterval) {
+      clearInterval(this._tieInterval);
+      this._tieInterval = null;
+    }
     
     this._tieRound++;
     this._tiePlayers = [...players];
@@ -2291,59 +2339,87 @@ export class GameServer extends CPUProtection {
       clearTimeout(this._tieTimer);
       this._tieTimer = null;
     }
+    if (this._tieInterval) {
+      clearInterval(this._tieInterval);
+      this._tieInterval = null;
+    }
     
     let timeLeft = 20;
-    let notified = {
-      10: false,
-      5: false
-    };
+    let notified10 = false;
+    let notified5 = false;
+    let isProcessed = false;
     
-    const interval = setInterval(() => {
+    this._tieInterval = setInterval(() => {
       timeLeft--;
       
-      if (timeLeft === 10 && !notified[10]) {
-        notified[10] = true;
+      if (timeLeft === 10 && !notified10) {
+        notified10 = true;
         this._broadcastDiceNotification("diceError", {
-          message: `10s remaining`,
+          message: "10s remaining",
           remaining: 10,
           isTieBreaker: true
         });
       }
       
-      if (timeLeft === 5 && !notified[5]) {
-        notified[5] = true;
+      if (timeLeft === 5 && !notified5) {
+        notified5 = true;
         this._broadcastDiceNotification("diceError", {
-          message: `5s remaining`,
+          message: "5s remaining",
           remaining: 5,
           isTieBreaker: true
         });
       }
       
-      if (timeLeft <= 0) {
-        clearInterval(interval);
+      if (timeLeft <= 0 && !isProcessed) {
+        isProcessed = true;
+        clearInterval(this._tieInterval);
+        this._tieInterval = null;
+        
+        this._canSubmitDiceAnswer = false;
+        this._isShowingDice = false;
+        
+        this._broadcastDiceNotification("diceError", {
+          message: "Time up",
+          remaining: -1,
+          isTieBreaker: true
+        });
+        
+        const tieId = this._getActiveTieBreakerId();
+        if (tieId) {
+          this._processTieResults(room, tieId, players);
+        } else {
+          this._resetTieBreakerState(null);
+          this._startCooldownAfterTieBreaker();
+        }
       }
     }, 1000);
     
-    this._tieTimer = setTimeout(async () => {
-      clearInterval(interval);
-      this._canSubmitDiceAnswer = false;
-      this._isShowingDice = false;
-      
-      this._broadcastDiceNotification("diceError", {
-        message: `Time up`,
-        remaining: -1,
-        isTieBreaker: true
-      });
-      
-      const tieId = this._getActiveTieBreakerId();
-      if (tieId) {
-        await this._processTieResults(room, tieId, players);
-      } else {
-        this._resetTieBreakerState(null);
-        this._startCooldownAfterTieBreaker();
+    this._tieTimer = setTimeout(() => {
+      if (!isProcessed) {
+        isProcessed = true;
+        if (this._tieInterval) {
+          clearInterval(this._tieInterval);
+          this._tieInterval = null;
+        }
+        
+        this._canSubmitDiceAnswer = false;
+        this._isShowingDice = false;
+        
+        this._broadcastDiceNotification("diceError", {
+          message: "Time up",
+          remaining: -1,
+          isTieBreaker: true
+        });
+        
+        const tieId = this._getActiveTieBreakerId();
+        if (tieId) {
+          this._processTieResults(room, tieId, players);
+        } else {
+          this._resetTieBreakerState(null);
+          this._startCooldownAfterTieBreaker();
+        }
       }
-      
-    }, 20000);
+    }, 22000);
   }
 
   async _processTieResults(room, id, players) {
@@ -2415,6 +2491,10 @@ export class GameServer extends CPUProtection {
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
+      }
+      if (this._tieInterval) {
+        clearInterval(this._tieInterval);
+        this._tieInterval = null;
       }
       
       setTimeout(() => {
@@ -2506,6 +2586,10 @@ export class GameServer extends CPUProtection {
       clearTimeout(this._tieTimer);
       this._tieTimer = null;
     }
+    if (this._tieInterval) {
+      clearInterval(this._tieInterval);
+      this._tieInterval = null;
+    }
   }
 
   _getActiveTieBreakerId() {
@@ -2594,7 +2678,7 @@ export class GameServer extends CPUProtection {
         
         this._broadcastDiceNotification("diceError", {
           answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
-          remainingTime: `20s remaining`,
+          remainingTime: "20s remaining",
           remaining: 20,
           message: "Go Cheers Catch draw",
           round: this._diceRound
@@ -2739,6 +2823,10 @@ export class GameServer extends CPUProtection {
             clearTimeout(this._tieTimer);
             this._tieTimer = null;
           }
+          if (this._tieInterval) {
+            clearInterval(this._tieInterval);
+            this._tieInterval = null;
+          }
           this._canSubmitDiceAnswer = false;
           this._isShowingDice = false;
           
@@ -2839,6 +2927,10 @@ export class GameServer extends CPUProtection {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
       }
+      if (this._tieInterval) {
+        clearInterval(this._tieInterval);
+        this._tieInterval = null;
+      }
     } catch(e) {}
   }
 
@@ -2927,6 +3019,10 @@ export class GameServer extends CPUProtection {
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
+      }
+      if (this._tieInterval) {
+        clearInterval(this._tieInterval);
+        this._tieInterval = null;
       }
       
       this._broadcastDiceNotification("diceError", {
@@ -5279,6 +5375,10 @@ export class GameServer extends CPUProtection {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
       }
+      if (this._tieInterval) {
+        clearInterval(this._tieInterval);
+        this._tieInterval = null;
+      }
       
       if (this._eventQueue) {
         this._eventQueue = [];
@@ -5328,6 +5428,10 @@ export class GameServer extends CPUProtection {
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
+      }
+      if (this._tieInterval) {
+        clearInterval(this._tieInterval);
+        this._tieInterval = null;
       }
     } catch(e) {}
   }
