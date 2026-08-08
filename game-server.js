@@ -76,7 +76,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 1, end: 4 },
+    { start: 1, end: 5 },
     { start: 14, end: 15 },
     { start: 21, end: 22 }
   ],
@@ -1980,12 +1980,6 @@ export class GameServer extends CPUProtection {
       status: 'waiting'
     });
     
-    this._broadcastDiceNotification("diceError", {
-      message: `Tie Breaker - ${players.length} players`,
-      remaining: -1,
-      isTieBreaker: true
-    });
-    
     await this._runTieRound(room, id, players);
   }
 
@@ -2165,7 +2159,7 @@ export class GameServer extends CPUProtection {
       const playerNames = highestPlayers.join(', ');
       
       this._broadcastDiceNotification("diceError", {
-        message: `Draw: ${playerNames} (${highest})`,
+        message: `Draw: ${playerNames}`,
         remaining: -1,
         isTieBreaker: true
       });
@@ -2444,21 +2438,7 @@ export class GameServer extends CPUProtection {
       const isTie = this._tieActive && this._tiePlayers.length > 0;
       
       if (isTie) {
-        if (!this._tiePlayers.includes(username)) {
-          this._safeSend(ws, ["diceError", "You are not in tie breaker"]);
-          return;
-        }
-        
-        if (this._tieAnswers.has(username)) {
-          this._safeSend(ws, ["diceError", "You already answered"]);
-          return;
-        }
-        
-        if (!this._canSubmitDiceAnswer) {
-          this._safeSend(ws, ["diceError", "Time is up"]);
-          return;
-        }
-        
+        // Langsung simpan jawaban tanpa validasi berlebihan
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
         
