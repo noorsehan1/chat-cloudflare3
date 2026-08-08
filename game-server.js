@@ -2024,23 +2024,12 @@ export class GameServer extends CPUProtection {
     
     let timeLeft = 20;
     let notified = {
-      15: false,
       10: false,
-      5: false,
-      3: false
+      5: false
     };
     
     const interval = setInterval(() => {
       timeLeft--;
-      
-      if (timeLeft === 15 && !notified[15]) {
-        notified[15] = true;
-        this._broadcastDiceNotification("diceError", {
-          message: `15s remaining`,
-          remaining: 15,
-          isTieBreaker: true
-        });
-      }
       
       if (timeLeft === 10 && !notified[10]) {
         notified[10] = true;
@@ -2056,15 +2045,6 @@ export class GameServer extends CPUProtection {
         this._broadcastDiceNotification("diceError", {
           message: `5s remaining`,
           remaining: 5,
-          isTieBreaker: true
-        });
-      }
-      
-      if (timeLeft === 3 && !notified[3]) {
-        notified[3] = true;
-        this._broadcastDiceNotification("diceError", {
-          message: `3s remaining`,
-          remaining: 3,
           isTieBreaker: true
         });
       }
@@ -2474,6 +2454,21 @@ export class GameServer extends CPUProtection {
       const isTie = this._tieActive && this._tiePlayers.length > 0;
       
       if (isTie) {
+        // CEK APAKAH SUDAH PERNAH MENJAWAB
+        if (this._tieAnswers.has(username)) {
+          return;
+        }
+        
+        // CEK APAKAH MASIH BISA MENJAWAB
+        if (!this._canSubmitDiceAnswer) {
+          return;
+        }
+        
+        // CEK APAKAH USER ADA DI TIE BREAKER
+        if (!this._tiePlayers.includes(username)) {
+          return;
+        }
+        
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
         
