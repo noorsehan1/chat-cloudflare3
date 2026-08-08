@@ -1987,6 +1987,11 @@ export class GameServer extends CPUProtection {
     const data = this._tieBreakers.get(id);
     if (!data) return;
     
+    if (this._tieTimer) {
+      clearTimeout(this._tieTimer);
+      this._tieTimer = null;
+    }
+    
     this._tieRound++;
     this._tiePlayers = [...players];
     this._tieAnswers = new Map();
@@ -2085,7 +2090,7 @@ export class GameServer extends CPUProtection {
         await this._processTieResults(room, tieId, players);
       } else {
         this._resetTieBreakerState(null);
-        this._startTimeUpCooldown();
+        this._startCooldownAfterTieBreaker();
       }
       
     }, 20000);
@@ -2126,7 +2131,7 @@ export class GameServer extends CPUProtection {
       });
       
       this._resetTieBreakerState(id);
-      this._startTimeUpCooldown();
+      this._startCooldownAfterTieBreaker();
       return;
     }
     
@@ -2151,25 +2156,22 @@ export class GameServer extends CPUProtection {
       }]);
       
       this._resetTieBreakerState(id);
-      this._startTimeUpCooldown();
+      this._startCooldownAfterTieBreaker();
       return;
     }
     
     if (hasTieAtHighest) {
-      const playerNames = highestPlayers.join(', ');
-      
-      this._broadcastDiceNotification("diceError", {
-        message: `Draw: ${playerNames}`,
-        remaining: -1,
-        isTieBreaker: true
-      });
-      
       this._tiePlayers = highestPlayers;
       this._tieAnswers = new Map();
       data.players = highestPlayers;
       data.round = this._tieRound;
       data.status = 'waiting';
       data.tieValue = highest;
+      
+      if (this._tieTimer) {
+        clearTimeout(this._tieTimer);
+        this._tieTimer = null;
+      }
       
       setTimeout(() => {
         if (this._tieActive && this._tiePlayers.length > 1) {
@@ -2192,7 +2194,7 @@ export class GameServer extends CPUProtection {
     });
     
     this._resetTieBreakerState(id);
-    this._startTimeUpCooldown();
+    this._startCooldownAfterTieBreaker();
   }
 
   async _processSingleWinner(room, id, winner) {
@@ -2211,7 +2213,41 @@ export class GameServer extends CPUProtection {
     }]);
     
     this._resetTieBreakerState(id);
-    this._startTimeUpCooldown();
+    this._startCooldownAfterTieBreaker();
+  }
+
+  _startCooldownAfterTieBreaker() {
+    this._broadcastDiceNotification("diceError", {
+      message: "wait 15s",
+      remaining: 15,
+      isDiceTime: true,
+      isActive: false,
+      cooldown: true
+    });
+    
+    this._diceTimeUpCooldown = true;
+    
+    if (this._diceTimeUpCooldownTimer) {
+      clearTimeout(this._diceTimeUpCooldownTimer);
+      this._diceTimeUpCooldownTimer = null;
+    }
+    
+    this._diceTimeUpCooldownTimer = setTimeout(() => {
+      this._diceTimeUpCooldownTimer = null;
+      this._diceTimeUpCooldown = false;
+      
+      this._diceNotifiedFlags = {
+        20: false,
+        10: false,
+        5: false,
+        timeup: false
+      };
+      this._lastSentRemaining = -1;
+      this._lastNotificationKey = "";
+      this._lastNotificationTime = 0;
+      
+      this._showDiceQuestionSilent();
+    }, 15000);
   }
 
   _resetTieBreakerState(id) {
@@ -2438,7 +2474,6 @@ export class GameServer extends CPUProtection {
       const isTie = this._tieActive && this._tiePlayers.length > 0;
       
       if (isTie) {
-        // Langsung simpan jawaban tanpa validasi berlebihan
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
         
