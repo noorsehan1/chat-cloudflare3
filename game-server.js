@@ -76,7 +76,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 1, end: 3 },
+    { start: 1, end: 2 },
     { start: 14, end: 15 },
     { start: 21, end: 22 }
   ],
@@ -2142,14 +2142,6 @@ export class GameServer extends CPUProtection {
     if (!hasTieAtHighest) {
       const winner = highestPlayers[0];
       
-      this._broadcastDiceNotification("diceError", {
-        message: `Winner: ${winner} (${highest})`,
-        remaining: -1,
-        isTieBreaker: true,
-        winner: winner,
-        value: highest
-      });
-      
       const points = await this._getDicePoints();
       points[winner] = (points[winner] || 0) + 1;
       await this.diceGameSystem.setPoints(points);
@@ -2173,7 +2165,7 @@ export class GameServer extends CPUProtection {
       const playerNames = highestPlayers.join(', ');
       
       this._broadcastDiceNotification("diceError", {
-        message: `Draw: ${playerNames} (${highest}) -> Round ${this._tieRound + 1}`,
+        message: `Draw: ${playerNames} (${highest})`,
         remaining: -1,
         isTieBreaker: true
       });
@@ -2210,12 +2202,6 @@ export class GameServer extends CPUProtection {
   }
 
   async _processSingleWinner(room, id, winner) {
-    this._broadcastDiceNotification("diceError", {
-      message: `Winner: ${winner}`,
-      remaining: -1,
-      isTieBreaker: true
-    });
-    
     const points = await this._getDicePoints();
     points[winner] = (points[winner] || 0) + 1;
     await this.diceGameSystem.setPoints(points);
@@ -2492,13 +2478,6 @@ export class GameServer extends CPUProtection {
           }
           this._canSubmitDiceAnswer = false;
           this._isShowingDice = false;
-          
-          this._broadcastDiceNotification("diceError", {
-            message: `All answered - Round ${this._tieRound}`,
-            remaining: -1,
-            isTieBreaker: true,
-            round: this._tieRound
-          });
           
           const tieId = this._getActiveTieBreakerId();
           if (tieId) {
