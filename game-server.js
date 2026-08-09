@@ -2101,7 +2101,6 @@ export class GameServer extends CPUProtection {
   }
 
   // ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
-  // ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
 // ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
 async submitDiceAnswer(ws, username, guess) {
   try {
@@ -2149,16 +2148,6 @@ async submitDiceAnswer(ws, username, guess) {
         isTieBreaker: true,
         tieRound: this._tieRound
       }]);
-      
-      // Notifikasi tambahan untuk status tie breaker
-      this._broadcastDiceNotification("diceError", {
-        message: `${username} answered ${guessValue} (${this._tieAnswers.size}/${this._tiePlayers.length})`,
-        username: username,
-        guess: guessValue,
-        remaining: this._tiePlayers.length - this._tieAnswers.size,
-        isTieBreaker: true,
-        round: this._tieRound
-      });
       
       // Jika semua sudah menjawab, proses hasil
       if (this._tieAnswers.size === this._tiePlayers.length) {
@@ -2219,6 +2208,7 @@ async submitDiceAnswer(ws, username, guess) {
     
   } catch(e) {}
 }
+
 
   // ==================== TIE BREAKER METHODS ====================
 
