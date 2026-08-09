@@ -2110,7 +2110,7 @@ export class GameServer extends CPUProtection {
         return;
       }
       
-      // TIE BREAKER MODE
+      // ============ TIE BREAKER MODE ============
       if (this._tieActive) {
         if (!this._tiePlayers.includes(username)) {
           this._safeSend(ws, ["diceError", "Not in tie breaker"]);
@@ -2170,7 +2170,7 @@ export class GameServer extends CPUProtection {
         return;
       }
       
-      // DICE NORMAL MODE
+      // ============ DICE NORMAL MODE ============
       if (this.diceAnswered.has(username)) return;
       
       const diceValue = this.currentDiceRoll?.value;
@@ -2846,9 +2846,10 @@ export class GameServer extends CPUProtection {
       data.status = 'waiting';
       data.tieValue = highest;
       
+      // Hanya kirim Round berikutnya: nama pemain
+      const nextRoundPlayerNames = highestPlayers.join(', ');
       this._broadcastDiceNotification("diceError", {
-        message: `Tie at ${highest}. Next round: ${highestPlayers.join(', ')}`,
-        highest: highest,
+        message: `Round ${this._tieRound + 1}: ${nextRoundPlayerNames}`,
         players: highestPlayers,
         remaining: -1,
         isTieBreaker: true,
@@ -4529,25 +4530,6 @@ export class GameServer extends CPUProtection {
       if (evt === "submitDiceAnswer") {
         const [_, username, guess] = data;
         await this.submitDiceAnswer(ws, username, guess);
-        return;
-      }
-
-      if (evt === "submitTieBreakerAnswer") {
-        const [_, username, guess] = data;
-        const result = this.tieBreaker.submitAnswer(username, parseInt(guess, 10));
-        if (result.success) {
-          this._broadcastToRoom(DICE_ROOM, ["tieBreakerAnswer", { 
-            username: username, 
-            answered: this.tieBreaker.answers.size 
-          }]);
-        } else {
-          this._safeSend(ws, ["tieBreakerError", result.message]);
-        }
-        return;
-      }
-
-      if (evt === "getTieBreakerStatus") {
-        this._safeSend(ws, ["tieBreakerStatus", this.tieBreaker.getStatus()]);
         return;
       }
 
