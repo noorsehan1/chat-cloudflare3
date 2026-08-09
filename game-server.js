@@ -2102,6 +2102,7 @@ export class GameServer extends CPUProtection {
 
   // ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
   // ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
+// ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
 async submitDiceAnswer(ws, username, guess) {
   try {
     if (!ws || !username) return;
@@ -2140,19 +2141,24 @@ async submitDiceAnswer(ws, username, guess) {
       this._tieAnswers.set(username, guessValue);
       this.diceAnswered.add(username);
       
-      // ============ KIRIM EVENT diceCanAnswer LANGSUNG ============
-      // Kirim ke semua client di room bahwa player ini sudah menjawab
-      this._broadcastToRoom(DICE_ROOM, ["diceCanAnswer", {
+      // ============ LANGSUNG KIRIM diceAnswer ============
+      this._broadcastToRoom(DICE_ROOM, ["diceAnswer", {
         username: username,
         guess: guessValue,
-        round: this._tieRound,
-        answered: this._tieAnswers.size,
-        total: this._tiePlayers.length,
-        isTieBreaker: true
+        round: this._diceRound || 1,
+        isTieBreaker: true,
+        tieRound: this._tieRound
       }]);
       
-      // HAPUS notifikasi "username answered X (Y/Z)"
-      // Tidak perlu broadcast diceNotification lagi
+      // Notifikasi tambahan untuk status tie breaker
+      this._broadcastDiceNotification("diceError", {
+        message: `${username} answered ${guessValue} (${this._tieAnswers.size}/${this._tiePlayers.length})`,
+        username: username,
+        guess: guessValue,
+        remaining: this._tiePlayers.length - this._tieAnswers.size,
+        isTieBreaker: true,
+        round: this._tieRound
+      });
       
       // Jika semua sudah menjawab, proses hasil
       if (this._tieAnswers.size === this._tiePlayers.length) {
