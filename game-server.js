@@ -605,6 +605,7 @@ export class GameServer extends CPUProtection {
       this._playerAnswers = new Map();
       this._processingTieResults = false;
       this._lastTieLog = '';
+      this._tieBreakerLock = false; // Lock untuk mencegah multiple round
 
       this._kvCache = new KVCache();
       this._kvCache.startCleanup();
@@ -2101,135 +2102,140 @@ export class GameServer extends CPUProtection {
   }
 
   // ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
-// ==================== SUBMIT DICE ANSWER WITH TIE BREAKER ====================
-async submitDiceAnswer(ws, username, guess) {
-  try {
-    if (!ws || !username) return;
-    
-    const room = this._ensureRoomConsistency(ws);
-    if (room !== DICE_ROOM) return;
-    if (!this._isDiceTime()) return;
-    
-    const guessValue = parseInt(guess, 10);
-    if (isNaN(guessValue) || guessValue < 1 || guessValue > 6) {
-      this._safeSend(ws, ["diceError", "invalid guess 1-6"]);
-      return;
-    }
-    
-    // ============ TIE BREAKER MODE ============
-    if (this._tieActive) {
-      // Cek apakah player ada di tie breaker
-      if (!this._tiePlayers.includes(username)) {
-        this._safeSend(ws, ["diceError", "Not in tie breaker"]);
+  async submitDiceAnswer(ws, username, guess) {
+    try {
+      if (!ws || !username) return;
+      
+      const room = this._ensureRoomConsistency(ws);
+      if (room !== DICE_ROOM) return;
+      if (!this._isDiceTime()) return;
+      
+      const guessValue = parseInt(guess, 10);
+      if (isNaN(guessValue) || guessValue < 1 || guessValue > 6) {
+        this._safeSend(ws, ["diceError", "invalid guess 1-6"]);
         return;
       }
       
-      // Cek apakah sudah menjawab
-      if (this._tieAnswers.has(username)) {
-        this._safeSend(ws, ["diceError", "Already answered"]);
+      // ============ TIE BREAKER MODE ============
+      if (this._tieActive) {
+        // Cek apakah player ada di tie breaker
+        if (!this._tiePlayers.includes(username)) {
+          this._safeSend(ws, ["diceError", "Not in tie breaker"]);
+          return;
+        }
+        
+        // Cek apakah sudah menjawab
+        if (this._tieAnswers.has(username)) {
+          this._safeSend(ws, ["diceError", "Already answered"]);
+          return;
+        }
+        
+        // Cek apakah masih bisa menjawab
+        if (!this._canSubmitDiceAnswer) {
+          this._safeSend(ws, ["diceError", "Cannot answer now"]);
+          return;
+        }
+        
+        // Simpan jawaban
+        this._tieAnswers.set(username, guessValue);
+        this.diceAnswered.add(username);
+        
+        // ============ LANGSUNG KIRIM diceAnswer ============
+        this._broadcastToRoom(DICE_ROOM, ["diceAnswer", {
+          username: username,
+          guess: guessValue,
+          round: this._diceRound || 1,
+          isTieBreaker: true,
+          tieRound: this._tieRound
+        }]);
+        
+        // Jika semua sudah menjawab, proses hasil
+        if (this._tieAnswers.size === this._tiePlayers.length) {
+          if (this._tieTimer) {
+            clearTimeout(this._tieTimer);
+            this._tieTimer = null;
+          }
+          if (this._tieInterval) {
+            clearInterval(this._tieInterval);
+            this._tieInterval = null;
+          }
+          
+          this._canSubmitDiceAnswer = false;
+          this._isShowingDice = false;
+          
+          const tieId = this._getActiveTieBreakerId();
+          if (tieId) {
+            setTimeout(async () => {
+              await this._processTieResults(DICE_ROOM, tieId, this._tiePlayers);
+            }, 500);
+          } else {
+            this._resetTieBreakerState(null);
+            this._startCooldownAfterTieBreaker();
+          }
+        }
         return;
       }
       
-      // Cek apakah masih bisa menjawab
-      if (!this._canSubmitDiceAnswer) {
-        this._safeSend(ws, ["diceError", "Cannot answer now"]);
+      // ============ DICE NORMAL MODE ============
+      if (this.diceAnswered.has(username)) return;
+      
+      const diceValue = this.currentDiceRoll?.value;
+      const remaining = this._getDiceAnswerRemainingTime();
+      if (remaining <= 0) {
+        this.diceAnswered.add(username);
         return;
       }
       
-      // Simpan jawaban
-      this._tieAnswers.set(username, guessValue);
+      const isCorrect = guessValue === diceValue;
+      this._playerAnswers.set(username, guessValue);
       this.diceAnswered.add(username);
       
-      // ============ LANGSUNG KIRIM diceAnswer ============
       this._broadcastToRoom(DICE_ROOM, ["diceAnswer", {
         username: username,
         guess: guessValue,
-        round: this._diceRound || 1,
-        isTieBreaker: true,
-        tieRound: this._tieRound
+        round: this._diceRound || 1
       }]);
       
-      // Jika semua sudah menjawab, proses hasil
-      if (this._tieAnswers.size === this._tiePlayers.length) {
-        if (this._tieTimer) {
-          clearTimeout(this._tieTimer);
-          this._tieTimer = null;
-        }
-        if (this._tieInterval) {
-          clearInterval(this._tieInterval);
-          this._tieInterval = null;
-        }
+      if (isCorrect && !this.diceHasWinner) {
+        this.diceHasWinner = true;
+        this.diceWinner = username;
         
-        this._canSubmitDiceAnswer = false;
-        this._isShowingDice = false;
-        
-        const tieId = this._getActiveTieBreakerId();
-        if (tieId) {
-          setTimeout(async () => {
-            await this._processTieResults(DICE_ROOM, tieId, this._tiePlayers);
-          }, 500);
-        } else {
-          this._resetTieBreakerState(null);
-          this._startCooldownAfterTieBreaker();
-        }
+        const points = await this._getDicePoints();
+        points[username] = (points[username] || 0) + 1;
+        await this.diceGameSystem.setPoints(points);
+        this._kvCache.delete('dice_points');
       }
-      return;
-    }
-    
-    // ============ DICE NORMAL MODE ============
-    if (this.diceAnswered.has(username)) return;
-    
-    const diceValue = this.currentDiceRoll?.value;
-    const remaining = this._getDiceAnswerRemainingTime();
-    if (remaining <= 0) {
-      this.diceAnswered.add(username);
-      return;
-    }
-    
-    const isCorrect = guessValue === diceValue;
-    this._playerAnswers.set(username, guessValue);
-    this.diceAnswered.add(username);
-    
-    this._broadcastToRoom(DICE_ROOM, ["diceAnswer", {
-      username: username,
-      guess: guessValue,
-      round: this._diceRound || 1
-    }]);
-    
-    if (isCorrect && !this.diceHasWinner) {
-      this.diceHasWinner = true;
-      this.diceWinner = username;
       
-      const points = await this._getDicePoints();
-      points[username] = (points[username] || 0) + 1;
-      await this.diceGameSystem.setPoints(points);
-      this._kvCache.delete('dice_points');
-    }
-    
-  } catch(e) {}
-}
-
+    } catch(e) {}
+  }
 
   // ==================== TIE BREAKER METHODS ====================
 
   async _startTieBreaker(room, players) {
     if (!players || players.length < 2) return;
     if (this._tieActive) return;
+    if (this._tieBreakerLock) return; // Cegah multiple tie breaker
     
-    this._tieActive = true;
-    this._tieRound = 0;
-    this._tiePlayers = [...players];
-    this._tieAnswers = new Map();
+    this._tieBreakerLock = true;
     
-    const id = `tie_${Date.now()}`;
-    this._tieBreakers.set(id, {
-      players: players,
-      round: 0,
-      winner: null,
-      status: 'waiting'
-    });
-    
-    await this._runTieRound(room, id, players);
+    try {
+      this._tieActive = true;
+      this._tieRound = 0;
+      this._tiePlayers = [...players];
+      this._tieAnswers = new Map();
+      
+      const id = `tie_${Date.now()}`;
+      this._tieBreakers.set(id, {
+        players: players,
+        round: 0,
+        winner: null,
+        status: 'waiting'
+      });
+      
+      await this._runTieRound(room, id, players);
+    } finally {
+      this._tieBreakerLock = false;
+    }
   }
 
   async _runTieRound(room, id, players) {
@@ -2254,23 +2260,16 @@ async submitDiceAnswer(ws, username, guess) {
     
     const playerNames = players.join(', ');
     
+    // Hanya satu broadcast untuk round tie breaker
     this._broadcastToRoom(DICE_ROOM, ["tieBreakerRound", {
       round: this._tieRound,
       players: players,
       playerNames: playerNames,
       message: `Round ${this._tieRound}: ${playerNames}`,
-      timeLimit: 20,
+      timeLimit: CONSTANTS.TIE_BREAKER_TIME_LIMIT || 20,
       status: 'waiting_for_answers',
       totalPlayers: players.length
     }]);
-    
-    this._broadcastDiceNotification("diceError", {
-      message: `Round ${this._tieRound}: ${playerNames}`,
-      remaining: 20,
-      isTieBreaker: true,
-      round: this._tieRound,
-      players: players
-    });
     
     this._canSubmitDiceAnswer = true;
     this._diceQuestionStartTime = Date.now();
@@ -2373,118 +2372,154 @@ async submitDiceAnswer(ws, username, guess) {
   }
 
   async _processTieResults(room, id, players) {
-    const data = this._tieBreakers.get(id);
-    if (!data) return;
+    // Cegah multiple processing
+    if (this._processingTieResults) return;
+    this._processingTieResults = true;
     
-    const results = [];
-    let highest = 0;
-    let highestPlayers = [];
-    let answeredPlayers = [];
-    
-    for (const player of players) {
-      const answer = this._tieAnswers.get(player);
-      if (answer !== undefined && answer >= 1 && answer <= 6) {
-        results.push({ player, answer });
-        answeredPlayers.push(player);
-        if (answer > highest) {
-          highest = answer;
-          highestPlayers = [player];
-        } else if (answer === highest) {
-          highestPlayers.push(player);
+    try {
+      const data = this._tieBreakers.get(id);
+      if (!data) {
+        this._processingTieResults = false;
+        return;
+      }
+      
+      const results = [];
+      let highest = 0;
+      let highestPlayers = [];
+      let answeredPlayers = [];
+      
+      for (const player of players) {
+        const answer = this._tieAnswers.get(player);
+        if (answer !== undefined && answer >= 1 && answer <= 6) {
+          results.push({ player, answer });
+          answeredPlayers.push(player);
+          if (answer > highest) {
+            highest = answer;
+            highestPlayers = [player];
+          } else if (answer === highest) {
+            highestPlayers.push(player);
+          }
         }
       }
-    }
-    
-    if (answeredPlayers.length === 0) {
-      this._broadcastToRoom(DICE_ROOM, ["tieBreakerCancel", {
-        message: "No one answered. Tie breaker cancelled.",
-        round: this._tieRound
-      }]);
-      this._resetTieBreakerState(id);
-      this._startCooldownAfterTieBreaker();
-      return;
-    }
-    
-    const resultStrings = results.map(r => `${r.player}: ${r.answer}`);
-    const eliminatedPlayers = players.filter(p => !highestPlayers.includes(p));
-    
-    this._broadcastToRoom(DICE_ROOM, ["tieBreakerResults", {
-      round: this._tieRound,
-      results: resultStrings,
-      highest: highest,
-      highestPlayers: highestPlayers,
-      eliminated: eliminatedPlayers,
-      status: highestPlayers.length > 1 ? 'tie_continues' : 'has_winner'
-    }]);
-    
-    // Jika hanya 1 pemain dengan nilai tertinggi -> PEMENANG
-    if (highestPlayers.length === 1) {
-      const winner = highestPlayers[0];
       
-      const points = await this._getDicePoints();
-      points[winner] = (points[winner] || 0) + 1;
-      await this.diceGameSystem.setPoints(points);
-      this._kvCache.delete('dice_points');
+      if (answeredPlayers.length === 0) {
+        this._broadcastToRoom(DICE_ROOM, ["tieBreakerCancel", {
+          message: "No one answered. Tie breaker cancelled.",
+          round: this._tieRound
+        }]);
+        this._resetTieBreakerState(id);
+        this._startCooldownAfterTieBreaker();
+        this._processingTieResults = false;
+        return;
+      }
       
-      this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
-        username: winner,
-        totalPoints: points[winner] || 0,
-        diceValue: highest,
-        round: this._diceRound || 1,
-        isTieBreaker: true,
-        tieBreakerRound: this._tieRound,
-        finalWinner: true
+      const resultStrings = results.map(r => `${r.player}: ${r.answer}`);
+      const eliminatedPlayers = players.filter(p => !highestPlayers.includes(p));
+      
+      this._broadcastToRoom(DICE_ROOM, ["tieBreakerResults", {
+        round: this._tieRound,
+        results: resultStrings,
+        highest: highest,
+        highestPlayers: highestPlayers,
+        eliminated: eliminatedPlayers,
+        status: highestPlayers.length > 1 ? 'tie_continues' : 'has_winner'
       }]);
       
-      this._broadcastDiceNotification("diceError", {
-        message: `${winner} wins tie breaker with ${highest}`,
-        winner: winner,
-        guess: highest,
-        remaining: -1,
-        isTieBreaker: true,
-        isTieBreakerWinner: true,
-        finalWinner: true
-      });
+      // Jika hanya 1 pemain dengan nilai tertinggi -> PEMENANG
+      if (highestPlayers.length === 1) {
+        const winner = highestPlayers[0];
+        
+        const points = await this._getDicePoints();
+        points[winner] = (points[winner] || 0) + 1;
+        await this.diceGameSystem.setPoints(points);
+        this._kvCache.delete('dice_points');
+        
+        this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
+          username: winner,
+          totalPoints: points[winner] || 0,
+          diceValue: highest,
+          round: this._diceRound || 1,
+          isTieBreaker: true,
+          tieBreakerRound: this._tieRound,
+          finalWinner: true
+        }]);
+        
+        this._broadcastDiceNotification("diceError", {
+          message: `${winner} wins tie breaker with ${highest}`,
+          winner: winner,
+          guess: highest,
+          remaining: -1,
+          isTieBreaker: true,
+          isTieBreakerWinner: true,
+          finalWinner: true
+        });
+        
+        this._resetTieBreakerState(id);
+        this._startCooldownAfterTieBreaker();
+        this._processingTieResults = false;
+        return;
+      }
+      
+      // Jika masih ada TIE di nilai tertinggi -> LANJUT ROUND BERIKUTNYA
+      if (highestPlayers.length > 1) {
+        // Reset state untuk round berikutnya
+        const nextRoundPlayers = [...highestPlayers];
+        const currentRound = this._tieRound;
+        
+        // Reset tie breaker state untuk round ini
+        this._resetTieBreakerState(id);
+        
+        // Hapus ID lama
+        this._tieBreakers.delete(id);
+        
+        // Siapkan untuk round berikutnya
+        this._tiePlayers = nextRoundPlayers;
+        this._tieAnswers = new Map();
+        this._tieActive = true;
+        
+        // Kirim notifikasi round berikutnya (hanya satu)
+        const nextRoundPlayerNames = nextRoundPlayers.join(', ');
+        const nextRound = currentRound + 1;
+        
+        this._broadcastToRoom(DICE_ROOM, ["tieBreakerNextRound", {
+          round: nextRound,
+          players: nextRoundPlayers,
+          playerNames: nextRoundPlayerNames,
+          message: `Tie continues! Round ${nextRound}: ${nextRoundPlayerNames}`,
+          status: 'tie_continues'
+        }]);
+        
+        // Tunggu sebentar sebelum memulai round berikutnya
+        setTimeout(() => {
+          if (this._tiePlayers.length > 1) {
+            // Buat ID baru untuk round baru
+            const newId = `tie_${Date.now()}`;
+            this._tieBreakers.set(newId, {
+              players: this._tiePlayers,
+              round: nextRound,
+              winner: null,
+              status: 'waiting'
+            });
+            this._runTieRound(room, newId, this._tiePlayers);
+          } else if (this._tiePlayers.length === 1) {
+            const winner = this._tiePlayers[0];
+            this._processSingleWinner(room, id, winner);
+          }
+        }, 3000);
+        
+        this._processingTieResults = false;
+        return;
+      }
       
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
-      return;
+      this._processingTieResults = false;
+      
+    } catch(e) {
+      this._processingTieResults = false;
+      this._resetTieBreakerState(id);
+      this._startCooldownAfterTieBreaker();
     }
-    
-    // Jika masih ada TIE di nilai tertinggi -> LANJUT ROUND BERIKUTNYA
-    if (highestPlayers.length > 1) {
-      this._tiePlayers = highestPlayers;
-      this._tieAnswers = new Map();
-      data.players = highestPlayers;
-      data.round = this._tieRound;
-      data.status = 'waiting';
-      data.tieValue = highest;
-      
-      // Hanya kirim Round berikutnya: nama pemain
-      const nextRoundPlayerNames = highestPlayers.join(', ');
-      this._broadcastDiceNotification("diceError", {
-        message: `Round ${this._tieRound + 1}: ${nextRoundPlayerNames}`,
-        players: highestPlayers,
-        remaining: -1,
-        isTieBreaker: true,
-        isTieContinues: true,
-        round: this._tieRound + 1
-      });
-      
-      setTimeout(() => {
-        if (this._tieActive && this._tiePlayers.length > 1) {
-          this._runTieRound(room, id, this._tiePlayers);
-        } else if (this._tiePlayers.length === 1) {
-          const winner = this._tiePlayers[0];
-          this._processSingleWinner(room, id, winner);
-        }
-      }, 3000);
-      
-      return;
-    }
-    
-    this._resetTieBreakerState(id);
-    this._startCooldownAfterTieBreaker();
   }
 
   async _processSingleWinner(room, id, winner) {
@@ -2562,7 +2597,6 @@ async submitDiceAnswer(ws, username, guess) {
     this._isShowingDice = false;
     this.currentDiceRoll = null;
     this.diceAnswered = new Set();
-    this._processingTieResults = false;
     
     if (this._tieTimer) {
       clearTimeout(this._tieTimer);
@@ -2572,6 +2606,14 @@ async submitDiceAnswer(ws, username, guess) {
       clearInterval(this._tieInterval);
       this._tieInterval = null;
     }
+    
+    // Reset flag notifikasi agar tidak duplikat
+    this._diceNotifiedFlags = {
+      20: false,
+      10: false,
+      5: false,
+      timeup: false
+    };
   }
 
   _getActiveTieBreakerId() {
@@ -2634,6 +2676,7 @@ async submitDiceAnswer(ws, username, guess) {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
+      this._tieBreakerLock = false;
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
@@ -2729,6 +2772,7 @@ async submitDiceAnswer(ws, username, guess) {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
+      this._tieBreakerLock = false;
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
@@ -5103,6 +5147,7 @@ async submitDiceAnswer(ws, username, guess) {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
+      this._tieBreakerLock = false;
       if (this._tieTimer) {
         clearTimeout(this._tieTimer);
         this._tieTimer = null;
