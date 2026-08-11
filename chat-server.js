@@ -1,6 +1,7 @@
-// ==================== CHAT SERVER - SIMPLE & EFFICIENT ====================
+// ==================== CHAT SERVER - TANPA RATE LIMITING ====================
 
 const C = {
+  // ===== KONFIGURASI DASAR =====
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 500,
   MAX_MESSAGE_SIZE: 5000,
@@ -13,11 +14,11 @@ const C = {
   NUMBER_UPDATE_INTERVAL: 15 * 60 * 1000, // 15 menit
   CLEANUP_INTERVAL: 5 * 60 * 1000, // 5 menit
   
-  // ===== RATE LIMITING =====
-  MAX_CHAT_PER_SECOND: 5,
-  MAX_GIFT_PER_SECOND: 2,
-  MAX_ROLL_PER_SECOND: 2,
-  MAX_CHAT_PER_ROOM: 20,
+  // ❌ RATE LIMITING DIHAPUS
+  // MAX_CHAT_PER_SECOND: 5,
+  // MAX_GIFT_PER_SECOND: 2,
+  // MAX_ROLL_PER_SECOND: 2,
+  // MAX_CHAT_PER_ROOM: 20,
 };
 
 const ROOMS = [
@@ -173,9 +174,9 @@ export class ChatServer {
     this._joinLocks = new Map();
     this._kursiLocks = new Map();
     
-    // Rate limiting
-    this._roomMessageCount = new Map();
-    this._roomMessageReset = new Map();
+    // ❌ RATE LIMITING DIHAPUS
+    // this._roomMessageCount = new Map();
+    // this._roomMessageReset = new Map();
     
     // Hybrid timers
     this.currentNumber = 1;
@@ -188,7 +189,7 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    // 🔥 Scheduled cleanup (tanpa alarm)
+    // Scheduled cleanup
     this._scheduleCleanup();
   }
   
@@ -198,6 +199,7 @@ export class ChatServer {
     if (this.closing || this.isDestroyed) return;
     
     setTimeout(() => {
+      this._updateNumberIfNeeded();
       this._doCleanup();
       this._cleanupStaleLocks();
       this._scheduleCleanup();
@@ -305,13 +307,6 @@ export class ChatServer {
       for (const [key, time] of this._kursiLocks) {
         if (now - time > C.LOCK_TIMEOUT) {
           this._kursiLocks.delete(key);
-        }
-      }
-      
-      for (const [room, resetTime] of this._roomMessageReset) {
-        if (now > resetTime + 60000) {
-          this._roomMessageCount.delete(room);
-          this._roomMessageReset.delete(room);
         }
       }
     } catch(e) {}
@@ -680,7 +675,6 @@ export class ChatServer {
     if (!ws) return;
     
     // Update timers
-    this._updateNumberIfNeeded();
     this._cleanupStaleLocks();
     
     try {
@@ -891,35 +885,8 @@ export class ChatServer {
             
             if (!chatMsg || !ROOMS_SET.has(chatRoom)) break;
             
-            const now = Date.now();
-            const roomKey = `chat_${chatRoom}`;
-            const reset = this._roomMessageReset.get(roomKey) || 0;
-            const count = this._roomMessageCount.get(roomKey) || 0;
-            
-            // Rate limiting per room
-            if (now > reset) {
-              this._roomMessageReset.set(roomKey, now + 1000);
-              this._roomMessageCount.set(roomKey, 1);
-            } else {
-              if (count > C.MAX_CHAT_PER_ROOM) {
-                break;
-              }
-              this._roomMessageCount.set(roomKey, count + 1);
-            }
-            
-            // Rate limiting per user
-            if (!ws._chatTime) ws._chatTime = 0;
-            if (!ws._chatCount) ws._chatCount = 0;
-            
-            if (now - ws._chatTime > 1000) {
-              ws._chatCount = 1;
-              ws._chatTime = now;
-            } else {
-              ws._chatCount++;
-              if (ws._chatCount > C.MAX_CHAT_PER_SECOND) {
-                break;
-              }
-            }
+            // ❌ RATE LIMITING DIHAPUS
+            // Kirim chat langsung tanpa batasan
             
             const clients = this.roomClients.get(chatRoom);
             if (!clients || clients.size === 0) break;
@@ -987,19 +954,8 @@ export class ChatServer {
           try {
             const [giftRoom, giftSender, giftReceiver, giftGiftName] = args;
             if (giftRoom && ROOMS_SET.has(giftRoom)) {
-              const now = Date.now();
-              if (!ws._giftTime) ws._giftTime = 0;
-              if (!ws._giftCount) ws._giftCount = 0;
-              
-              if (now - ws._giftTime > 1000) {
-                ws._giftCount = 1;
-                ws._giftTime = now;
-              } else {
-                ws._giftCount++;
-                if (ws._giftCount > C.MAX_GIFT_PER_SECOND) {
-                  break;
-                }
-              }
+              // ❌ RATE LIMITING DIHAPUS
+              // Kirim gift langsung tanpa batasan
               
               const clients = this.roomClients.get(giftRoom);
               if (!clients || clients.size === 0) break;
@@ -1013,19 +969,8 @@ export class ChatServer {
           try {
             const [rollRoom, rollUser, rollAngka] = args;
             if (rollRoom && ROOMS_SET.has(rollRoom)) {
-              const now = Date.now();
-              if (!ws._rollTime) ws._rollTime = 0;
-              if (!ws._rollCount) ws._rollCount = 0;
-              
-              if (now - ws._rollTime > 1000) {
-                ws._rollCount = 1;
-                ws._rollTime = now;
-              } else {
-                ws._rollCount++;
-                if (ws._rollCount > C.MAX_ROLL_PER_SECOND) {
-                  break;
-                }
-              }
+              // ❌ RATE LIMITING DIHAPUS
+              // Kirim roll langsung tanpa batasan
               
               const clients = this.roomClients.get(rollRoom);
               if (!clients || clients.size === 0) break;
@@ -1055,7 +1000,6 @@ export class ChatServer {
         
         case "getCurrentNumber":
           try { 
-            this._updateNumberIfNeeded();
             this.safeSend(ws, ["currentNumber", this.currentNumber]); 
           } catch(e) {}
           break;
@@ -1607,8 +1551,6 @@ export class ChatServer {
     this.wsRoomMap.clear();
     this._processingMessages.clear();
     this._cleaningUp.clear();
-    this._roomMessageCount.clear();
-    this._roomMessageReset.clear();
   }
   
   // ========== GET CLIENT COUNTRY ==========
