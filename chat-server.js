@@ -716,86 +716,64 @@ export class ChatServer {
           await this.handleJoin(ws, args[0]);
           break;
         
-case "multiJoin": {
-  const multiUsername = args[0];
-  const multiRoomname = args[1];
-  if (!multiUsername || !multiRoomname || this.closing || this.isDestroyed) break;
-  
-  // 🔥 CEK APAKAH USER SUDAH PUNYA DATA DARI SEBELUMNYA?
-  let existingData = null;
-  let existingSeat = null;
-  let existingRoom = null;
-  
-  // Cari data user di semua room
-  for (const [roomName, roomMan] of this.rooms) {
-    if (!roomMan) continue;
-    for (const [seat, seatData] of roomMan.seats) {
-      if (seatData?.namauser === multiUsername) {
-        existingData = seatData;
-        existingSeat = seat;
-        existingRoom = roomName;
-        break;
-      }
-    }
-    if (existingData) break;
-  }
-  
-  // Jika user sudah punya data, hapus dari room lama
-  if (existingData && existingRoom) {
-    const oldRoomMan = this.rooms.get(existingRoom);
-    if (oldRoomMan) {
-      oldRoomMan.removeSeat(existingSeat);
-      this.broadcast(existingRoom, ["removeKursi", existingRoom, existingSeat]);
-      this.updateRoomCount(existingRoom);
-    }
-    this.userSeat.delete(multiUsername);
-    this.userRoom.delete(multiUsername);
-  }
-  
-  const roomMan = this.rooms.get(multiRoomname);
-  if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
-  
-  // 🔥 PAKAI DATA YANG ADA (jika ada) ATAU DEFAULT
-  const noimageUrl = existingData?.noimageUrl || "";
-  const color = existingData?.color || "";
-  const itembawah = existingData?.itembawah || 0;
-  const itematas = existingData?.itematas || 0;
-  const vip = existingData?.vip || 0;        // 🔥 AMBIL DARI DATA YANG ADA!
-  const viptanda = existingData?.viptanda || 0; // 🔥 AMBIL DARI DATA YANG ADA!
-  
-  const seat = roomMan.addSeat(
-    multiUsername,
-    noimageUrl,
-    color,
-    itembawah,
-    itematas,
-    vip,      // 🔥 SEKARANG TIDAK KOSONG!
-    viptanda  // 🔥 SEKARANG TIDAK KOSONG!
-  );
-  
-  if (!seat) break;
-  
-  try {
-    this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
-    this.userRoom.set(multiUsername, multiRoomname);
-    if (!this.userCountry.has(multiUsername)) {
-      this.userCountry.set(multiUsername, ws.clientCountry || "Unknown");
-    }
-    
-    let connections = this.userConnections.get(multiUsername);
-    if (!connections) connections = new Set();
-    if (!connections.has(ws)) connections.add(ws);
-    this.userConnections.set(multiUsername, connections);
-    
-    this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
-    this._addToRoomClients(ws, multiRoomname);
-    
-    this.safeSend(ws, ["currentNumber", this.currentNumber]);
-    this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-    this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
-  } catch(e) {}
-  break;
-}
+        case "multiJoin": {
+          const multiUsername = args[0];
+          const multiRoomname = args[1];
+          if (!multiUsername || !multiRoomname || this.closing || this.isDestroyed) break;
+          
+          try {
+            let existingSeat = null, existingRoom = null;
+            for (const [roomName, roomMan] of this.rooms) {
+              if (!roomMan) continue;
+              for (const [seat, seatData] of roomMan.seats) {
+                if (seatData?.namauser === multiUsername) {
+                  existingSeat = seat;
+                  existingRoom = roomName;
+                  break;
+                }
+              }
+              if (existingSeat) break;
+            }
+            
+            if (existingSeat && existingRoom) {
+              const oldRoomMan = this.rooms.get(existingRoom);
+              if (oldRoomMan) {
+                oldRoomMan.removeSeat(existingSeat);
+                this.broadcast(existingRoom, ["removeKursi", existingRoom, existingSeat]);
+                this.updateRoomCount(existingRoom);
+              }
+              this.userSeat.delete(multiUsername);
+              this.userRoom.delete(multiUsername);
+            }
+          } catch(e) {}
+          
+          const roomMan = this.rooms.get(multiRoomname);
+          if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
+          
+          const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
+          if (!seat) break;
+          
+          try {
+            this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
+            this.userRoom.set(multiUsername, multiRoomname);
+            if (!this.userCountry.has(multiUsername)) {
+              this.userCountry.set(multiUsername, ws.clientCountry || "Unknown");
+            }
+            
+            let connections = this.userConnections.get(multiUsername);
+            if (!connections) connections = new Set();
+            if (!connections.has(ws)) connections.add(ws);
+            this.userConnections.set(multiUsername, connections);
+            
+            this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
+            this._addToRoomClients(ws, multiRoomname);
+            
+            this.safeSend(ws, ["currentNumber", this.currentNumber]);
+            this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
+            this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
+          } catch(e) {}
+          break;
+        }
         
         case "exitMulti": {
           const targetUsername = args[0];
