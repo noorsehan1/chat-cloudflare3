@@ -1,7 +1,7 @@
 // ==================== GAME-SERVER-HYBRID.js ====================
 // Hybrid approach: Event-driven + Alarm-based scheduling
-// NO CPU PROTECTION - Hemat Durable Object
 // KV Cache: Event-driven (no TTL, no timers)
+// NO CPU USAGE MONITORING
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -40,7 +40,8 @@ const CONSTANTS = {
   BROADCAST_BATCH_SIZE: 5,
   MAX_RESTART_ATTEMPTS: 3,
   RESTART_COOLDOWN_MS: 30000,
-  HEALTH_CHECK_INTERVAL_MS: 10000,
+  // FIXED: Duplicate key removed - use single definition
+  HEALTH_CHECK_INTERVAL_MS: 30000,
   MAX_IDLE_TIME_MS: 300000,
   RECONNECT_DELAY_MS: 2000,
   MAX_EVENT_QUEUE_SIZE: 1000,
@@ -78,8 +79,8 @@ const CONSTANTS = {
   
   ALARM_INTERVAL_MS: 15000,
   DICE_TICK_INTERVAL_MS: 1000,
-  CLEANUP_INTERVAL_MS: 30000,
-  HEALTH_CHECK_INTERVAL_MS: 30000,
+  // FIXED: Duplicate key removed - using single definition above
+  // CLEANUP_INTERVAL_MS: 30000, // REMOVED - use HEALTH_CHECK_INTERVAL_MS
   DICE_ACTIVITY_TIMEOUT_MS: 5000,
 };
 
@@ -486,24 +487,22 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== RATE LIMIT (SIMPLE) ====================
+  // ==================== RATE LIMIT ====================
+  
   _isRateLimited(wsId, eventType) {
     try {
       const now = Date.now();
       const key = `${wsId}_${eventType}`;
       const data = this._rateLimitMap.get(key);
-      
       if (!data) {
         this._rateLimitMap.set(key, { count: 1, resetTime: now + 1000 });
         return false;
       }
-      
       if (now > data.resetTime) {
         data.count = 1;
         data.resetTime = now + 1000;
         return false;
       }
-      
       data.count++;
       return data.count > 10;
     } catch(e) { return false; }
@@ -513,9 +512,7 @@ export class GameServer {
     try {
       const now = Date.now();
       for (const [key, data] of this._rateLimitMap) {
-        if (now - data.resetTime > 1000) {
-          this._rateLimitMap.delete(key);
-        }
+        if (now - data.resetTime > 1000) this._rateLimitMap.delete(key);
       }
     } catch(e) {}
   }
