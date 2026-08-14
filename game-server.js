@@ -1,6 +1,7 @@
-// ==================== GAME-SERVER-HYBRID.JS ====================
+// ==================== GAME-SERVER-HYBRID.js ====================
 // Hybrid approach: Event-driven + Alarm-based scheduling
-// Uses Durable Object Alarm API for efficient resource usage
+// NO CPU PROTECTION - Hemat Durable Object
+// KV Cache: Event-driven (no TTL, no timers)
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -35,9 +36,6 @@ const CONSTANTS = {
   TRANSLATE_TIMEOUT_MS: 10000,
   QUIZ_KEEP_ALIVE_INTERVAL_MS: 5000,
   QUIZ_NEXT_QUESTION_DELAY_MS: 5000,
-  CPU_TIME_LIMIT_MS: 10,
-  CPU_YIELD_DELAY_MS: 1,
-  CPU_CHECK_INTERVAL_MS: 100,
   MAX_EVENTS_PER_TICK: 5,
   BROADCAST_BATCH_SIZE: 5,
   MAX_RESTART_ATTEMPTS: 3,
@@ -78,12 +76,11 @@ const CONSTANTS = {
   TIE_BREAKER_TIME_LIMIT: 20,
   TIE_BREAKER_COOLDOWN: 15000,
   
-  // ==================== ALARM CONSTANTS ====================
-  ALARM_INTERVAL_MS: 15000,        // Main alarm interval (15 seconds)
-  DICE_TICK_INTERVAL_MS: 1000,     // Dice timer tick (per second)
-  CLEANUP_INTERVAL_MS: 30000,      // Cleanup every 30 seconds
-  HEALTH_CHECK_INTERVAL_MS: 30000, // Health check every 30 seconds
-  DICE_ACTIVITY_TIMEOUT_MS: 5000,  // Inactivity timeout
+  ALARM_INTERVAL_MS: 15000,
+  DICE_TICK_INTERVAL_MS: 1000,
+  CLEANUP_INTERVAL_MS: 30000,
+  HEALTH_CHECK_INTERVAL_MS: 30000,
+  DICE_ACTIVITY_TIMEOUT_MS: 5000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -97,30 +94,20 @@ const QUIZ_SCHEDULE = {
 
 const DICE_ROOM = "Quiz";
 
-// ==================== KV CACHE CLASS ====================
+// ==================== KV CACHE CLASS - EVENT DRIVEN ====================
 class KVCache {
   constructor() {
     this.cache = new Map();
-    this.ttl = 30000;
   }
 
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) return null;
-    if (Date.now() - entry.timestamp > this.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
     return entry.value;
   }
 
-  set(key, value, customTtl = null) {
-    const ttl = customTtl || this.ttl;
-    this.cache.set(key, {
-      value: value,
-      timestamp: Date.now(),
-      ttl: ttl
-    });
+  set(key, value) {
+    this.cache.set(key, { value: value });
   }
 
   delete(key) {
@@ -130,104 +117,66 @@ class KVCache {
   clear() {
     this.cache.clear();
   }
-}
 
-// ==================== CPU PROTECTION CLASS ====================
-class CPUProtection {
-  constructor() {
-    this._cpuStartTime = 0;
-    this._cpuTotalTime = 0;
-    this._cpuCheckCount = 0;
-    this._isThrottled = false;
-    this._pendingOperations = [];
-    this._isProcessingPending = false;
-    this._cpuHistory = [];
-    this._cpuAverage = 0;
-    this._eventQueue = [];
-    this._isProcessingQueue = false;
-    this._rateLimitMap = new Map();
+  updateIfChanged(key, newValue) {
+    const existing = this.cache.get(key);
+    if (!existing) {
+      this.cache.set(key, { value: newValue });
+      return true;
+    }
+    
+    const oldValue = existing.value;
+    if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+      this.cache.set(key, { value: newValue });
+      return true;
+    }
+    
+    return false;
   }
 
-  _startCPUTimer() {
-    this._cpuStartTime = performance.now ? performance.now() : Date.now();
-    return this._cpuStartTime;
-  }
-
-  _checkCPULimit() {
-    try {
-      const now = performance.now ? performance.now() : Date.now();
-      const elapsed = now - this._cpuStartTime;
-      if (elapsed >= CONSTANTS.CPU_TIME_LIMIT_MS) {
-        this._cpuTotalTime += elapsed;
-        this._cpuCheckCount++;
-        this._cpuHistory.push(elapsed);
-        if (this._cpuHistory.length > 10) this._cpuHistory.shift();
-        const sum = this._cpuHistory.reduce((a, b) => a + b, 0);
-        this._cpuAverage = sum / this._cpuHistory.length;
-        return true;
+  updateBatch(entries) {
+    const changed = [];
+    for (const [key, newValue] of entries) {
+      const existing = this.cache.get(key);
+      if (!existing) {
+        this.cache.set(key, { value: newValue });
+        changed.push(key);
+        continue;
       }
-      return false;
-    } catch(e) { return false; }
-  }
-
-  async _cpuYield() {
-    try {
-      if (this._isThrottled) {
-        await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 2);
-        return;
+      
+      const oldValue = existing.value;
+      if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+        this.cache.set(key, { value: newValue });
+        changed.push(key);
       }
-      if (this._cpuAverage > CONSTANTS.CPU_TIME_LIMIT_MS * 0.8) {
-        await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 3);
-        this._isThrottled = true;
-        setTimeout(() => { this._isThrottled = false; }, 100);
-      } else {
-        await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS);
-      }
-    } catch(e) {}
+    }
+    return changed;
   }
 
-  _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  invalidate(key) {
+    this.cache.delete(key);
   }
 
-  async _safeExecute(fn, ...args) {
-    this._startCPUTimer();
-    try {
-      const result = await fn(...args);
-      if (this._checkCPULimit()) await this._cpuYield();
-      return result;
-    } catch(e) {
-      if (this._checkCPULimit()) await this._cpuYield();
-      throw e;
+  invalidateBatch(keys) {
+    for (const key of keys) {
+      this.cache.delete(key);
     }
   }
 
-  _isRateLimited(wsId, eventType) {
-    try {
-      const now = Date.now();
-      const key = `${wsId}_${eventType}`;
-      const data = this._rateLimitMap.get(key);
-      if (!data) {
-        this._rateLimitMap.set(key, { count: 1, resetTime: now + 1000 });
-        return false;
-      }
-      if (now > data.resetTime) {
-        data.count = 1;
-        data.resetTime = now + 1000;
-        return false;
-      }
-      data.count++;
-      return data.count > 10;
-    } catch(e) { return false; }
+  keys() {
+    return Array.from(this.cache.keys());
   }
 
-  _cleanupRateLimitMap() {
-    try {
-      const now = Date.now();
-      for (const [key, data] of this._rateLimitMap) {
-        if (now - data.resetTime > 1000) this._rateLimitMap.delete(key);
-      }
-    } catch(e) {}
+  size() {
+    return this.cache.size;
+  }
+
+  entries() {
+    const result = {};
+    for (const [key, entry] of this.cache) {
+      result[key] = entry.value;
+    }
+    return result;
   }
 }
 
@@ -365,10 +314,9 @@ class DiceGameSystem {
 }
 
 // ==================== GAME SERVER CLASS - HYBRID VERSION ====================
-export class GameServer extends CPUProtection {
+export class GameServer {
   constructor(state, env) {
     try {
-      super();
       this.state = state;
       this.env = env;
       this.closing = false;
@@ -419,7 +367,6 @@ export class GameServer extends CPUProtection {
       this._diceBreakTimeout = null;
       this._diceStartTimeout = null;
       this.diceAutoEnabled = false;
-      this._diceKeepAliveInterval = null;
       this._lastActivityTime = Date.now();
       this._isDiceIdle = false;
       this._isShowingDice = false;
@@ -487,22 +434,24 @@ export class GameServer extends CPUProtection {
       this._cachedLastWeekWinner = null;
       this._cachedLastWeekWinnerTimestamp = 0;
 
+      // ==================== KV CACHE - EVENT DRIVEN ====================
       this._kvCache = new KVCache();
 
       this.diceGameSystem = new DiceGameSystem(this);
 
       // ==================== ALARM-BASED SCHEDULING ====================
-      // NO setInterval! Menggunakan Alarm API untuk menghemat resource
       this._alarmScheduled = false;
       this._diceTickCounter = 0;
       this._lastDiceTickTime = 0;
-      
-      // State persistence key
       this._stateKey = 'game_server_state';
 
-      // ==================== LOAD STATE DARI DURABLE ====================
+      // ==================== EVENT QUEUE ====================
+      this._eventQueue = [];
+      this._isProcessingQueue = false;
+      this._rateLimitMap = new Map();
+
+      // ==================== LOAD STATE ====================
       this._loadState().then(() => {
-        // Schedule first alarm if not already scheduled
         if (!this._alarmScheduled) {
           this._scheduleAlarm(CONSTANTS.ALARM_INTERVAL_MS);
           this._alarmScheduled = true;
@@ -537,13 +486,46 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== RATE LIMIT (SIMPLE) ====================
+  _isRateLimited(wsId, eventType) {
+    try {
+      const now = Date.now();
+      const key = `${wsId}_${eventType}`;
+      const data = this._rateLimitMap.get(key);
+      
+      if (!data) {
+        this._rateLimitMap.set(key, { count: 1, resetTime: now + 1000 });
+        return false;
+      }
+      
+      if (now > data.resetTime) {
+        data.count = 1;
+        data.resetTime = now + 1000;
+        return false;
+      }
+      
+      data.count++;
+      return data.count > 10;
+    } catch(e) { return false; }
+  }
+
+  _cleanupRateLimitMap() {
+    try {
+      const now = Date.now();
+      for (const [key, data] of this._rateLimitMap) {
+        if (now - data.resetTime > 1000) {
+          this._rateLimitMap.delete(key);
+        }
+      }
+    } catch(e) {}
+  }
+
   // ==================== STATE PERSISTENCE ====================
   
   async _saveState() {
     try {
       if (this.closing || this.isDestroyed) return;
       
-      // Only save critical state, not WebSocket connections
       const state = {
         _diceRound: this._diceRound || 0,
         _diceStartTime: this._diceStartTime,
@@ -555,21 +537,16 @@ export class GameServer extends CPUProtection {
         diceAutoEnabled: this.diceAutoEnabled,
         _diceNotifiedFlags: this._diceNotifiedFlags,
         _lastSentRemaining: this._lastSentRemaining,
-        _diceRound: this._diceRound,
-        // Tie breaker state
         _tieActive: this._tieActive,
         _tieRound: this._tieRound,
         _tiePlayers: this._tiePlayers,
-        // Game state summaries
         activeGamesCount: this.activeGames.size,
         wsConnectionsCount: this.wsMap.size,
         _lastHeartbeat: Date.now()
       };
       
       await this.state.storage.put(this._stateKey, state);
-    } catch(e) {
-      // Silent fail - state persistence is best effort
-    }
+    } catch(e) {}
   }
 
   async _loadState() {
@@ -592,14 +569,11 @@ export class GameServer extends CPUProtection {
         this._tieRound = state._tieRound || 0;
         this._tiePlayers = state._tiePlayers || [];
         
-        // Restore dice timer if dice is active
         if (this.currentDiceRoll && this._diceQuestionStartTime) {
           this._restoreDiceTimer();
         }
       }
-    } catch(e) {
-      // Silent fail
-    }
+    } catch(e) {}
   }
 
   // ==================== ALARM HANDLING ====================
@@ -611,39 +585,18 @@ export class GameServer extends CPUProtection {
         return;
       }
 
-      // Reset alarm flag before processing
       this._alarmScheduled = false;
 
       // ====== RUN ALL PERIODIC TASKS ======
-      
-      // 1. CPU Monitor cleanup
       this._cleanupRateLimitMap();
-      
-      // 2. Dice timer tick (if dice is active)
       this._processDiceTick();
-      
-      // 3. Health check
       this._performHealthCheck();
-      
-      // 4. Check stuck games
       this._checkStuckGames();
-      
-      // 5. Cleanup stale games
       this._cleanupStaleGames();
-      
-      // 6. Cleanup dead connections
       this._cleanupDeadConnections();
-      
-      // 7. Dice auto task
       await this._diceAutoTask();
-      
-      // 8. Dice keep alive
       this._diceKeepAliveTask();
-      
-      // 9. Check weekly reset
       await this._checkAndResetWeeklyDice();
-      
-      // 10. Save state
       await this._saveState();
 
       // ====== SCHEDULE NEXT ALARM ======
@@ -653,7 +606,6 @@ export class GameServer extends CPUProtection {
       }
 
     } catch(e) {
-      // Schedule next alarm even on error
       if (!this.closing && !this.isDestroyed) {
         this._scheduleAlarm(CONSTANTS.ALARM_INTERVAL_MS);
         this._alarmScheduled = true;
@@ -664,32 +616,26 @@ export class GameServer extends CPUProtection {
   _scheduleAlarm(delayMs) {
     try {
       const currentAlarm = this.state.storage.getAlarm();
-      // Don't schedule if already scheduled
       if (currentAlarm) return;
       this.state.storage.setAlarm(Date.now() + delayMs);
-    } catch(e) {
-      // Silent fail
-    }
+    } catch(e) {}
   }
 
   // ==================== DICE TIMER - TICK BASED ====================
   
   _restoreDiceTimer() {
-    // Restart dice timer notifications from saved state
     this._diceNotifiedFlags = {
       20: false,
       10: false,
       5: false,
       timeup: false
     };
-    // The alarm tick will handle remaining time
   }
 
   _processDiceTick() {
     try {
       if (this._tieActive) return;
       
-      // Only process if dice is active
       if (!this.currentDiceRoll || !this._diceQuestionStartTime) {
         return;
       }
@@ -702,7 +648,6 @@ export class GameServer extends CPUProtection {
         let shouldSend = false;
         let message = "";
         
-        // Check notification thresholds
         if (remainingInt === 20 && !this._diceNotifiedFlags[20]) {
           this._diceNotifiedFlags[20] = true;
           shouldSend = true;
@@ -748,8 +693,6 @@ export class GameServer extends CPUProtection {
       cooldown: true
     });
     
-    // Reset cooldown after 15 seconds (will be handled by alarm)
-    // But we also set a fallback timeout
     if (this._diceTimeUpCooldownTimer) {
       clearTimeout(this._diceTimeUpCooldownTimer);
     }
@@ -767,7 +710,6 @@ export class GameServer extends CPUProtection {
       this._lastNotificationKey = "";
       this._lastNotificationTime = 0;
       
-      // Also handle dice timeout/cleanup here
       this._handleDiceTimeout();
     }, 15000);
   }
@@ -841,45 +783,26 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== ORIGINAL METHODS (with modifications) ====================
-  
-  // [Keep all original methods from the provided code]
-  // Only remove setInterval-based scheduling and replace with alarm-based
-  
   // ==================== CACHE METHODS ====================
 
-  async _updateCachedResetWeek(week) {
-    this._cachedResetWeek = week;
-    this._cachedResetWeekTimestamp = Date.now();
-  }
-
-  async _getCachedResetWeek() {
-    try {
-      if (this._cachedResetWeek !== null) {
-        return this._cachedResetWeek;
-      }
-      
-      if (this.env?.QUESTIONS) {
-        const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
-        if (lastResetWeek) {
-          this._cachedResetWeek = lastResetWeek;
-          this._cachedResetWeekTimestamp = Date.now();
-          return lastResetWeek;
-        }
-      }
-      
-      return null;
-    } catch(e) {
-      return null;
+  async _updateCacheFromKV(key, kvValue) {
+    const cached = this._kvCache.get(key);
+    const newValue = kvValue;
+    if (cached !== undefined && JSON.stringify(cached) === JSON.stringify(newValue)) {
+      return false;
     }
+    this._kvCache.set(key, newValue);
+    return true;
   }
 
   async _getRecordingStatusFromKV(roomName) {
     try {
       if (!roomName) return false;
       
-      if (this._recordingEnabled.has(roomName)) {
-        return this._recordingEnabled.get(roomName);
+      const cacheKey = `recording_${roomName}`;
+      const cached = this._kvCache.get(cacheKey);
+      if (cached !== undefined && cached !== null) {
+        return cached;
       }
       
       if (this.env?.QUESTIONS) {
@@ -887,6 +810,7 @@ export class GameServer extends CPUProtection {
           CONSTANTS.LOWCARD_RECORDING_KEY + roomName
         );
         const isRecording = kvValue === 'true';
+        this._kvCache.set(cacheKey, isRecording);
         this._recordingEnabled.set(roomName, isRecording);
         return isRecording;
       }
@@ -1019,10 +943,6 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  _healthCheckTask() {
-    // Removed - handled by alarm
-  }
-
   _diceKeepAliveTask() {
     try {
       this._lastHeartbeat = Date.now();
@@ -1061,7 +981,6 @@ export class GameServer extends CPUProtection {
       
       await this._checkDiceAutoStatus();
       
-      // Don't use setInterval - alarm handles periodic checks
       const isDiceTime = this._isDiceTime();
       const clients = this.wsClients.get(DICE_ROOM);
       const hasPlayers = clients && clients.size > 0;
@@ -1085,7 +1004,6 @@ export class GameServer extends CPUProtection {
             await this.startDiceWithDelay(CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
           }
           
-          // Use setTimeout for immediate start, not interval
           setTimeout(() => {
             if (!this.closing && !this.isDestroyed && 
                 !this.currentDiceRoll && !this._diceTimeout && 
@@ -1225,6 +1143,8 @@ export class GameServer extends CPUProtection {
     try {
       if (!roomName) return false;
       
+      const cacheKey = `recording_${roomName}`;
+      
       const currentStatus = await this._getRecordingStatusFromKV(roomName);
       if (currentStatus) {
         this._broadcastToRoom(roomName, ["recordingStatus", true]);
@@ -1240,6 +1160,9 @@ export class GameServer extends CPUProtection {
         );
       }
       
+      this._kvCache.invalidate(cacheKey);
+      this._kvCache.set(cacheKey, true);
+      
       this._broadcastToRoom(roomName, ["recordingStatus", true]);
       
       return true;
@@ -1253,6 +1176,7 @@ export class GameServer extends CPUProtection {
       if (!roomName) return false;
       
       const room = roomName.trim();
+      const cacheKey = `recording_${room}`;
       
       const currentStatus = await this._getRecordingStatusFromKV(room);
       if (!currentStatus) {
@@ -1286,6 +1210,9 @@ export class GameServer extends CPUProtection {
         }
       }
       
+      this._kvCache.invalidate(cacheKey);
+      this._kvCache.set(cacheKey, false);
+      
       this._broadcastToRoom(room, ["recordingStatus", false]);
       
       return true;
@@ -1315,6 +1242,12 @@ export class GameServer extends CPUProtection {
       if (!room) return {};
       if (!this.env?.QUESTIONS) return {};
       
+      const cacheKey = `winners_${room}`;
+      const cached = this._kvCache.get(cacheKey);
+      if (cached !== undefined && cached !== null) {
+        return cached;
+      }
+      
       const isRecording = await this._getRecordingStatusFromKV(room);
       if (!isRecording) {
         return {};
@@ -1324,6 +1257,7 @@ export class GameServer extends CPUProtection {
       const winners = await this.env.QUESTIONS.get(key, 'json');
       
       if (winners && typeof winners === 'object' && Object.keys(winners).length > 0) {
+        this._kvCache.set(cacheKey, winners);
         return winners;
       }
       
@@ -1378,6 +1312,7 @@ export class GameServer extends CPUProtection {
       if (!this.env?.QUESTIONS) return false;
       
       const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
+      const cacheKey = `winners_${room}`;
       
       let roomWinners = await this.env.QUESTIONS.get(key, 'json') || {};
       
@@ -1391,6 +1326,8 @@ export class GameServer extends CPUProtection {
       roomWinners[username] = newCount + "x";
       
       await this.env.QUESTIONS.put(key, JSON.stringify(roomWinners));
+      
+      this._kvCache.set(cacheKey, roomWinners);
       
       return true;
     } catch(e) {
@@ -1411,6 +1348,9 @@ export class GameServer extends CPUProtection {
       const points = await this.diceGameSystem.getPoints();
       points[username] = (points[username] || 0) + 1;
       await this.diceGameSystem.setPoints(points);
+      
+      this._kvCache.invalidate('dice_points');
+      this._kvCache.set('dice_points', points);
       
       this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
         username: username,
@@ -1438,7 +1378,15 @@ export class GameServer extends CPUProtection {
   async _getDicePoints() {
     try {
       if (!this.env?.QUESTIONS) return {};
+      
+      const cacheKey = 'dice_points';
+      const cached = this._kvCache.get(cacheKey);
+      if (cached !== undefined && cached !== null) {
+        return cached;
+      }
+      
       const points = await this.diceGameSystem.getPoints();
+      this._kvCache.set(cacheKey, points);
       return points;
     } catch(e) {
       return {};
@@ -1526,7 +1474,6 @@ export class GameServer extends CPUProtection {
       await this.diceGameSystem.loadScores();
       await this._initDice();
       
-      // Use setTimeout instead of interval for initial start
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) {
           if (this._isDiceTime()) {
@@ -1683,7 +1630,6 @@ export class GameServer extends CPUProtection {
         5: false,
         timeup: false
       };
-      // Timer handled by alarm ticks
     } catch(e) {}
   }
 
@@ -2089,7 +2035,6 @@ export class GameServer extends CPUProtection {
         return;
       }
       
-      // ============ TIE BREAKER MODE ============
       if (this._tieActive) {
         if (!this._tiePlayers.includes(username)) {
           return;
@@ -2140,7 +2085,6 @@ export class GameServer extends CPUProtection {
         return;
       }
       
-      // ============ DICE NORMAL MODE ============
       if (this.diceAnswered.has(username)) return;
       
       const diceValue = this.currentDiceRoll?.value;
@@ -2167,6 +2111,9 @@ export class GameServer extends CPUProtection {
         const points = await this._getDicePoints();
         points[username] = (points[username] || 0) + 1;
         await this.diceGameSystem.setPoints(points);
+        
+        this._kvCache.invalidate('dice_points');
+        this._kvCache.set('dice_points', points);
       }
       
     } catch(e) {}
@@ -2336,13 +2283,15 @@ export class GameServer extends CPUProtection {
       return;
     }
     
-    // ============ CASE 1: HANYA 1 PEMENANG ============
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
       
       const points = await this._getDicePoints();
       points[winner] = (points[winner] || 0) + 1;
       await this.diceGameSystem.setPoints(points);
+      
+      this._kvCache.invalidate('dice_points');
+      this._kvCache.set('dice_points', points);
       
       this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
         username: winner,
@@ -2359,7 +2308,6 @@ export class GameServer extends CPUProtection {
       return;
     }
     
-    // ============ CASE 2: MASIH TIE -> LANGSUNG ROUND BERIKUTNYA ============
     if (highestPlayers.length > 1) {
       this._tiePlayers = highestPlayers;
       this._tieAnswers = new Map();
@@ -2388,6 +2336,9 @@ export class GameServer extends CPUProtection {
     const points = await this._getDicePoints();
     points[winner] = (points[winner] || 0) + 1;
     await this.diceGameSystem.setPoints(points);
+    
+    this._kvCache.invalidate('dice_points');
+    this._kvCache.set('dice_points', points);
     
     this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
       username: winner,
@@ -2526,8 +2477,6 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== CONTINUE WITH REMAINING METHODS ====================
-  
   async startDiceWithDelay(delayMs) {
     try {
       if (this._diceStartTimeout) return;
@@ -2633,26 +2582,16 @@ export class GameServer extends CPUProtection {
       const msgStr = JSON.stringify([type, data]);
       const wsIdArray = Array.from(wsIds);
       const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
-      let startTime = Date.now();
       
       for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
         const batch = wsIdArray.slice(i, i + BATCH_SIZE);
-        
         for (const wsId of batch) {
           const ws = this.wsMap.get(wsId);
           if (ws && ws.readyState === 1) {
-            try { 
-              ws.send(msgStr); 
-            } catch(e) {}
+            try { ws.send(msgStr); } catch(e) {}
           }
         }
-        
-        if (Date.now() - startTime > 8) {
-          await this._cpuYield();
-          startTime = Date.now();
-        }
       }
-      
     } catch(e) {}
   }
 
@@ -2836,21 +2775,14 @@ export class GameServer extends CPUProtection {
       const msgStr = JSON.stringify(["diceRoll", msgData]);
       const wsIdArray = Array.from(wsIds);
       const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
-      let startTime = Date.now();
       
       for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
         const batch = wsIdArray.slice(i, i + BATCH_SIZE);
-        
         for (const wsId of batch) {
           const ws = this.wsMap.get(wsId);
           if (ws && ws.readyState === 1) {
             try { ws.send(msgStr); } catch(e) {}
           }
-        }
-        
-        if (Date.now() - startTime > 8) {
-          await this._cpuYield();
-          startTime = Date.now();
         }
       }
       
@@ -3351,7 +3283,6 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ==================== EVALUATE ROUND ====================
   async _evaluateRound(room, game) {
     try {
       if (this.isDestroyed || !game?._isActive || game._gameEnded || game._isEvaluating || !game.players) return;
@@ -3384,8 +3315,6 @@ export class GameServer extends CPUProtection {
       const entries = Array.from(numbers.entries());
       const submittedIds = new Set(numbers.keys());
       const activeIds = this._getActivePlayerIds(game);
-      
-      if (this._checkCPULimit()) await this._cpuYield();
       
       for (const id of activeIds) {
         if (!submittedIds.has(id)) eliminated.add(id);
@@ -3925,40 +3854,36 @@ export class GameServer extends CPUProtection {
       if (this.isDestroyed || !ws || !data?.[0]) return;
       this._eventQueue.push({ ws, data });
       if (!this._isProcessingQueue) {
-        await this._safeExecute(async () => {
-          await this._processEventQueue();
-        });
+        this._processEventQueue();
       }
     } catch(e) {}
   }
 
-  async _processEventQueue() {
+  _processEventQueue() {
     try {
       if (this._isProcessingQueue || this._eventQueue.length === 0) return;
       if (this._eventQueue.length > CONSTANTS.MAX_EVENT_QUEUE_SIZE) {
         this._eventQueue.splice(0, this._eventQueue.length - CONSTANTS.MAX_EVENT_QUEUE_SIZE);
       }
       this._isProcessingQueue = true;
-      this._startCPUTimer();
+      
       const batchSize = CONSTANTS.MAX_EVENTS_PER_TICK;
       const batch = this._eventQueue.splice(0, batchSize);
+      
       for (const item of batch) {
         try {
-          await this._processEventItem(item.ws, item.data);
+          this._processEventItem(item.ws, item.data);
         } catch(e) {
           this._handleError('processEvent', e);
         }
-        if (this._checkCPULimit()) {
-          await this._cpuYield();
-          this._startCPUTimer();
-        }
       }
+      
       if (this._eventQueue.length > 0) {
         setTimeout(() => {
           if (!this.closing && !this.isDestroyed) {
             this._processEventQueue();
           }
-        }, CONSTANTS.CPU_YIELD_DELAY_MS);
+        }, 10);
       }
     } catch(e) {
       this._handleError('processQueue', e);
@@ -3967,7 +3892,7 @@ export class GameServer extends CPUProtection {
     }
   }
 
-  async _processEventItem(ws, data) {
+  _processEventItem(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
@@ -3976,9 +3901,7 @@ export class GameServer extends CPUProtection {
         this._safeSend(ws, ["gameLowCardError", "Too many requests"]);
         return;
       }
-      await this._safeExecute(async () => {
-        await this._handleEventInternal(ws, data);
-      });
+      this._handleEventInternal(ws, data);
     } catch(e) {}
   }
 
@@ -4988,21 +4911,14 @@ export class GameServer extends CPUProtection {
       const msgStr = JSON.stringify(message);
       const wsIdArray = Array.from(wsIds);
       const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
-      let startTime = Date.now();
       
       for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
         const batch = wsIdArray.slice(i, i + BATCH_SIZE);
-        
         for (const wsId of batch) {
           const ws = this.wsMap.get(wsId);
           if (ws && ws.readyState === 1) {
             try { ws.send(msgStr); } catch(e) {}
           }
-        }
-        
-        if (Date.now() - startTime > 8) {
-          await this._cpuYield();
-          startTime = Date.now();
         }
       }
       
@@ -5023,12 +4939,10 @@ export class GameServer extends CPUProtection {
       this.isDestroyed = true;
       this.closing = true;
       
-      // Cancel any pending alarms
       try {
         await this.state.storage.setAlarm(null);
       } catch(e) {}
       
-      // Cleanup all timers
       if (this._diceTimeout) {
         clearTimeout(this._diceTimeout);
         this._diceTimeout = null;
@@ -5056,7 +4970,6 @@ export class GameServer extends CPUProtection {
       
       this._stopDiceTimerNotifications();
       
-      // Cleanup games
       for (const [room, game] of this.activeGames) {
         await this._forceCleanupGame(room, game);
       }
@@ -5065,7 +4978,6 @@ export class GameServer extends CPUProtection {
       await this.resetDice();
       this.diceGameSystem.clearCache();
       
-      // Close all connections
       for (const [wsId, ws] of this.wsMap) {
         try {
           if (ws && ws.readyState === 1) {
@@ -5077,7 +4989,6 @@ export class GameServer extends CPUProtection {
       this.wsClients.clear();
       this.clientRooms.clear();
       
-      // Save final state
       await this._saveState();
       
       this._alarmScheduled = false;
@@ -5116,7 +5027,8 @@ export class GameServer extends CPUProtection {
             tieActive: this._tieActive,
             tieRound: this._tieRound,
             tiePlayers: this._tiePlayers.length,
-            alarmScheduled: this._alarmScheduled
+            alarmScheduled: this._alarmScheduled,
+            cacheSize: this._kvCache.size()
           };
           return new Response(JSON.stringify(status), {
             headers: { 'Content-Type': 'application/json' }
