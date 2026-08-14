@@ -1,7 +1,7 @@
 // ==================== GAME-SERVER-FULL.js ====================
 // ✅ VERSI LENGKAP - TANPA LOG - SIAP DEPLOY - HEMAT & DURABLE
 
-const CONSTANTS = {
+ const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
   DRAW_TIME_MS: 20000,
   EVALUATION_DELAY_MS: 2000,
