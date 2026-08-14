@@ -15,4 +15,4 @@ new_sqlite_classes = ["ChatServer", "GameServer"]
 # ==================== KV STORAGE UNTUK SOAL QUIZ ====================
 [[kv_namespaces]]
 binding = "QUESTIONS"
-id = "2b61fe8b00064736a0054041fda7c2f2"
+id = "b8da7b275e6b4214a8acd0d257b3d7ac"
