@@ -3,6 +3,7 @@
 // ✅ TANPA CPU PROTECTION - TANPA TTL - TANPA RATE LIMITING
 // ✅ HANYA 3 INTERVAL - SEMUA PAKAI CACHE PERMANEN
 // ✅ SIAP DEPLOY - HEMAT - DURABLE - ANTI HYBERNATE
+// ✅ SUPPORT startGameWithRecording DARI ANDROID
 
 const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
@@ -25,6 +26,8 @@ const CONSTANTS = {
   STUCK_DRAW_TIMEOUT_MS: 30000,
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
   ERROR_RECOVERY_DELAY_MS: 5000,
+  ERROR_RESET_INTERVAL_MS: 60000,
+  MAX_UNHANDLED_ERRORS: 10,
   
   DICE_POINT_KEY: 'dice_points',
   DICE_LAST_WEEK_WINNER: 'dice_last_week_winner',
@@ -1834,7 +1837,7 @@ export class GameServer {
 
   // ==================== GAME METHODS ====================
 
-  async startGame(ws, bet, username) {
+  async startGame(ws, bet, username, forceStart = false) {
     try {
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
@@ -1856,10 +1859,16 @@ export class GameServer {
         return;
       }
 
+      // ✅ CEK RECORDING - IZINKAN JIKA forceStart = true
       const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
-      if (isRecordingEnabled) {
+      if (isRecordingEnabled && !forceStart) {
         this._safeSend(ws, ["gameLowCardError", "Recording is ACTIVE in this room"]);
         return;
+      }
+      
+      // ✅ KIRIM INFO KE CLIENT JIKA forceStart
+      if (isRecordingEnabled && forceStart) {
+        this._safeSend(ws, ["gameLowCardInfo", "Game started with recording enabled"]);
       }
 
       const existingGame = this.activeGames.get(room);
@@ -1887,8 +1896,8 @@ export class GameServer {
         _registrationTimer: null, _drawTimer: null, _evalTimer: null, _safetyTimer: null,
         _isEvaluating: false, _createdAt: Date.now(), _drawPhaseStart: null, _endTime: null,
         playerWsId: new Map(),
-        _startedByRecording: false,
-        _startedBy: 'user'
+        _startedByRecording: isRecordingEnabled && forceStart,
+        _startedBy: forceStart ? 'recording' : 'user'
       };
       
       game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
@@ -3089,6 +3098,17 @@ export class GameServer {
       if (evt === "switchRoom") {
         const [_, room, username] = data;
         await this.switchRoom(ws, room, username);
+        return;
+      }
+
+      // ========== START GAME WITH RECORDING (DARI ANDROID) ==========
+      if (evt === "startGameWithRecording") {
+        const [_, room, bet, username] = data;
+        if (!room || !username) {
+          this._safeSend(ws, ["gameLowCardError", "Room and username required"]);
+          return;
+        }
+        await this.startGame(ws, bet, username, true);
         return;
       }
 
