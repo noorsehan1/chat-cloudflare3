@@ -15,6 +15,8 @@
 // ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
 // ✅ PERHITUNGAN MINGGU ISO 8601 (BUKAN MATH SEDERHANA)
 // ✅ HANYA UPDATE RESET WEEK, TIDAK RESET POINTS
+// ✅ FIX: _isWeekChanged() return true jika lastResetWeek null
+// ✅ FIX: _calculateAndGetLastWeekWinner() handle null lastResetWeek
 
 const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
@@ -337,11 +339,17 @@ export class GameServer {
         if (!this.closing && !this.isDestroyed) {
           try {
             const currentWeek = this._generateCurrentWeek(new Date());
-            // ✅ HANYA UPDATE reset week
-            await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
-            this._resetWeekCache = currentWeek;
-            // ❌ TIDAK RESET POIN
-            // ❌ TIDAK HAPUS WINNER
+            let existingResetWeek = await this._getCachedResetWeek();
+            
+            // ✅ FIX: Jika belum pernah reset → set sekarang
+            if (!existingResetWeek) {
+              await this._updateCachedResetWeek(currentWeek);
+              this._resetWeekCache = currentWeek;
+            } else if (this._compareWeeks(currentWeek, existingResetWeek) > 0) {
+              // ✅ SUDAH MINGGU BARU → UPDATE
+              await this._updateCachedResetWeek(currentWeek);
+              this._resetWeekCache = currentWeek;
+            }
           } catch(e) {}
         }
       }, 1000);
@@ -766,12 +774,16 @@ export class GameServer {
     }
   }
 
+  // ✅ FIX: _isWeekChanged - return true jika lastResetWeek null
   _isWeekChanged() {
     try {
       const currentWeek = this._generateCurrentWeek(new Date());
       const lastResetWeek = this._resetWeekCache;
       
-      if (!lastResetWeek) return false;
+      // ✅ FIX: Jika belum pernah reset → anggap berubah (harus reset)
+      if (!lastResetWeek) {
+        return true;
+      }
       
       return this._compareWeeks(currentWeek, lastResetWeek) > 0;
     } catch(e) {
@@ -780,6 +792,7 @@ export class GameServer {
   }
 
   // ✅ CALCULATE WINNER ON DEMAND - HANYA DIPANGGIL SAAT GetDiceLastWeekWinner()
+  // ✅ FIX: Handle null lastResetWeek dengan benar
   async _calculateAndGetLastWeekWinner() {
     try {
       if (!this.env?.QUESTIONS) return null;
@@ -793,16 +806,67 @@ export class GameServer {
         lastResetWeek = await this._getCachedResetWeek();
       }
       
-      // 3. Jika tidak ada lastResetWeek, set ke minggu sekarang
+      // 3. ✅ FIX: Jika tidak ada lastResetWeek → BELUM PERNAH RESET
       if (!lastResetWeek) {
-        await this._updateCachedResetWeek(currentWeek);
-        return null;
+        // Ambil semua poin
+        const points = await this.diceGameSystem.getPoints();
+        
+        // Cari winner dengan poin tertinggi
+        let winner = null;
+        let highestScore = 0;
+        let participants = 0;
+        
+        for (const [username, score] of Object.entries(points)) {
+          const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
+          participants++;
+          if (numericScore > highestScore) {
+            highestScore = numericScore;
+            winner = username;
+          }
+        }
+        
+        // 4. Jika ada winner
+        if (winner && highestScore > 0) {
+          const winnerData = {
+            username: winner,
+            score: highestScore,
+            week: currentWeek,
+            participants: participants,
+            timestamp: Date.now()
+          };
+          
+          // Simpan winner ke KV
+          await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winnerData));
+          this._cachedLastWeekWinner = winnerData;
+          
+          // ✅ RESET POIN KE {}
+          await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
+          this.diceGameSystem.clearCache();
+          
+          // ✅ UPDATE reset week ke minggu sekarang
+          await this._updateCachedResetWeek(currentWeek);
+          
+          return winnerData;
+        } else {
+          // Tidak ada winner (tidak ada poin)
+          await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+          this._cachedLastWeekWinner = null;
+          
+          // ✅ RESET POIN KE {}
+          await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
+          this.diceGameSystem.clearCache();
+          
+          // ✅ UPDATE reset week ke minggu sekarang
+          await this._updateCachedResetWeek(currentWeek);
+          
+          return null;
+        }
       }
       
-      // 4. Cek apakah minggu sekarang > minggu di cache
+      // 5. Cek apakah minggu sekarang > minggu di cache
       const weekChanged = this._compareWeeks(currentWeek, lastResetWeek) > 0;
       
-      // 5. Jika minggu berubah (sudah minggu baru) → RESET DAN CARI PEMENANG
+      // 6. Jika minggu berubah (sudah minggu baru) → RESET DAN CARI PEMENANG
       if (weekChanged) {
         // Ambil semua poin
         const points = await this.diceGameSystem.getPoints();
@@ -821,7 +885,7 @@ export class GameServer {
           }
         }
         
-        // 6. Jika ada winner
+        // 7. Jika ada winner
         if (winner && highestScore > 0) {
           const winnerData = {
             username: winner,
@@ -859,7 +923,7 @@ export class GameServer {
         }
       }
       
-      // 7. Jika minggu belum berubah, ambil winner yang sudah ada (jika ada)
+      // 8. Jika minggu belum berubah, ambil winner yang sudah ada (jika ada)
       const savedWinner = await this.diceGameSystem.getLastWeekWinner();
       if (savedWinner && savedWinner.username) {
         return savedWinner;
