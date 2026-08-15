@@ -1,5 +1,8 @@
 // ==================== GAME-SERVER-FINAL.js ====================
-// ✅ VERSI FINAL - HAPUS SEMUA PENYEBAB LIMIT EXCEEDED
+// ✅ VERSI FINAL - OPTIMASI DO TIMEOUT
+// ✅ SEMUA ASYNC DI _initAsync()
+// ✅ HANYA 1 SETTIMEOUT DI CONSTRUCTOR
+// ✅ LOAD KV CEPAT
 // ✅ TANPA CPU PROTECTION - TANPA TTL - TANPA RATE LIMITING
 // ✅ HANYA 1 INTERVAL (GABUNGAN) - HEMAT DURABLE 95%
 // ✅ RESET OTOMATIS SAAT MINGGU BERGANTI (PAKAI UTC SERVER - ISO 8601)
@@ -7,16 +10,9 @@
 // ✅ SIAP DEPLOY - HEMAT - DURABLE - ANTI HYBERNATE
 // ✅ SUPPORT startGameWithRecording DARI ANDROID
 // ✅ TAMBAH NOTIF LEFTIME SAAT MASUK ROOM QUIZ (DELAY 5 DETIK)
-// ✅ HAPUS NOTIF "Server is active"
-// ✅ HAPUS SEMUA LOG UNTUK DEPLOY
-// ✅ LAST WEEK WINNER SILENT (TANPA BROADCAST)
-// ✅ PERGANTIAN MINGGU PAKAI UTC SERVER - ISO 8601
-// ✅ RESET HARI SENIN 00:00 UTC
-// ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
-// ✅ PERHITUNGAN MINGGU ISO 8601 (BUKAN MATH SEDERHANA)
-// ✅ HANYA UPDATE RESET WEEK, TIDAK RESET POINTS
 // ✅ FIX: _isWeekChanged() return true jika lastResetWeek null
 // ✅ FIX: _calculateAndGetLastWeekWinner() handle null lastResetWeek
+// ✅ FIX: DO Timeout - Optimasi Constructor
 
 const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
@@ -319,6 +315,7 @@ export class GameServer {
       this._recoveryAttempts = 0;
       this._maxRecoveryAttempts = 3;
 
+      // ✅ ALARM INTERVAL
       this._alarmInterval = setInterval(() => {
         if (this.closing || this.isDestroyed) {
           clearInterval(this._alarmInterval);
@@ -328,48 +325,67 @@ export class GameServer {
         this._alarmTick();
       }, CONSTANTS.ALARM_INTERVAL_MS || 180000);
       
-      this._initAsync();
+      // ✅ PANGGIL _initAsync() SEKALI SAJA
+      this._initAsync().catch(() => {});
       
+      // ✅ ALARM TICK PERTAMA (CEPAT)
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) this._alarmTick();
-      }, 1000);
-
-      // ✅ OPSI 2: HANYA UPDATE RESET WEEK, TIDAK RESET POINTS
-      setTimeout(async () => {
-        if (!this.closing && !this.isDestroyed) {
-          try {
-            const currentWeek = this._generateCurrentWeek(new Date());
-            let existingResetWeek = await this._getCachedResetWeek();
-            
-            // ✅ FIX: Jika belum pernah reset → set sekarang
-            if (!existingResetWeek) {
-              await this._updateCachedResetWeek(currentWeek);
-              this._resetWeekCache = currentWeek;
-            } else if (this._compareWeeks(currentWeek, existingResetWeek) > 0) {
-              // ✅ SUDAH MINGGU BARU → UPDATE
-              await this._updateCachedResetWeek(currentWeek);
-              this._resetWeekCache = currentWeek;
-            }
-          } catch(e) {}
-        }
-      }, 1000);
-
-      // ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
-      setTimeout(async () => {
-        if (!this.closing && !this.isDestroyed) {
-          await this._loadAllKVDataToCache();
-        }
-      }, 3000);
-
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed && !this._isShowingDice) {
-          this.forceStartDice();
-        }
-      }, 8000);
-
+      }, 100);
+      
+      // ✅ START DICE AUTO CHECKER
       this._startDiceAutoChecker();
 
     } catch(e) {}
+  }
+
+  // ==================== INIT ASYNC (OPTIMASI) ====================
+  
+  async _initAsync() {
+    try {
+      if (this._initializing) return;
+      if (this._initialized && !this._isRecovering) return;
+      this._initializing = true;
+      
+      // ✅ LOAD KV DATA KE CACHE
+      await this._loadAllKVDataToCache();
+      
+      // ✅ LOAD DICE POINTS
+      await this.diceGameSystem.getPoints();
+      
+      // ✅ CHECK RESET WEEK
+      const currentWeek = this._generateCurrentWeek(new Date());
+      const existing = await this._getCachedResetWeek();
+      if (!existing) {
+        await this._updateCachedResetWeek(currentWeek);
+      } else if (this._compareWeeks(currentWeek, existing) > 0) {
+        await this._updateCachedResetWeek(currentWeek);
+      }
+      
+      // ✅ START DICE JIKA ADA PLAYER
+      setTimeout(() => {
+        if (!this.closing && !this.isDestroyed) {
+          if (this._isDiceTime()) {
+            const clients = this.wsClients.get(DICE_ROOM);
+            if (clients && clients.size > 0) {
+              this.diceAutoEnabled = true;
+              setTimeout(() => {
+                if (!this.closing && !this.isDestroyed) {
+                  this.forceStartDice();
+                }
+              }, 2000);
+            }
+          }
+        }
+      }, 1000);
+      
+      this._initialized = true;
+      this._initializing = false;
+      this._errorCount = 0;
+      this._isRecovering = false;
+    } catch(e) {
+      this._initializing = false;
+    }
   }
 
   // ==================== LOAD ALL KV DATA TO CACHE ====================
@@ -385,7 +401,6 @@ export class GameServer {
       const currentWeek = this._generateCurrentWeek(new Date());
       
       if (resetWeek) {
-        // Jika berbeda, UPDATE ke minggu sekarang (TAPI TIDAK RESET POINTS)
         if (resetWeek !== currentWeek) {
           this._resetWeekCache = currentWeek;
           await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
@@ -398,7 +413,7 @@ export class GameServer {
       }
       
       // ========================================
-      // 2. LOAD dice_points (TETAP, TIDAK DIHAPUS)
+      // 2. LOAD dice_points
       // ========================================
       const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json');
       if (points && typeof points === 'object') {
@@ -411,7 +426,7 @@ export class GameServer {
       }
       
       // ========================================
-      // 3. LOAD dice_last_week_winner (TETAP, TIDAK DIHAPUS)
+      // 3. LOAD dice_last_week_winner
       // ========================================
       const winner = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
       if (winner && winner.username) {
@@ -429,7 +444,6 @@ export class GameServer {
         const roomName = key.name.replace(CONSTANTS.LOWCARD_RECORDING_KEY, '');
         const value = await this.env.QUESTIONS.get(key.name);
         const isRecording = value === 'true';
-        
         this._recordingEnabled.set(roomName, isRecording);
         
         if (isRecording) {
@@ -703,7 +717,7 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== WEEKLY RESET METHODS (PAKAI UTC - ISO 8601) ====================
+  // ==================== WEEKLY RESET METHODS ====================
 
   async _getCachedResetWeek() {
     try {
@@ -731,23 +745,9 @@ export class GameServer {
     }
   }
 
-  async _initResetWeek() {
-    try {
-      if (!this.env?.QUESTIONS) return;
-      const existingResetWeek = await this._getCachedResetWeek();
-      const currentWeek = this._generateCurrentWeek(new Date());
-      if (!existingResetWeek) {
-        await this._updateCachedResetWeek(currentWeek);
-      }
-    } catch(e) {}
-  }
-
-  // ✅ GENERATE WEEK PAKAI ISO 8601 (BUKAN UTC MATH SEDERHANA)
   _generateCurrentWeek(date) {
     try {
       const d = new Date(date);
-      // Set ke hari Kamis di minggu yang sama (ISO 8601)
-      // Kamis = hari ke-4 dalam ISO
       d.setUTCDate(d.getUTCDate() + 3 - (d.getUTCDay() + 6) % 7);
       const week1 = new Date(d.getUTCFullYear(), 0, 4);
       const diff = (d - week1) / 86400000;
@@ -756,7 +756,6 @@ export class GameServer {
     } catch(e) { return '2026-W01'; }
   }
 
-  // ✅ COMPARE WEEKS
   _compareWeeks(week1, week2) {
     try {
       const [year1, w1] = week1.split('-W');
@@ -774,13 +773,12 @@ export class GameServer {
     }
   }
 
-  // ✅ FIX: _isWeekChanged - return true jika lastResetWeek null
+  // ✅ FIX: return true jika lastResetWeek null
   _isWeekChanged() {
     try {
       const currentWeek = this._generateCurrentWeek(new Date());
       const lastResetWeek = this._resetWeekCache;
       
-      // ✅ FIX: Jika belum pernah reset → anggap berubah (harus reset)
       if (!lastResetWeek) {
         return true;
       }
@@ -791,27 +789,20 @@ export class GameServer {
     }
   }
 
-  // ✅ CALCULATE WINNER ON DEMAND - HANYA DIPANGGIL SAAT GetDiceLastWeekWinner()
-  // ✅ FIX: Handle null lastResetWeek dengan benar
+  // ✅ FIX: handle null lastResetWeek
   async _calculateAndGetLastWeekWinner() {
     try {
       if (!this.env?.QUESTIONS) return null;
       
-      // 1. Dapatkan minggu sekarang (UTC - ISO 8601)
       const currentWeek = this._generateCurrentWeek(new Date());
-      
-      // 2. Dapatkan minggu terakhir reset dari cache
       let lastResetWeek = this._resetWeekCache;
       if (lastResetWeek === null) {
         lastResetWeek = await this._getCachedResetWeek();
       }
       
-      // 3. ✅ FIX: Jika tidak ada lastResetWeek → BELUM PERNAH RESET
+      // ✅ Jika tidak ada lastResetWeek
       if (!lastResetWeek) {
-        // Ambil semua poin
         const points = await this.diceGameSystem.getPoints();
-        
-        // Cari winner dengan poin tertinggi
         let winner = null;
         let highestScore = 0;
         let participants = 0;
@@ -825,7 +816,6 @@ export class GameServer {
           }
         }
         
-        // 4. Jika ada winner
         if (winner && highestScore > 0) {
           const winnerData = {
             username: winner,
@@ -835,43 +825,26 @@ export class GameServer {
             timestamp: Date.now()
           };
           
-          // Simpan winner ke KV
           await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winnerData));
           this._cachedLastWeekWinner = winnerData;
-          
-          // ✅ RESET POIN KE {}
           await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
           this.diceGameSystem.clearCache();
-          
-          // ✅ UPDATE reset week ke minggu sekarang
           await this._updateCachedResetWeek(currentWeek);
-          
           return winnerData;
         } else {
-          // Tidak ada winner (tidak ada poin)
           await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
           this._cachedLastWeekWinner = null;
-          
-          // ✅ RESET POIN KE {}
           await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
           this.diceGameSystem.clearCache();
-          
-          // ✅ UPDATE reset week ke minggu sekarang
           await this._updateCachedResetWeek(currentWeek);
-          
           return null;
         }
       }
       
-      // 5. Cek apakah minggu sekarang > minggu di cache
       const weekChanged = this._compareWeeks(currentWeek, lastResetWeek) > 0;
       
-      // 6. Jika minggu berubah (sudah minggu baru) → RESET DAN CARI PEMENANG
       if (weekChanged) {
-        // Ambil semua poin
         const points = await this.diceGameSystem.getPoints();
-        
-        // Cari winner dengan poin tertinggi
         let winner = null;
         let highestScore = 0;
         let participants = 0;
@@ -885,7 +858,6 @@ export class GameServer {
           }
         }
         
-        // 7. Jika ada winner
         if (winner && highestScore > 0) {
           const winnerData = {
             username: winner,
@@ -895,35 +867,22 @@ export class GameServer {
             timestamp: Date.now()
           };
           
-          // Simpan winner ke KV
           await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winnerData));
           this._cachedLastWeekWinner = winnerData;
-          
-          // ✅ RESET POIN KE {}
           await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
           this.diceGameSystem.clearCache();
-          
-          // ✅ UPDATE reset week ke minggu sekarang
           await this._updateCachedResetWeek(currentWeek);
-          
           return winnerData;
         } else {
-          // Tidak ada winner (tidak ada poin)
           await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
           this._cachedLastWeekWinner = null;
-          
-          // ✅ RESET POIN KE {}
           await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
           this.diceGameSystem.clearCache();
-          
-          // ✅ UPDATE reset week ke minggu sekarang
           await this._updateCachedResetWeek(currentWeek);
-          
           return null;
         }
       }
       
-      // 8. Jika minggu belum berubah, ambil winner yang sudah ada (jika ada)
       const savedWinner = await this.diceGameSystem.getLastWeekWinner();
       if (savedWinner && savedWinner.username) {
         return savedWinner;
@@ -935,9 +894,8 @@ export class GameServer {
     }
   }
 
-  // ==================== DICE METHODS (PAKAI WITA) ====================
+  // ==================== DICE METHODS ====================
 
-  // ✅ IS DICE TIME PAKAI WITA (UTC+8)
   _isDiceTime() {
     try {
       const now = new Date();
@@ -954,7 +912,6 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
-  // ✅ GET CURRENT WITA TIME
   _getCurrentWITATime() {
     try {
       const now = new Date();
@@ -964,7 +921,6 @@ export class GameServer {
     } catch(e) { return { hours: 0, minutes: 0, totalMinutes: 0 }; }
   }
 
-  // ✅ GET TIME LEFT UNTIL NEXT DICE (PAKAI WITA)
   _getTimeLeftUntilNextDice() {
     try {
       const currentTotal = this._getCurrentWITATime().totalMinutes;
@@ -2015,41 +1971,6 @@ export class GameServer {
       this._kvCache.set(key, roomWinners);
       return true;
     } catch(e) { return false; }
-  }
-
-  // ==================== INIT ====================
-
-  async _initAsync() {
-    try {
-      if (this._initializing) return;
-      if (this._initialized && !this._isRecovering) return;
-      this._initializing = true;
-      
-      await this.diceGameSystem.getPoints();
-      
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed) {
-          if (this._isDiceTime()) {
-            const clients = this.wsClients.get(DICE_ROOM);
-            if (clients && clients.size > 0) {
-              this.diceAutoEnabled = true;
-              setTimeout(() => {
-                if (!this.closing && !this.isDestroyed) {
-                  this.forceStartDice();
-                }
-              }, CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
-            }
-          }
-        }
-      }, 2000);
-      
-      this._initialized = true;
-      this._initializing = false;
-      this._errorCount = 0;
-      this._isRecovering = false;
-    } catch(e) {
-      this._initializing = false;
-    }
   }
 
   // ==================== HEALTH CHECK ====================
@@ -3200,7 +3121,6 @@ export class GameServer {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
         
-        // ✅ TAMBAH NOTIF LEFTIME SAAT MASUK ROOM QUIZ (DELAY 5 DETIK)
         if (roomName === DICE_ROOM) {
           setTimeout(() => {
             if (!this.closing && !this.isDestroyed && ws && ws.readyState === 1) {
@@ -3369,7 +3289,6 @@ export class GameServer {
         return;
       }
 
-      // ✅ GET DICE LAST WEEK WINNER - HANYA DIPANGGIL SAAT DIMINTA
       if (evt === "getDiceLastWeekWinner") {
         try {
           const result = await this._calculateAndGetLastWeekWinner();
@@ -3384,7 +3303,6 @@ export class GameServer {
         return;
       }
 
-      // ✅ DELETE DICE LAST WEEK WINNER - HANYA HAPUS WINNER, TIDAK HAPUS POIN
       if (evt === "deleteDiceLastWeekWinner") {
         try {
           const success = await this.diceGameSystem.deleteLastWeekWinner();
@@ -3629,7 +3547,7 @@ export class GameServer {
       this._cleanupDeadConnections();
       
       if (!this._initialized && !this._initializing) {
-        this._initAsync();
+        this._initAsync().catch(() => {});
       }
       if (this._isDiceTime()) {
         this.diceAutoEnabled = true;
