@@ -2,7 +2,7 @@
 // ✅ VERSI FINAL - HAPUS SEMUA PENYEBAB LIMIT EXCEEDED
 // ✅ TANPA CPU PROTECTION - TANPA TTL - TANPA RATE LIMITING
 // ✅ HANYA 1 INTERVAL (GABUNGAN) - HEMAT DURABLE 95%
-// ✅ RESET OTOMATIS SAAT MINGGU BERGANTI (PAKAI UTC SERVER)
+// ✅ RESET OTOMATIS SAAT MINGGU BERGANTI (PAKAI UTC SERVER - ISO 8601)
 // ✅ SESSION DICE TETAP PAKAI WITA (UTC+8)
 // ✅ SIAP DEPLOY - HEMAT - DURABLE - ANTI HYBERNATE
 // ✅ SUPPORT startGameWithRecording DARI ANDROID
@@ -10,9 +10,10 @@
 // ✅ HAPUS NOTIF "Server is active"
 // ✅ HAPUS SEMUA LOG UNTUK DEPLOY
 // ✅ LAST WEEK WINNER SILENT (TANPA BROADCAST)
-// ✅ PERGANTIAN MINGGU PAKAI UTC SERVER (BUKAN WITA)
+// ✅ PERGANTIAN MINGGU PAKAI UTC SERVER - ISO 8601
 // ✅ RESET HARI SENIN 00:00 UTC
 // ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
+// ✅ PERHITUNGAN MINGGU ISO 8601 (BUKAN MATH SEDERHANA)
 
 const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
@@ -676,7 +677,7 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== WEEKLY RESET METHODS (PAKAI UTC) ====================
+  // ==================== WEEKLY RESET METHODS (PAKAI UTC - ISO 8601) ====================
 
   async _getCachedResetWeek() {
     try {
@@ -715,15 +716,17 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ✅ GENERATE WEEK PAKAI UTC
+  // ✅ GENERATE WEEK PAKAI ISO 8601 (BUKAN UTC MATH SEDERHANA)
   _generateCurrentWeek(date) {
     try {
-      const now = date || new Date();
-      const year = now.getUTCFullYear();
-      const startOfYear = new Date(Date.UTC(year, 0, 1));
-      const diff = now.getTime() - startOfYear.getTime();
-      const week = Math.ceil((diff / 86400000 + startOfYear.getUTCDay() + 1) / 7);
-      return `${year}-W${String(week).padStart(2, '0')}`;
+      const d = new Date(date);
+      // Set ke hari Kamis di minggu yang sama (ISO 8601)
+      // Kamis = minggu ke-4 dalam ISO
+      d.setUTCDate(d.getUTCDate() + 3 - (d.getUTCDay() + 6) % 7);
+      const week1 = new Date(d.getUTCFullYear(), 0, 4);
+      const diff = (d - week1) / 86400000;
+      const week = 1 + Math.floor(diff / 7);
+      return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
     } catch(e) { return '2026-W01'; }
   }
 
@@ -763,7 +766,7 @@ export class GameServer {
     try {
       if (!this.env?.QUESTIONS) return null;
       
-      // 1. Dapatkan minggu sekarang (UTC)
+      // 1. Dapatkan minggu sekarang (UTC - ISO 8601)
       const currentWeek = this._generateCurrentWeek(new Date());
       
       // 2. Dapatkan minggu terakhir reset dari cache
@@ -2685,8 +2688,7 @@ export class GameServer {
           this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
             winners: allWinners,
             room: room,
-            recording: true
-          }]);
+            recording: true          }]);
         }
         
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
