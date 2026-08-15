@@ -14,6 +14,7 @@
 // ✅ RESET HARI SENIN 00:00 UTC
 // ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
 // ✅ PERHITUNGAN MINGGU ISO 8601 (BUKAN MATH SEDERHANA)
+// ✅ AUTO FIX DATA KV YANG SALAH SAAT DEPLOY
 
 const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
@@ -331,6 +332,13 @@ export class GameServer {
         if (!this.closing && !this.isDestroyed) this._alarmTick();
       }, 1000);
 
+      // ✅ FIX RESET WEEK (perbaiki jika data salah)
+      setTimeout(async () => {
+        if (!this.closing && !this.isDestroyed) {
+          await this._fixResetWeek();
+        }
+      }, 2000);
+
       // ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
       setTimeout(async () => {
         if (!this.closing && !this.isDestroyed) {
@@ -349,6 +357,40 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ==================== FIX RESET WEEK ====================
+
+  async _fixResetWeek() {
+    try {
+      if (!this.env?.QUESTIONS) return;
+      
+      const currentWeek = this._generateCurrentWeek(new Date());
+      const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
+      
+      // Jika tidak ada data, set ke minggu sekarang
+      if (!lastResetWeek) {
+        await this._updateCachedResetWeek(currentWeek);
+        return;
+      }
+      
+      // Cek apakah perbedaan minggu terlalu besar (lebih dari 2 minggu)
+      const diff = this._compareWeeks(currentWeek, lastResetWeek);
+      
+      // Jika diff negatif (resetWeek di masa depan) atau diff > 2 (terlalu lama)
+      if (diff < 0 || diff > 2) {
+        // Hapus winner yang tidak valid
+        await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+        this._cachedLastWeekWinner = null;
+        
+        // Reset points
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
+        this.diceGameSystem.clearCache();
+        
+        // Update reset week ke minggu sekarang
+        await this._updateCachedResetWeek(currentWeek);
+      }
+    } catch(e) {}
+  }
+
   // ==================== LOAD ALL KV DATA TO CACHE ====================
 
   async _loadAllKVDataToCache() {
@@ -359,11 +401,17 @@ export class GameServer {
       // 1. LOAD dice_last_reset_week
       // ========================================
       const resetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
+      const currentWeek = this._generateCurrentWeek(new Date());
+      
       if (resetWeek) {
-        this._resetWeekCache = resetWeek;
+        const diff = this._compareWeeks(currentWeek, resetWeek);
+        if (diff < 0 || diff > 2) {
+          this._resetWeekCache = currentWeek;
+          await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
+        } else {
+          this._resetWeekCache = resetWeek;
+        }
       } else {
-        // Jika tidak ada, set ke minggu sekarang
-        const currentWeek = this._generateCurrentWeek(new Date());
         this._resetWeekCache = currentWeek;
         await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
       }
@@ -403,7 +451,6 @@ export class GameServer {
         
         this._recordingEnabled.set(roomName, isRecording);
         
-        // Jika recording enabled, ambil juga winner-nya
         if (isRecording) {
           const winnerKey = CONSTANTS.LOWCARD_WINNER_KEY + roomName;
           const winners = await this.env.QUESTIONS.get(winnerKey, 'json');
@@ -427,9 +474,7 @@ export class GameServer {
         this._recordingEnabled.set(roomName, isRecording);
       }
       
-    } catch(e) {
-      // Silent fail
-    }
+    } catch(e) {}
   }
 
   // ==================== ALARM TICK ====================
@@ -721,7 +766,7 @@ export class GameServer {
     try {
       const d = new Date(date);
       // Set ke hari Kamis di minggu yang sama (ISO 8601)
-      // Kamis = minggu ke-4 dalam ISO
+      // Kamis = hari ke-4 dalam ISO
       d.setUTCDate(d.getUTCDate() + 3 - (d.getUTCDay() + 6) % 7);
       const week1 = new Date(d.getUTCFullYear(), 0, 4);
       const diff = (d - week1) / 86400000;
@@ -2688,7 +2733,8 @@ export class GameServer {
           this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
             winners: allWinners,
             room: room,
-            recording: true          }]);
+            recording: true
+          }]);
         }
         
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
