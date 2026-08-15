@@ -360,37 +360,31 @@ export class GameServer {
   // ==================== FIX RESET WEEK ====================
 
   async _fixResetWeek() {
-    try {
-      if (!this.env?.QUESTIONS) return;
+  try {
+    if (!this.env?.QUESTIONS) return;
+    
+    const currentWeek = this._generateCurrentWeek(new Date());
+    const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
+    
+    if (!lastResetWeek) {
+      await this._updateCachedResetWeek(currentWeek);
+      return;
+    }
+    
+    const diff = this._compareWeeks(currentWeek, lastResetWeek);
+    
+    // ✅ Jika berbeda, perbaiki ke minggu sekarang
+    if (diff !== 0) {
+      await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+      this._cachedLastWeekWinner = null;
       
-      const currentWeek = this._generateCurrentWeek(new Date());
-      const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
+      await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
+      this.diceGameSystem.clearCache();
       
-      // Jika tidak ada data, set ke minggu sekarang
-      if (!lastResetWeek) {
-        await this._updateCachedResetWeek(currentWeek);
-        return;
-      }
-      
-      // Cek apakah perbedaan minggu terlalu besar (lebih dari 2 minggu)
-      const diff = this._compareWeeks(currentWeek, lastResetWeek);
-      
-      // Jika diff negatif (resetWeek di masa depan) atau diff > 2 (terlalu lama)
-      if (diff < 0 || diff > 2) {
-        // Hapus winner yang tidak valid
-        await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
-        this._cachedLastWeekWinner = null;
-        
-        // Reset points
-        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
-        this.diceGameSystem.clearCache();
-        
-        // Update reset week ke minggu sekarang
-        await this._updateCachedResetWeek(currentWeek);
-      }
-    } catch(e) {}
-  }
-
+      await this._updateCachedResetWeek(currentWeek);
+    }
+  } catch(e) {}
+}
   // ==================== LOAD ALL KV DATA TO CACHE ====================
 
   async _loadAllKVDataToCache() {
