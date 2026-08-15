@@ -14,7 +14,7 @@
 // ✅ RESET HARI SENIN 00:00 UTC
 // ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
 // ✅ PERHITUNGAN MINGGU ISO 8601 (BUKAN MATH SEDERHANA)
-// ✅ AUTO FIX DATA KV YANG SALAH SAAT DEPLOY
+// ✅ HANYA UPDATE RESET WEEK, TIDAK RESET POINTS
 
 const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
@@ -63,7 +63,7 @@ const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
     { start: 14, end: 15 },
-    { start: 20, end: 23 }
+    { start: 22, end: 23 }
   ],
   TIMEZONE_OFFSET: 8,
 };
@@ -332,12 +332,19 @@ export class GameServer {
         if (!this.closing && !this.isDestroyed) this._alarmTick();
       }, 1000);
 
-      // ✅ FIX RESET WEEK (perbaiki jika data salah)
+      // ✅ OPSI 2: HANYA UPDATE RESET WEEK, TIDAK RESET POINTS
       setTimeout(async () => {
         if (!this.closing && !this.isDestroyed) {
-          await this._fixResetWeek();
+          try {
+            const currentWeek = this._generateCurrentWeek(new Date());
+            // ✅ HANYA UPDATE reset week
+            await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
+            this._resetWeekCache = currentWeek;
+            // ❌ TIDAK RESET POIN
+            // ❌ TIDAK HAPUS WINNER
+          } catch(e) {}
         }
-      }, 2000);
+      }, 1000);
 
       // ✅ LOAD SEMUA DATA KV KE CACHE SAAT DEPLOY
       setTimeout(async () => {
@@ -357,34 +364,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== FIX RESET WEEK ====================
-
-  async _fixResetWeek() {
-  try {
-    if (!this.env?.QUESTIONS) return;
-    
-    const currentWeek = this._generateCurrentWeek(new Date());
-    const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
-    
-    if (!lastResetWeek) {
-      await this._updateCachedResetWeek(currentWeek);
-      return;
-    }
-    
-    const diff = this._compareWeeks(currentWeek, lastResetWeek);
-    
-    // ✅ Jika berbeda, perbaiki ke minggu sekarang
-    if (diff !== 0) {
-      await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
-      this._cachedLastWeekWinner = null;
-      
-      await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
-      this.diceGameSystem.clearCache();
-      
-      await this._updateCachedResetWeek(currentWeek);
-    }
-  } catch(e) {}
-}
   // ==================== LOAD ALL KV DATA TO CACHE ====================
 
   async _loadAllKVDataToCache() {
@@ -398,8 +377,8 @@ export class GameServer {
       const currentWeek = this._generateCurrentWeek(new Date());
       
       if (resetWeek) {
-        const diff = this._compareWeeks(currentWeek, resetWeek);
-        if (diff < 0 || diff > 2) {
+        // Jika berbeda, UPDATE ke minggu sekarang (TAPI TIDAK RESET POINTS)
+        if (resetWeek !== currentWeek) {
           this._resetWeekCache = currentWeek;
           await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
         } else {
@@ -411,7 +390,7 @@ export class GameServer {
       }
       
       // ========================================
-      // 2. LOAD dice_points
+      // 2. LOAD dice_points (TETAP, TIDAK DIHAPUS)
       // ========================================
       const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json');
       if (points && typeof points === 'object') {
@@ -424,7 +403,7 @@ export class GameServer {
       }
       
       // ========================================
-      // 3. LOAD dice_last_week_winner
+      // 3. LOAD dice_last_week_winner (TETAP, TIDAK DIHAPUS)
       // ========================================
       const winner = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
       if (winner && winner.username) {
