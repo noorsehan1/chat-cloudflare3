@@ -1,6 +1,7 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 7.1.0 - FIXED UPDATE KURSI & POINT
-// OTOMATIS RESET STORAGE SAAT DEPLOY (VERSION DETECT)
+// VERSION: 7.0.0 - STORAGE-ONLY ARCHITECTURE
+// SEMUA DATA LANGSUNG BACA/TULIS KE STORAGE
+// TIDAK PAKAI MEMORY UNTUK DATA (userSeat, userRoom, rooms)
 
 const C = {
   MAX_SEATS: 45,
@@ -13,6 +14,7 @@ const C = {
   MAX_EVENT_QUEUE: 100,
   MAX_PROCESS_TIME_MS: 500,
   USER_JOIN_LOCK_TIMEOUT: 10000,
+  STORAGE_CACHE_TTL: 2000, // 2 detik
 };
 
 const ROOMS = [
@@ -56,9 +58,10 @@ export class ChatServer {
     this.currentNumber = 1;
     this._isNumberUpdating = false;
     
-    // ========== ✅ VERSION UNTUK DETECT DEPLOY ==========
-    this._appVersion = `v${Date.now()}`;
-    console.log(`[INIT] App Version: ${this._appVersion}`);
+    // ========== STORAGE CACHE (HANYA UNTUK PERFORMANCE) ==========
+    this._storageCache = null;
+    this._storageCacheTime = 0;
+    this._storageCacheTTL = C.STORAGE_CACHE_TTL;
     
     // ========== INIT ROOMS ==========
     for (const room of ROOMS) {
@@ -77,17 +80,28 @@ export class ChatServer {
   // ✅ STORAGE OPERATIONS (SEMUA LANGSUNG KE STORAGE)
   // ============================================================
 
+  // 1. LOAD DARI STORAGE (DENGAN CACHE)
   async _loadFromStorage() {
+    const now = Date.now();
+    if (this._storageCache && (now - this._storageCacheTime) < this._storageCacheTTL) {
+      return this._storageCache;
+    }
+    
     try {
       const roomsData = await this.ctx.storage.get("roomsData") || {};
       const userSeatData = await this.ctx.storage.get("userSeatData") || {};
       const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
-      return { roomsData, userSeatData, currentNumber };
+      
+      this._storageCache = { roomsData, userSeatData, currentNumber };
+      this._storageCacheTime = now;
+      
+      return this._storageCache;
     } catch(e) {
       return { roomsData: {}, userSeatData: {}, currentNumber: 1 };
     }
   }
 
+  // 2. SAVE KE STORAGE
   async _saveToStorage(roomsData, userSeatData, currentNumber) {
     try {
       if (roomsData !== undefined) {
@@ -99,21 +113,28 @@ export class ChatServer {
       if (currentNumber !== undefined) {
         await this.ctx.storage.put("currentNumber", currentNumber);
       }
+      
+      this._storageCache = { roomsData, userSeatData, currentNumber };
+      this._storageCacheTime = Date.now();
+      
     } catch(e) {
       console.error('[SAVE] Error:', e.message);
     }
   }
 
+  // 3. GET ROOM DATA DARI STORAGE
   async _getRoomData(roomName) {
     const storage = await this._loadFromStorage();
     return storage.roomsData[roomName] || null;
   }
 
+  // 4. GET USER SEAT DARI STORAGE
   async _getUserSeat(username) {
     const storage = await this._loadFromStorage();
     return storage.userSeatData[username] || null;
   }
 
+  // 5. UPDATE ROOM DATA DI STORAGE
   async _updateRoomData(roomName, updater) {
     const storage = await this._loadFromStorage();
     const roomsData = storage.roomsData || {};
@@ -123,10 +144,16 @@ export class ChatServer {
     }
     
     updater(roomsData[roomName]);
+    
     await this.ctx.storage.put("roomsData", roomsData);
+    
+    this._storageCache.roomsData = roomsData;
+    this._storageCacheTime = Date.now();
+    
     return roomsData[roomName];
   }
 
+  // 6. UPDATE USER SEAT DI STORAGE
   async _updateUserSeat(username, updater) {
     const storage = await this._loadFromStorage();
     const userSeatData = storage.userSeatData || {};
@@ -142,16 +169,27 @@ export class ChatServer {
     }
     
     await this.ctx.storage.put("userSeatData", userSeatData);
+    
+    this._storageCache.userSeatData = userSeatData;
+    this._storageCacheTime = Date.now();
+    
     return userSeatData[username];
   }
 
+  // 7. DELETE USER SEAT DARI STORAGE
   async _deleteUserSeat(username) {
     const storage = await this._loadFromStorage();
     const userSeatData = storage.userSeatData || {};
+    
     delete userSeatData[username];
+    
     await this.ctx.storage.put("userSeatData", userSeatData);
+    
+    this._storageCache.userSeatData = userSeatData;
+    this._storageCacheTime = Date.now();
   }
 
+  // 8. DELETE ROOM JIKA KOSONG
   async _deleteRoomIfEmpty(roomName) {
     const roomData = await this._getRoomData(roomName);
     if (!roomData) return;
@@ -163,11 +201,17 @@ export class ChatServer {
       const storage = await this._loadFromStorage();
       const roomsData = storage.roomsData || {};
       delete roomsData[roomName];
+      
       await this.ctx.storage.put("roomsData", roomsData);
+      
+      this._storageCache.roomsData = roomsData;
+      this._storageCacheTime = Date.now();
+      
       console.log(`[DELETE] Room "${roomName}" deleted from storage (empty)`);
     }
   }
 
+  // 9. CEK USER DI ROOM LAIN (DARI STORAGE)
   async _isUserInAnyRoom(username) {
     if (!username) return null;
     
@@ -238,6 +282,7 @@ export class ChatServer {
     
     this.broadcast(roomName, ["removeKursi", roomName, seat]);
     await this.updateRoomCount(roomName);
+    
     await this._deleteRoomIfEmpty(roomName);
     
     console.log(`[removeUserFromRoom] User "${username}" removed from "${roomName}" seat ${seat}`);
@@ -245,82 +290,47 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ UPDATE KURSI (FIXED - LANGSUNG SAVE KE STORAGE)
+  // ✅ UPDATE KURSI (LANGSUNG KE STORAGE)
   // ============================================================
   
   async _updateKursi(roomName, seat, data) {
-    if (!roomName || !seat || !data) return false;
+    const roomData = await this._getRoomData(roomName);
+    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
     
-    try {
-      const storage = await this._loadFromStorage();
-      const roomsData = storage.roomsData || {};
-      
-      if (!roomsData[roomName]) {
-        roomsData[roomName] = { seats: {}, points: {}, muted: false, number: 1 };
-      }
-      
-      if (!roomsData[roomName].seats) {
-        roomsData[roomName].seats = {};
-      }
-      
-      roomsData[roomName].seats[seat] = {
-        noimageUrl: data.noimageUrl || "",
-        namauser: data.namauser || "",
-        color: data.color || "",
-        itembawah: data.itembawah || 0,
-        itematas: data.itematas || 0,
-        vip: data.vip || 0,
-        viptanda: data.viptanda || 0
-      };
-      
-      await this.ctx.storage.put("roomsData", roomsData);
-      console.log(`[_updateKursi] ✅ Seat ${seat} updated in "${roomName}"`);
-      return true;
-      
-    } catch(e) {
-      console.error('[_updateKursi] Error:', e.message);
-      return false;
-    }
+    roomData.seats[seat] = {
+      noimageUrl: data.noimageUrl || "",
+      namauser: data.namauser || "",
+      color: data.color || "",
+      itembawah: data.itembawah || 0,
+      itematas: data.itematas || 0,
+      vip: data.vip || 0,
+      viptanda: data.viptanda || 0
+    };
+    
+    await this._updateRoomData(roomName, (d) => {
+      d.seats = roomData.seats;
+    });
+    
+    return true;
   }
 
   // ============================================================
-  // ✅ UPDATE POINT (FIXED - LANGSUNG SAVE KE STORAGE)
+  // ✅ UPDATE POINT (LANGSUNG KE STORAGE)
   // ============================================================
   
   async _updatePoint(roomName, seat, x, y, fast) {
-    if (!roomName || !seat) return false;
+    const roomData = await this._getRoomData(roomName);
+    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
     
-    try {
-      const storage = await this._loadFromStorage();
-      const roomsData = storage.roomsData || {};
-      
-      if (!roomsData[roomName]) {
-        roomsData[roomName] = { seats: {}, points: {}, muted: false, number: 1 };
-      }
-      
-      if (!roomsData[roomName].seats || !roomsData[roomName].seats[seat]) {
-        console.log(`[_updatePoint] ❌ Seat ${seat} not found in "${roomName}"`);
-        return false;
-      }
-      
-      if (!roomsData[roomName].points) {
-        roomsData[roomName].points = {};
-      }
-      
-      roomsData[roomName].points[seat] = {
-        x: x || 0,
-        y: y || 0,
-        fast: !!fast
-      };
-      
-      await this.ctx.storage.put("roomsData", roomsData);
-      console.log(`[_updatePoint] ✅ Point saved for seat ${seat} in "${roomName}"`);
-      return true;
-      
-    } catch(e) {
-      console.error('[_updatePoint] Error:', e.message);
-      return false;
-    }
+    if (!roomData.points) roomData.points = {};
+    
+    roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
+    
+    await this._updateRoomData(roomName, (d) => {
+      d.points = roomData.points;
+    });
+    
+    return true;
   }
 
   // ============================================================
@@ -354,17 +364,20 @@ export class ChatServer {
   }
 
   async _joinInternal(ws, roomName, username) {
+    // 1. CEK USER DI ROOM LAIN
     const existing = await this._isUserInAnyRoom(username);
     if (existing && existing.room !== roomName) {
       console.log(`[join] User "${username}" in "${existing.room}", removing...`);
       await this._removeUserFromRoom(username, existing.room);
     }
     
+    // 2. LOAD ROOM DATA
     let roomData = await this._getRoomData(roomName);
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
     }
     
+    // 3. CEK USER SUDAH DI ROOM INI
     let seat = null;
     for (const [s, data] of Object.entries(roomData.seats)) {
       if (data && data.namauser === username) {
@@ -373,6 +386,7 @@ export class ChatServer {
       }
     }
     
+    // 4. TAMBAHKAN JIKA BELUM
     if (!seat) {
       const seatCount = Object.keys(roomData.seats).length;
       if (seatCount >= C.MAX_SEATS) {
@@ -410,11 +424,13 @@ export class ChatServer {
       });
     }
     
+    // 5. SAVE USER SEAT
     const seatInfo = { room: roomName, seat, isMulti: false };
     await this._updateUserSeat(username, (data) => {
       Object.assign(data, seatInfo);
     });
     
+    // 6. UPDATE WEBSOCKET
     ws.room = roomName;
     ws.roomname = roomName;
     ws.idtarget = username;
@@ -424,6 +440,7 @@ export class ChatServer {
       seatInfo: seatInfo
     });
     
+    // 7. UPDATE ROOM CLIENTS
     for (const [otherRoom, clients] of this.roomClients) {
       if (otherRoom !== roomName && clients) {
         clients.delete(ws);
@@ -434,6 +451,7 @@ export class ChatServer {
     
     this.wsActiveMulti.delete(ws);
     
+    // 8. SEND RESPONSE
     this.safeSend(ws, ["rooMasuk", seat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", seat]);
     this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
@@ -442,6 +460,7 @@ export class ChatServer {
     this.safeSend(ws, ["roomUserCount", roomName, count]);
     this.broadcast(roomName, ["roomUserCount", roomName, count]);
     
+    // 9. SEND ALL STATE
     setTimeout(() => {
       try {
         if (ws && ws.readyState === 1) {
@@ -469,6 +488,7 @@ export class ChatServer {
       
       console.log(`[DISCONNECT] Cleaning up user "${username}" from room "${roomName}"`);
       
+      // 1. Hapus dari storage
       if (roomName) {
         await this._removeUserFromRoom(username, roomName);
       } else {
@@ -480,6 +500,7 @@ export class ChatServer {
         }
       }
       
+      // 2. Hapus dari userConnections
       const connections = this.userConnections.get(username);
       if (connections) {
         connections.delete(ws);
@@ -488,6 +509,7 @@ export class ChatServer {
         }
       }
       
+      // 3. Hapus dari roomClients
       const targetRoom = roomName || (await this._getUserSeat(username))?.room;
       if (targetRoom) {
         const roomClients = this.roomClients.get(targetRoom);
@@ -496,7 +518,10 @@ export class ChatServer {
         }
       }
       
+      // 4. Hapus dari wsActiveMulti
       this.wsActiveMulti.delete(ws);
+      
+      // 5. Hapus dari wsSet
       this.wsSet.delete(ws);
       
       console.log(`[DISCONNECT] User "${username}" fully cleaned`);
@@ -713,6 +738,8 @@ export class ChatServer {
       
       if (changed) {
         await this.ctx.storage.put("roomsData", roomsData);
+        this._storageCache.roomsData = roomsData;
+        this._storageCacheTime = Date.now();
       }
       
       const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
@@ -1070,8 +1097,10 @@ export class ChatServer {
           try {
             console.log(`[exitMulti] Exiting user "${targetUsername}"`);
             
+            // 1. CARI USER DI STORAGE
             let userSeat = await this._getUserSeat(targetUsername);
             
+            // 2. FALLBACK: SCAN SEMUA ROOM
             if (!userSeat) {
               const storage = await this._loadFromStorage();
               const roomsData = storage.roomsData || {};
@@ -1097,9 +1126,11 @@ export class ChatServer {
             const roomName = userSeat.room;
             const seatNumber = userSeat.seat;
             
+            // 3. HAPUS DARI STORAGE
             await this._removeUserFromRoom(targetUsername, roomName);
             await this._deleteUserSeat(targetUsername);
             
+            // 4. HAPUS DARI SEMUA WEBSOCKET
             const connections = this.userConnections.get(targetUsername);
             if (connections) {
               for (const conn of connections) {
@@ -1141,6 +1172,7 @@ export class ChatServer {
               this.wsSet.delete(wsKey);
             }
             
+            // 5. BROADCAST
             this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
             await this.updateRoomCount(roomName);
             await this._deleteRoomIfEmpty(roomName);
@@ -1188,39 +1220,15 @@ export class ChatServer {
           break;
         }
         
-        // ============================================================
-        // ✅ UPDATE KURSI - FIXED (LANGSUNG SAVE KE STORAGE)
-        // ============================================================
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           
-          if (!kursiRoom || !kursiSeat || !ROOMS_SET.has(kursiRoom)) {
-            console.log('[updateKursi] ❌ Invalid input');
-            break;
-          }
-          
           const lockKey = `kursi_${kursiRoom}_${kursiSeat}`;
-          if (this._kursiLocks.has(lockKey)) {
-            console.log(`[updateKursi] ⏳ Lock active for seat ${kursiSeat}`);
-            break;
-          }
+          if (this._kursiLocks.has(lockKey)) break;
           this._kursiLocks.set(lockKey, Date.now());
           
           try {
-            // ✅ LOAD + UPDATE + SAVE LANGSUNG KE STORAGE
-            const storage = await this._loadFromStorage();
-            const roomsData = storage.roomsData || {};
-            
-            if (!roomsData[kursiRoom]) {
-              roomsData[kursiRoom] = { seats: {}, points: {}, muted: false, number: 1 };
-            }
-            
-            if (!roomsData[kursiRoom].seats) {
-              roomsData[kursiRoom].seats = {};
-            }
-            
-            // ✅ UPDATE DATA
-            roomsData[kursiRoom].seats[kursiSeat] = {
+            const updated = await this._updateKursi(kursiRoom, kursiSeat, {
               noimageUrl: kursiNoimg || "",
               namauser: kursiName || "",
               color: kursiColor || "",
@@ -1228,18 +1236,15 @@ export class ChatServer {
               itematas: kursiAtas || 0,
               vip: kursiVip || 0,
               viptanda: kursiVt || 0
-            };
+            });
             
-            // ✅ SAVE KE STORAGE
-            await this.ctx.storage.put("roomsData", roomsData);
-            console.log(`[updateKursi] ✅ Seat ${kursiSeat} updated in "${kursiRoom}"`);
-            
-            // ✅ BROADCAST
-            const updatedSeat = roomsData[kursiRoom].seats[kursiSeat];
-            this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
-            
-          } catch(e) {
-            console.error('[updateKursi] Error:', e.message);
+            if (updated) {
+              const roomData = await this._getRoomData(kursiRoom);
+              const updatedSeat = roomData?.seats?.[kursiSeat];
+              if (updatedSeat) {
+                this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
+              }
+            }
           } finally {
             this._kursiLocks.delete(lockKey);
           }
@@ -1261,51 +1266,13 @@ export class ChatServer {
           break;
         }
         
-        // ============================================================
-        // ✅ UPDATE POINT - FIXED (LANGSUNG SAVE KE STORAGE)
-        // ============================================================
         case "updatePoint": {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
+          if (!pointRoom || typeof pointSeat !== 'number') break;
           
-          if (!pointRoom || typeof pointSeat !== 'number' || !ROOMS_SET.has(pointRoom)) {
-            console.log('[updatePoint] ❌ Invalid input');
-            break;
-          }
-          
-          try {
-            // ✅ LOAD + UPDATE + SAVE LANGSUNG KE STORAGE
-            const storage = await this._loadFromStorage();
-            const roomsData = storage.roomsData || {};
-            
-            if (!roomsData[pointRoom]) {
-              roomsData[pointRoom] = { seats: {}, points: {}, muted: false, number: 1 };
-            }
-            
-            if (!roomsData[pointRoom].seats || !roomsData[pointRoom].seats[pointSeat]) {
-              console.log(`[updatePoint] ❌ Seat ${pointSeat} not found in "${pointRoom}"`);
-              break;
-            }
-            
-            if (!roomsData[pointRoom].points) {
-              roomsData[pointRoom].points = {};
-            }
-            
-            // ✅ UPDATE POINT
-            roomsData[pointRoom].points[pointSeat] = {
-              x: pointX || 0,
-              y: pointY || 0,
-              fast: pointFast === 1
-            };
-            
-            // ✅ SAVE KE STORAGE
-            await this.ctx.storage.put("roomsData", roomsData);
-            console.log(`[updatePoint] ✅ Point updated for seat ${pointSeat} in "${pointRoom}"`);
-            
-            // ✅ BROADCAST
+          const updated = await this._updatePoint(pointRoom, pointSeat, pointX, pointY, pointFast === 1);
+          if (updated) {
             this._broadcastToRoom(pointRoom, JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]));
-            
-          } catch(e) {
-            console.error('[updatePoint] Error:', e.message);
           }
           break;
         }
@@ -1365,7 +1332,7 @@ export class ChatServer {
           break;
         }
         
-        // ✅ NOTIF: LANGSUNG KIRIM
+        // ✅ NOTIF: LANGSUNG KIRIM (SAMA SEPERTI KODE AWAL)
         case "sendnotif": {
           try {
             const [notifTarget, notifNoimg, notifUser, notifMsg] = args;
@@ -1445,32 +1412,16 @@ export class ChatServer {
           break;
         }
         
-        // ============================================================
-        // ✅ SET MUTE TYPE - FIXED (LANGSUNG SAVE KE STORAGE)
-        // ============================================================
         case "setMuteType": {
           const [muteVal, muteRoom] = args;
           if (!muteRoom || !ROOMS_SET.has(muteRoom)) break;
           
-          try {
-            const storage = await this._loadFromStorage();
-            const roomsData = storage.roomsData || {};
-            
-            if (!roomsData[muteRoom]) {
-              roomsData[muteRoom] = { seats: {}, points: {}, muted: false, number: 1 };
-            }
-            
-            roomsData[muteRoom].muted = !!muteVal;
-            
-            await this.ctx.storage.put("roomsData", roomsData);
-            console.log(`[setMuteType] ✅ Mute set to ${!!muteVal} in "${muteRoom}"`);
-            
-            this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
-            this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
-            
-          } catch(e) {
-            console.error('[setMuteType] Error:', e.message);
-          }
+          await this._updateRoomData(muteRoom, (data) => {
+            data.muted = !!muteVal;
+          });
+          
+          this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
+          this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
           break;
         }
 
@@ -1505,71 +1456,11 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ RESTORE ALL STATE + RESET OTOMATIS SAAT DEPLOY
+  // ✅ RESTORE ALL STATE (LOAD DARI STORAGE)
   // ============================================================
   
   async _restoreAllState() {
     try {
-      // ✅ CEK VERSION DI STORAGE
-      const savedVersion = await this.ctx.storage.get("appVersion");
-      console.log(`[RESTORE] Saved Version: ${savedVersion}`);
-      console.log(`[RESTORE] Current Version: ${this._appVersion}`);
-      
-      // ✅ JIKA VERSION BERBEDA → RESET SEMUA!
-      if (savedVersion !== this._appVersion) {
-        console.log(`[RESET] 🗑️ Version changed! ${savedVersion} → ${this._appVersion}`);
-        console.log('[RESET] Deleting ALL storage and memory...');
-        
-        // 1. Hapus semua data dari storage
-        await this.ctx.storage.deleteAll();
-        console.log('[RESET] ✅ storage.deleteAll() executed');
-        
-        // 2. Simpan version baru
-        await this.ctx.storage.put("appVersion", this._appVersion);
-        console.log(`[RESET] ✅ New version saved: ${this._appVersion}`);
-        
-        // 3. Reset memory
-        this.currentNumber = 1;
-        
-        // 4. Reset rooms di memory
-        for (const [roomName, clients] of this.roomClients) {
-          clients.clear();
-        }
-        
-        // 5. Reset websocket connections
-        this.userConnections.clear();
-        this.wsActiveMulti.clear();
-        this.wsSet.clear();
-        
-        // 6. Reset locks
-        this._joinLocks.clear();
-        this._kursiLocks.clear();
-        this._userJoinLock.clear();
-        
-        // 7. Clear event queue
-        this._eventQueue = [];
-        this._processingMessages.clear();
-        this._cleaningUp.clear();
-        
-        // 8. ✅ SAVE EMPTY STATE
-        await this._saveToStorage({}, {}, 1);
-        console.log('[RESET] ✅ Empty state saved');
-        
-        console.log('[RESET] 🎉 All storage and memory cleared successfully!');
-        
-        // 9. Schedule alarm
-        if (!this.closing && !this.isDestroyed) {
-          this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
-        }
-        
-        return; // ← LANGSUNG KELUAR, TIDAK RESTORE DATA LAMA!
-      }
-      
-      // ============================================================
-      // ✅ NORMAL RESTORE (VERSION SAMA)
-      // ============================================================
-      console.log('[RESTORE] ✅ Version match - normal restore from storage...');
-      
       const storage = await this._loadFromStorage();
       const { roomsData, userSeatData, currentNumber } = storage;
       
@@ -1626,8 +1517,6 @@ export class ChatServer {
       if (!this.closing && !this.isDestroyed) {
         this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
       }
-      
-      console.log('[RESTORE] ✅ Normal restore complete!');
       
     } catch(e) {
       console.error('[RESTORE] Error:', e.message);
