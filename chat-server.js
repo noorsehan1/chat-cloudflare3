@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 7.0.0 - STORAGE-ONLY ARCHITECTURE
+// VERSION: 7.1.0 - FIXED UPDATE KURSI & POINT
 // OTOMATIS RESET STORAGE SAAT DEPLOY (VERSION DETECT)
 
 const C = {
@@ -245,47 +245,82 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ UPDATE KURSI (LANGSUNG KE STORAGE)
+  // ✅ UPDATE KURSI (FIXED - LANGSUNG SAVE KE STORAGE)
   // ============================================================
   
   async _updateKursi(roomName, seat, data) {
-    const roomData = await this._getRoomData(roomName);
-    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
+    if (!roomName || !seat || !data) return false;
     
-    roomData.seats[seat] = {
-      noimageUrl: data.noimageUrl || "",
-      namauser: data.namauser || "",
-      color: data.color || "",
-      itembawah: data.itembawah || 0,
-      itematas: data.itematas || 0,
-      vip: data.vip || 0,
-      viptanda: data.viptanda || 0
-    };
-    
-    await this._updateRoomData(roomName, (d) => {
-      d.seats = roomData.seats;
-    });
-    
-    return true;
+    try {
+      const storage = await this._loadFromStorage();
+      const roomsData = storage.roomsData || {};
+      
+      if (!roomsData[roomName]) {
+        roomsData[roomName] = { seats: {}, points: {}, muted: false, number: 1 };
+      }
+      
+      if (!roomsData[roomName].seats) {
+        roomsData[roomName].seats = {};
+      }
+      
+      roomsData[roomName].seats[seat] = {
+        noimageUrl: data.noimageUrl || "",
+        namauser: data.namauser || "",
+        color: data.color || "",
+        itembawah: data.itembawah || 0,
+        itematas: data.itematas || 0,
+        vip: data.vip || 0,
+        viptanda: data.viptanda || 0
+      };
+      
+      await this.ctx.storage.put("roomsData", roomsData);
+      console.log(`[_updateKursi] ✅ Seat ${seat} updated in "${roomName}"`);
+      return true;
+      
+    } catch(e) {
+      console.error('[_updateKursi] Error:', e.message);
+      return false;
+    }
   }
 
   // ============================================================
-  // ✅ UPDATE POINT (LANGSUNG KE STORAGE)
+  // ✅ UPDATE POINT (FIXED - LANGSUNG SAVE KE STORAGE)
   // ============================================================
   
   async _updatePoint(roomName, seat, x, y, fast) {
-    const roomData = await this._getRoomData(roomName);
-    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
+    if (!roomName || !seat) return false;
     
-    if (!roomData.points) roomData.points = {};
-    
-    roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
-    
-    await this._updateRoomData(roomName, (d) => {
-      d.points = roomData.points;
-    });
-    
-    return true;
+    try {
+      const storage = await this._loadFromStorage();
+      const roomsData = storage.roomsData || {};
+      
+      if (!roomsData[roomName]) {
+        roomsData[roomName] = { seats: {}, points: {}, muted: false, number: 1 };
+      }
+      
+      if (!roomsData[roomName].seats || !roomsData[roomName].seats[seat]) {
+        console.log(`[_updatePoint] ❌ Seat ${seat} not found in "${roomName}"`);
+        return false;
+      }
+      
+      if (!roomsData[roomName].points) {
+        roomsData[roomName].points = {};
+      }
+      
+      roomsData[roomName].points[seat] = {
+        x: x || 0,
+        y: y || 0,
+        fast: !!fast
+      };
+      
+      await this.ctx.storage.put("roomsData", roomsData);
+      console.log(`[_updatePoint] ✅ Point saved for seat ${seat} in "${roomName}"`);
+      return true;
+      
+    } catch(e) {
+      console.error('[_updatePoint] Error:', e.message);
+      return false;
+    }
   }
 
   // ============================================================
@@ -1153,15 +1188,39 @@ export class ChatServer {
           break;
         }
         
+        // ============================================================
+        // ✅ UPDATE KURSI - FIXED (LANGSUNG SAVE KE STORAGE)
+        // ============================================================
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           
+          if (!kursiRoom || !kursiSeat || !ROOMS_SET.has(kursiRoom)) {
+            console.log('[updateKursi] ❌ Invalid input');
+            break;
+          }
+          
           const lockKey = `kursi_${kursiRoom}_${kursiSeat}`;
-          if (this._kursiLocks.has(lockKey)) break;
+          if (this._kursiLocks.has(lockKey)) {
+            console.log(`[updateKursi] ⏳ Lock active for seat ${kursiSeat}`);
+            break;
+          }
           this._kursiLocks.set(lockKey, Date.now());
           
           try {
-            const updated = await this._updateKursi(kursiRoom, kursiSeat, {
+            // ✅ LOAD + UPDATE + SAVE LANGSUNG KE STORAGE
+            const storage = await this._loadFromStorage();
+            const roomsData = storage.roomsData || {};
+            
+            if (!roomsData[kursiRoom]) {
+              roomsData[kursiRoom] = { seats: {}, points: {}, muted: false, number: 1 };
+            }
+            
+            if (!roomsData[kursiRoom].seats) {
+              roomsData[kursiRoom].seats = {};
+            }
+            
+            // ✅ UPDATE DATA
+            roomsData[kursiRoom].seats[kursiSeat] = {
               noimageUrl: kursiNoimg || "",
               namauser: kursiName || "",
               color: kursiColor || "",
@@ -1169,21 +1228,25 @@ export class ChatServer {
               itematas: kursiAtas || 0,
               vip: kursiVip || 0,
               viptanda: kursiVt || 0
-            });
+            };
             
-            if (updated) {
-              const roomData = await this._getRoomData(kursiRoom);
-              const updatedSeat = roomData?.seats?.[kursiSeat];
-              if (updatedSeat) {
-                this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
-              }
-            }
+            // ✅ SAVE KE STORAGE
+            await this.ctx.storage.put("roomsData", roomsData);
+            console.log(`[updateKursi] ✅ Seat ${kursiSeat} updated in "${kursiRoom}"`);
+            
+            // ✅ BROADCAST
+            const updatedSeat = roomsData[kursiRoom].seats[kursiSeat];
+            this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
+            
+          } catch(e) {
+            console.error('[updateKursi] Error:', e.message);
           } finally {
             this._kursiLocks.delete(lockKey);
           }
           break;
         }
         
+        // ✅ CHAT: LANGSUNG KIRIM (TANPA SAVE)
         case "chat": {
           const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
           if (!chatMsg || !ROOMS_SET.has(chatRoom)) break;
@@ -1198,13 +1261,51 @@ export class ChatServer {
           break;
         }
         
+        // ============================================================
+        // ✅ UPDATE POINT - FIXED (LANGSUNG SAVE KE STORAGE)
+        // ============================================================
         case "updatePoint": {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
-          if (!pointRoom || typeof pointSeat !== 'number') break;
           
-          const updated = await this._updatePoint(pointRoom, pointSeat, pointX, pointY, pointFast === 1);
-          if (updated) {
+          if (!pointRoom || typeof pointSeat !== 'number' || !ROOMS_SET.has(pointRoom)) {
+            console.log('[updatePoint] ❌ Invalid input');
+            break;
+          }
+          
+          try {
+            // ✅ LOAD + UPDATE + SAVE LANGSUNG KE STORAGE
+            const storage = await this._loadFromStorage();
+            const roomsData = storage.roomsData || {};
+            
+            if (!roomsData[pointRoom]) {
+              roomsData[pointRoom] = { seats: {}, points: {}, muted: false, number: 1 };
+            }
+            
+            if (!roomsData[pointRoom].seats || !roomsData[pointRoom].seats[pointSeat]) {
+              console.log(`[updatePoint] ❌ Seat ${pointSeat} not found in "${pointRoom}"`);
+              break;
+            }
+            
+            if (!roomsData[pointRoom].points) {
+              roomsData[pointRoom].points = {};
+            }
+            
+            // ✅ UPDATE POINT
+            roomsData[pointRoom].points[pointSeat] = {
+              x: pointX || 0,
+              y: pointY || 0,
+              fast: pointFast === 1
+            };
+            
+            // ✅ SAVE KE STORAGE
+            await this.ctx.storage.put("roomsData", roomsData);
+            console.log(`[updatePoint] ✅ Point updated for seat ${pointSeat} in "${pointRoom}"`);
+            
+            // ✅ BROADCAST
             this._broadcastToRoom(pointRoom, JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]));
+            
+          } catch(e) {
+            console.error('[updatePoint] Error:', e.message);
           }
           break;
         }
@@ -1224,6 +1325,7 @@ export class ChatServer {
           break;
         }
         
+        // ✅ PRIVATE: LANGSUNG KIRIM
         case "private": {
           const [privTarget, privNoimg, privMsg, privSender] = args;
           if (privTarget && privMsg) {
@@ -1241,6 +1343,7 @@ export class ChatServer {
           break;
         }
         
+        // ✅ GIFT: LANGSUNG KIRIM
         case "gift": {
           const [giftRoom, giftSender, giftReceiver, giftGiftName] = args;
           if (giftRoom && ROOMS_SET.has(giftRoom)) {
@@ -1251,6 +1354,7 @@ export class ChatServer {
           break;
         }
         
+        // ✅ ROLL: LANGSUNG KIRIM
         case "rollangak": {
           const [rollRoom, rollUser, rollAngka] = args;
           if (rollRoom && ROOMS_SET.has(rollRoom)) {
@@ -1261,6 +1365,7 @@ export class ChatServer {
           break;
         }
         
+        // ✅ NOTIF: LANGSUNG KIRIM
         case "sendnotif": {
           try {
             const [notifTarget, notifNoimg, notifUser, notifMsg] = args;
@@ -1340,16 +1445,32 @@ export class ChatServer {
           break;
         }
         
+        // ============================================================
+        // ✅ SET MUTE TYPE - FIXED (LANGSUNG SAVE KE STORAGE)
+        // ============================================================
         case "setMuteType": {
           const [muteVal, muteRoom] = args;
           if (!muteRoom || !ROOMS_SET.has(muteRoom)) break;
           
-          await this._updateRoomData(muteRoom, (data) => {
-            data.muted = !!muteVal;
-          });
-          
-          this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
-          this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
+          try {
+            const storage = await this._loadFromStorage();
+            const roomsData = storage.roomsData || {};
+            
+            if (!roomsData[muteRoom]) {
+              roomsData[muteRoom] = { seats: {}, points: {}, muted: false, number: 1 };
+            }
+            
+            roomsData[muteRoom].muted = !!muteVal;
+            
+            await this.ctx.storage.put("roomsData", roomsData);
+            console.log(`[setMuteType] ✅ Mute set to ${!!muteVal} in "${muteRoom}"`);
+            
+            this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
+            this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
+            
+          } catch(e) {
+            console.error('[setMuteType] Error:', e.message);
+          }
           break;
         }
 
@@ -1409,8 +1530,6 @@ export class ChatServer {
         
         // 3. Reset memory
         this.currentNumber = 1;
-        this._storageCache = null;
-        this._storageCacheTime = 0;
         
         // 4. Reset rooms di memory
         for (const [roomName, clients] of this.roomClients) {
