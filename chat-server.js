@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.9 - FULL DELETE & REPLACE SYSTEM
+// VERSION: 9.3.10 - FIX SETIDTARGET2 FOR MULTI USER
 
 const C = {
   MAX_SEATS: 45,
@@ -1032,8 +1032,10 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
+    // HAPUS USER DARI SEMUA ROOM (UNTUK USER BIASA)
     await this._removeUserFromAllRooms(username);
     
+    // RESET WS
     ws.username = username;
     ws.idtarget = username;
     ws.room = null;
@@ -1101,14 +1103,41 @@ export class ChatServer {
           this.safeSend(ws, ["currentNumber", this.currentNumber]);
           break;
         
+        // ============================================================
+        // PERBAIKAN setIdTarget2 UNTUK MULTI USER
+        // ============================================================
         case "setIdTarget2": {
           const username = args[0];
           const isNewUser = args[1];
           
           if (username) {
+            const seatInfo = this._userSeatDataCache[username];
+            
+            // KHUSUS MULTI + isNewUser=false: SETOR WS AJA, LANGSUNG RETURN
+            if (seatInfo && seatInfo.isMulti && !isNewUser) {
+              // RESET WS TANPA HAPUS DATA
+              ws.username = username;
+              ws.idtarget = username;
+              ws.room = null;
+              ws.roomname = null;
+              ws._closing = false;
+              ws._isMulti = false;
+              ws._multiRoom = null;
+              ws._multiSeat = null;
+              ws._cachedUsername = username;
+              ws._cachedRoom = null;
+              
+              ws.serializeAttachment({ username: username });
+              
+              this.safeSend(ws, ["needJoinRoom"]);
+              return;  // ← LANGSUNG RETURN, JANGAN LANJUT
+            }
+            
+            // USER BIASA / NON-MULTI: HAPUS DATA DULU
             await this._removeUserFromAllRooms(username);
           }
           
+          // LANJUTKAN PROSES NORMAL
           await this._handleSetId(ws, username, isNewUser);
           break;
         }
@@ -1134,7 +1163,7 @@ export class ChatServer {
           // ========================================
           // HAPUS DATA SEBELUMNYA UNTUK MULTI USER
           // ========================================
-          await this._removeUserFromAllRooms(multiUsername);  // ← HAPUS DATA LAMA
+          await this._removeUserFromAllRooms(multiUsername);
           
           let roomData = this._roomsDataCache[multiRoomname];
           if (!roomData) {
