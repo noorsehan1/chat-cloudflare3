@@ -1129,12 +1129,9 @@ export class ChatServer {
               
               ws.serializeAttachment({ username: username });
               
-              this.safeSend(ws, ["needJoinRoom"]);
               return;  // ← LANGSUNG RETURN, JANGAN LANJUT
             }
             
-            // USER BIASA / NON-MULTI: HAPUS DATA DULU
-            await this._removeUserFromAllRooms(username);
           }
           
           // LANJUTKAN PROSES NORMAL (SUDAH TIDAK REMOVE LAGI)
