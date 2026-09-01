@@ -1,5 +1,5 @@
-// ==================== CHAT-SERVER-HIBERNATION-MULTI-STORAGE-OPTIMIZED-V2.JS ====================
-// VERSION: 9.8.0 - OPTIMIZED MULTI-USER STORAGE (REAL-TIME + ROLL EXCLUDED)
+// ==================== CHAT-SERVER-MULTI-ACTIVE-FULL.JS ====================
+// VERSION: 10.0.0 - FULL MULTI-USER WITH ACTIVE SWITCH
 
 const C = {
   MAX_SEATS: 45,
@@ -33,11 +33,12 @@ export class ChatServer {
     
     this._roomsDataCache = {};
     this._userSeatDataCache = {};
-    this._multiUserDataCache = {}; // Cache for multi-user data
+    this._multiUserDataCache = {};
     this.currentNumber = 1;
     
     this._onlineUsers = new Set();
-    this._multiUsers = new Set(); // Track multi-users
+    this._multiUsers = new Set();
+    this._activeMultiUsers = new Set();
     this._userCounts = {};
     for (const room of ROOMS) {
       this._userCounts[room] = 0;
@@ -48,22 +49,15 @@ export class ChatServer {
     this._lastRefreshTime = 0;
     this._saveQueue = [];
     this._isSaving = false;
-    
-    // Track WS ID to user mapping
     this._wsIdToUser = new Map();
+    this._multiActivities = new Map();
     
-    // Track multi-user activities (in-memory only for real-time)
-    this._multiActivities = new Map(); // username -> { lastActivity, room, seat }
-    
-    // Restore state first
     this._restoreAllState().then(() => {
       if (!this.closing && !this.isDestroyed) {
         this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
       }
     });
   }
-
-  // ============ UTILITY METHODS ============
 
   _getActiveWebSockets() {
     try {
@@ -73,8 +67,6 @@ export class ChatServer {
     }
   }
 
-  // ============ RESTORE WEB SOCKET STATE ============
-  
   _restoreWebSocketState(ws) {
     if (!ws) return false;
     
@@ -99,20 +91,25 @@ export class ChatServer {
         ws._cachedUsername = attachment.username;
         ws._cachedRoom = attachment.room;
         ws._closing = false;
+        ws._isActiveMulti = attachment.isActiveMulti || false;
         
         if (attachment.seatInfo) {
           this._userSeatDataCache[attachment.username] = attachment.seatInfo;
         }
         
-        // Restore multi-user data
         if (attachment.isMulti && attachment.multiRoom) {
           this._multiUsers.add(attachment.username);
           this._multiUserDataCache[attachment.username] = {
             room: attachment.multiRoom,
             seat: attachment.multiSeat,
             isMulti: true,
+            isActive: attachment.isActiveMulti || false,
             lastActivity: Date.now()
           };
+          
+          if (attachment.isActiveMulti) {
+            this._activeMultiUsers.add(attachment.username);
+          }
         }
         
         this._wsIdToUser.set(ws._wsId, attachment.username);
@@ -130,6 +127,7 @@ export class ChatServer {
         ws._multiSeat = seatInfo.multiSeat || seatInfo.seat;
         ws.idtarget = ws.username;
         ws._closing = false;
+        ws._isActiveMulti = seatInfo.isActive || false;
         
         try {
           ws.serializeAttachment({
@@ -139,6 +137,7 @@ export class ChatServer {
             isMulti: seatInfo.isMulti || false,
             multiRoom: seatInfo.multiRoom || seatInfo.room,
             multiSeat: seatInfo.multiSeat || seatInfo.seat,
+            isActiveMulti: seatInfo.isActive || false,
             seatInfo: seatInfo
           });
         } catch(e) {}
@@ -149,8 +148,13 @@ export class ChatServer {
             room: seatInfo.multiRoom || seatInfo.room,
             seat: seatInfo.multiSeat || seatInfo.seat,
             isMulti: true,
+            isActive: seatInfo.isActive || false,
             lastActivity: Date.now()
           };
+          
+          if (seatInfo.isActive) {
+            this._activeMultiUsers.add(ws.username);
+          }
         }
         
         this._wsIdToUser.set(ws._wsId, ws.username);
@@ -165,7 +169,8 @@ export class ChatServer {
               const seatInfo = {
                 room: roomName,
                 seat: parseInt(seat),
-                isMulti: false
+                isMulti: false,
+                isActive: false
               };
               this._userSeatDataCache[ws.username] = seatInfo;
               ws.room = roomName;
@@ -175,6 +180,7 @@ export class ChatServer {
               ws._isMulti = false;
               ws.idtarget = ws.username;
               ws._closing = false;
+              ws._isActiveMulti = false;
               
               try {
                 ws.serializeAttachment({
@@ -182,6 +188,7 @@ export class ChatServer {
                   room: roomName,
                   seat: parseInt(seat),
                   isMulti: false,
+                  isActiveMulti: false,
                   seatInfo: seatInfo
                 });
               } catch(e) {}
@@ -199,8 +206,6 @@ export class ChatServer {
     }
   }
 
-  // ============ GET USER SEAT ============
-  
   _getUserSeat(username) {
     if (!username) return null;
     
@@ -214,7 +219,8 @@ export class ChatServer {
           seatInfo = {
             room: roomName,
             seat: parseInt(seat),
-            isMulti: false
+            isMulti: false,
+            isActive: this._activeMultiUsers.has(username)
           };
           this._userSeatDataCache[username] = seatInfo;
           return seatInfo;
@@ -247,8 +253,6 @@ export class ChatServer {
       } catch(e) {}
     }
   }
-
-  // ============ STORAGE METHODS WITH MULTI SUPPORT ============
 
   async _syncSave(roomsData, userSeatData, multiUserData, currentNumber) {
     try {
@@ -296,9 +300,6 @@ export class ChatServer {
     }
   }
 
-  // ============ MULTI-USER STORAGE METHODS (ONLY IMPORTANT ACTIVITIES) ============
-
-  // ✅ SIMPAN: Multi-join activity (important)
   async _saveMultiJoin(username, room, seat) {
     if (!username) return false;
     
@@ -307,6 +308,7 @@ export class ChatServer {
         room: room,
         seat: seat,
         isMulti: true,
+        isActive: false,
         joinTime: Date.now(),
         lastActivity: Date.now()
       };
@@ -315,7 +317,6 @@ export class ChatServer {
       multiData.seat = seat;
       multiData.lastActivity = Date.now();
       
-      // ✅ SIMPAN: Important activity
       if (!multiData.importantActivities) multiData.importantActivities = [];
       multiData.importantActivities.push({
         type: 'multiJoin',
@@ -324,7 +325,6 @@ export class ChatServer {
         seat: seat
       });
       
-      // Keep last 50 important activities
       if (multiData.importantActivities.length > 50) {
         multiData.importantActivities = multiData.importantActivities.slice(-50);
       }
@@ -332,14 +332,13 @@ export class ChatServer {
       this._multiUserDataCache[username] = multiData;
       this._multiUsers.add(username);
       
-      // ✅ SIMPAN KE STORAGE
       await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
       
-      // Also update userSeatData
       this._userSeatDataCache[username] = {
         room: room,
         seat: seat,
         isMulti: true,
+        isActive: false,
         multiRoom: room,
         multiSeat: seat
       };
@@ -351,86 +350,20 @@ export class ChatServer {
     }
   }
 
-  // ✅ SIMPAN: Update kursi (important)
-  async _saveMultiKursiUpdate(username, room, seat) {
-    if (!username) return false;
-    
-    try {
-      const multiData = this._multiUserDataCache[username];
-      if (!multiData) return false;
-      
-      multiData.lastActivity = Date.now();
-      
-      // ✅ SIMPAN: Important activity
-      if (!multiData.importantActivities) multiData.importantActivities = [];
-      multiData.importantActivities.push({
-        type: 'updateKursi',
-        timestamp: Date.now(),
-        room: room,
-        seat: seat
-      });
-      
-      if (multiData.importantActivities.length > 50) {
-        multiData.importantActivities = multiData.importantActivities.slice(-50);
-      }
-      
-      this._multiUserDataCache[username] = multiData;
-      
-      // ✅ SIMPAN KE STORAGE
-      await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
-      
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  // ✅ SIMPAN: Update point (important)
-  async _saveMultiPointUpdate(username, room, seat) {
-    if (!username) return false;
-    
-    try {
-      const multiData = this._multiUserDataCache[username];
-      if (!multiData) return false;
-      
-      multiData.lastActivity = Date.now();
-      
-      // ✅ SIMPAN: Important activity
-      if (!multiData.importantActivities) multiData.importantActivities = [];
-      multiData.importantActivities.push({
-        type: 'updatePoint',
-        timestamp: Date.now(),
-        room: room,
-        seat: seat
-      });
-      
-      if (multiData.importantActivities.length > 50) {
-        multiData.importantActivities = multiData.importantActivities.slice(-50);
-      }
-      
-      this._multiUserDataCache[username] = multiData;
-      
-      // ✅ SIMPAN KE STORAGE
-      await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
-      
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  // ✅ SIMPAN: Set active multi (important)
   async _saveMultiActive(username, room, seat) {
     if (!username) return false;
     
     try {
-      const multiData = this._multiUserDataCache[username] || {
+      let multiData = this._multiUserDataCache[username] || {
         room: room,
         seat: seat,
         isMulti: true,
+        isActive: true,
+        joinTime: Date.now(),
         lastActivity: Date.now()
       };
       
+      multiData.isActive = true;
       multiData.room = room;
       multiData.seat = seat;
       multiData.lastActivity = Date.now();
@@ -440,7 +373,8 @@ export class ChatServer {
         type: 'setActiveMulti',
         timestamp: Date.now(),
         room: room,
-        seat: seat
+        seat: seat,
+        isActive: true
       });
       
       if (multiData.importantActivities.length > 50) {
@@ -449,9 +383,19 @@ export class ChatServer {
       
       this._multiUserDataCache[username] = multiData;
       this._multiUsers.add(username);
+      this._activeMultiUsers.add(username);
       
-      // ✅ SIMPAN KE STORAGE
-      await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
+      this._userSeatDataCache[username] = {
+        room: room,
+        seat: seat,
+        isMulti: true,
+        isActive: true,
+        multiRoom: room,
+        multiSeat: seat
+      };
+      
+      await this._syncSave(undefined, this._userSeatDataCache, this._multiUserDataCache, undefined);
+      await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
       
       return true;
     } catch(e) {
@@ -459,20 +403,32 @@ export class ChatServer {
     }
   }
 
-  // ✅ SIMPAN: Exit multi (important)
-  async _saveMultiExit(username) {
+  async _saveMultiKursiUpdate(username, room, seat) {
     if (!username) return false;
     
     try {
-      const multiData = this._multiUserDataCache[username];
-      if (!multiData) return false;
+      let multiData = this._multiUserDataCache[username];
+      if (!multiData) {
+        multiData = {
+          room: room,
+          seat: seat,
+          isMulti: true,
+          isActive: this._activeMultiUsers.has(username),
+          lastActivity: Date.now()
+        };
+      }
+      
+      multiData.lastActivity = Date.now();
+      multiData.room = room;
+      multiData.seat = seat;
       
       if (!multiData.importantActivities) multiData.importantActivities = [];
       multiData.importantActivities.push({
-        type: 'exitMulti',
+        type: 'updateKursi',
         timestamp: Date.now(),
-        room: multiData.room,
-        seat: multiData.seat
+        room: room,
+        seat: seat,
+        isActive: multiData.isActive
       });
       
       if (multiData.importantActivities.length > 50) {
@@ -480,8 +436,6 @@ export class ChatServer {
       }
       
       this._multiUserDataCache[username] = multiData;
-      
-      // ✅ SIMPAN KE STORAGE
       await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
       
       return true;
@@ -490,33 +444,150 @@ export class ChatServer {
     }
   }
 
-  // ❌ TIDAK DISIMPAN: Chat (real-time only)
-  // ❌ TIDAK DISIMPAN: Private message (real-time only)
-  // ❌ TIDAK DISIMPAN: Gift (real-time only)
-  // ❌ TIDAK DISIMPAN: Roll (real-time only)
+  async _saveMultiPointUpdate(username, room, seat) {
+    if (!username) return false;
+    
+    try {
+      let multiData = this._multiUserDataCache[username];
+      if (!multiData) {
+        multiData = {
+          room: room,
+          seat: seat,
+          isMulti: true,
+          isActive: this._activeMultiUsers.has(username),
+          lastActivity: Date.now()
+        };
+      }
+      
+      multiData.lastActivity = Date.now();
+      multiData.room = room;
+      multiData.seat = seat;
+      
+      if (!multiData.importantActivities) multiData.importantActivities = [];
+      multiData.importantActivities.push({
+        type: 'updatePoint',
+        timestamp: Date.now(),
+        room: room,
+        seat: seat,
+        isActive: multiData.isActive
+      });
+      
+      if (multiData.importantActivities.length > 50) {
+        multiData.importantActivities = multiData.importantActivities.slice(-50);
+      }
+      
+      this._multiUserDataCache[username] = multiData;
+      await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
+      
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
 
-  // Update last activity in memory (not saved to storage)
+  async _saveMultiExit(username) {
+    if (!username) return false;
+    
+    try {
+      const multiData = this._multiUserDataCache[username];
+      if (!multiData) return false;
+      
+      multiData.isActive = false;
+      
+      if (!multiData.importantActivities) multiData.importantActivities = [];
+      multiData.importantActivities.push({
+        type: 'exitMulti',
+        timestamp: Date.now(),
+        room: multiData.room,
+        seat: multiData.seat,
+        isActive: false
+      });
+      
+      if (multiData.importantActivities.length > 50) {
+        multiData.importantActivities = multiData.importantActivities.slice(-50);
+      }
+      
+      this._multiUserDataCache[username] = multiData;
+      this._activeMultiUsers.delete(username);
+      
+      await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
+      await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
+      
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _deactivateAllActiveUsers() {
+    const activeUsers = Array.from(this._activeMultiUsers);
+    
+    for (const username of activeUsers) {
+      if (this._multiUserDataCache[username]) {
+        this._multiUserDataCache[username].isActive = false;
+        if (!this._multiUserDataCache[username].importantActivities) {
+          this._multiUserDataCache[username].importantActivities = [];
+        }
+        this._multiUserDataCache[username].importantActivities.push({
+          type: 'deactivated_all',
+          timestamp: Date.now()
+        });
+      }
+      
+      if (this._userSeatDataCache[username]) {
+        this._userSeatDataCache[username].isActive = false;
+      }
+    }
+    
+    this._activeMultiUsers.clear();
+    
+    await this._syncSave(undefined, this._userSeatDataCache, this._multiUserDataCache, undefined);
+    await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
+  }
+
   _updateMultiActivityInMemory(username) {
     if (!username) return;
-    
     try {
       const multiData = this._multiUserDataCache[username];
       if (multiData) {
         multiData.lastActivity = Date.now();
-        // Just update in-memory, don't save to storage
+        if (this._activeMultiUsers.has(username)) {
+          multiData.isActive = true;
+        }
       }
     } catch(e) {}
   }
 
-  // Get multi-user data
   _getMultiUserData(username) {
     if (!username) return null;
     return this._multiUserDataCache[username] || null;
   }
 
-  // Get all multi-users
   _getAllMultiUsers() {
     return Array.from(this._multiUsers);
+  }
+
+  _getActiveMultiUsers() {
+    return Array.from(this._activeMultiUsers);
+  }
+
+  _isActiveMulti(username) {
+    if (!username) return false;
+    return this._activeMultiUsers.has(username);
+  }
+
+  _getCurrentActiveUser() {
+    for (const [username, multiData] of Object.entries(this._multiUserDataCache)) {
+      if (multiData && multiData.isActive === true) {
+        return {
+          username: username,
+          room: multiData.room,
+          seat: multiData.seat,
+          data: multiData
+        };
+      }
+    }
+    return null;
   }
 
   async _updateUserCounts() {
@@ -537,7 +608,6 @@ export class ChatServer {
         this._onlineUsers.add(username);
       }
       
-      // Add multi-users to online users
       for (const username of this._multiUsers) {
         this._onlineUsers.add(username);
       }
@@ -545,7 +615,8 @@ export class ChatServer {
       await this.ctx.storage.put({
         userCounts: this._userCounts,
         onlineUsers: Array.from(this._onlineUsers),
-        multiUsers: Array.from(this._multiUsers)
+        multiUsers: Array.from(this._multiUsers),
+        activeMultiUsers: Array.from(this._activeMultiUsers)
       });
       
       return { counts: newCounts, total: totalUsers };
@@ -565,6 +636,7 @@ export class ChatServer {
         const userCounts = await this.ctx.storage.get("userCounts") || {};
         const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
         const multiUsers = await this.ctx.storage.get("multiUsers") || [];
+        const activeMultiUsers = await this.ctx.storage.get("activeMultiUsers") || [];
         
         this._roomsDataCache = roomsData;
         this._userSeatDataCache = userSeatData;
@@ -573,6 +645,7 @@ export class ChatServer {
         this._userCounts = userCounts;
         this._onlineUsers = new Set(onlineUsers);
         this._multiUsers = new Set(multiUsers);
+        this._activeMultiUsers = new Set(activeMultiUsers);
       }
       
       return {
@@ -582,7 +655,8 @@ export class ChatServer {
         currentNumber: this.currentNumber,
         userCounts: this._userCounts,
         onlineUsers: Array.from(this._onlineUsers),
-        multiUsers: Array.from(this._multiUsers)
+        multiUsers: Array.from(this._multiUsers),
+        activeMultiUsers: Array.from(this._activeMultiUsers)
       };
     } catch(e) {
       return { 
@@ -592,7 +666,8 @@ export class ChatServer {
         currentNumber: 1,
         userCounts: {},
         onlineUsers: [],
-        multiUsers: []
+        multiUsers: [],
+        activeMultiUsers: []
       };
     }
   }
@@ -620,14 +695,11 @@ export class ChatServer {
            this._multiUsers.has(username);
   }
 
-  // ============ CLEANUP USER DATA ============
-
   async _cleanupAllUserData(username) {
     if (!username) return false;
     
     let removed = false;
     
-    // 1. Hapus dari semua room
     for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
       if (!roomData || !roomData.seats) continue;
       
@@ -652,45 +724,43 @@ export class ChatServer {
       }
     }
     
-    // 2. Hapus dari user seat data
     if (this._userSeatDataCache[username]) {
       delete this._userSeatDataCache[username];
       removed = true;
     }
     
-    // 3. Hapus dari multi-user data (tapi simpan exit activity dulu)
     if (this._multiUserDataCache[username]) {
       await this._saveMultiExit(username);
       delete this._multiUserDataCache[username];
       removed = true;
     }
     
-    // 4. Hapus dari online users
     if (this._onlineUsers.has(username)) {
       this._onlineUsers.delete(username);
       removed = true;
     }
     
-    // 5. Hapus dari multi-users
     if (this._multiUsers.has(username)) {
       this._multiUsers.delete(username);
       removed = true;
     }
     
-    // 6. Hapus dari WS mapping
+    if (this._activeMultiUsers.has(username)) {
+      this._activeMultiUsers.delete(username);
+      removed = true;
+    }
+    
     for (const [wsId, uname] of this._wsIdToUser) {
       if (uname === username) {
         this._wsIdToUser.delete(wsId);
       }
     }
     
-    // 7. Hapus dari multi activities in-memory
     if (this._multiActivities.has(username)) {
       this._multiActivities.delete(username);
       removed = true;
     }
     
-    // 8. Sync save ke storage
     if (removed) {
       await this._syncSave(
         this._roomsDataCache,
@@ -700,6 +770,7 @@ export class ChatServer {
       );
       await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       await this.ctx.storage.put("multiUsers", Array.from(this._multiUsers));
+      await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
       await this._updateUserCounts();
     }
     
@@ -722,7 +793,8 @@ export class ChatServer {
             return { 
               room: seatInfo.room, 
               seat: parseInt(seat), 
-              isMulti: seatInfo.isMulti || false 
+              isMulti: seatInfo.isMulti || false,
+              isActive: seatInfo.isActive || false
             };
           }
         }
@@ -740,12 +812,13 @@ export class ChatServer {
           this._userSeatDataCache[username] = { 
             room: roomName, 
             seat: parseInt(seat), 
-            isMulti: false 
+            isMulti: false,
+            isActive: this._activeMultiUsers.has(username)
           };
           await this._syncSave(undefined, this._userSeatDataCache, undefined);
           this._onlineUsers.add(username);
           await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-          return { room: roomName, seat: parseInt(seat), isMulti: false };
+          return { room: roomName, seat: parseInt(seat), isMulti: false, isActive: false };
         }
       }
     }
@@ -783,6 +856,7 @@ export class ChatServer {
     delete this._multiUserDataCache[username];
     this._onlineUsers.delete(username);
     this._multiUsers.delete(username);
+    this._activeMultiUsers.delete(username);
     
     await this._syncSave(
       this._roomsDataCache,
@@ -792,6 +866,7 @@ export class ChatServer {
     );
     await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this.ctx.storage.put("multiUsers", Array.from(this._multiUsers));
+    await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
     
     await this._updateUserCounts();
     
@@ -816,8 +891,7 @@ export class ChatServer {
       viptanda: data.viptanda || 0
     };
     
-    // ✅ SIMPAN: Save multi-user activity (important)
-    if (data.namauser && this._multiUsers.has(data.namauser)) {
+    if (data.namauser && this._activeMultiUsers.has(data.namauser)) {
       await this._saveMultiKursiUpdate(data.namauser, roomName, seat);
     }
     
@@ -832,9 +906,8 @@ export class ChatServer {
     if (!roomData.points) roomData.points = {};
     roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
     
-    // ✅ SIMPAN: Save multi-user activity (important)
     const username = roomData.seats[seat].namauser;
-    if (username && this._multiUsers.has(username)) {
+    if (username && this._activeMultiUsers.has(username)) {
       await this._saveMultiPointUpdate(username, roomName, seat);
     }
     
@@ -845,11 +918,13 @@ export class ChatServer {
   async _deleteUserSeat(username) {
     delete this._userSeatDataCache[username];
     delete this._multiUserDataCache[username];
+    this._activeMultiUsers.delete(username);
     await this._syncSave(undefined, this._userSeatDataCache, this._multiUserDataCache, undefined);
     this._onlineUsers.delete(username);
     this._multiUsers.delete(username);
     await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this.ctx.storage.put("multiUsers", Array.from(this._multiUsers));
+    await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
     await this._updateUserCounts();
   }
 
@@ -866,8 +941,6 @@ export class ChatServer {
       await this._updateUserCounts();
     }
   }
-
-  // ============ JOIN & ROOM METHODS ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -917,7 +990,7 @@ export class ChatServer {
     
     await this._syncSave(this._roomsDataCache, undefined, undefined);
     
-    const seatInfo = { room: roomName, seat, isMulti: false };
+    const seatInfo = { room: roomName, seat, isMulti: false, isActive: false };
     this._userSeatDataCache[username] = seatInfo;
     await this._syncSave(undefined, this._userSeatDataCache, undefined);
     
@@ -925,12 +998,12 @@ export class ChatServer {
     await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this._updateUserCounts();
     
-    // Simpan attachment
     const attachmentData = {
       username: username,
       room: roomName,
       seat: seat,
       isMulti: false,
+      isActiveMulti: false,
       seatInfo: seatInfo
     };
     
@@ -948,6 +1021,7 @@ export class ChatServer {
     ws._multiRoom = null;
     ws._multiSeat = null;
     ws._closing = false;
+    ws._isActiveMulti = false;
     
     if (!ws._wsId) {
       ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
@@ -1006,8 +1080,6 @@ export class ChatServer {
       
     } catch(e) {}
   }
-
-  // ============ BROADCAST & SEND METHODS ============
 
   broadcast(room, msg) {
     if (this.closing || this.isDestroyed || !room || !msg) return;
@@ -1131,14 +1203,14 @@ export class ChatServer {
         }
       }
       
-      // Send multi-user status
       const multiUsersInRoom = [];
       for (const [username, data] of Object.entries(this._multiUserDataCache)) {
         if (data && data.room === room) {
           multiUsersInRoom.push({
             username: username,
             seat: data.seat,
-            lastActivity: data.lastActivity
+            lastActivity: data.lastActivity,
+            isActive: data.isActive || false
           });
         }
       }
@@ -1146,10 +1218,13 @@ export class ChatServer {
         this.safeSend(ws, ["multiUsersInRoom", room, multiUsersInRoom]);
       }
       
+      const activeUsers = this._getActiveMultiUsers();
+      if (activeUsers.length > 0) {
+        this.safeSend(ws, ["activeMultiUsers", activeUsers]);
+      }
+      
     } catch(e) {}
   }
-
-  // ============ ALARM & NUMBER METHODS ============
 
   async alarm() {
     if (this.closing || this.isDestroyed) return;
@@ -1216,7 +1291,6 @@ export class ChatServer {
         } catch(e) {}
       }
       
-      // Cleanup regular users
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
           delete this._userSeatDataCache[username];
@@ -1230,11 +1304,11 @@ export class ChatServer {
         }
       }
       
-      // Cleanup multi-users
       for (const [username, multiData] of Object.entries(this._multiUserDataCache)) {
         if (!multiData || !multiData.room) {
           delete this._multiUserDataCache[username];
           this._multiUsers.delete(username);
+          this._activeMultiUsers.delete(username);
           changed = true;
           continue;
         }
@@ -1242,11 +1316,11 @@ export class ChatServer {
         if (!connectedUsers.has(username)) {
           delete this._multiUserDataCache[username];
           this._multiUsers.delete(username);
+          this._activeMultiUsers.delete(username);
           changed = true;
         }
       }
       
-      // Cleanup rooms
       for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
         const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
         const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
@@ -1265,12 +1339,11 @@ export class ChatServer {
           this.currentNumber
         );
         await this.ctx.storage.put("multiUsers", Array.from(this._multiUsers));
+        await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
       }
       
     } catch(e) {}
   }
-
-  // ============ WEBSOCKET EVENT HANDLERS ============
 
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
@@ -1288,6 +1361,7 @@ export class ChatServer {
             ws.idtarget = attachment.username;
             ws._cachedUsername = attachment.username;
             ws._cachedRoom = attachment.room;
+            ws._isActiveMulti = attachment.isActiveMulti || false;
           }
         } catch(e) {}
       }
@@ -1332,6 +1406,7 @@ export class ChatServer {
     ws._multiSeat = null;
     ws._cachedUsername = username;
     ws._cachedRoom = null;
+    ws._isActiveMulti = false;
     
     if (!ws._wsId) {
       ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
@@ -1339,7 +1414,7 @@ export class ChatServer {
     this._wsIdToUser.set(ws._wsId, username);
     
     try {
-      ws.serializeAttachment({ username: username });
+      ws.serializeAttachment({ username: username, isActiveMulti: false });
     } catch(e) {}
     
     if (isNewUser) { 
@@ -1378,8 +1453,6 @@ export class ChatServer {
       await this._handleEventInternal(ws, [evt, ...args]);
     } catch(e) {}
   }
-
-  // ============ EVENT HANDLERS ============
 
   async _handleEventInternal(ws, data) {
     try {
@@ -1472,13 +1545,13 @@ export class ChatServer {
             room: multiRoomname, 
             seat, 
             isMulti: true,
+            isActive: false,
             multiRoom: multiRoomname,
             multiSeat: seat
           };
           this._userSeatDataCache[multiUsername] = seatInfo;
           await this._syncSave(undefined, this._userSeatDataCache, undefined);
           
-          // ✅ SIMPAN: Save multi-join to storage
           await this._saveMultiJoin(multiUsername, multiRoomname, seat);
           
           this._onlineUsers.add(multiUsername);
@@ -1493,6 +1566,7 @@ export class ChatServer {
             isMulti: true,
             multiRoom: multiRoomname,
             multiSeat: seat,
+            isActiveMulti: false,
             seatInfo: seatInfo
           };
           
@@ -1510,6 +1584,7 @@ export class ChatServer {
           ws._multiRoom = multiRoomname;
           ws._multiSeat = seat;
           ws._closing = false;
+          ws._isActiveMulti = false;
           
           if (!ws._wsId) {
             ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
@@ -1537,6 +1612,7 @@ export class ChatServer {
                 wsKey._multiRoom = multiRoomname;
                 wsKey._multiSeat = seat;
                 wsKey._closing = false;
+                wsKey._isActiveMulti = false;
                 
                 if (!wsKey._wsId) {
                   wsKey._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
@@ -1550,19 +1626,83 @@ export class ChatServer {
           
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
           this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
-          
-          // Broadcast multi-user join
-          this.broadcast(multiRoomname, ["multiUserJoined", multiUsername, seat]);
+          this.broadcast(multiRoomname, ["multiUserJoined", multiUsername, seat, false]);
           
           break;
         }
         
         case "setActiveMulti": {
           const targetUsername = args[0];
+          const sourceUsername = args[1] || ws.username || ws._cachedUsername;
           
           if (!targetUsername) {
-            this.safeSend(ws, ["activeChangedMultiError", "Username tidak boleh kosong"]);
+            this.safeSend(ws, ["activeChangedMultiError", "Username target tidak boleh kosong"]);
             break;
+          }
+          
+          if (targetUsername === sourceUsername) {
+            this.safeSend(ws, ["activeChangedMultiError", "Tidak bisa mengaktifkan diri sendiri"]);
+            break;
+          }
+          
+          let previousActiveUser = null;
+          let previousActiveRoom = null;
+          let previousActiveSeat = null;
+          
+          for (const [username, multiData] of Object.entries(this._multiUserDataCache)) {
+            if (multiData && multiData.isActive === true) {
+              previousActiveUser = username;
+              previousActiveRoom = multiData.room;
+              previousActiveSeat = multiData.seat;
+              break;
+            }
+          }
+          
+          if (previousActiveUser && previousActiveUser !== targetUsername) {
+            if (this._multiUserDataCache[previousActiveUser]) {
+              this._multiUserDataCache[previousActiveUser].isActive = false;
+              if (!this._multiUserDataCache[previousActiveUser].importantActivities) {
+                this._multiUserDataCache[previousActiveUser].importantActivities = [];
+              }
+              this._multiUserDataCache[previousActiveUser].importantActivities.push({
+                type: 'deactivated',
+                timestamp: Date.now(),
+                room: previousActiveRoom,
+                seat: previousActiveSeat,
+                deactivatedBy: sourceUsername || 'system',
+                newActiveUser: targetUsername
+              });
+              if (this._multiUserDataCache[previousActiveUser].importantActivities.length > 50) {
+                this._multiUserDataCache[previousActiveUser].importantActivities = 
+                  this._multiUserDataCache[previousActiveUser].importantActivities.slice(-50);
+              }
+            }
+            
+            if (this._userSeatDataCache[previousActiveUser]) {
+              this._userSeatDataCache[previousActiveUser].isActive = false;
+            }
+            
+            this._activeMultiUsers.delete(previousActiveUser);
+            
+            if (previousActiveRoom) {
+              this.broadcast(previousActiveRoom, ["userActiveChanged", previousActiveUser, previousActiveSeat, false]);
+            }
+            
+            const webSocketsPrev = this._getActiveWebSockets();
+            for (const wsKey of webSocketsPrev) {
+              try {
+                const uname = wsKey._cachedUsername || wsKey.username || (wsKey.deserializeAttachment()?.username);
+                if (uname === previousActiveUser && wsKey.readyState === 1) {
+                  this.safeSend(wsKey, ["activeChangedMulti", previousActiveUser, previousActiveSeat, previousActiveRoom, false]);
+                  try {
+                    const attachment = wsKey.deserializeAttachment() || {};
+                    attachment.isActiveMulti = false;
+                    wsKey.serializeAttachment(attachment);
+                  } catch(e) {}
+                  wsKey._isActiveMulti = false;
+                }
+              } catch(e) {}
+            }
           }
           
           let userSeat = this._userSeatDataCache[targetUsername];
@@ -1575,7 +1715,8 @@ export class ChatServer {
                   userSeat = { 
                     room: roomName, 
                     seat: parseInt(seat), 
-                    isMulti: true 
+                    isMulti: true,
+                    isActive: true
                   };
                   break;
                 }
@@ -1585,24 +1726,51 @@ export class ChatServer {
           }
           
           if (!userSeat) {
-            this.safeSend(ws, ["activeChangedMultiError", `User ${targetUsername} tidak ditemukan`]);
+            this.safeSend(ws, ["activeChangedMultiError", `User ${targetUsername} tidak ditemukan di room manapun`]);
             break;
           }
           
           const roomName = userSeat.room;
           const seatNumber = userSeat.seat;
           
+          if (this._activeMultiUsers.has(targetUsername)) {
+            this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName, true]);
+            break;
+          }
+          
           this._userSeatDataCache[targetUsername] = {
             room: roomName,
             seat: seatNumber,
             isMulti: true,
+            isActive: true,
             multiRoom: roomName,
             multiSeat: seatNumber
           };
           await this._syncSave(undefined, this._userSeatDataCache, undefined);
           
-          // ✅ SIMPAN: Save multi-active to storage
           await this._saveMultiActive(targetUsername, roomName, seatNumber);
+          
+          if (this._multiUserDataCache[targetUsername]) {
+            const multiData = this._multiUserDataCache[targetUsername];
+            multiData.isActive = true;
+            if (!multiData.importantActivities) multiData.importantActivities = [];
+            multiData.importantActivities.push({
+              type: 'activated',
+              timestamp: Date.now(),
+              room: roomName,
+              seat: seatNumber,
+              activatedBy: sourceUsername || 'system',
+              previousActiveUser: previousActiveUser || null
+            });
+            if (multiData.importantActivities.length > 50) {
+              multiData.importantActivities = multiData.importantActivities.slice(-50);
+            }
+            this._multiUserDataCache[targetUsername] = multiData;
+            await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
+          }
+          
+          this._activeMultiUsers.add(targetUsername);
+          await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
           
           const webSockets = this._getActiveWebSockets();
           let foundAny = false;
@@ -1621,10 +1789,12 @@ export class ChatServer {
                   isMulti: true,
                   multiRoom: roomName,
                   multiSeat: seatNumber,
+                  isActiveMulti: true,
                   seatInfo: { 
                     room: roomName, 
                     seat: seatNumber, 
                     isMulti: true,
+                    isActive: true,
                     multiRoom: roomName,
                     multiSeat: seatNumber
                   }
@@ -1644,6 +1814,7 @@ export class ChatServer {
                 wsKey._multiRoom = roomName;
                 wsKey._multiSeat = seatNumber;
                 wsKey._closing = false;
+                wsKey._isActiveMulti = true;
                 
                 if (!wsKey._wsId) {
                   wsKey._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
@@ -1652,21 +1823,36 @@ export class ChatServer {
                 
                 foundAny = true;
                 
-                this.safeSend(wsKey, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
+                this.safeSend(wsKey, ["activeChangedMulti", targetUsername, seatNumber, roomName, true, previousActiveUser]);
                 
                 if (wsKey !== ws) {
-                  this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
+                  this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName, true, previousActiveUser]);
                 }
               }
             } catch(e) {}
           }
           
           if (!foundAny) {
-            this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
+            this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName, true, previousActiveUser]);
           }
           
-          this.broadcast(roomName, ["userActiveChanged", targetUsername, seatNumber]);
+          this.broadcast(roomName, ["userActiveChanged", targetUsername, seatNumber, true, previousActiveUser]);
+          
+          if (previousActiveUser && previousActiveRoom && previousActiveRoom !== roomName) {
+            this.broadcast(previousActiveRoom, ["userActiveChanged", previousActiveUser, previousActiveSeat, false, targetUsername]);
+          }
+          
           this._refreshRoomClients(true);
+          
+          this.safeSend(ws, ["activeSwitchSummary", {
+            newActive: targetUsername,
+            newRoom: roomName,
+            newSeat: seatNumber,
+            previousActive: previousActiveUser,
+            previousRoom: previousActiveRoom,
+            previousSeat: previousActiveSeat,
+            timestamp: Date.now()
+          }]);
           
           break;
         }
@@ -1680,9 +1866,29 @@ export class ChatServer {
           }
           
           try {
-            // ✅ SIMPAN: Save exit activity before cleanup
-            await this._saveMultiExit(targetUsername);
+            if (this._activeMultiUsers.has(targetUsername)) {
+              this._activeMultiUsers.delete(targetUsername);
+              
+              if (this._multiUserDataCache[targetUsername]) {
+                this._multiUserDataCache[targetUsername].isActive = false;
+                if (!this._multiUserDataCache[targetUsername].importantActivities) {
+                  this._multiUserDataCache[targetUsername].importantActivities = [];
+                }
+                this._multiUserDataCache[targetUsername].importantActivities.push({
+                  type: 'exitMulti',
+                  timestamp: Date.now(),
+                  room: this._multiUserDataCache[targetUsername].room,
+                  seat: this._multiUserDataCache[targetUsername].seat,
+                  isActive: false
+                });
+              }
+              
+              if (this._userSeatDataCache[targetUsername]) {
+                this._userSeatDataCache[targetUsername].isActive = false;
+              }
+            }
             
+            await this._saveMultiExit(targetUsername);
             await this._cleanupAllUserData(targetUsername);
             
             const webSockets = this._getActiveWebSockets();
@@ -1699,10 +1905,12 @@ export class ChatServer {
                   wsKey.room = null;
                   wsKey.roomname = null;
                   wsKey.idtarget = null;
+                  wsKey._isActiveMulti = false;
                   try {
                     wsKey.serializeAttachment({ 
                       username: targetUsername,
-                      isMulti: false
+                      isMulti: false,
+                      isActiveMulti: false
                     });
                   } catch(e) {}
                   
@@ -1710,14 +1918,13 @@ export class ChatServer {
                     this._wsIdToUser.delete(wsKey._wsId);
                   }
                   
-                  this.safeSend(wsKey, ["exitMultiSuccess", targetUsername, null, null]);
+                  this.safeSend(wsKey, ["exitMultiSuccess", targetUsername, null, null, false]);
                 }
               } catch(e) {}
             }
             
             this._refreshRoomClients(true);
-            
-            this.safeSend(ws, ["exitMultiSuccess", targetUsername, null, null]);
+            this.safeSend(ws, ["exitMultiSuccess", targetUsername, null, null, false]);
             
           } catch(e) {
             this.safeSend(ws, ["exitMultiError", e.message]);
@@ -1757,9 +1964,7 @@ export class ChatServer {
             break;
           }
           
-          // ❌ TIDAK DISIMPAN: Chat is real-time only
-          // Just update last activity in memory (no storage save)
-          if (this._multiUsers.has(chatUser)) {
+          if (this._activeMultiUsers.has(chatUser)) {
             this._updateMultiActivityInMemory(chatUser);
           }
           
@@ -1772,23 +1977,12 @@ export class ChatServer {
           if (!pointRoom || typeof pointSeat !== 'number') break;
           
           const username = ws.username || ws._cachedUsername;
-          if (!username) {
-            break;
-          }
+          if (!username) break;
           
           const userSeat = this._getUserSeat(username);
-          
-          if (!userSeat) {
-            break;
-          }
-          
-          if (userSeat.room !== pointRoom) {
-            break;
-          }
-          
-          if (userSeat.seat !== pointSeat) {
-            break;
-          }
+          if (!userSeat) break;
+          if (userSeat.room !== pointRoom) break;
+          if (userSeat.seat !== pointSeat) break;
           
           const updated = await this._updatePoint(pointRoom, pointSeat, pointX, pointY, pointFast === 1);
           if (updated) {
@@ -1815,9 +2009,7 @@ export class ChatServer {
         case "private": {
           const [privTarget, privNoimg, privMsg, privSender] = args;
           if (privTarget && privMsg) {
-            // ❌ TIDAK DISIMPAN: Private message is real-time only
-            // Just update last activity in memory (no storage save)
-            if (this._multiUsers.has(privSender)) {
+            if (this._activeMultiUsers.has(privSender)) {
               this._updateMultiActivityInMemory(privSender);
             }
             
@@ -1845,9 +2037,7 @@ export class ChatServer {
             const receiverSeat = this._getUserSeat(giftReceiver);
             if (!receiverSeat || receiverSeat.room !== giftRoom) break;
             
-            // ❌ TIDAK DISIMPAN: Gift is real-time only
-            // Just update last activity in memory (no storage save)
-            if (this._multiUsers.has(giftSender)) {
+            if (this._activeMultiUsers.has(giftSender)) {
               this._updateMultiActivityInMemory(giftSender);
             }
             
@@ -1862,9 +2052,7 @@ export class ChatServer {
             const userSeat = this._getUserSeat(rollUser);
             if (!userSeat || userSeat.room !== rollRoom) break;
             
-            // ❌ TIDAK DISIMPAN: Roll is real-time only
-            // Just update last activity in memory (no storage save)
-            if (this._multiUsers.has(rollUser)) {
+            if (this._activeMultiUsers.has(rollUser)) {
               this._updateMultiActivityInMemory(rollUser);
             }
             
@@ -1896,11 +2084,13 @@ export class ChatServer {
         case "isUserOnline": {
           const [onlineTarget, onlineCallback] = args;
           let isOnline = false;
+          let isActive = false;
           const userSeat = this._getUserSeat(onlineTarget);
           
           if (userSeat) {
             if (userSeat.isMulti || this._multiUsers.has(onlineTarget)) {
               isOnline = true;
+              isActive = this._activeMultiUsers.has(onlineTarget);
             } else {
               const webSockets = this._getActiveWebSockets();
               for (const wsKey of webSockets) {
@@ -1909,6 +2099,7 @@ export class ChatServer {
                   const uname = wsKey._cachedUsername || wsKey.username;
                   if (uname === onlineTarget && wsKey.readyState === 1 && !wsKey._isMulti) {
                     isOnline = true;
+                    isActive = false;
                     break;
                   }
                 } catch(e) {}
@@ -1916,7 +2107,7 @@ export class ChatServer {
             }
           }
           
-          this.safeSend(ws, ["userOnlineStatus", onlineTarget, isOnline, onlineCallback || ""]);
+          this.safeSend(ws, ["userOnlineStatus", onlineTarget, isOnline, isActive, onlineCallback || ""]);
           break;
         }
         
@@ -1924,8 +2115,9 @@ export class ChatServer {
           const users = [];
           for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
             if (seatInfo) {
+              const isActive = this._activeMultiUsers.has(username);
               if (seatInfo.isMulti || this._multiUsers.has(username)) {
-                users.push(username);
+                users.push({ username, isActive });
               } else {
                 const webSockets = this._getActiveWebSockets();
                 for (const wsKey of webSockets) {
@@ -1933,7 +2125,7 @@ export class ChatServer {
                     this._restoreWebSocketState(wsKey);
                     const uname = wsKey._cachedUsername || wsKey.username;
                     if (uname === username && wsKey.readyState === 1 && !wsKey._isMulti) {
-                      users.push(username);
+                      users.push({ username, isActive: false });
                       break;
                     }
                   } catch(e) {}
@@ -1941,13 +2133,38 @@ export class ChatServer {
               }
             }
           }
-          // Add multi-users
+          
           for (const username of this._multiUsers) {
-            if (!users.includes(username)) {
-              users.push(username);
+            if (!users.find(u => u.username === username)) {
+              users.push({ 
+                username, 
+                isActive: this._activeMultiUsers.has(username) 
+              });
             }
           }
           this.safeSend(ws, ["allOnlineUsers", users]);
+          break;
+        }
+        
+        case "getActiveMultiUsers": {
+          const activeUsers = this._getActiveMultiUsers();
+          this.safeSend(ws, ["activeMultiUsersList", activeUsers]);
+          break;
+        }
+        
+        case "getActiveUser": {
+          const activeUser = this._getCurrentActiveUser();
+          if (activeUser) {
+            this.safeSend(ws, ["currentActiveUser", activeUser]);
+          } else {
+            this.safeSend(ws, ["currentActiveUser", null]);
+          }
+          break;
+        }
+        
+        case "deactivateAll": {
+          await this._deactivateAllActiveUsers();
+          this.safeSend(ws, ["allDeactivated", true]);
           break;
         }
         
@@ -1986,7 +2203,6 @@ export class ChatServer {
           break;
         }
 
-        // Get multi-user data
         case "getMultiUserData": {
           const targetUsername = args[0];
           if (targetUsername) {
@@ -2000,7 +2216,6 @@ export class ChatServer {
           break;
         }
 
-        // Get all multi-users
         case "getAllMultiUsers": {
           const multiUsers = this._getAllMultiUsers();
           const data = {};
@@ -2011,7 +2226,6 @@ export class ChatServer {
           break;
         }
 
-        // Get multi-user important activities only
         case "getMultiImportantActivities": {
           const targetUsername = args[0];
           const limit = args[1] || 20;
@@ -2027,19 +2241,18 @@ export class ChatServer {
           break;
         }
 
-        // Clear multi-user data
         case "clearMultiData": {
           const targetUsername = args[0];
           if (targetUsername) {
             if (this._multiUserDataCache[targetUsername]) {
-              // Save exit activity before clearing
               await this._saveMultiExit(targetUsername);
               
-              // Clear data
               delete this._multiUserDataCache[targetUsername];
               this._multiUsers.delete(targetUsername);
+              this._activeMultiUsers.delete(targetUsername);
               await this._syncSave(undefined, undefined, this._multiUserDataCache, undefined);
               await this.ctx.storage.put("multiUsers", Array.from(this._multiUsers));
+              await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
               
               this.safeSend(ws, ["multiDataCleared", targetUsername, true]);
             } else {
@@ -2076,8 +2289,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ STATE RESTORE & RESET ============
-
   async _restoreAllState() {
     if (this._isRestoring) return;
     this._isRestoring = true;
@@ -2090,6 +2301,7 @@ export class ChatServer {
       const userCounts = await this.ctx.storage.get("userCounts") || {};
       const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
       const multiUsers = await this.ctx.storage.get("multiUsers") || [];
+      const activeMultiUsers = await this.ctx.storage.get("activeMultiUsers") || [];
       
       this._roomsDataCache = roomsData;
       this._userSeatDataCache = userSeatData;
@@ -2098,8 +2310,8 @@ export class ChatServer {
       this._userCounts = userCounts;
       this._onlineUsers = new Set(onlineUsers);
       this._multiUsers = new Set(multiUsers);
+      this._activeMultiUsers = new Set(activeMultiUsers);
       
-      // Validate data
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
           delete this._userSeatDataCache[username];
@@ -2113,21 +2325,21 @@ export class ChatServer {
         }
       }
       
-      // Validate multi-user data
       for (const [username, multiData] of Object.entries(this._multiUserDataCache)) {
         if (!multiData || !multiData.room) {
           delete this._multiUserDataCache[username];
           this._multiUsers.delete(username);
+          this._activeMultiUsers.delete(username);
           continue;
         }
         const roomData = this._roomsDataCache[multiData.room];
         if (!roomData || !roomData.seats || !roomData.seats[multiData.seat]) {
           delete this._multiUserDataCache[username];
           this._multiUsers.delete(username);
+          this._activeMultiUsers.delete(username);
         }
       }
       
-      // Restore WebSocket state
       const webSockets = this.ctx.getWebSockets();
       for (const ws of webSockets) {
         try {
@@ -2146,6 +2358,7 @@ export class ChatServer {
       );
       await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       await this.ctx.storage.put("multiUsers", Array.from(this._multiUsers));
+      await this.ctx.storage.put("activeMultiUsers", Array.from(this._activeMultiUsers));
       
       if (!this.closing && !this.isDestroyed) {
         const existingAlarm = await this.ctx.storage.getAlarm();
@@ -2170,6 +2383,7 @@ export class ChatServer {
       this.currentNumber = 1;
       this._onlineUsers.clear();
       this._multiUsers.clear();
+      this._activeMultiUsers.clear();
       this._userCounts = {};
       for (const room of ROOMS) {
         this._userCounts[room] = 0;
@@ -2182,6 +2396,7 @@ export class ChatServer {
       await this.ctx.storage.delete("userCounts");
       await this.ctx.storage.delete("onlineUsers");
       await this.ctx.storage.delete("multiUsers");
+      await this.ctx.storage.delete("activeMultiUsers");
       
       let resetCount = await this.ctx.storage.get("resetCount") || 0;
       resetCount++;
@@ -2231,8 +2446,6 @@ export class ChatServer {
     }
   }
 
-  // ============ FETCH & DESTROY ============
-
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -2259,6 +2472,7 @@ export class ChatServer {
           rooms: this._userCounts,
           totalUsers: this._onlineUsers.size,
           multiUsers: this._multiUsers.size,
+          activeMultiUsers: this._activeMultiUsers.size,
           currentNumber: this.currentNumber,
           isClosing: this.closing,
           isDestroyed: this.isDestroyed,
@@ -2313,6 +2527,7 @@ export class ChatServer {
       server._multiSeat = null;
       server._cachedUsername = null;
       server._cachedRoom = null;
+      server._isActiveMulti = false;
       
       try {
         server.serializeAttachment({});
@@ -2348,6 +2563,7 @@ export class ChatServer {
     this.roomClients.clear();
     this._onlineUsers.clear();
     this._multiUsers.clear();
+    this._activeMultiUsers.clear();
     this._wsIdToUser.clear();
     
     try {
