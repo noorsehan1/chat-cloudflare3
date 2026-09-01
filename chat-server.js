@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.8 - FULL DELETE KEYS & REPLACE SYSTEM
+// VERSION: 9.3.9 - FULL DELETE & REPLACE SYSTEM
 
 const C = {
   MAX_SEATS: 45,
@@ -242,16 +242,16 @@ export class ChatServer {
     return false;
   }
 
+  // ========================================
+  // HAPUS SEMUA DATA USER DARI SEMUA ROOM
+  // (UNTUK PINDAH ROOM - SEMUA USER)
+  // ========================================
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
     
-    if (this._isMultiUser(username)) {
-      console.log(`Multi user ${username} - skipping data removal`);
-      return false;
-    }
-    
     let removed = false;
     
+    // 1. HAPUS DARI SEMUA ROOM (CACHE)
     for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
       if (!roomData || !roomData.seats) continue;
       
@@ -264,6 +264,7 @@ export class ChatServer {
       }
       
       if (seatToRemove !== null) {
+        // DELETE data kursi
         delete roomData.seats[seatToRemove];
         if (roomData.points) {
           delete roomData.points[seatToRemove];
@@ -276,16 +277,19 @@ export class ChatServer {
       }
     }
     
+    // 2. HAPUS DARI USER SEAT DATA (CACHE)
     if (this._userSeatDataCache[username]) {
       delete this._userSeatDataCache[username];
       removed = true;
     }
     
+    // 3. HAPUS DARI ONLINE USERS (CACHE)
     if (this._onlineUsers.has(username)) {
       this._onlineUsers.delete(username);
       removed = true;
     }
     
+    // 4. SIMPAN KE STORAGE (DATA SUDAH DI-DELETE)
     if (removed) {
       await this._saveToStorage(
         this._roomsDataCache,
@@ -299,7 +303,7 @@ export class ChatServer {
     return removed;
   }
 
-  // CLEANUP KHUSUS MULTI - HANYA HAPUS WS
+  // CLEANUP KHUSUS MULTI - HANYA HAPUS WS (UNTUK DISCONNECT)
   async _cleanupMultiWebSocket(username) {
     if (!username) return false;
     
@@ -387,11 +391,6 @@ export class ChatServer {
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
     
-    if (this._isMultiUser(username)) {
-      console.log(`Multi user ${username} - skip remove from room`);
-      return false;
-    }
-    
     const roomData = this._roomsDataCache[roomName];
     if (!roomData || !roomData.seats) return false;
     
@@ -460,12 +459,6 @@ export class ChatServer {
   }
 
   async _deleteUserSeat(username) {
-    if (this._isMultiUser(username)) {
-      console.log(`Multi user ${username} - skip delete seat`);
-      return;
-    }
-    
-    // DELETE data user
     delete this._userSeatDataCache[username];
     await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
     this._onlineUsers.delete(username);
@@ -490,6 +483,10 @@ export class ChatServer {
 
   // ============ JOIN HANDLING ============
 
+  // ========================================
+  // HANDLE JOIN - PINDAH ROOM
+  // HAPUS DATA SEBELUMNYA UNTUK SEMUA USER
+  // ========================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -497,10 +494,13 @@ export class ChatServer {
     
     const username = ws.username;
     
-    if (!this._isMultiUser(username)) {
-      await this._removeUserFromAllRooms(username);
-    }
+    // ========================================
+    // HAPUS DATA SEBELUMNYA UNTUK SEMUA USER
+    // (BAIK NORMAL MAUPUN MULTI)
+    // ========================================
+    await this._removeUserFromAllRooms(username);  // ← HAPUS DATA LAMA
     
+    // TAMBAH KE ROOM BARU
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       // REPLACE data room
@@ -1032,9 +1032,7 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    if (!this._isMultiUser(username)) {
-      await this._removeUserFromAllRooms(username);
-    }
+    await this._removeUserFromAllRooms(username);
     
     ws.username = username;
     ws.idtarget = username;
@@ -1108,9 +1106,7 @@ export class ChatServer {
           const isNewUser = args[1];
           
           if (username) {
-            if (!this._isMultiUser(username)) {
-              await this._removeUserFromAllRooms(username);
-            }
+            await this._removeUserFromAllRooms(username);
           }
           
           await this._handleSetId(ws, username, isNewUser);
@@ -1135,9 +1131,10 @@ export class ChatServer {
             break;
           }
           
-          if (!this._isMultiUser(multiUsername)) {
-            await this._removeUserFromAllRooms(multiUsername);
-          }
+          // ========================================
+          // HAPUS DATA SEBELUMNYA UNTUK MULTI USER
+          // ========================================
+          await this._removeUserFromAllRooms(multiUsername);  // ← HAPUS DATA LAMA
           
           let roomData = this._roomsDataCache[multiRoomname];
           if (!roomData) {
@@ -1513,9 +1510,7 @@ export class ChatServer {
           }
           
           if (username) {
-            if (!this._isMultiUser(username)) {
-              await this._removeUserFromAllRooms(username);
-            }
+            await this._removeUserFromAllRooms(username);
           }
           break;
         }
