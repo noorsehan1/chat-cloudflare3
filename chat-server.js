@@ -1,16 +1,12 @@
 // ==================== CHAT-SERVER-HIBERNATION-FULL-FIXED.JS ====================
-// VERSION: 10.0.0 - COMPLETE OPTIMIZED CLASS
+// VERSION: 9.5.0 - FULL FIXED HIBERNATION & STATE RESTORE
 
-// ==================== KONFIGURASI ====================
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
-  NUMBER_INTERVAL_MS: 900000, // 15 menit
+  NUMBER_INTERVAL_MS: 900000,
   MAX_NUMBER: 6,
-  RATE_LIMIT_WINDOW: 1000, // 1 detik
-  RATE_LIMIT_MAX: 10, // 10 pesan per detik
-  BATCH_SAVE_DELAY: 500, // 500ms
 };
 
 const ROOMS = [
@@ -21,11 +17,8 @@ const ROOMS = [
 
 const ROOMS_SET = new Set(ROOMS);
 
-// ==================== MAIN CLASS ====================
 export class ChatServer {
-  // ============ CONSTRUCTOR ============
   constructor(state, env) {
-    // State dasar
     this.state = state;
     this.env = env;
     this.ctx = state;
@@ -33,43 +26,31 @@ export class ChatServer {
     this.isDestroyed = false;
     this._startTime = Date.now();
     
-    // Inisialisasi room clients
     this.roomClients = new Map();
     for (const room of ROOMS) {
       this.roomClients.set(room, new Set());
     }
     
-    // Cache data
     this._roomsDataCache = {};
     this._userSeatDataCache = {};
     this.currentNumber = 1;
     
-    // Tracking users
     this._onlineUsers = new Set();
-    this._userConnections = new Map(); // username -> Set of WebSocket
     this._userCounts = {};
     for (const room of ROOMS) {
       this._userCounts[room] = 0;
     }
     
-    // Tracking WebSocket
-    this._wsIdToUser = new Map();
-    
-    // Rate limiting
-    this._messageTimestamps = new Map();
-    
-    // Save queue
-    this._saveQueue = [];
-    this._isSaving = false;
-    this._dirty = false;
-    this._saveTimeout = null;
-    
-    // Status flags
     this._isNumberUpdating = false;
     this._isRestoring = false;
     this._lastRefreshTime = 0;
+    this._saveQueue = [];
+    this._isSaving = false;
     
-    // ============ RESTORE STATE ============
+    // ============ FIX: TRACK WS ID TO USER MAPPING ============
+    this._wsIdToUser = new Map();
+    
+    // ============ RESTORE STATE TERLEBIH DAHULU ============
     this._restoreAllState().then(() => {
       if (!this.closing && !this.isDestroyed) {
         this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
@@ -77,8 +58,8 @@ export class ChatServer {
     });
   }
 
-  // ==================== UTILITY METHODS ====================
-  
+  // ============ UTILITY METHODS ============
+
   _getActiveWebSockets() {
     try {
       return this.ctx.getWebSockets();
@@ -87,28 +68,14 @@ export class ChatServer {
     }
   }
 
-  _generateWsId() {
-    return Date.now() + '_' + Math.random().toString(36).substring(2, 8);
-  }
-
-  _isValidUsername(username) {
-    return username && typeof username === 'string' && username.length > 0 && username.length <= 50;
-  }
-
-  _sanitizeInput(str) {
-    if (!str) return '';
-    return String(str).replace(/[<>]/g, '').substring(0, C.MAX_MESSAGE_SIZE);
-  }
-
-  // ==================== WEBSOCKET STATE RESTORATION ====================
-  
+  // ============ FIX: RESTORE USER STATE DARI WEBSOCKET ============
   _restoreWebSocketState(ws) {
     if (!ws) return false;
     
     try {
-      // Generate ID jika belum ada
+      // Generate unique ID untuk WebSocket jika belum ada
       if (!ws._wsId) {
-        ws._wsId = this._generateWsId();
+        ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
       }
       
       // Coba dapatkan attachment
@@ -117,7 +84,7 @@ export class ChatServer {
         attachment = ws.deserializeAttachment();
       } catch(e) {}
       
-      // Restore dari attachment
+      // Jika attachment ada, restore dari situ
       if (attachment && attachment.username) {
         ws.username = attachment.username;
         ws.room = attachment.room;
@@ -135,11 +102,10 @@ export class ChatServer {
         }
         
         this._wsIdToUser.set(ws._wsId, attachment.username);
-        this._addUserConnection(attachment.username, ws);
         return true;
       }
       
-      // Restore dari cache
+      // Jika attachment kosong, coba restore dari cache berdasarkan username
       if (ws.username && this._userSeatDataCache[ws.username]) {
         const seatInfo = this._userSeatDataCache[ws.username];
         ws.room = seatInfo.room;
@@ -166,11 +132,10 @@ export class ChatServer {
         } catch(e) {}
         
         this._wsIdToUser.set(ws._wsId, ws.username);
-        this._addUserConnection(ws.username, ws);
         return true;
       }
       
-      // Cari dari room data
+      // Coba cocokkan dengan data online users
       if (ws.username) {
         for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
           if (!roomData || !roomData.seats) continue;
@@ -201,7 +166,6 @@ export class ChatServer {
               } catch(e) {}
               
               this._wsIdToUser.set(ws._wsId, ws.username);
-              this._addUserConnection(ws.username, ws);
               return true;
             }
           }
@@ -214,49 +178,15 @@ export class ChatServer {
     }
   }
 
-  // ==================== USER CONNECTION TRACKING ====================
-  
-  _addUserConnection(username, ws) {
-    if (!username || !ws) return;
-    
-    if (!this._userConnections.has(username)) {
-      this._userConnections.set(username, new Set());
-    }
-    this._userConnections.get(username).add(ws);
-    this._onlineUsers.add(username);
-  }
-
-  _removeUserConnection(username, ws) {
-    if (!username) return;
-    
-    const connections = this._userConnections.get(username);
-    if (connections) {
-      connections.delete(ws);
-      if (connections.size === 0) {
-        this._userConnections.delete(username);
-        this._onlineUsers.delete(username);
-      }
-    }
-  }
-
-  _getUserConnections(username) {
-    return this._userConnections.get(username) || new Set();
-  }
-
-  _isUserConnected(username) {
-    const connections = this._userConnections.get(username);
-    return connections && connections.size > 0;
-  }
-
-  // ==================== USER SEAT MANAGEMENT ====================
-  
+  // ============ FIX: GET USER SEAT DENGAN FALLBACK ============
   _getUserSeat(username) {
     if (!username) return null;
     
+    // Coba dari cache
     let seatInfo = this._userSeatDataCache[username];
     if (seatInfo) return seatInfo;
     
-    // Cari di semua room
+    // Jika tidak ada, cari di semua room
     for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
       if (!roomData || !roomData.seats) continue;
       for (const [seat, data] of Object.entries(roomData.seats)) {
@@ -276,13 +206,6 @@ export class ChatServer {
   }
 
   _refreshRoomClients(force = false) {
-    const now = Date.now();
-    if (!force && (now - this._lastRefreshTime) < 1000) {
-      return;
-    }
-    this._lastRefreshTime = now;
-    
-    // Reset room clients
     for (const room of ROOMS) {
       this.roomClients.set(room, new Set());
     }
@@ -295,7 +218,7 @@ export class ChatServer {
         let room = ws._cachedRoom || ws.room || ws.roomname;
         let username = ws._cachedUsername || ws.username;
         
-        if (room && username && ROOMS_SET.has(room)) {
+        if (room && username) {
           const roomClients = this.roomClients.get(room);
           if (roomClients) {
             roomClients.add(ws);
@@ -305,8 +228,8 @@ export class ChatServer {
     }
   }
 
-  // ==================== STORAGE METHODS ====================
-  
+  // ============ STORAGE METHODS ============
+
   async _syncSave(roomsData, userSeatData, currentNumber) {
     try {
       if (roomsData !== undefined) {
@@ -336,7 +259,6 @@ export class ChatServer {
       
       return true;
     } catch(e) {
-      // Reload dari storage jika gagal
       try {
         const storage = await this.ctx.storage.get(["roomsData", "userSeatData", "currentNumber"]);
         if (storage.roomsData !== undefined) this._roomsDataCache = storage.roomsData;
@@ -345,32 +267,6 @@ export class ChatServer {
       } catch(err) {}
       throw e;
     }
-  }
-
-  // Batch save dengan debounce
-  _scheduleSave() {
-    this._dirty = true;
-    
-    if (this._saveTimeout) {
-      clearTimeout(this._saveTimeout);
-    }
-    
-    this._saveTimeout = setTimeout(async () => {
-      if (this._dirty && !this.closing && !this.isDestroyed) {
-        try {
-          await this._syncSave(
-            this._roomsDataCache,
-            this._userSeatDataCache,
-            this.currentNumber
-          );
-          this._dirty = false;
-        } catch(e) {
-          // Retry nanti
-          this._scheduleSave();
-        }
-      }
-      this._saveTimeout = null;
-    }, C.BATCH_SAVE_DELAY);
   }
 
   async _updateUserCounts() {
@@ -386,6 +282,10 @@ export class ChatServer {
       }
       
       this._userCounts = newCounts;
+      this._onlineUsers.clear();
+      for (const [username] of Object.entries(this._userSeatDataCache)) {
+        this._onlineUsers.add(username);
+      }
       
       await this.ctx.storage.put({
         userCounts: this._userCounts,
@@ -433,8 +333,26 @@ export class ChatServer {
     }
   }
 
-  // ==================== CLEANUP METHODS ====================
-  
+  _getRoomsData() {
+    return this._roomsDataCache;
+  }
+
+  _getUserSeatData() {
+    return this._userSeatDataCache;
+  }
+
+  _getCurrentNumber() {
+    return this.currentNumber;
+  }
+
+  _isUsernameExists(username) {
+    if (!username) return false;
+    return this._onlineUsers.has(username) || 
+           this._userSeatDataCache.hasOwnProperty(username);
+  }
+
+  // ============ CLEANUP USER DATA ============
+
   async _cleanupAllUserData(username) {
     if (!username) return false;
     
@@ -477,20 +395,14 @@ export class ChatServer {
       removed = true;
     }
     
-    // 4. Hapus dari user connections
-    if (this._userConnections.has(username)) {
-      this._userConnections.delete(username);
-      removed = true;
-    }
-    
-    // 5. Hapus dari WS mapping
+    // 4. Hapus dari WS mapping
     for (const [wsId, uname] of this._wsIdToUser) {
       if (uname === username) {
         this._wsIdToUser.delete(wsId);
       }
     }
     
-    // 6. Save ke storage
+    // 5. Sync save ke storage
     if (removed) {
       await this._syncSave(
         this._roomsDataCache,
@@ -610,7 +522,7 @@ export class ChatServer {
       viptanda: data.viptanda || 0
     };
     
-    this._scheduleSave();
+    await this._syncSave(this._roomsDataCache, undefined, undefined);
     return true;
   }
 
@@ -621,7 +533,7 @@ export class ChatServer {
     if (!roomData.points) roomData.points = {};
     roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
     
-    this._scheduleSave();
+    await this._syncSave(this._roomsDataCache, undefined, undefined);
     return true;
   }
 
@@ -647,8 +559,8 @@ export class ChatServer {
     }
   }
 
-  // ==================== JOIN & ROOM METHODS ====================
-  
+  // ============ JOIN & ROOM METHODS ============
+
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -701,7 +613,7 @@ export class ChatServer {
     this._userSeatDataCache[username] = seatInfo;
     await this._syncSave(undefined, this._userSeatDataCache, undefined);
     
-    this._addUserConnection(username, ws);
+    this._onlineUsers.add(username);
     await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this._updateUserCounts();
     
@@ -730,7 +642,7 @@ export class ChatServer {
     ws._closing = false;
     
     if (!ws._wsId) {
-      ws._wsId = this._generateWsId();
+      ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     }
     this._wsIdToUser.set(ws._wsId, username);
     
@@ -775,11 +687,7 @@ export class ChatServer {
       }
       
       if (username) {
-        this._removeUserConnection(username, ws);
-        // Cek apakah masih ada koneksi lain untuk user ini
-        if (!this._isUserConnected(username)) {
-          await this._cleanupAllUserData(username);
-        }
+        await this._cleanupAllUserData(username);
       }
       
       if (ws._wsId) {
@@ -791,8 +699,8 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ==================== BROADCAST & SEND METHODS ====================
-  
+  // ============ BROADCAST & SEND METHODS ============
+
   broadcast(room, msg) {
     if (this.closing || this.isDestroyed || !room || !msg) return;
     try {
@@ -917,8 +825,8 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ==================== ALARM & NUMBER METHODS ====================
-  
+  // ============ ALARM & NUMBER METHODS ============
+
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     
@@ -984,24 +892,6 @@ export class ChatServer {
         } catch(e) {}
       }
       
-      // Update user connections
-      for (const [username, connections] of this._userConnections) {
-        const validConnections = new Set();
-        for (const ws of connections) {
-          if (ws && ws.readyState === 1 && !ws._closing) {
-            validConnections.add(ws);
-          }
-        }
-        if (validConnections.size === 0) {
-          this._userConnections.delete(username);
-          this._onlineUsers.delete(username);
-          changed = true;
-        } else {
-          this._userConnections.set(username, validConnections);
-        }
-      }
-      
-      // Cleanup user seat data
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
           delete this._userSeatDataCache[username];
@@ -1009,13 +899,12 @@ export class ChatServer {
           continue;
         }
         
-        if (!this._isUserConnected(username)) {
+        if (!connectedUsers.has(username)) {
           delete this._userSeatDataCache[username];
           changed = true;
         }
       }
       
-      // Cleanup room data
       for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
         const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
         const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
@@ -1033,26 +922,8 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ==================== RATE LIMITING ====================
-  
-  _checkRateLimit(username) {
-    if (!username) return true;
-    
-    const now = Date.now();
-    const timestamps = this._messageTimestamps.get(username) || [];
-    const recent = timestamps.filter(t => now - t < C.RATE_LIMIT_WINDOW);
-    
-    if (recent.length >= C.RATE_LIMIT_MAX) {
-      return false; // Rate limited
-    }
-    
-    recent.push(now);
-    this._messageTimestamps.set(username, recent);
-    return true;
-  }
+  // ============ WEBSOCKET EVENT HANDLERS ============
 
-  // ==================== WEBSOCKET EVENT HANDLERS ====================
-  
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
@@ -1080,16 +951,6 @@ export class ChatServer {
   async webSocketClose(ws, code, reason, wasClean) {
     if (!ws) return;
     try {
-      // Hapus dari rate limiting
-      if (ws.username) {
-        this._messageTimestamps.delete(ws.username);
-      }
-      
-      // Hapus dari mapping
-      if (ws._wsId) {
-        this._wsIdToUser.delete(ws._wsId);
-      }
-      
       this._restoreWebSocketState(ws);
       await this._cleanupUserOnDisconnect(ws);
     } catch(e) {}
@@ -1111,13 +972,6 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    // Sanitasi username
-    username = this._sanitizeInput(username).trim();
-    if (username.length === 0) {
-      try { ws.close(1000, "Invalid username"); } catch(e) {}
-      return;
-    }
-    
     await this._cleanupAllUserData(username);
     
     ws.username = username;
@@ -1132,10 +986,9 @@ export class ChatServer {
     ws._cachedRoom = null;
     
     if (!ws._wsId) {
-      ws._wsId = this._generateWsId();
+      ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     }
     this._wsIdToUser.set(ws._wsId, username);
-    this._addUserConnection(username, ws);
     
     try {
       ws.serializeAttachment({ username: username });
@@ -1169,14 +1022,6 @@ export class ChatServer {
       
       const [evt, ...args] = data;
       
-      // Rate limiting untuk chat dan private
-      if ((evt === "chat" || evt === "private") && ws.username) {
-        if (!this._checkRateLimit(ws.username)) {
-          this.safeSend(ws, ["error", "Rate limit exceeded. Please slow down."]);
-          return;
-        }
-      }
-      
       if (evt === "chat" || evt === "updatePoint" || evt === "gift" || evt === "rollangak") {
         const room = args[0];
         if (room && !ROOMS_SET.has(room)) return;
@@ -1186,8 +1031,8 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ==================== EVENT HANDLERS ====================
-  
+  // ============ EVENT HANDLERS ============
+
   async _handleEventInternal(ws, data) {
     try {
       if (!ws || !data || !data[0]) return;
@@ -1285,7 +1130,7 @@ export class ChatServer {
           this._userSeatDataCache[multiUsername] = seatInfo;
           await this._syncSave(undefined, this._userSeatDataCache, undefined);
           
-          this._addUserConnection(multiUsername, ws);
+          this._onlineUsers.add(multiUsername);
           await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
           await this._updateUserCounts();
           
@@ -1315,11 +1160,10 @@ export class ChatServer {
           ws._closing = false;
           
           if (!ws._wsId) {
-            ws._wsId = this._generateWsId();
+            ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
           }
           this._wsIdToUser.set(ws._wsId, multiUsername);
           
-          // Update semua koneksi untuk user yang sama
           const webSockets = this._getActiveWebSockets();
           for (const wsKey of webSockets) {
             if (wsKey === ws) continue;
@@ -1343,10 +1187,9 @@ export class ChatServer {
                 wsKey._closing = false;
                 
                 if (!wsKey._wsId) {
-                  wsKey._wsId = this._generateWsId();
+                  wsKey._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
                 }
                 this._wsIdToUser.set(wsKey._wsId, multiUsername);
-                this._addUserConnection(multiUsername, wsKey);
               }
             } catch(e) {}
           }
@@ -1445,10 +1288,9 @@ export class ChatServer {
                 wsKey._closing = false;
                 
                 if (!wsKey._wsId) {
-                  wsKey._wsId = this._generateWsId();
+                  wsKey._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
                 }
                 this._wsIdToUser.set(wsKey._wsId, targetUsername);
-                this._addUserConnection(targetUsername, wsKey);
                 
                 foundAny = true;
                 
@@ -1526,9 +1368,9 @@ export class ChatServer {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           
           const updated = await this._updateKursi(kursiRoom, kursiSeat, {
-            noimageUrl: this._sanitizeInput(kursiNoimg || ""),
-            namauser: this._sanitizeInput(kursiName || ""),
-            color: this._sanitizeInput(kursiColor || ""),
+            noimageUrl: kursiNoimg || "",
+            namauser: kursiName || "",
+            color: kursiColor || "",
             itembawah: kursiBawah || 0,
             itematas: kursiAtas || 0,
             vip: kursiVip || 0,
@@ -1554,19 +1396,7 @@ export class ChatServer {
             break;
           }
           
-          // Sanitasi pesan
-          const sanitizedMsg = this._sanitizeInput(chatMsg);
-          if (!sanitizedMsg) break;
-          
-          this._broadcastToRoom(chatRoom, JSON.stringify([
-            "chat", 
-            chatRoom, 
-            this._sanitizeInput(chatNoimg || ""), 
-            this._sanitizeInput(chatUser), 
-            sanitizedMsg, 
-            this._sanitizeInput(chatColor || ""), 
-            this._sanitizeInput(chatTextColor || "")
-          ]));
+          this._broadcastToRoom(chatRoom, JSON.stringify(["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor]));
           break;
         }
         
@@ -1618,9 +1448,6 @@ export class ChatServer {
         case "private": {
           const [privTarget, privNoimg, privMsg, privSender] = args;
           if (privTarget && privMsg) {
-            const sanitizedMsg = this._sanitizeInput(privMsg);
-            if (!sanitizedMsg) break;
-            
             const userSeat = this._getUserSeat(privTarget);
             if (userSeat) {
               const webSockets = this._getActiveWebSockets();
@@ -1629,26 +1456,12 @@ export class ChatServer {
                   this._restoreWebSocketState(wsKey);
                   const uname = wsKey._cachedUsername || wsKey.username;
                   if (uname === privTarget && wsKey.readyState === 1) {
-                    this.safeSend(wsKey, [
-                      "private", 
-                      privTarget, 
-                      this._sanitizeInput(privNoimg || ""), 
-                      sanitizedMsg, 
-                      Date.now(), 
-                      this._sanitizeInput(privSender)
-                    ]);
+                    this.safeSend(wsKey, ["private", privTarget, privNoimg, privMsg, Date.now(), privSender]);
                   }
                 } catch(e) {}
               }
             }
-            this.safeSend(ws, [
-              "private", 
-              privTarget, 
-              this._sanitizeInput(privNoimg || ""), 
-              sanitizedMsg, 
-              Date.now(), 
-              this._sanitizeInput(privSender)
-            ]);
+            this.safeSend(ws, ["private", privTarget, privNoimg, privMsg, Date.now(), privSender]);
           }
           break;
         }
@@ -1658,14 +1471,7 @@ export class ChatServer {
           if (giftRoom && ROOMS_SET.has(giftRoom)) {
             const receiverSeat = this._getUserSeat(giftReceiver);
             if (!receiverSeat || receiverSeat.room !== giftRoom) break;
-            this._broadcastToRoom(giftRoom, JSON.stringify([
-              "gift", 
-              giftRoom, 
-              this._sanitizeInput(giftSender), 
-              this._sanitizeInput(giftReceiver), 
-              this._sanitizeInput(giftGiftName), 
-              Date.now()
-            ]));
+            this._broadcastToRoom(giftRoom, JSON.stringify(["gift", giftRoom, giftSender, giftReceiver, giftGiftName, Date.now()]));
           }
           break;
         }
@@ -1675,12 +1481,7 @@ export class ChatServer {
           if (rollRoom && ROOMS_SET.has(rollRoom)) {
             const userSeat = this._getUserSeat(rollUser);
             if (!userSeat || userSeat.room !== rollRoom) break;
-            this._broadcastToRoom(rollRoom, JSON.stringify([
-              "rollangakBroadcast", 
-              rollRoom, 
-              this._sanitizeInput(rollUser), 
-              this._sanitizeInput(rollAngka)
-            ]));
+            this._broadcastToRoom(rollRoom, JSON.stringify(["rollangakBroadcast", rollRoom, rollUser, rollAngka]));
           }
           break;
         }
@@ -1689,22 +1490,13 @@ export class ChatServer {
           try {
             const [notifTarget, notifNoimg, notifUser, notifMsg] = args;
             if (notifTarget && notifMsg) {
-              const sanitizedMsg = this._sanitizeInput(notifMsg);
-              if (!sanitizedMsg) break;
-              
               const webSockets = this._getActiveWebSockets();
               for (const wsKey of webSockets) {
                 try {
                   this._restoreWebSocketState(wsKey);
                   const uname = wsKey._cachedUsername || wsKey.username;
                   if (uname === notifTarget && wsKey.readyState === 1) {
-                    this.safeSend(wsKey, [
-                      "notif", 
-                      this._sanitizeInput(notifNoimg || ""), 
-                      this._sanitizeInput(notifUser), 
-                      sanitizedMsg, 
-                      Date.now()
-                    ]);
+                    this.safeSend(wsKey, ["notif", notifNoimg, notifUser, notifMsg, Date.now()]);
                     break;
                   }
                 } catch(e) {}
@@ -1723,7 +1515,17 @@ export class ChatServer {
             if (userSeat.isMulti) {
               isOnline = true;
             } else {
-              isOnline = this._isUserConnected(onlineTarget);
+              const webSockets = this._getActiveWebSockets();
+              for (const wsKey of webSockets) {
+                try {
+                  this._restoreWebSocketState(wsKey);
+                  const uname = wsKey._cachedUsername || wsKey.username;
+                  if (uname === onlineTarget && wsKey.readyState === 1 && !wsKey._isMulti) {
+                    isOnline = true;
+                    break;
+                  }
+                } catch(e) {}
+              }
             }
           }
           
@@ -1732,7 +1534,26 @@ export class ChatServer {
         }
         
         case "getOnlineUsers": {
-          const users = Array.from(this._onlineUsers);
+          const users = [];
+          for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
+            if (seatInfo) {
+              if (seatInfo.isMulti) {
+                users.push(username);
+              } else {
+                const webSockets = this._getActiveWebSockets();
+                for (const wsKey of webSockets) {
+                  try {
+                    this._restoreWebSocketState(wsKey);
+                    const uname = wsKey._cachedUsername || wsKey.username;
+                    if (uname === username && wsKey.readyState === 1 && !wsKey._isMulti) {
+                      users.push(username);
+                      break;
+                    }
+                  } catch(e) {}
+                }
+              }
+            }
+          }
           this.safeSend(ws, ["allOnlineUsers", users]);
           break;
         }
@@ -1799,8 +1620,8 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ==================== STATE RESTORE & RESET ====================
-  
+  // ============ STATE RESTORE & RESET ============
+
   async _restoreAllState() {
     if (this._isRestoring) return;
     this._isRestoring = true;
@@ -1871,9 +1692,7 @@ export class ChatServer {
       this._userSeatDataCache = {};
       this.currentNumber = 1;
       this._onlineUsers.clear();
-      this._userConnections.clear();
       this._userCounts = {};
-      this._messageTimestamps.clear();
       for (const room of ROOMS) {
         this._userCounts[room] = 0;
       }
@@ -1932,8 +1751,8 @@ export class ChatServer {
     }
   }
 
-  // ==================== FETCH & DESTROY ====================
-  
+  // ============ FETCH & DESTROY ============
+
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1965,8 +1784,7 @@ export class ChatServer {
           uptime: Date.now() - this._startTime,
           cacheSize: {
             roomsData: Object.keys(this._roomsDataCache).length,
-            userSeatData: Object.keys(this._userSeatDataCache).length,
-            userConnections: this._userConnections.size
+            userSeatData: Object.keys(this._userSeatDataCache).length
           },
           resetInfo: {
             resetOnStart: this.env.RESET_ON_START !== "false",
@@ -2007,7 +1825,7 @@ export class ChatServer {
       server.roomname = null;
       server.idtarget = null;
       server._closing = false;
-      server._wsId = this._generateWsId();
+      server._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
       server._isMulti = false;
       server._multiRoom = null;
       server._multiSeat = null;
@@ -2035,24 +1853,6 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
-    // Bersihkan timeout save
-    if (this._saveTimeout) {
-      clearTimeout(this._saveTimeout);
-      this._saveTimeout = null;
-    }
-    
-    // Save terakhir
-    if (this._dirty) {
-      try {
-        await this._syncSave(
-          this._roomsDataCache,
-          this._userSeatDataCache,
-          this.currentNumber
-        );
-        this._dirty = false;
-      } catch(e) {}
-    }
-    
     await this._cleanupStorage();
     
     const webSockets = this._getActiveWebSockets();
@@ -2065,9 +1865,7 @@ export class ChatServer {
     
     this.roomClients.clear();
     this._onlineUsers.clear();
-    this._userConnections.clear();
     this._wsIdToUser.clear();
-    this._messageTimestamps.clear();
     
     try {
       await this.ctx.storage.deleteAlarm();
