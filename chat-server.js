@@ -1032,10 +1032,10 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    // HAPUS USER DARI SEMUA ROOM (UNTUK USER BIASA)
-    await this._removeUserFromAllRooms(username);
+    // ❌ HAPUS INI - REMOVE SUDAH DI HANDLE DI setIdTarget2
+    // await this._removeUserFromAllRooms(username);
     
-    // RESET WS
+    // ✅ LANGSUNG SETOR WS
     ws.username = username;
     ws.idtarget = username;
     ws.room = null;
@@ -1137,7 +1137,7 @@ export class ChatServer {
             await this._removeUserFromAllRooms(username);
           }
           
-          // LANJUTKAN PROSES NORMAL
+          // LANJUTKAN PROSES NORMAL (SUDAH TIDAK REMOVE LAGI)
           await this._handleSetId(ws, username, isNewUser);
           break;
         }
