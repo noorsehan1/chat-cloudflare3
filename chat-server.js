@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.10 - FIX SETIDTARGET2 FOR MULTI USER
+// VERSION: 9.3.11 - FIX SETIDTARGET2 FOR MULTI USER
 
 const C = {
   MAX_SEATS: 45,
@@ -498,12 +498,11 @@ export class ChatServer {
     // HAPUS DATA SEBELUMNYA UNTUK SEMUA USER
     // (BAIK NORMAL MAUPUN MULTI)
     // ========================================
-    await this._removeUserFromAllRooms(username);  // ← HAPUS DATA LAMA
+    await this._removeUserFromAllRooms(username);
     
     // TAMBAH KE ROOM BARU
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
-      // REPLACE data room
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
       this._roomsDataCache[roomName] = roomData;
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
@@ -529,7 +528,6 @@ export class ChatServer {
       return false;
     }
     
-    // REPLACE data kursi
     roomData.seats[seat] = {
       noimageUrl: "",
       namauser: username,
@@ -542,7 +540,6 @@ export class ChatServer {
     
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     
-    // REPLACE data user seat
     const seatInfo = { room: roomName, seat, isMulti: false };
     this._userSeatDataCache[username] = seatInfo;
     await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
@@ -601,7 +598,6 @@ export class ChatServer {
       const seatInfo = this._userSeatDataCache[username];
       const isMultiFromCache = seatInfo ? (seatInfo.isMulti || false) : false;
       
-      // JIKA MULTI, HANYA HAPUS WS, TIDAK HAPUS DATA
       if (isMulti || isMultiFromCache) {
         console.log(`Multi user ${username} disconnected, keeping data`);
         
@@ -615,7 +611,6 @@ export class ChatServer {
         return;
       }
       
-      // UNTUK USER NON-MULTI, HAPUS SEMUA DATA
       console.log(`Non-multi user ${username} disconnected, removing all data`);
       
       await this._removeUserFromAllRooms(username);
@@ -1032,10 +1027,7 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    // ❌ HAPUS INI - REMOVE SUDAH DI HANDLE DI setIdTarget2
-    // await this._removeUserFromAllRooms(username);
-    
-    // ✅ LANGSUNG SETOR WS
+    // ✅ LANGSUNG SETOR WS TANPA REMOVE
     ws.username = username;
     ws.idtarget = username;
     ws.room = null;
@@ -1104,7 +1096,7 @@ export class ChatServer {
           break;
         
         // ============================================================
-        // PERBAIKAN setIdTarget2 UNTUK MULTI USER
+        // setIdTarget2 - FIX MULTI USER
         // ============================================================
         case "setIdTarget2": {
           const username = args[0];
@@ -1115,26 +1107,45 @@ export class ChatServer {
             
             // KHUSUS MULTI + isNewUser=false: SETOR WS AJA, LANGSUNG RETURN
             if (seatInfo && seatInfo.isMulti && !isNewUser) {
-              // RESET WS TANPA HAPUS DATA
+              // SETOR WS TANPA HAPUS DATA
               ws.username = username;
               ws.idtarget = username;
-              ws.room = null;
-              ws.roomname = null;
+              ws.room = seatInfo.room;
+              ws.roomname = seatInfo.room;
               ws._closing = false;
-              ws._isMulti = false;
-              ws._multiRoom = null;
-              ws._multiSeat = null;
+              ws._isMulti = true;
+              ws._multiRoom = seatInfo.room;
+              ws._multiSeat = seatInfo.seat;
               ws._cachedUsername = username;
-              ws._cachedRoom = null;
+              ws._cachedRoom = seatInfo.room;
               
-              ws.serializeAttachment({ username: username });
+              ws.serializeAttachment({
+                username: username,
+                room: seatInfo.room,
+                seat: seatInfo.seat,
+                isMulti: true,
+                multiRoom: seatInfo.room,
+                multiSeat: seatInfo.seat,
+                seatInfo: seatInfo
+              });
               
-              return;  // ← LANGSUNG RETURN, JANGAN LANJUT
+              // TAMBAHKAN KE roomClients
+              const roomClients = this.roomClients.get(seatInfo.room);
+              if (roomClients) {
+                roomClients.add(ws);
+              }
+              
+              // ✅ HANYA needJoinRoom (TANPA EVENT TAMBAHAN LAIN)
+              
+              this._refreshRoomClients(true);
+              return;  // ← LANGSUNG RETURN
             }
             
+            // USER BIASA: HAPUS DATA DULU
+            await this._removeUserFromAllRooms(username);
           }
           
-          // LANJUTKAN PROSES NORMAL (SUDAH TIDAK REMOVE LAGI)
+          // USER BIASA: SETOR WS
           await this._handleSetId(ws, username, isNewUser);
           break;
         }
@@ -1157,9 +1168,6 @@ export class ChatServer {
             break;
           }
           
-          // ========================================
-          // HAPUS DATA SEBELUMNYA UNTUK MULTI USER
-          // ========================================
           await this._removeUserFromAllRooms(multiUsername);
           
           let roomData = this._roomsDataCache[multiRoomname];
@@ -1189,7 +1197,6 @@ export class ChatServer {
             break;
           }
           
-          // REPLACE data kursi multi
           roomData.seats[seat] = {
             noimageUrl: "",
             namauser: multiUsername,
@@ -1202,10 +1209,9 @@ export class ChatServer {
           
           await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           
-          // REPLACE data user seat multi
           const seatInfo = { 
             room: multiRoomname, 
-            seat, 
+            seat: seat, 
             isMulti: true,
             multiRoom: multiRoomname,
             multiSeat: seat
@@ -1311,7 +1317,6 @@ export class ChatServer {
           const roomName = userSeat.room;
           const seatNumber = userSeat.seat;
           
-          // REPLACE data user seat
           this._userSeatDataCache[targetUsername] = {
             room: roomName,
             seat: seatNumber,
@@ -1396,8 +1401,6 @@ export class ChatServer {
               break;
             }
             
-            // HAPUS DATA, TAPI JANGAN HAPUS WS
-            // 1. Hapus dari semua room
             for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
               if (!roomData || !roomData.seats) continue;
               
@@ -1410,7 +1413,6 @@ export class ChatServer {
               }
               
               if (seatToRemove !== null) {
-                // DELETE data kursi
                 delete roomData.seats[seatToRemove];
                 if (roomData.points) {
                   delete roomData.points[seatToRemove];
@@ -1422,17 +1424,14 @@ export class ChatServer {
               }
             }
             
-            // 2. DELETE dari userSeatDataCache
             if (this._userSeatDataCache[targetUsername]) {
               delete this._userSeatDataCache[targetUsername];
             }
             
-            // 3. DELETE dari online users
             if (this._onlineUsers.has(targetUsername)) {
               this._onlineUsers.delete(targetUsername);
             }
             
-            // 4. Simpan ke storage (data sudah di-delete)
             await this._saveToStorage(
               this._roomsDataCache,
               this._userSeatDataCache,
@@ -1441,7 +1440,6 @@ export class ChatServer {
             await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
             await this._updateUserCounts();
             
-            // 5. UPDATE WS - DELETE SEMUA KEY
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
               try {
@@ -1449,7 +1447,6 @@ export class ChatServer {
                               wsKey.username || 
                               wsKey.deserializeAttachment()?.username;
                 if (uname === targetUsername && wsKey.readyState === 1) {
-                  // DELETE SEMUA KEY - DATA OTOMATIS TERHAPUS
                   delete wsKey._isMulti;
                   delete wsKey._multiRoom;
                   delete wsKey._multiSeat;
@@ -1460,10 +1457,8 @@ export class ChatServer {
                   delete wsKey.idtarget;
                   delete wsKey.username;
                   
-                  // HAPUS attachment
                   wsKey.serializeAttachment({});
                   
-                  // Kirim notifikasi
                   this.safeSend(wsKey, ["exitMultiSuccess", targetUsername, null, null]);
                 }
               } catch(e) {}
