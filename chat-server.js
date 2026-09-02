@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.13 - FIX MULTI USER JOIN ROOM - STORAGE SYNC
+// VERSION: 9.3.14 - FIX RESET DATA - MULTI USER TETAP
 
 const C = {
   MAX_SEATS: 45,
@@ -1904,11 +1904,32 @@ export class ChatServer {
   }
 
   // ============ RESET ALL DATA ============
+  // FIX: RESET HANYA UNTUK USER BIASA, MULTI USER TETAP
+  // VERSION: 9.3.14
 
   async resetAllData() {
     const timestamp = Date.now();
     
     try {
+      // ✅ 1. KUMPULKAN DATA MULTI USER YANG HARUS DI-PERTAHANKAN
+      const multiUsersData = {};
+      const multiUsersSeatInfo = {};
+      
+      for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
+        if (seatInfo && seatInfo.isMulti) {
+          // SIMPAN DATA MULTI USER
+          multiUsersData[username] = seatInfo;
+          
+          // SIMPAN JUGA DATA KURSI MULTI USER
+          const roomData = this._roomsDataCache[seatInfo.room];
+          if (roomData && roomData.seats && roomData.seats[seatInfo.seat]) {
+            multiUsersSeatInfo[seatInfo.room] = multiUsersSeatInfo[seatInfo.room] || {};
+            multiUsersSeatInfo[seatInfo.room][seatInfo.seat] = roomData.seats[seatInfo.seat];
+          }
+        }
+      }
+      
+      // ✅ 2. RESET DATA NON-MULTI
       this._roomsDataCache = {};
       this._userSeatDataCache = {};
       this.currentNumber = 1;
@@ -1918,33 +1939,70 @@ export class ChatServer {
         this._userCounts[room] = 0;
       }
       
+      // ✅ 3. KEMBALIKAN DATA MULTI USER
+      for (const [username, seatInfo] of Object.entries(multiUsersData)) {
+        this._userSeatDataCache[username] = seatInfo;
+        this._onlineUsers.add(username);
+        
+        // KEMBALIKAN DATA KURSI MULTI USER
+        const roomName = seatInfo.room;
+        const seatNumber = seatInfo.seat;
+        
+        if (!this._roomsDataCache[roomName]) {
+          this._roomsDataCache[roomName] = { seats: {}, points: {}, muted: false, number: 1 };
+        }
+        
+        if (multiUsersSeatInfo[roomName] && multiUsersSeatInfo[roomName][seatNumber]) {
+          this._roomsDataCache[roomName].seats[seatNumber] = multiUsersSeatInfo[roomName][seatNumber];
+        }
+        
+        // UPDATE USER COUNTS
+        this._userCounts[roomName] = (this._userCounts[roomName] || 0) + 1;
+      }
+      
+      // ✅ 4. SIMPAN KE STORAGE
       await this.ctx.storage.delete("roomsData");
       await this.ctx.storage.delete("userSeatData");
       await this.ctx.storage.delete("currentNumber");
       await this.ctx.storage.delete("userCounts");
       await this.ctx.storage.delete("onlineUsers");
       
+      // SIMPAN DATA MULTI USER
+      if (Object.keys(this._roomsDataCache).length > 0) {
+        await this.ctx.storage.put("roomsData", this._roomsDataCache);
+      }
+      if (Object.keys(this._userSeatDataCache).length > 0) {
+        await this.ctx.storage.put("userSeatData", this._userSeatDataCache);
+      }
+      await this.ctx.storage.put("currentNumber", this.currentNumber);
+      await this.ctx.storage.put("userCounts", this._userCounts);
+      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+      
+      // ✅ 5. KIRIM PESAN RESET KE SEMUA USER (KECUALI MULTI)
       const resetMessage = JSON.stringify(["serverReset", "Server di-reset pada: " + new Date(timestamp).toLocaleString()]);
+      const multiResetMessage = JSON.stringify(["serverResetMulti", "Server di-reset, data multi user tetap dipertahankan"]);
       
       const webSockets = this._getActiveWebSockets();
       for (const ws of webSockets) {
         try {
           if (ws.readyState === 1) {
-            ws.send(resetMessage);
+            const isMulti = ws._isMulti || false;
+            if (isMulti) {
+              // MULTI USER: KIRIM PESAN KHUSUS
+              ws.send(multiResetMessage);
+            } else {
+              // USER BIASA: KIRIM PESAN RESET + CLOSE
+              ws.send(resetMessage);
+              ws.close(1000, "Server reset - " + timestamp);
+            }
           }
         } catch(e) {}
       }
       
-      for (const ws of webSockets) {
-        try {
-          if (ws.readyState === 1) {
-            ws.close(1000, "Server reset - " + timestamp);
-          }
-        } catch(e) {}
-      }
-      
+      // ✅ 6. REFRESH ROOM CLIENTS
       this._refreshRoomClients(true);
       
+      // ✅ 7. SET ALARM
       if (!this.closing && !this.isDestroyed) {
         await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
       }
@@ -1953,7 +2011,8 @@ export class ChatServer {
       
       return {
         success: true,
-        message: "Semua data berhasil direset",
+        message: "Reset data berhasil, multi user tetap dipertahankan",
+        multiUsersKept: Object.keys(multiUsersData),
         timestamp: timestamp,
         resetTime: new Date(timestamp).toLocaleString()
       };
