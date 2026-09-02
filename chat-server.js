@@ -614,7 +614,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // HANDLE JOIN - HANYA KURSI KOSONG, TANPA INPUT DATA
+  // HANDLE JOIN - PERBAIKAN: SEMUA USER (TERMASUK MULTI) KEHILANGAN DATA
   // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -628,25 +628,36 @@ export class ChatServer {
     // 1. CLEANUP DUPLIKAT
     await this._cleanupDuplicateUser(username);
     
-    // 2. CARI DAN HAPUS USER DARI SEMUA ROOM
+    // 2. CARI DAN HAPUS USER DARI SEMUA ROOM - PERBAIKAN UNTUK MULTI USER
     let oldRoom = null;
     let oldSeat = null;
     let oldRoomData = null;
     
-    for (const [roomNameKey, roomData] of Object.entries(this._roomsDataCache)) {
-      if (!roomData || !roomData.seats) continue;
-      for (const [seat, data] of Object.entries(roomData.seats)) {
-        if (data && data.namauser === username) {
-          oldRoom = roomNameKey;
-          oldSeat = parseInt(seat);
-          oldRoomData = roomData;
-          break;
-        }
-      }
-      if (oldRoom) break;
+    // CEK DARI CACHE USER SEAT DATA (UNTUK MULTI USER)
+    const seatInfoCache = this._userSeatDataCache[username];
+    if (seatInfoCache && seatInfoCache.room) {
+      oldRoom = seatInfoCache.room;
+      oldSeat = seatInfoCache.seat;
+      oldRoomData = this._roomsDataCache[oldRoom];
     }
     
-    // 3. HAPUS DARI ROOM LAMA (TOTAL)
+    // JIKA TIDAK DITEMUKAN DI CACHE, CEK SEMUA ROOM (UNTUK USER NORMAL)
+    if (!oldRoom) {
+      for (const [roomNameKey, roomData] of Object.entries(this._roomsDataCache)) {
+        if (!roomData || !roomData.seats) continue;
+        for (const [seat, data] of Object.entries(roomData.seats)) {
+          if (data && data.namauser === username) {
+            oldRoom = roomNameKey;
+            oldSeat = parseInt(seat);
+            oldRoomData = roomData;
+            break;
+          }
+        }
+        if (oldRoom) break;
+      }
+    }
+    
+    // 3. HAPUS DARI ROOM LAMA - SEKARANG MULTI USER JUGA TERHAPUS
     if (oldRoom && oldSeat !== null && oldRoomData) {
       delete oldRoomData.seats[oldSeat];
       if (oldRoomData.points) {
@@ -709,7 +720,7 @@ export class ChatServer {
     }
     
     // ============================================================
-    // ✅ HANYA KURSI KOSONG - TANPA DATA
+    // ✅ HANYA KURSI KOSONG - TANPA DATA (SAMA UNTUK SEMUA USER)
     // ============================================================
     newRoomData.seats[newSeat] = {};
     
