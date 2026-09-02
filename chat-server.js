@@ -1,6 +1,6 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.15 - AUTO VERSION WITH TIMESTAMP
-// DEPLOY: 2026-09-02 14:30:00 UTC
+// VERSION: Auto-generated with timestamp
+// DEPLOY: Auto-generated
 
 const C = {
   MAX_SEATS: 45,
@@ -19,19 +19,32 @@ const ROOMS = [
 const ROOMS_SET = new Set(ROOMS);
 
 // ============================================================
-// AUTO VERSION GENERATOR - FIXED FOR CLOUDFLARE WORKERS
+// AUTO VERSION GENERATOR - WITH TIMESTAMP
 // ============================================================
-// No process.env - hardcoded for Cloudflare Workers
-const DEPLOY_VERSION = {
-  version: "9.3.15",
-  timestamp: Date.now(),
-  deployDate: new Date().toISOString(),
-  buildId: Math.random().toString(36).substring(2, 8).toUpperCase(),
-  environment: "production"  // ✅ FIXED: Hardcoded for Cloudflare Workers
-};
+function generateVersion() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  const timestamp = now.getTime();
+  const buildId = Math.random().toString(36).substring(2, 8).toUpperCase();
+  
+  return {
+    version: `${year}${month}${day}.${hours}${minutes}${seconds}`,
+    timestamp: timestamp,
+    deployDate: now.toISOString(),
+    buildId: buildId,
+    environment: "production",
+    fullVersion: `v${year}${month}${day}-${hours}${minutes}${seconds}-${buildId}`
+  };
+}
 
 // GENERATE UNIQUE VERSION PER DEPLOY
-const SERVER_VERSION = `v${DEPLOY_VERSION.version}-${DEPLOY_VERSION.buildId}-${DEPLOY_VERSION.timestamp}`;
+const DEPLOY_VERSION = generateVersion();
+const SERVER_VERSION = DEPLOY_VERSION.fullVersion;
 
 export class ChatServer {
   constructor(state, env) {
@@ -45,7 +58,7 @@ export class ChatServer {
     // VERSION INFO
     this._version = SERVER_VERSION;
     this._deployInfo = DEPLOY_VERSION;
-    this._deployTime = new Date().toISOString();
+    this._deployTime = DEPLOY_VERSION.deployDate;
     
     this.roomClients = new Map();
     for (const room of ROOMS) {
@@ -70,8 +83,93 @@ export class ChatServer {
     console.log(`[${this._deployTime}] Server deployed: ${this._version}`);
     console.log(`[${this._deployTime}] Build ID: ${this._deployInfo.buildId}`);
     console.log(`[${this._deployTime}] Environment: ${this._deployInfo.environment}`);
+    console.log(`[${this._deployTime}] Timestamp: ${this._deployInfo.timestamp}`);
     
-    this._restoreAllState().then(() => {});
+    // ============================================================
+    // AUTO RESET PADA SETIAP DEPLOY
+    // ============================================================
+    this._autoResetOnDeploy().then(() => {});
+  }
+
+  // ============================================================
+  // AUTO RESET ON DEPLOY - MERESET SEMUA DATA
+  // ============================================================
+  async _autoResetOnDeploy() {
+    try {
+      // CEK VERSION SEBELUMNYA DI STORAGE
+      const storedVersion = await this.ctx.storage.get("lastDeployVersion");
+      
+      // LOG UNTUK DEBUG
+      console.log(`[${this._deployTime}] Stored version: ${storedVersion}`);
+      console.log(`[${this._deployTime}] Current version: ${this._version}`);
+      
+      // ============================================================
+      // RESET DATA JIKA VERSION BERBEDA (DEPLOY BARU)
+      // ============================================================
+      if (storedVersion !== this._version) {
+        console.log(`[${this._deployTime}] 🔄 NEW DEPLOY DETECTED! Resetting all data...`);
+        console.log(`[${this._deployTime}] Old version: ${storedVersion}`);
+        console.log(`[${this._deployTime}] New version: ${this._version}`);
+        
+        // === RESET SEMUA DATA ===
+        
+        // 1. RESET CACHE
+        this._roomsDataCache = {};
+        this._userSeatDataCache = {};
+        this.currentNumber = 1;
+        this._onlineUsers.clear();
+        this._userCounts = {};
+        for (const room of ROOMS) {
+          this._userCounts[room] = 0;
+        }
+        
+        // 2. HAPUS DARI STORAGE
+        await this.ctx.storage.delete("roomsData");
+        await this.ctx.storage.delete("userSeatData");
+        await this.ctx.storage.delete("currentNumber");
+        await this.ctx.storage.delete("userCounts");
+        await this.ctx.storage.delete("onlineUsers");
+        await this.ctx.storage.delete("lastReset");
+        
+        // 3. SIMPAN VERSION BARU
+        await this.ctx.storage.put("lastDeployVersion", this._version);
+        await this.ctx.storage.put("lastDeployTime", this._deployTime);
+        await this.ctx.storage.put("lastReset", Date.now());
+        
+        // 4. SET ALARM
+        if (!this.closing && !this.isDestroyed) {
+          await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+        }
+        
+        // 5. KIRIM PESAN KE SEMUA CONNECTION
+        const resetMessage = JSON.stringify(["serverReset", `Server di-reset pada: ${new Date().toLocaleString()}`]);
+        const webSockets = this._getActiveWebSockets();
+        for (const ws of webSockets) {
+          try {
+            if (ws.readyState === 1) {
+              ws.send(resetMessage);
+              ws.close(1000, "Server reset - deploy baru");
+            }
+          } catch(e) {}
+        }
+        
+        // 6. REFRESH ROOM CLIENTS
+        this._refreshRoomClients(true);
+        
+        console.log(`[${this._deployTime}] ✅ Reset completed successfully!`);
+        console.log(`[${this._deployTime}] All data cleared for new deploy`);
+      } else {
+        console.log(`[${this._deployTime}] ℹ️ Same version, restoring existing data...`);
+        
+        // RESTORE DATA DARI STORAGE (VERSION SAMA)
+        await this._restoreAllState();
+      }
+      
+    } catch(e) {
+      console.error(`[${this._deployTime}] Auto reset error:`, e);
+      // JIKA ERROR, RESTORE DATA
+      await this._restoreAllState();
+    }
   }
 
   // ============ WEBSOCKET MANAGEMENT ============
@@ -534,7 +632,7 @@ export class ChatServer {
   // ========================================
   // HANDLE JOIN - PINDAH ROOM
   // FIX: MULTI USER - STORAGE DAN CACHE SINKRON
-  // VERSION: 9.3.13
+  // VERSION: Auto-generated
   // ========================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -1991,7 +2089,7 @@ export class ChatServer {
 
   // ============ RESET ALL DATA ============
   // FIX: RESET HANYA UNTUK USER BIASA, MULTI USER TETAP
-  // VERSION: 9.3.14
+  // VERSION: Auto-generated
 
   async resetAllData() {
     const timestamp = Date.now();
@@ -2183,7 +2281,9 @@ export class ChatServer {
           serverVersion: this._version,
           deployTime: this._deployTime,
           buildId: this._deployInfo.buildId,
-          environment: this._deployInfo.environment
+          environment: this._deployInfo.environment,
+          versionTimestamp: this._deployInfo.timestamp,
+          lastReset: await this.ctx.storage.get("lastReset") || null
         };
         return new Response(JSON.stringify(status), {
           status: 200,
@@ -2197,7 +2297,9 @@ export class ChatServer {
           deployTime: this._deployTime,
           buildId: this._deployInfo.buildId,
           environment: this._deployInfo.environment,
-          timestamp: Date.now()
+          timestamp: this._deployInfo.timestamp,
+          versionNumber: this._deployInfo.version,
+          fullVersion: this._version
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" }
