@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.11 - FIX SETIDTARGET2 FOR MULTI USER
+// VERSION: 9.3.12 - FIX MULTI USER JOIN ROOM
 
 const C = {
   MAX_SEATS: 45,
@@ -485,7 +485,7 @@ export class ChatServer {
 
   // ========================================
   // HANDLE JOIN - PINDAH ROOM
-  // HAPUS DATA SEBELUMNYA UNTUK SEMUA USER
+  // FIX: MULTI USER TETAP DI-PERTAHANKAN
   // ========================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -494,13 +494,45 @@ export class ChatServer {
     
     const username = ws.username;
     
-    // ========================================
-    // HAPUS DATA SEBELUMNYA UNTUK SEMUA USER
-    // (BAIK NORMAL MAUPUN MULTI)
-    // ========================================
-    await this._removeUserFromAllRooms(username);
+    // ✅ CEK APAKAH USER ADALAH MULTI USER
+    const seatInfo = this._userSeatDataCache[username];
+    const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
     
-    // TAMBAH KE ROOM BARU
+    // ✅ JIKA MULTI USER: HANYA HAPUS DATA DI ROOM LAMA, PERTAHANKAN STATUS MULTI
+    if (isMulti) {
+      // Hapus dari room lama saja (pertahankan data multi user)
+      const oldRoom = seatInfo.room;
+      const oldSeat = seatInfo.seat;
+      
+      if (oldRoom && oldSeat !== undefined && oldSeat !== null) {
+        const oldRoomData = this._roomsDataCache[oldRoom];
+        if (oldRoomData && oldRoomData.seats && oldRoomData.seats[oldSeat]) {
+          // HAPUS DARI ROOM LAMA
+          delete oldRoomData.seats[oldSeat];
+          if (oldRoomData.points) {
+            delete oldRoomData.points[oldSeat];
+          }
+          
+          // BROADCAST PERUBAHAN
+          this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+          await this.updateRoomCount(oldRoom);
+          await this._deleteRoomIfEmpty(oldRoom);
+        }
+      }
+      
+      // Hapus dari roomClients (WS akan ditambahkan ke room baru nanti)
+      for (const [room, clients] of this.roomClients) {
+        if (clients.has(ws)) {
+          clients.delete(ws);
+        }
+      }
+      
+    } else {
+      // USER BIASA: HAPUS SEMUA DATA DARI SEMUA ROOM
+      await this._removeUserFromAllRooms(username);
+    }
+    
+    // TAMBAHKAN KE ROOM BARU
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -540,34 +572,45 @@ export class ChatServer {
     
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     
-    const seatInfo = { room: roomName, seat, isMulti: false };
-    this._userSeatDataCache[username] = seatInfo;
+    // ✅ PERTAHANKAN STATUS MULTI
+    const newSeatInfo = { 
+      room: roomName, 
+      seat: seat, 
+      isMulti: isMulti  // ← PERTAHANKAN
+    };
+    this._userSeatDataCache[username] = newSeatInfo;
     await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
     
     this._onlineUsers.add(username);
     await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this._updateUserCounts();
     
+    // SERIALIZE ATTACHMENT
     ws.serializeAttachment({
       username: username,
       room: roomName,
       seat: seat,
-      isMulti: false,
-      seatInfo: seatInfo
+      isMulti: isMulti,  // ← PERTAHANKAN
+      multiRoom: isMulti ? roomName : null,
+      multiSeat: isMulti ? seat : null,
+      seatInfo: newSeatInfo
     });
     
+    // UPDATE WS PROPERTIES
     ws._cachedRoom = roomName;
     ws._cachedUsername = username;
     ws.username = username;
     ws.room = roomName;
     ws.roomname = roomName;
     ws.idtarget = username;
-    ws._isMulti = false;
-    ws._multiRoom = null;
-    ws._multiSeat = null;
+    ws._isMulti = isMulti;  // ← PERTAHANKAN
+    ws._multiRoom = isMulti ? roomName : null;
+    ws._multiSeat = isMulti ? seat : null;
+    ws._closing = false;
     
     this._refreshRoomClients(true);
     
+    // KIRIM RESPONSE
     this.safeSend(ws, ["rooMasuk", seat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", seat]);
     this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
@@ -576,6 +619,7 @@ export class ChatServer {
     this.safeSend(ws, ["roomUserCount", roomName, count]);
     this.broadcast(roomName, ["roomUserCount", roomName, count]);
     
+    // KIRIM STATE ROOM
     setTimeout(() => {
       try {
         if (ws && ws.readyState === 1) {
