@@ -576,6 +576,46 @@ export class ChatServer {
     }
   }
 
+  async _cleanupDuplicateUser(username) {
+    if (!username) return false;
+    
+    let removed = false;
+    const foundSeats = [];
+    
+    for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+      if (!roomData || !roomData.seats) continue;
+      for (const [seat, data] of Object.entries(roomData.seats)) {
+        if (data && data.namauser === username) {
+          foundSeats.push({ room: roomName, seat: parseInt(seat), roomData });
+        }
+      }
+    }
+    
+    if (foundSeats.length > 1) {
+      const keep = foundSeats[0];
+      for (let i = 1; i < foundSeats.length; i++) {
+        const { room, seat, roomData } = foundSeats[i];
+        delete roomData.seats[seat];
+        if (roomData.points) {
+          delete roomData.points[seat];
+        }
+        this.broadcast(room, ["removeKursi", room, seat]);
+        removed = true;
+      }
+      
+      await this._saveToStorage(
+        this._roomsDataCache,
+        this._userSeatDataCache,
+        this.currentNumber
+      );
+    }
+    
+    return removed;
+  }
+
+  // ============================================================
+  // HANDLE JOIN - HANYA KURSI KOSONG, TANPA INPUT DATA
+  // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -585,11 +625,14 @@ export class ChatServer {
     const seatInfo = this._userSeatDataCache[username];
     const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
     
+    // 1. CLEANUP DUPLIKAT
+    await this._cleanupDuplicateUser(username);
+    
+    // 2. CARI DAN HAPUS USER DARI SEMUA ROOM
     let oldRoom = null;
     let oldSeat = null;
     let oldRoomData = null;
     
-    // 1. CARI USER DI SEMUA ROOM
     for (const [roomNameKey, roomData] of Object.entries(this._roomsDataCache)) {
       if (!roomData || !roomData.seats) continue;
       for (const [seat, data] of Object.entries(roomData.seats)) {
@@ -603,40 +646,28 @@ export class ChatServer {
       if (oldRoom) break;
     }
     
-    // 2. HAPUS SEMUA DATA DARI ROOM LAMA
+    // 3. HAPUS DARI ROOM LAMA (TOTAL)
     if (oldRoom && oldSeat !== null && oldRoomData) {
-      // HAPUS KURSI
       delete oldRoomData.seats[oldSeat];
-      
-      // HAPUS POINTS
       if (oldRoomData.points) {
         delete oldRoomData.points[oldSeat];
       }
-      
-      // HAPUS DARI USER SEAT DATA CACHE
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
       }
-      
-      // HAPUS DARI ONLINE USERS
       if (this._onlineUsers.has(username)) {
         this._onlineUsers.delete(username);
       }
       
-      // CEK APAKAH ROOM KOSONG
       const hasSeats = oldRoomData.seats && Object.keys(oldRoomData.seats).length > 0;
       const hasPoints = oldRoomData.points && Object.keys(oldRoomData.points).length > 0;
-      
-      // HAPUS ROOM JIKA KOSONG
       if (!hasSeats && !hasPoints) {
         delete this._roomsDataCache[oldRoom];
       }
       
-      // BROADCAST KE ROOM LAMA
       this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
       await this.updateRoomCount(oldRoom);
       
-      // HAPUS DARI roomClients
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
           clients.delete(ws);
@@ -644,28 +675,26 @@ export class ChatServer {
       }
     }
     
-    // 3. SIMPAN KE STORAGE - PASTIKAN DATA ROOM LAMA SUDAH TERHAPUS
+    // 4. SIMPAN KE STORAGE
     await this._saveToStorage(
       this._roomsDataCache,
       this._userSeatDataCache,
       this.currentNumber
     );
     
-    // 4. TAMBAHKAN KE ROOM BARU
+    // 5. TAMBAHKAN KE ROOM BARU
     let newRoomData = this._roomsDataCache[roomName];
     if (!newRoomData) {
       newRoomData = { seats: {}, points: {}, muted: false, number: 1 };
       this._roomsDataCache[roomName] = newRoomData;
     }
     
-    // CEK ROOM PENUH
     const seatCount = Object.keys(newRoomData.seats).length;
     if (seatCount >= C.MAX_SEATS) {
       this.safeSend(ws, ["roomFull", roomName]);
       return false;
     }
     
-    // CARI KURSI KOSONG
     let newSeat = null;
     for (let s = 1; s <= C.MAX_SEATS; s++) {
       if (!newRoomData.seats[s]) {
@@ -679,33 +708,19 @@ export class ChatServer {
       return false;
     }
     
-    // TAMBAHKAN KE ROOM BARU
-    newRoomData.seats[newSeat] = {
-      noimageUrl: "",
-      namauser: username,
-      color: "",
-      itembawah: 0,
-      itematas: 0,
-      vip: 0,
-      viptanda: 0
-    };
+    // ============================================================
+    // ✅ HANYA KURSI KOSONG - TANPA DATA
+    // ============================================================
+    newRoomData.seats[newSeat] = {};
     
-    const newSeatInfo = { 
-      room: roomName, 
-      seat: newSeat, 
-      isMulti: isMulti
-    };
-    this._userSeatDataCache[username] = newSeatInfo;
-    this._onlineUsers.add(username);
-    
-    // 5. SIMPAN KE STORAGE LAGI DENGAN DATA BARU
+    // 6. SIMPAN KE STORAGE
     await this._saveToStorage(
       this._roomsDataCache,
       this._userSeatDataCache,
       this.currentNumber
     );
     
-    // 6. UPDATE WEBSOCKET
+    // 7. UPDATE WEBSOCKET
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -713,7 +728,6 @@ export class ChatServer {
       isMulti: isMulti,
       multiRoom: isMulti ? roomName : null,
       multiSeat: isMulti ? newSeat : null,
-      seatInfo: newSeatInfo,
       serverVersion: this._version,
       serverDeploy: this._deployTime
     });
@@ -731,7 +745,7 @@ export class ChatServer {
     
     this._refreshRoomClients(true);
     
-    // 7. KIRIM RESPONSE
+    // 8. KIRIM RESPONSE
     this.safeSend(ws, ["rooMasuk", newSeat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", newSeat]);
     this.safeSend(ws, ["muteTypeResponse", newRoomData.muted || false, roomName]);
@@ -1302,7 +1316,6 @@ export class ChatServer {
           }
           
           let seat = null;
-          
           const seatCount = Object.keys(roomData.seats).length;
           if (seatCount >= C.MAX_SEATS) {
             this.safeSend(ws, ["multiJoinError", "Room penuh"]);
@@ -1321,15 +1334,7 @@ export class ChatServer {
             break;
           }
           
-          roomData.seats[seat] = {
-            noimageUrl: "",
-            namauser: multiUsername,
-            color: "",
-            itembawah: 0,
-            itematas: 0,
-            vip: 0,
-            viptanda: 0
-          };
+          roomData.seats[seat] = {};
           
           await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           
