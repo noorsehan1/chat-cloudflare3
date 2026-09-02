@@ -50,6 +50,7 @@ export class ChatServer {
     this.closing = false;
     this.isDestroyed = false;
     this._startTime = Date.now();
+    this._isRestoring = false;
     
     this._version = SERVER_VERSION;
     this._deployInfo = DEPLOY_VERSION;
@@ -68,11 +69,142 @@ export class ChatServer {
     }
     
     this._isNumberUpdating = false;
-    this._isRestoring = false;
     this._lastRefreshTime = 0;
     
-    this._initFromStorage().catch(() => {});
-    this._autoResetOnDeploy().catch(() => {});
+    this._initialize().catch(() => {});
+  }
+
+  // ============================================================
+  // INITIALIZATION WITH AUTO-HIBERNATE
+  // ============================================================
+  async _initialize() {
+    try {
+      const savedState = await this.ctx.storage.get("hibernateState");
+      
+      if (savedState && savedState.timestamp) {
+        await this._restoreFromHibernate(savedState);
+      } else {
+        await this._initFromStorage();
+        await this._autoResetOnDeploy();
+      }
+      
+      if (!this.closing && !this.isDestroyed) {
+        const existingAlarm = await this.ctx.storage.getAlarm();
+        if (!existingAlarm) {
+          await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+        }
+      }
+      
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // SAVE STATE FOR HIBERNATE
+  // ============================================================
+  async _saveForHibernate() {
+    if (this.closing || this.isDestroyed) return;
+    
+    try {
+      const roomsData = await this._getRoomsData();
+      const userSeatData = await this._getUserSeatData();
+      
+      const hibernateState = {
+        version: this._version,
+        timestamp: Date.now(),
+        currentNumber: this.currentNumber,
+        userCounts: this._userCounts,
+        onlineUsers: Array.from(this._onlineUsers),
+        roomsData: roomsData,
+        userSeatData: userSeatData,
+        deployTime: this._deployTime,
+        webSocketInfo: this._getWebSocketInfo()
+      };
+      
+      await this.ctx.storage.put("hibernateState", hibernateState);
+      await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
+      
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // RESTORE FROM HIBERNATE
+  // ============================================================
+  async _restoreFromHibernate(savedState) {
+    if (this._isRestoring) return;
+    this._isRestoring = true;
+    
+    try {
+      this.currentNumber = savedState.currentNumber || 1;
+      this._userCounts = savedState.userCounts || {};
+      this._onlineUsers = new Set(savedState.onlineUsers || []);
+      this._deployTime = savedState.deployTime || this._deployTime;
+      
+      if (savedState.roomsData) {
+        await this.ctx.storage.put("roomsData", savedState.roomsData);
+      }
+      
+      if (savedState.userSeatData) {
+        await this.ctx.storage.put("userSeatData", savedState.userSeatData);
+      }
+      
+      this._refreshRoomClients(true);
+      
+      for (const room of ROOMS) {
+        const roomData = savedState.roomsData?.[room];
+        if (roomData) {
+          this._userCounts[room] = Object.keys(roomData.seats || {}).length;
+        }
+      }
+      
+      const webSockets = this._getActiveWebSockets();
+      for (const ws of webSockets) {
+        try {
+          if (ws.readyState === 1) {
+            const username = ws._cachedUsername || ws.username;
+            if (username) {
+              const userSeat = savedState.userSeatData?.[username];
+              if (userSeat) {
+                this.safeSend(ws, ["rooMasuk", userSeat.seat, userSeat.room]);
+                this.safeSend(ws, ["numberKursiSaya", userSeat.seat]);
+                this.sendAllStateTo(ws, userSeat.room, true);
+              }
+            }
+          }
+        } catch(e) {}
+      }
+      
+    } catch(e) {} finally {
+      this._isRestoring = false;
+    }
+  }
+
+  // ============================================================
+  // GET WEBSOCKET INFO
+  // ============================================================
+  _getWebSocketInfo() {
+    const webSockets = this._getActiveWebSockets();
+    const info = [];
+    
+    for (const ws of webSockets) {
+      try {
+        const username = ws._cachedUsername || ws.username;
+        const room = ws._cachedRoom || ws.room;
+        const attachment = ws.deserializeAttachment();
+        
+        if (username && room) {
+          info.push({
+            username: username,
+            room: room,
+            seat: attachment?.seat || null,
+            isMulti: attachment?.isMulti || false,
+            multiRoom: attachment?.multiRoom || null,
+            multiSeat: attachment?.multiSeat || null
+          });
+        }
+      } catch(e) {}
+    }
+    
+    return info;
   }
 
   // ============================================================
@@ -83,7 +215,7 @@ export class ChatServer {
       const storedVersion = await this.ctx.storage.get("lastDeployVersion");
       
       if (storedVersion !== this._version) {
-        // HAPUS SEMUA DATA DI STORAGE
+        await this.ctx.storage.delete("hibernateState");
         await this.ctx.storage.delete("roomsData");
         await this.ctx.storage.delete("userSeatData");
         await this.ctx.storage.delete("currentNumber");
@@ -91,7 +223,6 @@ export class ChatServer {
         await this.ctx.storage.delete("onlineUsers");
         await this.ctx.storage.delete("lastReset");
         
-        // RESET MEMORY
         this.currentNumber = 1;
         this._onlineUsers.clear();
         this._userCounts = {};
@@ -102,23 +233,18 @@ export class ChatServer {
           this.roomClients.set(room, new Set());
         }
         
-        // SIMPAN VERSION BARU
         await this.ctx.storage.put("lastDeployVersion", this._version);
         await this.ctx.storage.put("lastDeployTime", this._deployTime);
         await this.ctx.storage.put("lastReset", Date.now());
         
-        // SET ALARM
         if (!this.closing && !this.isDestroyed) {
           await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
         }
         
-        // KIRIM NOTIF KE SEMUA WEBSOCKET
-        const resetMessage = JSON.stringify(["serverReset", `Server di-reset pada: ${new Date().toLocaleString()}`]);
         const webSockets = this._getActiveWebSockets();
         for (const ws of webSockets) {
           try {
             if (ws.readyState === 1) {
-              ws.send(resetMessage);
               ws.close(1000, "Server reset - deploy baru");
             }
           } catch(e) {}
@@ -184,7 +310,7 @@ export class ChatServer {
       if (!this.closing && !this.isDestroyed) {
         const existingAlarm = await this.ctx.storage.getAlarm();
         if (!existingAlarm) {
-          this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+          await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
         }
       }
       
@@ -239,12 +365,9 @@ export class ChatServer {
       
       const currentRoomsData = roomsData || await this._getRoomsData();
       const userCounts = {};
-      let totalUsers = 0;
       for (const room of ROOMS) {
         const roomData = currentRoomsData[room];
-        const count = roomData?.seats ? Object.keys(roomData.seats).length : 0;
-        userCounts[room] = count;
-        totalUsers += count;
+        userCounts[room] = roomData?.seats ? Object.keys(roomData.seats).length : 0;
       }
       this._userCounts = userCounts;
       updates.userCounts = userCounts;
@@ -256,6 +379,18 @@ export class ChatServer {
       
       if (Object.keys(updates).length > 0) {
         await this.ctx.storage.put(updates);
+        
+        const hibernateState = {
+          version: this._version,
+          timestamp: Date.now(),
+          currentNumber: this.currentNumber,
+          userCounts: this._userCounts,
+          onlineUsers: Array.from(this._onlineUsers),
+          roomsData: currentRoomsData,
+          userSeatData: currentUserSeatData,
+          deployTime: this._deployTime
+        };
+        await this.ctx.storage.put("hibernateState", hibernateState);
       }
       
       return {
@@ -311,7 +446,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // HANDLE JOIN - FIX MULTI USER
+  // HANDLE JOIN
   // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -320,7 +455,6 @@ export class ChatServer {
     
     const username = ws.username;
     
-    // 1. GET DATA LANGSUNG DARI STORAGE
     let roomsData = await this._getRoomsData();
     let userSeatData = await this._getUserSeatData();
     const currentNumber = await this._getCurrentNumber();
@@ -329,17 +463,14 @@ export class ChatServer {
     const seatInfo = userSeatData[username];
     const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
     
-    // 2. CLEANUP DUPLIKAT - PERBAIKAN UNTUK MULTI USER
     let oldRoom = null;
     let oldSeat = null;
     
-    // CEK DARI USER SEAT DATA (UNTUK SEMUA USER)
     if (seatInfo && seatInfo.room) {
       oldRoom = seatInfo.room;
       oldSeat = seatInfo.seat;
     }
     
-    // JIKA TIDAK DITEMUKAN, CEK DARI WEBSOCKET (UNTUK MULTI USER)
     if (!oldRoom) {
       if (ws._isMulti && ws._multiRoom && ws._multiSeat) {
         oldRoom = ws._multiRoom;
@@ -347,7 +478,6 @@ export class ChatServer {
       }
     }
     
-    // JIKA TIDAK DITEMUKAN, CEK SEMUA ROOM (UNTUK USER NORMAL)
     if (!oldRoom) {
       for (const [roomNameKey, roomData] of Object.entries(roomsData)) {
         if (!roomData || !roomData.seats) continue;
@@ -366,38 +496,31 @@ export class ChatServer {
       }
     }
     
-    // 3. HAPUS DARI ROOM LAMA DI STORAGE
     if (oldRoom && oldSeat !== null && roomsData[oldRoom]) {
       const roomData = roomsData[oldRoom];
       
-      // HAPUS KURSI
       delete roomData.seats[oldSeat];
       if (roomData.points) {
         delete roomData.points[oldSeat];
       }
       
-      // HAPUS DARI USER SEAT DATA
       if (userSeatData[username]) {
         delete userSeatData[username];
       }
       
-      // HAPUS DARI ONLINE USERS
       if (this._onlineUsers.has(username)) {
         this._onlineUsers.delete(username);
       }
       
-      // HAPUS ROOM JIKA KOSONG
       const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
       const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
       if (!hasSeats && !hasPoints) {
         delete roomsData[oldRoom];
       }
       
-      // BROADCAST HAPUS KURSI
       this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
       await this.updateRoomCount(oldRoom);
       
-      // HAPUS DARI ROOM CLIENTS
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
           clients.delete(ws);
@@ -405,10 +528,8 @@ export class ChatServer {
       }
     }
     
-    // 4. SIMPAN PERUBAHAN KE STORAGE
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
-    // 5. TAMBAHKAN KE ROOM BARU DI STORAGE
     let newRoomData = roomsData[roomName];
     if (!newRoomData) {
       newRoomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -434,10 +555,8 @@ export class ChatServer {
       return false;
     }
     
-    // KURSI KOSONG
     newRoomData.seats[newSeat] = {};
     
-    // 6. UPDATE USER SEAT DATA DI STORAGE
     userSeatData[username] = {
       room: roomName,
       seat: newSeat,
@@ -446,10 +565,8 @@ export class ChatServer {
       multiSeat: isMulti ? newSeat : null
     };
     
-    // 7. SIMPAN KE STORAGE
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
-    // 8. UPDATE WEBSOCKET
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -475,7 +592,6 @@ export class ChatServer {
     
     this._refreshRoomClients(true);
     
-    // 9. KIRIM RESPONSE
     this.safeSend(ws, ["rooMasuk", newSeat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", newSeat]);
     this.safeSend(ws, ["muteTypeResponse", newRoomData.muted || false, roomName]);
@@ -1533,7 +1649,6 @@ export class ChatServer {
         }
         
         case "clearCacheTotal": {
-          // HAPUS SEMUA DATA DI STORAGE
           await this.ctx.storage.delete("roomsData");
           await this.ctx.storage.delete("userSeatData");
           await this.ctx.storage.delete("currentNumber");
@@ -1542,8 +1657,8 @@ export class ChatServer {
           await this.ctx.storage.delete("lastReset");
           await this.ctx.storage.delete("lastDeployVersion");
           await this.ctx.storage.delete("lastDeployTime");
+          await this.ctx.storage.delete("hibernateState");
           
-          // RESET MEMORY
           this.currentNumber = 1;
           this._onlineUsers.clear();
           this._userCounts = {};
@@ -1554,7 +1669,6 @@ export class ChatServer {
             this.roomClients.set(room, new Set());
           }
           
-          // TUTUP SEMUA WEBSOCKET
           const webSockets = this._getActiveWebSockets();
           for (const ws of webSockets) {
             try {
@@ -1599,9 +1713,10 @@ export class ChatServer {
     
     await this._updateNumber();
     await this._cleanupStorage();
+    await this._saveForHibernate();
     
     if (!this.closing && !this.isDestroyed) {
-      this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+      await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
     }
   }
 
@@ -1664,15 +1779,14 @@ export class ChatServer {
     const timestamp = Date.now();
     
     try {
-      // HAPUS SEMUA DATA DI STORAGE
       await this.ctx.storage.delete("roomsData");
       await this.ctx.storage.delete("userSeatData");
       await this.ctx.storage.delete("currentNumber");
       await this.ctx.storage.delete("userCounts");
       await this.ctx.storage.delete("onlineUsers");
       await this.ctx.storage.delete("lastReset");
+      await this.ctx.storage.delete("hibernateState");
       
-      // RESET MEMORY
       this.currentNumber = 1;
       this._onlineUsers.clear();
       this._userCounts = {};
@@ -1687,13 +1801,10 @@ export class ChatServer {
       await this.ctx.storage.put("lastDeployTime", this._deployTime);
       await this.ctx.storage.put("lastReset", timestamp);
       
-      const resetMessage = JSON.stringify(["serverReset", "Server di-reset pada: " + new Date(timestamp).toLocaleString()]);
-      
       const webSockets = this._getActiveWebSockets();
       for (const ws of webSockets) {
         try {
           if (ws.readyState === 1) {
-            ws.send(resetMessage);
             ws.close(1000, "Server reset - " + timestamp);
           }
         } catch(e) {}
@@ -1752,6 +1863,7 @@ export class ChatServer {
         await this.ctx.storage.delete("lastReset");
         await this.ctx.storage.delete("lastDeployVersion");
         await this.ctx.storage.delete("lastDeployTime");
+        await this.ctx.storage.delete("hibernateState");
         
         this.currentNumber = 1;
         this._onlineUsers.clear();
@@ -1783,51 +1895,6 @@ export class ChatServer {
           success: true,
           message: "Semua cache dan storage berhasil dihapus total",
           timestamp: Date.now()
-        }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" }
-        });
-      }
-      
-      if (url.pathname === "/status") {
-        const webSockets = this._getActiveWebSockets();
-        const roomsData = await this._getRoomsData();
-        const userSeatData = await this._getUserSeatData();
-        const userCounts = await this._getUserCounts();
-        const onlineUsers = await this._getOnlineUsers();
-        
-        const status = {
-          activeConnections: webSockets.length,
-          rooms: userCounts,
-          totalUsers: onlineUsers.length,
-          currentNumber: this.currentNumber,
-          isClosing: this.closing,
-          isDestroyed: this.isDestroyed,
-          uptime: Date.now() - this._startTime,
-          serverVersion: this._version,
-          deployTime: this._deployTime,
-          buildId: this._deployInfo.buildId,
-          environment: this._deployInfo.environment,
-          versionTimestamp: this._deployInfo.timestamp,
-          lastReset: await this.ctx.storage.get("lastReset") || null,
-          roomsDataKeys: Object.keys(roomsData),
-          userSeatDataKeys: Object.keys(userSeatData)
-        };
-        return new Response(JSON.stringify(status), {
-          status: 200,
-          headers: { "Content-Type": "application/json" }
-        });
-      }
-      
-      if (url.pathname === "/version") {
-        return new Response(JSON.stringify({
-          version: this._version,
-          deployTime: this._deployTime,
-          buildId: this._deployInfo.buildId,
-          environment: this._deployInfo.environment,
-          timestamp: this._deployInfo.timestamp,
-          versionNumber: this._deployInfo.version,
-          fullVersion: this._version
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" }
@@ -1893,6 +1960,7 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
+    await this._saveForHibernate();
     await this._cleanupStorage();
     
     const webSockets = this._getActiveWebSockets();
