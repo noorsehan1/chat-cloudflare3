@@ -72,6 +72,62 @@ export class ChatServer {
     this._lastRefreshTime = 0;
     
     this._initFromStorage().then(() => {});
+    this._autoResetOnDeploy().then(() => {});
+  }
+
+  // ============================================================
+  // AUTO RESET ON DEPLOY
+  // ============================================================
+  async _autoResetOnDeploy() {
+    try {
+      const storedVersion = await this.ctx.storage.get("lastDeployVersion");
+      
+      if (storedVersion !== this._version) {
+        // HAPUS SEMUA DATA DI STORAGE
+        await this.ctx.storage.delete("roomsData");
+        await this.ctx.storage.delete("userSeatData");
+        await this.ctx.storage.delete("currentNumber");
+        await this.ctx.storage.delete("userCounts");
+        await this.ctx.storage.delete("onlineUsers");
+        await this.ctx.storage.delete("lastReset");
+        
+        // RESET MEMORY
+        this.currentNumber = 1;
+        this._onlineUsers.clear();
+        this._userCounts = {};
+        for (const room of ROOMS) {
+          this._userCounts[room] = 0;
+        }
+        for (const room of ROOMS) {
+          this.roomClients.set(room, new Set());
+        }
+        
+        // SIMPAN VERSION BARU
+        await this.ctx.storage.put("lastDeployVersion", this._version);
+        await this.ctx.storage.put("lastDeployTime", this._deployTime);
+        await this.ctx.storage.put("lastReset", Date.now());
+        
+        // SET ALARM
+        if (!this.closing && !this.isDestroyed) {
+          await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+        }
+        
+        // KIRIM NOTIF KE SEMUA WEBSOCKET
+        const resetMessage = JSON.stringify(["serverReset", `Server di-reset pada: ${new Date().toLocaleString()}`]);
+        const webSockets = this._getActiveWebSockets();
+        for (const ws of webSockets) {
+          try {
+            if (ws.readyState === 1) {
+              ws.send(resetMessage);
+              ws.close(1000, "Server reset - deploy baru");
+            }
+          } catch(e) {}
+        }
+        
+        this._refreshRoomClients(true);
+      }
+      
+    } catch(e) {}
   }
 
   // ============================================================
