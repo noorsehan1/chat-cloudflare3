@@ -19,14 +19,15 @@ const ROOMS = [
 const ROOMS_SET = new Set(ROOMS);
 
 // ============================================================
-// AUTO VERSION GENERATOR
+// AUTO VERSION GENERATOR - FIXED FOR CLOUDFLARE WORKERS
 // ============================================================
+// No process.env - hardcoded for Cloudflare Workers
 const DEPLOY_VERSION = {
   version: "9.3.15",
   timestamp: Date.now(),
   deployDate: new Date().toISOString(),
   buildId: Math.random().toString(36).substring(2, 8).toUpperCase(),
-  environment: process.env.ENVIRONMENT || "production"
+  environment: "production"  // ✅ FIXED: Hardcoded for Cloudflare Workers
 };
 
 // GENERATE UNIQUE VERSION PER DEPLOY
