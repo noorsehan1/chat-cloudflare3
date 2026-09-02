@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-REAL-TIME-STORAGE.JS ====================
-// VERSION: FIXED - No duplicate username in same room
+// VERSION: FIXED - Hibernate Recovery & Mute Type Persistence
 // DEPLOY: Auto-generated
 // SUPPORTS CLOUDFLARE HIBERNATION (AUTOMATIC)
 
@@ -51,6 +51,8 @@ export class ChatServer {
     this.closing = false;
     this.isDestroyed = false;
     this._startTime = Date.now();
+    this._isRestoring = false;
+    this._restoreComplete = false;
     
     this._version = SERVER_VERSION;
     this._deployInfo = DEPLOY_VERSION;
@@ -68,12 +70,80 @@ export class ChatServer {
       this._userCounts[room] = 0;
     }
     
+    // Store mute states per room
+    this._muteStates = new Map();
+    for (const room of ROOMS) {
+      this._muteStates.set(room, false);
+    }
+    
     this._isNumberUpdating = false;
-    this._isRestoring = false;
     this._lastRefreshTime = 0;
     
-    this._initFromStorage().then(() => {});
+    // Initialize from storage with restore flag
+    this._initFromStorage().then(() => {
+      this._restoreComplete = true;
+      this._restoreAfterHibernate();
+    });
     this._autoResetOnDeploy().then(() => {});
+  }
+
+  // ============================================================
+  // RESTORE AFTER HIBERNATE
+  // ============================================================
+  async _restoreAfterHibernate() {
+    try {
+      // Restore mute states from roomsData
+      const roomsData = await this._getRoomsData();
+      for (const room of ROOMS) {
+        const roomData = roomsData[room];
+        if (roomData && roomData.muted !== undefined) {
+          this._muteStates.set(room, roomData.muted);
+        }
+      }
+      
+      // Restore current number
+      this.currentNumber = await this._getCurrentNumber();
+      
+      // Restore user counts
+      const userCounts = await this._getUserCounts();
+      for (const room of ROOMS) {
+        if (userCounts[room] !== undefined) {
+          this._userCounts[room] = userCounts[room];
+        }
+      }
+      
+      // Restore online users
+      const onlineUsers = await this._getOnlineUsers();
+      this._onlineUsers = new Set(onlineUsers);
+      
+      // Rebuild room clients from active WebSockets
+      this._refreshRoomClients(true);
+      
+      // Send restore complete notification to all clients
+      const restoreMessage = JSON.stringify(["serverRestored", {
+        version: this._version,
+        deployTime: this._deployTime,
+        timestamp: Date.now()
+      }]);
+      
+      const webSockets = this._getActiveWebSockets();
+      for (const ws of webSockets) {
+        try {
+          if (ws.readyState === 1) {
+            ws.send(restoreMessage);
+            // Send current mute states for each room
+            for (const [room, muted] of this._muteStates) {
+              this.safeSend(ws, ["muteTypeResponse", muted, room]);
+            }
+            // Send current number
+            this.safeSend(ws, ["currentNumber", this.currentNumber]);
+            // Send server version
+            this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+          }
+        } catch(e) {}
+      }
+      
+    } catch(e) {}
   }
 
   // ============================================================
@@ -96,6 +166,7 @@ export class ChatServer {
         this._userCounts = {};
         for (const room of ROOMS) {
           this._userCounts[room] = 0;
+          this._muteStates.set(room, false);
         }
         for (const room of ROOMS) {
           this.roomClients.set(room, new Set());
@@ -131,6 +202,8 @@ export class ChatServer {
   // ============================================================
   async _initFromStorage() {
     try {
+      this._isRestoring = true;
+      
       const roomsData = await this.ctx.storage.get("roomsData") || {};
       const userSeatData = await this.ctx.storage.get("userSeatData") || {};
       const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
@@ -141,6 +214,17 @@ export class ChatServer {
       this._userCounts = userCounts;
       this._onlineUsers = new Set(onlineUsers);
       
+      // Restore mute states from roomsData
+      for (const room of ROOMS) {
+        const roomData = roomsData[room];
+        if (roomData && roomData.muted !== undefined) {
+          this._muteStates.set(room, roomData.muted);
+        } else {
+          this._muteStates.set(room, false);
+        }
+      }
+      
+      // Restore WebSocket attachments
       const webSockets = this.ctx.getWebSockets();
       for (const ws of webSockets) {
         try {
@@ -168,7 +252,8 @@ export class ChatServer {
                 multiSeat: userSeat.isMulti ? userSeat.seat : null,
                 seatInfo: userSeat,
                 serverVersion: this._version,
-                serverDeploy: this._deployTime
+                serverDeploy: this._deployTime,
+                muteStates: Object.fromEntries(this._muteStates)
               });
             }
           }
@@ -184,7 +269,11 @@ export class ChatServer {
         }
       }
       
-    } catch(e) {}
+      this._isRestoring = false;
+      
+    } catch(e) {
+      this._isRestoring = false;
+    }
   }
 
   // ============================================================
@@ -349,16 +438,13 @@ export class ChatServer {
     const currentNumber = await this._getCurrentNumber();
     this.currentNumber = currentNumber;
     
-    // CHECK IF USERNAME ALREADY EXISTS IN THIS ROOM
     if (this._isUsernameInRoom(roomsData, roomName, username)) {
       this.safeSend(ws, ["joinError", `Username "${username}" sudah ada di room ini!`]);
       return false;
     }
     
-    // FIND IF USER ALREADY IN ANOTHER ROOM
     const existingUser = this._findUserInAllRooms(roomsData, username);
     if (existingUser) {
-      // Remove from old room first
       const oldRoom = existingUser.room;
       const oldSeat = existingUser.seat;
       
@@ -389,12 +475,10 @@ export class ChatServer {
       
       await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
       
-      // Re-fetch data after removal
       roomsData = await this._getRoomsData();
       userSeatData = await this._getUserSeatData();
     }
     
-    // GET SEAT INFO FROM USER SEAT DATA
     const seatInfo = userSeatData[username];
     const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
     let oldRoom = null;
@@ -446,11 +530,9 @@ export class ChatServer {
     
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
-    // RE-FETCH DATA TO ENSURE CONSISTENCY
     roomsData = await this._getRoomsData();
     userSeatData = await this._getUserSeatData();
     
-    // DOUBLE CHECK: Username already in target room after removal?
     if (this._isUsernameInRoom(roomsData, roomName, username)) {
       this.safeSend(ws, ["joinError", `Username "${username}" sudah ada di room ini!`]);
       return false;
@@ -458,7 +540,7 @@ export class ChatServer {
     
     let newRoomData = roomsData[roomName];
     if (!newRoomData) {
-      newRoomData = { seats: {}, points: {}, muted: false, number: 1 };
+      newRoomData = { seats: {}, points: {}, muted: this._muteStates.get(roomName) || false, number: 1 };
       roomsData[roomName] = newRoomData;
     }
     
@@ -502,7 +584,8 @@ export class ChatServer {
       multiSeat: isMulti ? newSeat : null,
       seatInfo: userSeatData[username],
       serverVersion: this._version,
-      serverDeploy: this._deployTime
+      serverDeploy: this._deployTime,
+      muteStates: Object.fromEntries(this._muteStates)
     });
     
     ws._cachedRoom = roomName;
@@ -522,6 +605,7 @@ export class ChatServer {
     this.safeSend(ws, ["numberKursiSaya", newSeat]);
     this.safeSend(ws, ["muteTypeResponse", newRoomData.muted || false, roomName]);
     this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+    this.safeSend(ws, ["currentNumber", this.currentNumber]);
     
     const count = Object.keys(newRoomData.seats).length;
     this.safeSend(ws, ["roomUserCount", roomName, count]);
@@ -539,7 +623,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // UPDATE KURSI - FIXED: Prevent duplicate username
+  // UPDATE KURSI
   // ============================================================
   async _updateKursi(roomName, seat, data) {
     const roomsData = await this._getRoomsData();
@@ -548,11 +632,10 @@ export class ChatServer {
     
     const username = data.namauser;
     
-    // Check if username already exists in this room at different seat
     if (username) {
       for (const [s, seatData] of Object.entries(roomData.seats)) {
         if (parseInt(s) !== seat && seatData && seatData.namauser === username) {
-          return false; // Duplicate username detected
+          return false;
         }
       }
     }
@@ -774,6 +857,11 @@ export class ChatServer {
       const count = Object.keys(allSeats).length;
       this.safeSend(ws, ["roomUserCount", room, count]);
       this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+      this.safeSend(ws, ["currentNumber", this.currentNumber]);
+      
+      // Send mute state
+      const muteState = this._muteStates.get(room) || false;
+      this.safeSend(ws, ["muteTypeResponse", muteState, room]);
       
       if (allSeats && Object.keys(allSeats).length > 0) {
         if (excludeSelf && selfSeat && allSeats[selfSeat]) {
@@ -828,6 +916,15 @@ export class ChatServer {
         ws._multiSeat = attachment.multiSeat || null;
         ws._cachedUsername = attachment.username;
         ws._cachedRoom = attachment.room;
+        
+        // Restore mute states from attachment if available
+        if (attachment.muteStates) {
+          for (const [room, muted] of Object.entries(attachment.muteStates)) {
+            if (ROOMS_SET.has(room)) {
+              this._muteStates.set(room, muted);
+            }
+          }
+        }
         
         if (attachment.seatInfo) {
           const userSeatData = await this._getUserSeatData();
@@ -927,15 +1024,18 @@ export class ChatServer {
     ws.serializeAttachment({ 
       username: username,
       serverVersion: this._version,
-      serverDeploy: this._deployTime
+      serverDeploy: this._deployTime,
+      muteStates: Object.fromEntries(this._muteStates)
     });
     
     if (isNewUser) { 
       this.safeSend(ws, ["joinroomawal"]); 
       this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+      this.safeSend(ws, ["currentNumber", this.currentNumber]);
     } else { 
       this.safeSend(ws, ["needJoinRoom"]); 
       this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+      this.safeSend(ws, ["currentNumber", this.currentNumber]);
     }
   }
 
@@ -1020,7 +1120,8 @@ export class ChatServer {
                 multiSeat: seatInfo.seat,
                 seatInfo: seatInfo,
                 serverVersion: this._version,
-                serverDeploy: this._deployTime
+                serverDeploy: this._deployTime,
+                muteStates: Object.fromEntries(this._muteStates)
               });
               
               const roomClients = this.roomClients.get(seatInfo.room);
@@ -1029,6 +1130,7 @@ export class ChatServer {
               }
               
               this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+              this.safeSend(ws, ["currentNumber", this.currentNumber]);
               this._refreshRoomClients(true);
               return;
             }
@@ -1058,7 +1160,6 @@ export class ChatServer {
             break;
           }
           
-          // CHECK DUPLICATE USERNAME IN MULTI ROOM
           let roomsData = await this._getRoomsData();
           if (this._isUsernameInRoom(roomsData, multiRoomname, multiUsername)) {
             this.safeSend(ws, ["multiJoinError", `Username "${multiUsername}" sudah ada di room ini!`]);
@@ -1067,16 +1168,14 @@ export class ChatServer {
           
           await this._removeUserFromAllRooms(multiUsername);
           
-          // RE-FETCH DATA
           roomsData = await this._getRoomsData();
           let roomData = roomsData[multiRoomname];
           if (!roomData) {
-            roomData = { seats: {}, points: {}, muted: false, number: 1 };
+            roomData = { seats: {}, points: {}, muted: this._muteStates.get(multiRoomname) || false, number: 1 };
             roomsData[multiRoomname] = roomData;
             await this._saveToStorage(roomsData, undefined, undefined);
           }
           
-          // DOUBLE CHECK
           if (this._isUsernameInRoom(roomsData, multiRoomname, multiUsername)) {
             this.safeSend(ws, ["multiJoinError", `Username "${multiUsername}" sudah ada di room ini!`]);
             break;
@@ -1125,7 +1224,8 @@ export class ChatServer {
             multiSeat: seat,
             seatInfo: seatInfo,
             serverVersion: this._version,
-            serverDeploy: this._deployTime
+            serverDeploy: this._deployTime,
+            muteStates: Object.fromEntries(this._muteStates)
           });
           
           ws._cachedUsername = multiUsername;
@@ -1155,7 +1255,8 @@ export class ChatServer {
                   multiSeat: seat,
                   seatInfo: seatInfo,
                   serverVersion: this._version,
-                  serverDeploy: this._deployTime
+                  serverDeploy: this._deployTime,
+                  muteStates: Object.fromEntries(this._muteStates)
                 });
                 wsKey._cachedUsername = multiUsername;
                 wsKey._cachedRoom = multiRoomname;
@@ -1175,6 +1276,7 @@ export class ChatServer {
           
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
           this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+          this.safeSend(ws, ["currentNumber", this.currentNumber]);
           this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
           
           break;
@@ -1251,7 +1353,8 @@ export class ChatServer {
                     multiSeat: seatNumber
                   },
                   serverVersion: this._version,
-                  serverDeploy: this._deployTime
+                  serverDeploy: this._deployTime,
+                  muteStates: Object.fromEntries(this._muteStates)
                 });
                 
                 wsKey._cachedUsername = targetUsername;
@@ -1269,6 +1372,7 @@ export class ChatServer {
                 
                 this.safeSend(wsKey, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
                 this.safeSend(wsKey, ["serverVersion", this._version, this._deployTime]);
+                this.safeSend(wsKey, ["currentNumber", this.currentNumber]);
                 
                 if (wsKey !== ws) {
                   this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
@@ -1396,6 +1500,13 @@ export class ChatServer {
         case "chat": {
           const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
           if (!chatMsg || !ROOMS_SET.has(chatRoom)) break;
+          
+          // Check if room is muted
+          const isMuted = this._muteStates.get(chatRoom) || false;
+          if (isMuted) {
+            this.safeSend(ws, ["chatError", "Room sedang di-mute, tidak bisa mengirim pesan"]);
+            break;
+          }
           
           const userSeatData = await this._getUserSeatData();
           const userSeat = userSeatData[chatUser];
@@ -1578,8 +1689,23 @@ export class ChatServer {
             await this._saveToStorage(roomsData, undefined, undefined);
           }
           
+          // Update memory cache
+          this._muteStates.set(muteRoom, !!muteVal);
+          
+          // Broadcast mute status change
           this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
           this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
+          
+          // Update all websocket attachments with new mute state
+          const webSockets = this._getActiveWebSockets();
+          for (const wsKey of webSockets) {
+            try {
+              const attachment = wsKey.deserializeAttachment() || {};
+              attachment.muteStates = Object.fromEntries(this._muteStates);
+              wsKey.serializeAttachment(attachment);
+            } catch(e) {}
+          }
+          
           break;
         }
 
@@ -1594,9 +1720,8 @@ export class ChatServer {
         case "getMuteType": {
           const getMuteRoom = args[0];
           if (getMuteRoom && ROOMS_SET.has(getMuteRoom)) {
-            const roomsData = await this._getRoomsData();
-            const roomData = roomsData[getMuteRoom];
-            this.safeSend(ws, ["muteTypeResponse", roomData?.muted || false, getMuteRoom]);
+            const muteState = this._muteStates.get(getMuteRoom) || false;
+            this.safeSend(ws, ["muteTypeResponse", muteState, getMuteRoom]);
           }
           break;
         }
@@ -1616,6 +1741,7 @@ export class ChatServer {
           this._userCounts = {};
           for (const room of ROOMS) {
             this._userCounts[room] = 0;
+            this._muteStates.set(room, false);
           }
           for (const room of ROOMS) {
             this.roomClients.set(room, new Set());
@@ -1742,6 +1868,7 @@ export class ChatServer {
       this._userCounts = {};
       for (const room of ROOMS) {
         this._userCounts[room] = 0;
+        this._muteStates.set(room, false);
       }
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
@@ -1822,6 +1949,7 @@ export class ChatServer {
         this._userCounts = {};
         for (const room of ROOMS) {
           this._userCounts[room] = 0;
+          this._muteStates.set(room, false);
         }
         for (const room of ROOMS) {
           this.roomClients.set(room, new Set());
@@ -1875,7 +2003,9 @@ export class ChatServer {
           versionTimestamp: this._deployInfo.timestamp,
           lastReset: await this.ctx.storage.get("lastReset") || null,
           roomsDataKeys: Object.keys(roomsData),
-          userSeatDataKeys: Object.keys(userSeatData)
+          userSeatDataKeys: Object.keys(userSeatData),
+          muteStates: Object.fromEntries(this._muteStates),
+          restoreComplete: this._restoreComplete
         };
         return new Response(JSON.stringify(status), {
           status: 200,
@@ -1934,7 +2064,8 @@ export class ChatServer {
       
       server.serializeAttachment({
         serverVersion: this._version,
-        serverDeploy: this._deployTime
+        serverDeploy: this._deployTime,
+        muteStates: Object.fromEntries(this._muteStates)
       });
       
       this._refreshRoomClients(true);
