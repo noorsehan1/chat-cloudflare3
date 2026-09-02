@@ -1,6 +1,6 @@
-// ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: Auto-generated with timestamp
-// DEPLOY: Auto-generated
+// ============================================================
+// CHAT-SERVER - REAL-TIME STORAGE (TANPA CACHE)
+// ============================================================
 
 const C = {
   MAX_SEATS: 45,
@@ -60,10 +60,10 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    this._roomsDataCache = {};
-    this._userSeatDataCache = {};
+    // ============================================================
+    // TIDAK PAKAI CACHE - LANGSUNG KE STORAGE
+    // ============================================================
     this.currentNumber = 1;
-    
     this._onlineUsers = new Set();
     this._userCounts = {};
     for (const room of ROOMS) {
@@ -74,56 +74,150 @@ export class ChatServer {
     this._isRestoring = false;
     this._lastRefreshTime = 0;
     
-    this._autoResetOnDeploy().then(() => {});
+    this._initFromStorage().then(() => {});
   }
 
-  async _autoResetOnDeploy() {
+  // ============================================================
+  // INITIALIZE FROM STORAGE (TANPA CACHE)
+  // ============================================================
+  async _initFromStorage() {
     try {
-      const storedVersion = await this.ctx.storage.get("lastDeployVersion");
+      const roomsData = await this.ctx.storage.get("roomsData") || {};
+      const userSeatData = await this.ctx.storage.get("userSeatData") || {};
+      const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
+      const userCounts = await this.ctx.storage.get("userCounts") || {};
+      const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
       
-      if (storedVersion !== this._version) {
-        this._roomsDataCache = {};
-        this._userSeatDataCache = {};
-        this.currentNumber = 1;
-        this._onlineUsers.clear();
-        this._userCounts = {};
-        for (const room of ROOMS) {
-          this._userCounts[room] = 0;
-        }
-        
-        await this.ctx.storage.delete("roomsData");
-        await this.ctx.storage.delete("userSeatData");
-        await this.ctx.storage.delete("currentNumber");
-        await this.ctx.storage.delete("userCounts");
-        await this.ctx.storage.delete("onlineUsers");
-        await this.ctx.storage.delete("lastReset");
-        
-        await this.ctx.storage.put("lastDeployVersion", this._version);
-        await this.ctx.storage.put("lastDeployTime", this._deployTime);
-        await this.ctx.storage.put("lastReset", Date.now());
-        
-        if (!this.closing && !this.isDestroyed) {
-          await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
-        }
-        
-        const resetMessage = JSON.stringify(["serverReset", `Server di-reset pada: ${new Date().toLocaleString()}`]);
-        const webSockets = this._getActiveWebSockets();
-        for (const ws of webSockets) {
-          try {
-            if (ws.readyState === 1) {
-              ws.send(resetMessage);
-              ws.close(1000, "Server reset - deploy baru");
+      this.currentNumber = currentNumber;
+      this._userCounts = userCounts;
+      this._onlineUsers = new Set(onlineUsers);
+      
+      // RESTORE WEBSOCKET ATTACHMENTS
+      const webSockets = this.ctx.getWebSockets();
+      for (const ws of webSockets) {
+        try {
+          const attachment = ws.deserializeAttachment();
+          if (attachment && attachment.username) {
+            const userSeat = userSeatData[attachment.username];
+            if (userSeat) {
+              ws.username = attachment.username;
+              ws.room = userSeat.room;
+              ws.roomname = userSeat.room;
+              ws.idtarget = attachment.username;
+              ws._closing = false;
+              ws._isMulti = userSeat.isMulti || false;
+              ws._multiRoom = userSeat.isMulti ? userSeat.room : null;
+              ws._multiSeat = userSeat.isMulti ? userSeat.seat : null;
+              ws._cachedUsername = attachment.username;
+              ws._cachedRoom = userSeat.room;
+              
+              ws.serializeAttachment({
+                username: attachment.username,
+                room: userSeat.room,
+                seat: userSeat.seat,
+                isMulti: userSeat.isMulti || false,
+                multiRoom: userSeat.isMulti ? userSeat.room : null,
+                multiSeat: userSeat.isMulti ? userSeat.seat : null,
+                seatInfo: userSeat,
+                serverVersion: this._version,
+                serverDeploy: this._deployTime
+              });
             }
-          } catch(e) {}
-        }
-        
-        this._refreshRoomClients(true);
-      } else {
-        await this._restoreAllState();
+          }
+        } catch(e) {}
       }
       
+      this._refreshRoomClients(true);
+      
+      if (!this.closing && !this.isDestroyed) {
+        const existingAlarm = await this.ctx.storage.getAlarm();
+        if (!existingAlarm) {
+          this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+        }
+      }
+      
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // GET DATA LANGSUNG DARI STORAGE
+  // ============================================================
+  async _getRoomsData() {
+    return await this.ctx.storage.get("roomsData") || {};
+  }
+
+  async _getUserSeatData() {
+    return await this.ctx.storage.get("userSeatData") || {};
+  }
+
+  async _getCurrentNumber() {
+    return await this.ctx.storage.get("currentNumber") || 1;
+  }
+
+  async _getUserCounts() {
+    return await this.ctx.storage.get("userCounts") || {};
+  }
+
+  async _getOnlineUsers() {
+    return await this.ctx.storage.get("onlineUsers") || [];
+  }
+
+  // ============================================================
+  // SAVE LANGSUNG KE STORAGE (TANPA CACHE)
+  // ============================================================
+  async _saveToStorage(roomsData, userSeatData, currentNumber) {
+    try {
+      const updates = {};
+      
+      if (roomsData !== undefined) {
+        updates.roomsData = roomsData;
+      }
+      
+      if (userSeatData !== undefined) {
+        updates.userSeatData = userSeatData;
+      }
+      
+      if (currentNumber !== undefined) {
+        this.currentNumber = currentNumber;
+        updates.currentNumber = currentNumber;
+      }
+      
+      updates.lastDeployVersion = this._version;
+      updates.lastDeployTime = this._deployTime;
+      
+      // UPDATE USER COUNTS
+      const userCounts = {};
+      let totalUsers = 0;
+      const currentRoomsData = roomsData || await this._getRoomsData();
+      for (const room of ROOMS) {
+        const roomData = currentRoomsData[room];
+        const count = roomData?.seats ? Object.keys(roomData.seats).length : 0;
+        userCounts[room] = count;
+        totalUsers += count;
+      }
+      this._userCounts = userCounts;
+      updates.userCounts = userCounts;
+      
+      // UPDATE ONLINE USERS
+      const currentUserSeatData = userSeatData || await this._getUserSeatData();
+      const onlineUsers = Object.keys(currentUserSeatData);
+      this._onlineUsers = new Set(onlineUsers);
+      updates.onlineUsers = onlineUsers;
+      
+      if (Object.keys(updates).length > 0) {
+        await this.ctx.storage.put(updates);
+      }
+      
+      return {
+        roomsData: currentRoomsData,
+        userSeatData: currentUserSeatData,
+        currentNumber: this.currentNumber,
+        userCounts: this._userCounts,
+        onlineUsers: onlineUsers
+      };
+      
     } catch(e) {
-      await this._restoreAllState();
+      throw e;
     }
   }
 
@@ -166,455 +260,8 @@ export class ChatServer {
     }
   }
 
-  async _saveToStorage(roomsData, userSeatData, currentNumber) {
-    try {
-      const updates = {};
-      
-      if (roomsData !== undefined) {
-        this._roomsDataCache = roomsData;
-        updates.roomsData = roomsData;
-      }
-      
-      if (userSeatData !== undefined) {
-        this._userSeatDataCache = userSeatData;
-        updates.userSeatData = userSeatData;
-      }
-      
-      if (currentNumber !== undefined) {
-        this.currentNumber = currentNumber;
-        updates.currentNumber = currentNumber;
-      }
-      
-      updates.lastDeployVersion = this._version;
-      updates.lastDeployTime = this._deployTime;
-      
-      const userCounts = {};
-      let totalUsers = 0;
-      for (const room of ROOMS) {
-        const roomData = this._roomsDataCache[room];
-        const count = roomData?.seats ? Object.keys(roomData.seats).length : 0;
-        userCounts[room] = count;
-        totalUsers += count;
-      }
-      this._userCounts = userCounts;
-      updates.userCounts = userCounts;
-      
-      this._onlineUsers.clear();
-      for (const [username] of Object.entries(this._userSeatDataCache)) {
-        this._onlineUsers.add(username);
-      }
-      updates.onlineUsers = Array.from(this._onlineUsers);
-      
-      if (Object.keys(updates).length > 0) {
-        await this.ctx.storage.put(updates);
-      }
-      
-      return {
-        roomsData: this._roomsDataCache,
-        userSeatData: this._userSeatDataCache,
-        currentNumber: this.currentNumber,
-        userCounts: this._userCounts,
-        onlineUsers: Array.from(this._onlineUsers)
-      };
-      
-    } catch(e) {
-      try {
-        const storage = await this.ctx.storage.get(["roomsData", "userSeatData", "currentNumber"]);
-        if (storage.roomsData !== undefined) this._roomsDataCache = storage.roomsData;
-        if (storage.userSeatData !== undefined) this._userSeatDataCache = storage.userSeatData;
-        if (storage.currentNumber !== undefined) this.currentNumber = storage.currentNumber;
-      } catch(err) {}
-      throw e;
-    }
-  }
-
-  async _updateUserCounts() {
-    try {
-      const newCounts = {};
-      let totalUsers = 0;
-      
-      for (const room of ROOMS) {
-        const roomData = this._roomsDataCache[room];
-        const count = roomData?.seats ? Object.keys(roomData.seats).length : 0;
-        newCounts[room] = count;
-        totalUsers += count;
-      }
-      
-      this._userCounts = newCounts;
-      
-      this._onlineUsers.clear();
-      for (const [username] of Object.entries(this._userSeatDataCache)) {
-        this._onlineUsers.add(username);
-      }
-      
-      await this.ctx.storage.put({
-        userCounts: this._userCounts,
-        onlineUsers: Array.from(this._onlineUsers),
-        lastDeployVersion: this._version,
-        lastDeployTime: this._deployTime
-      });
-      
-      return { counts: newCounts, total: totalUsers };
-      
-    } catch(e) {
-      return { counts: this._userCounts, total: this._onlineUsers.size };
-    }
-  }
-
-  async _loadFromStorage() {
-    try {
-      if (Object.keys(this._roomsDataCache).length === 0 && 
-          Object.keys(this._userSeatDataCache).length === 0) {
-        const roomsData = await this.ctx.storage.get("roomsData") || {};
-        const userSeatData = await this.ctx.storage.get("userSeatData") || {};
-        const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
-        const userCounts = await this.ctx.storage.get("userCounts") || {};
-        const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
-        const lastDeployVersion = await this.ctx.storage.get("lastDeployVersion") || "unknown";
-        const lastDeployTime = await this.ctx.storage.get("lastDeployTime") || "unknown";
-        
-        this._roomsDataCache = roomsData;
-        this._userSeatDataCache = userSeatData;
-        this.currentNumber = currentNumber;
-        this._userCounts = userCounts;
-        this._onlineUsers = new Set(onlineUsers);
-        
-        if (lastDeployVersion !== this._version) {
-          // version changed
-        }
-      }
-      
-      return {
-        roomsData: this._roomsDataCache,
-        userSeatData: this._userSeatDataCache,
-        currentNumber: this.currentNumber,
-        userCounts: this._userCounts,
-        onlineUsers: Array.from(this._onlineUsers),
-        lastDeployVersion: this._version,
-        lastDeployTime: this._deployTime
-      };
-      
-    } catch(e) {
-      return { 
-        roomsData: {}, 
-        userSeatData: {}, 
-        currentNumber: 1,
-        userCounts: {},
-        onlineUsers: [],
-        lastDeployVersion: this._version,
-        lastDeployTime: this._deployTime
-      };
-    }
-  }
-
-  _isUsernameExists(username) {
-    if (!username) return false;
-    return this._onlineUsers.has(username) || 
-           this._userSeatDataCache.hasOwnProperty(username);
-  }
-
-  _isMultiUser(username) {
-    if (!username) return false;
-    const seatInfo = this._userSeatDataCache[username];
-    if (seatInfo && seatInfo.isMulti) {
-      return true;
-    }
-    const webSockets = this._getActiveWebSockets();
-    for (const ws of webSockets) {
-      try {
-        const uname = ws._cachedUsername || ws.username || ws.deserializeAttachment()?.username;
-        if (uname === username && ws._isMulti) {
-          return true;
-        }
-      } catch(e) {}
-    }
-    return false;
-  }
-
-  _isUserOnline(username) {
-    if (!username) return false;
-    
-    const seatInfo = this._userSeatDataCache[username];
-    if (!seatInfo) return false;
-    
-    if (seatInfo.isMulti) {
-      const roomData = this._roomsDataCache[seatInfo.room];
-      if (roomData && roomData.seats && roomData.seats[seatInfo.seat]) {
-        return roomData.seats[seatInfo.seat].namauser === username;
-      }
-      return false;
-    }
-    
-    const webSockets = this._getActiveWebSockets();
-    for (const ws of webSockets) {
-      try {
-        const uname = ws._cachedUsername || ws.username || ws.deserializeAttachment()?.username;
-        if (uname === username && ws.readyState === 1 && !ws._isMulti) {
-          return true;
-        }
-      } catch(e) {}
-    }
-    
-    return false;
-  }
-
-  async _removeUserFromAllRooms(username) {
-    if (!username) return false;
-    
-    let removed = false;
-    
-    for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
-      if (!roomData || !roomData.seats) continue;
-      
-      let seatToRemove = null;
-      for (const [seat, data] of Object.entries(roomData.seats)) {
-        if (data && data.namauser === username) {
-          seatToRemove = parseInt(seat);
-          break;
-        }
-      }
-      
-      if (seatToRemove !== null) {
-        delete roomData.seats[seatToRemove];
-        if (roomData.points) {
-          delete roomData.points[seatToRemove];
-        }
-        removed = true;
-        
-        this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
-        await this.updateRoomCount(roomName);
-        await this._deleteRoomIfEmpty(roomName);
-      }
-    }
-    
-    if (this._userSeatDataCache[username]) {
-      delete this._userSeatDataCache[username];
-      removed = true;
-    }
-    
-    if (this._onlineUsers.has(username)) {
-      this._onlineUsers.delete(username);
-      removed = true;
-    }
-    
-    if (removed) {
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userSeatDataCache,
-        this.currentNumber
-      );
-    }
-    
-    return removed;
-  }
-
-  async _cleanupMultiWebSocket(username) {
-    if (!username) return false;
-    
-    try {
-      const webSockets = this._getActiveWebSockets();
-      let removed = false;
-      
-      for (const ws of webSockets) {
-        try {
-          const uname = ws._cachedUsername || ws.username || ws.deserializeAttachment()?.username;
-          if (uname === username && ws._isMulti) {
-            for (const [room, clients] of this.roomClients) {
-              if (clients.has(ws)) {
-                clients.delete(ws);
-                removed = true;
-              }
-            }
-            
-            if (ws.readyState === 1) {
-              ws.close(1000, "Multi cleanup");
-            }
-          }
-        } catch(e) {}
-      }
-      
-      this._refreshRoomClients(true);
-      return removed;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  async _isUserInAnyRoom(username) {
-    if (!username) return null;
-    
-    const seatInfo = this._userSeatDataCache[username];
-    if (seatInfo && seatInfo.room) {
-      const roomData = this._roomsDataCache[seatInfo.room];
-      if (roomData && roomData.seats) {
-        for (const [seat, data] of Object.entries(roomData.seats)) {
-          if (data && data.namauser === username) {
-            return { 
-              room: seatInfo.room, 
-              seat: parseInt(seat), 
-              isMulti: seatInfo.isMulti || false 
-            };
-          }
-        }
-      }
-      if (!seatInfo.isMulti) {
-        delete this._userSeatDataCache[username];
-        await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-        this._onlineUsers.delete(username);
-        await this._saveToStorage(undefined, undefined, undefined);
-      }
-    }
-    
-    for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
-      if (!roomData || !roomData.seats) continue;
-      for (const [seat, data] of Object.entries(roomData.seats)) {
-        if (data && data.namauser === username) {
-          this._userSeatDataCache[username] = { 
-            room: roomName, 
-            seat: parseInt(seat), 
-            isMulti: false 
-          };
-          await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-          this._onlineUsers.add(username);
-          await this._saveToStorage(undefined, undefined, undefined);
-          return { room: roomName, seat: parseInt(seat), isMulti: false };
-        }
-      }
-    }
-    
-    return null;
-  }
-
-  _isUserMulti(username) {
-    if (!username) return false;
-    const seatInfo = this._userSeatDataCache[username];
-    return seatInfo ? (seatInfo.isMulti || false) : false;
-  }
-
-  async _removeUserFromRoom(username, roomName) {
-    if (!username || !roomName) return false;
-    
-    const roomData = this._roomsDataCache[roomName];
-    if (!roomData || !roomData.seats) return false;
-    
-    let seat = null;
-    for (const [s, data] of Object.entries(roomData.seats)) {
-      if (data && data.namauser === username) {
-        seat = parseInt(s);
-        break;
-      }
-    }
-    
-    if (!seat) return false;
-    
-    delete roomData.seats[seat];
-    if (roomData.points) {
-      delete roomData.points[seat];
-    }
-    delete this._userSeatDataCache[username];
-    this._onlineUsers.delete(username);
-    
-    await this._saveToStorage(
-      this._roomsDataCache,
-      this._userSeatDataCache,
-      this.currentNumber
-    );
-    
-    this.broadcast(roomName, ["removeKursi", roomName, seat]);
-    await this.updateRoomCount(roomName);
-    await this._deleteRoomIfEmpty(roomName);
-    
-    return true;
-  }
-
-  async _updateKursi(roomName, seat, data) {
-    const roomData = this._roomsDataCache[roomName];
-    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
-    
-    roomData.seats[seat] = {
-      noimageUrl: data.noimageUrl || "",
-      namauser: data.namauser || "",
-      color: data.color || "",
-      itembawah: data.itembawah || 0,
-      itematas: data.itematas || 0,
-      vip: data.vip || 0,
-      viptanda: data.viptanda || 0
-    };
-    
-    await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-    return true;
-  }
-
-  async _updatePoint(roomName, seat, x, y, fast) {
-    const roomData = this._roomsDataCache[roomName];
-    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
-    
-    if (!roomData.points) roomData.points = {};
-    roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
-    
-    await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-    return true;
-  }
-
-  async _deleteUserSeat(username) {
-    delete this._userSeatDataCache[username];
-    await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-    this._onlineUsers.delete(username);
-    await this._saveToStorage(undefined, undefined, undefined);
-  }
-
-  async _deleteRoomIfEmpty(roomName) {
-    const roomData = this._roomsDataCache[roomName];
-    if (!roomData) return;
-    
-    const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
-    const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
-    
-    if (!hasSeats && !hasPoints) {
-      delete this._roomsDataCache[roomName];
-      await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-    }
-  }
-
-  async _cleanupDuplicateUser(username) {
-    if (!username) return false;
-    
-    let removed = false;
-    const foundSeats = [];
-    
-    for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
-      if (!roomData || !roomData.seats) continue;
-      for (const [seat, data] of Object.entries(roomData.seats)) {
-        if (data && data.namauser === username) {
-          foundSeats.push({ room: roomName, seat: parseInt(seat), roomData });
-        }
-      }
-    }
-    
-    if (foundSeats.length > 1) {
-      const keep = foundSeats[0];
-      for (let i = 1; i < foundSeats.length; i++) {
-        const { room, seat, roomData } = foundSeats[i];
-        delete roomData.seats[seat];
-        if (roomData.points) {
-          delete roomData.points[seat];
-        }
-        this.broadcast(room, ["removeKursi", room, seat]);
-        removed = true;
-      }
-      
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userSeatDataCache,
-        this.currentNumber
-      );
-    }
-    
-    return removed;
-  }
-
   // ============================================================
-  // HANDLE JOIN - FIX TOTAL: SEMUA USER KEHILANGAN DATA
+  // HANDLE JOIN - LANGSUNG KE STORAGE
   // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -622,50 +269,38 @@ export class ChatServer {
     }
     
     const username = ws.username;
-    const seatInfo = this._userSeatDataCache[username];
+    
+    // 1. GET DATA LANGSUNG DARI STORAGE
+    let roomsData = await this._getRoomsData();
+    let userSeatData = await this._getUserSeatData();
+    const currentNumber = await this._getCurrentNumber();
+    this.currentNumber = currentNumber;
+    
+    const seatInfo = userSeatData[username];
     const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
     
-    // 1. CLEANUP DUPLIKAT
-    await this._cleanupDuplicateUser(username);
-    
-    // 2. CARI DAN HAPUS USER DARI SEMUA ROOM - FIX UNTUK SEMUA USER
+    // 2. CLEANUP DUPLIKAT DI STORAGE
     let oldRoom = null;
     let oldSeat = null;
-    let oldRoomData = null;
     
-    // CEK DARI CACHE USER SEAT DATA (UNTUK SEMUA USER)
-    const seatInfoCache = this._userSeatDataCache[username];
-    if (seatInfoCache && seatInfoCache.room) {
-      oldRoom = seatInfoCache.room;
-      oldSeat = seatInfoCache.seat;
-      oldRoomData = this._roomsDataCache[oldRoom];
-      
-      // VERIFIKASI: Pastikan data benar-benar ada di room
-      if (oldRoomData && oldRoomData.seats && oldRoomData.seats[oldSeat]) {
-        // Data ditemukan di cache
-      } else {
-        // Cache tidak valid, reset
-        oldRoom = null;
-        oldSeat = null;
-        oldRoomData = null;
-        delete this._userSeatDataCache[username];
-      }
+    // CEK DARI USER SEAT DATA
+    if (seatInfo && seatInfo.room) {
+      oldRoom = seatInfo.room;
+      oldSeat = seatInfo.seat;
     }
     
-    // JIKA TIDAK DITEMUKAN DI CACHE, CEK SEMUA ROOM
+    // JIKA TIDAK DITEMUKAN, CEK SEMUA ROOM
     if (!oldRoom) {
-      for (const [roomNameKey, roomData] of Object.entries(this._roomsDataCache)) {
+      for (const [roomNameKey, roomData] of Object.entries(roomsData)) {
         if (!roomData || !roomData.seats) continue;
         for (const [seat, data] of Object.entries(roomData.seats)) {
-          // CEK: data.namauser ATAU data kosong dengan seatInfo di cache
           const isUserHere = 
             (data && data.namauser === username) ||
-            (seatInfoCache && parseInt(seat) === seatInfoCache.seat && roomNameKey === seatInfoCache.room);
+            (seatInfo && parseInt(seat) === seatInfo.seat && roomNameKey === seatInfo.room);
           
           if (isUserHere) {
             oldRoom = roomNameKey;
             oldSeat = parseInt(seat);
-            oldRoomData = roomData;
             break;
           }
         }
@@ -673,55 +308,37 @@ export class ChatServer {
       }
     }
     
-    // 3. HAPUS DARI ROOM LAMA - TERMASUK HAPUS DARI CACHE DAN STORAGE
-    if (oldRoom && oldSeat !== null && oldRoomData) {
-      // HAPUS DARI ROOM
-      delete oldRoomData.seats[oldSeat];
-      if (oldRoomData.points) {
-        delete oldRoomData.points[oldSeat];
+    // 3. HAPUS DARI ROOM LAMA DI STORAGE
+    if (oldRoom && oldSeat !== null && roomsData[oldRoom]) {
+      const roomData = roomsData[oldRoom];
+      delete roomData.seats[oldSeat];
+      if (roomData.points) {
+        delete roomData.points[oldSeat];
       }
       
-      // HAPUS DARI CACHE USER SEAT DATA
-      if (this._userSeatDataCache[username]) {
-        delete this._userSeatDataCache[username];
-      }
-      
-      // HAPUS DARI ONLINE USERS
-      if (this._onlineUsers.has(username)) {
-        this._onlineUsers.delete(username);
+      if (userSeatData[username]) {
+        delete userSeatData[username];
       }
       
       // HAPUS ROOM JIKA KOSONG
-      const hasSeats = oldRoomData.seats && Object.keys(oldRoomData.seats).length > 0;
-      const hasPoints = oldRoomData.points && Object.keys(oldRoomData.points).length > 0;
+      const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
+      const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
       if (!hasSeats && !hasPoints) {
-        delete this._roomsDataCache[oldRoom];
+        delete roomsData[oldRoom];
       }
       
       // BROADCAST HAPUS KURSI
       this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
-      await this.updateRoomCount(oldRoom);
-      
-      // HAPUS DARI ROOM CLIENTS
-      for (const [room, clients] of this.roomClients) {
-        if (clients.has(ws)) {
-          clients.delete(ws);
-        }
-      }
     }
     
-    // 4. SIMPAN KE STORAGE - PASTIKAN DATA TERHAPUS DI STORAGE
-    await this._saveToStorage(
-      this._roomsDataCache,
-      this._userSeatDataCache,
-      this.currentNumber
-    );
+    // 4. SIMPAN PERUBAHAN KE STORAGE
+    await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
-    // 5. TAMBAHKAN KE ROOM BARU
-    let newRoomData = this._roomsDataCache[roomName];
+    // 5. TAMBAHKAN KE ROOM BARU DI STORAGE
+    let newRoomData = roomsData[roomName];
     if (!newRoomData) {
       newRoomData = { seats: {}, points: {}, muted: false, number: 1 };
-      this._roomsDataCache[roomName] = newRoomData;
+      roomsData[roomName] = newRoomData;
     }
     
     const seatCount = Object.keys(newRoomData.seats).length;
@@ -743,17 +360,11 @@ export class ChatServer {
       return false;
     }
     
-    // ============================================================
-    // ✅ KURSI KOSONG - TANPA DATA (SAMA UNTUK SEMUA USER)
-    // ============================================================
+    // KURSI KOSONG
     newRoomData.seats[newSeat] = {};
     
     // 6. SIMPAN KE STORAGE
-    await this._saveToStorage(
-      this._roomsDataCache,
-      this._userSeatDataCache,
-      this.currentNumber
-    );
+    await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
     // 7. UPDATE WEBSOCKET
     ws.serializeAttachment({
@@ -801,46 +412,134 @@ export class ChatServer {
     return true;
   }
 
-  async _cleanupUserOnDisconnect(ws) {
-    try {
-      const username = ws.username || ws._cachedUsername;
-      if (!username) return;
-      
-      const isMulti = ws._isMulti || false;
-      const seatInfo = this._userSeatDataCache[username];
-      const isMultiFromCache = seatInfo ? (seatInfo.isMulti || false) : false;
-      
-      if (isMulti || isMultiFromCache) {
-        for (const [room, clients] of this.roomClients) {
-          if (clients.has(ws)) {
-            clients.delete(ws);
-          }
-        }
-        this._refreshRoomClients(true);
-        return;
-      }
-      
-      await this._removeUserFromAllRooms(username);
-      
-      if (this._userSeatDataCache[username]) {
-        delete this._userSeatDataCache[username];
-      }
-      
-      if (this._onlineUsers.has(username)) {
-        this._onlineUsers.delete(username);
-      }
-      
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userSeatDataCache,
-        this.currentNumber
-      );
-      
-      this._refreshRoomClients(true);
-      
-    } catch(e) {}
+  // ============================================================
+  // UPDATE KURSI - LANGSUNG KE STORAGE
+  // ============================================================
+  async _updateKursi(roomName, seat, data) {
+    const roomsData = await this._getRoomsData();
+    const roomData = roomsData[roomName];
+    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
+    
+    roomData.seats[seat] = {
+      noimageUrl: data.noimageUrl || "",
+      namauser: data.namauser || "",
+      color: data.color || "",
+      itembawah: data.itembawah || 0,
+      itematas: data.itematas || 0,
+      vip: data.vip || 0,
+      viptanda: data.viptanda || 0
+    };
+    
+    await this._saveToStorage(roomsData, undefined, undefined);
+    return true;
   }
 
+  // ============================================================
+  // UPDATE POINT - LANGSUNG KE STORAGE
+  // ============================================================
+  async _updatePoint(roomName, seat, x, y, fast) {
+    const roomsData = await this._getRoomsData();
+    const roomData = roomsData[roomName];
+    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
+    
+    if (!roomData.points) roomData.points = {};
+    roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
+    
+    await this._saveToStorage(roomsData, undefined, undefined);
+    return true;
+  }
+
+  // ============================================================
+  // REMOVE USER - LANGSUNG KE STORAGE
+  // ============================================================
+  async _removeUserFromAllRooms(username) {
+    if (!username) return false;
+    
+    let removed = false;
+    const roomsData = await this._getRoomsData();
+    const userSeatData = await this._getUserSeatData();
+    
+    for (const [roomName, roomData] of Object.entries(roomsData)) {
+      if (!roomData || !roomData.seats) continue;
+      
+      let seatToRemove = null;
+      for (const [seat, data] of Object.entries(roomData.seats)) {
+        if (data && data.namauser === username) {
+          seatToRemove = parseInt(seat);
+          break;
+        }
+      }
+      
+      if (seatToRemove !== null) {
+        delete roomData.seats[seatToRemove];
+        if (roomData.points) {
+          delete roomData.points[seatToRemove];
+        }
+        removed = true;
+        
+        this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
+      }
+    }
+    
+    if (userSeatData[username]) {
+      delete userSeatData[username];
+      removed = true;
+    }
+    
+    if (removed) {
+      await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
+    }
+    
+    return removed;
+  }
+
+  // ============================================================
+  // UPDATE NUMBER - LANGSUNG KE STORAGE
+  // ============================================================
+  async _updateNumber() {
+    if (this._isNumberUpdating || this.closing || this.isDestroyed) return;
+    this._isNumberUpdating = true;
+    try {
+      const currentNumber = await this._getCurrentNumber();
+      const newNumber = currentNumber < C.MAX_NUMBER ? currentNumber + 1 : 1;
+      this.currentNumber = newNumber;
+      
+      let roomsData = await this._getRoomsData();
+      let changed = false;
+      
+      for (const [roomName, roomData] of Object.entries(roomsData)) {
+        if (roomData) {
+          roomData.number = newNumber;
+          changed = true;
+        }
+      }
+      
+      if (changed) {
+        await this._saveToStorage(roomsData, undefined, newNumber);
+      } else {
+        await this._saveToStorage(undefined, undefined, newNumber);
+      }
+      
+      const numberMsg = JSON.stringify(["currentNumber", newNumber]);
+      
+      this._refreshRoomClients(true);
+      for (const [room, clients] of this.roomClients) {
+        if (clients && clients.size > 0) {
+          this._broadcastToRoom(room, numberMsg);
+        }
+      }
+      
+    } catch(e) {
+      const currentNumber = await this._getCurrentNumber();
+      this.currentNumber = currentNumber;
+    } finally {
+      this._isNumberUpdating = false;
+    }
+  }
+
+  // ============================================================
+  // BROADCAST
+  // ============================================================
   _broadcastToRoom(room, msgStr) {
     if (this.closing || this.isDestroyed || !room) return;
     
@@ -898,7 +597,8 @@ export class ChatServer {
   async updateRoomCount(room) {
     if (this.closing || this.isDestroyed || !room) return 0;
     try {
-      const roomData = this._roomsDataCache[room];
+      const roomsData = await this._getRoomsData();
+      const roomData = roomsData[room];
       if (!roomData || !roomData.seats) return 0;
       const count = Object.keys(roomData.seats).length;
       
@@ -916,14 +616,16 @@ export class ChatServer {
       if (ws.readyState !== 1 || ws._closing) return;
     } catch(e) { return; }
     
-    const roomData = this._roomsDataCache[room];
+    const roomsData = await this._getRoomsData();
+    const roomData = roomsData[room];
     if (!roomData) return;
     
     try {
       const allSeats = roomData.seats || {};
       const allPoints = roomData.points || {};
       
-      const userSeat = this._userSeatDataCache[ws.username];
+      const userSeatData = await this._getUserSeatData();
+      const userSeat = userSeatData[ws.username];
       const selfSeat = userSeat?.seat;
       
       const count = Object.keys(allSeats).length;
@@ -961,150 +663,9 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  async alarm() {
-    if (this.closing || this.isDestroyed) return;
-    
-    await this._updateNumber();
-    await this._cleanupStorage();
-    await this._cleanupOrphanedUsers();
-    
-    if (!this.closing && !this.isDestroyed) {
-      this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
-    }
-  }
-
-  async _updateNumber() {
-    if (this._isNumberUpdating || this.closing || this.isDestroyed) return;
-    this._isNumberUpdating = true;
-    try {
-      this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
-      
-      await this._saveToStorage(undefined, undefined, this.currentNumber);
-      
-      const storage = await this._loadFromStorage();
-      const roomsData = storage.roomsData || {};
-      let changed = false;
-      
-      for (const [roomName, roomData] of Object.entries(roomsData)) {
-        if (roomData) {
-          roomData.number = this.currentNumber;
-          changed = true;
-        }
-      }
-      
-      if (changed) {
-        await this._saveToStorage(roomsData, undefined, undefined);
-      }
-      
-      const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
-      
-      this._refreshRoomClients(true);
-      for (const [room, clients] of this.roomClients) {
-        if (clients && clients.size > 0) {
-          this._broadcastToRoom(room, numberMsg);
-        }
-      }
-      
-    } catch(e) {
-      const storage = await this.ctx.storage.get(["currentNumber", "roomsData"]);
-      if (storage.currentNumber !== undefined) this.currentNumber = storage.currentNumber;
-      if (storage.roomsData !== undefined) this._roomsDataCache = storage.roomsData;
-    } finally {
-      this._isNumberUpdating = false;
-    }
-  }
-
-  async _cleanupStorage() {
-    try {
-      const storage = await this._loadFromStorage();
-      const roomsData = storage.roomsData || {};
-      const userSeatData = storage.userSeatData || {};
-      
-      let changed = false;
-      
-      const connectedUsers = new Set();
-      const webSockets = this._getActiveWebSockets();
-      for (const ws of webSockets) {
-        try {
-          const uname = ws._cachedUsername || ws.username || ws.deserializeAttachment()?.username;
-          if (uname) {
-            connectedUsers.add(uname);
-          }
-        } catch(e) {}
-      }
-      
-      for (const [username, seatInfo] of Object.entries(userSeatData)) {
-        if (!seatInfo || !seatInfo.room) {
-          delete userSeatData[username];
-          changed = true;
-          continue;
-        }
-        
-        if (seatInfo.isMulti) {
-          continue;
-        }
-        
-        if (!connectedUsers.has(username)) {
-          delete userSeatData[username];
-          changed = true;
-        }
-      }
-      
-      for (const [roomName, roomData] of Object.entries(roomsData)) {
-        const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
-        const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
-        
-        if (!hasSeats && !hasPoints) {
-          delete roomsData[roomName];
-          changed = true;
-        }
-      }
-      
-      if (changed) {
-        await this._saveToStorage(roomsData, userSeatData, storage.currentNumber);
-      }
-      
-    } catch(e) {}
-  }
-
-  async _cleanupOrphanedUsers() {
-    try {
-      const connectedUsers = new Set();
-      const webSockets = this._getActiveWebSockets();
-      for (const ws of webSockets) {
-        try {
-          const uname = ws._cachedUsername || ws.username || ws.deserializeAttachment()?.username;
-          if (uname) {
-            connectedUsers.add(uname);
-          }
-        } catch(e) {}
-      }
-      
-      const usersToRemove = [];
-      for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
-        if (seatInfo && seatInfo.isMulti) {
-          continue;
-        }
-        
-        if (!connectedUsers.has(username)) {
-          usersToRemove.push(username);
-        }
-      }
-      
-      for (const username of usersToRemove) {
-        await this._removeUserFromAllRooms(username);
-      }
-      
-      if (usersToRemove.length > 0) {
-        await this._saveToStorage(
-          this._roomsDataCache,
-          this._userSeatDataCache,
-          this.currentNumber
-        );
-      }
-    } catch(e) {}
-  }
-
+  // ============================================================
+  // WEBSOCKET EVENTS
+  // ============================================================
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
@@ -1124,10 +685,6 @@ export class ChatServer {
         ws._multiSeat = attachment.multiSeat || null;
         ws._cachedUsername = attachment.username;
         ws._cachedRoom = attachment.room;
-        
-        if (attachment.seatInfo) {
-          this._userSeatDataCache[attachment.username] = attachment.seatInfo;
-        }
       }
       
       await this.handleMessage(ws, message);
@@ -1139,7 +696,8 @@ export class ChatServer {
     try {
       const isMulti = ws._isMulti || false;
       const username = ws._cachedUsername || ws.username;
-      const seatInfo = username ? this._userSeatDataCache[username] : null;
+      const userSeatData = await this._getUserSeatData();
+      const seatInfo = username ? userSeatData[username] : null;
       const isMultiFromCache = seatInfo ? (seatInfo.isMulti || false) : false;
       
       if (isMulti || isMultiFromCache) {
@@ -1152,7 +710,7 @@ export class ChatServer {
         return;
       }
       
-      await this._cleanupUserOnDisconnect(ws);
+      await this._removeUserFromAllRooms(username);
       
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
@@ -1169,7 +727,8 @@ export class ChatServer {
     try {
       const isMulti = ws._isMulti || false;
       const username = ws._cachedUsername || ws.username;
-      const seatInfo = username ? this._userSeatDataCache[username] : null;
+      const userSeatData = await this._getUserSeatData();
+      const seatInfo = username ? userSeatData[username] : null;
       const isMultiFromCache = seatInfo ? (seatInfo.isMulti || false) : false;
       
       if (isMulti || isMultiFromCache) {
@@ -1182,7 +741,7 @@ export class ChatServer {
         return;
       }
       
-      await this._cleanupUserOnDisconnect(ws);
+      await this._removeUserFromAllRooms(username);
       
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
@@ -1194,6 +753,9 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // HANDLE MESSAGE
+  // ============================================================
   async _handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
       try { if (ws?.readyState === 1) ws.close(1000, "Invalid username"); } catch(e) {}
@@ -1267,9 +829,11 @@ export class ChatServer {
           break;
         }
         
-        case "getCurrentNumber":
-          this.safeSend(ws, ["currentNumber", this.currentNumber]);
+        case "getCurrentNumber": {
+          const currentNumber = await this._getCurrentNumber();
+          this.safeSend(ws, ["currentNumber", currentNumber]);
           break;
+        }
         
         case "getServerVersion":
           this.safeSend(ws, ["serverVersion", this._version, this._deployTime, this._deployInfo]);
@@ -1280,7 +844,8 @@ export class ChatServer {
           const isNewUser = args[1];
           
           if (username) {
-            const seatInfo = this._userSeatDataCache[username];
+            const userSeatData = await this._getUserSeatData();
+            const seatInfo = userSeatData[username];
             
             if (seatInfo && seatInfo.isMulti && !isNewUser) {
               ws.username = username;
@@ -1343,11 +908,12 @@ export class ChatServer {
           
           await this._removeUserFromAllRooms(multiUsername);
           
-          let roomData = this._roomsDataCache[multiRoomname];
+          let roomsData = await this._getRoomsData();
+          let roomData = roomsData[multiRoomname];
           if (!roomData) {
             roomData = { seats: {}, points: {}, muted: false, number: 1 };
-            this._roomsDataCache[multiRoomname] = roomData;
-            await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+            roomsData[multiRoomname] = roomData;
+            await this._saveToStorage(roomsData, undefined, undefined);
           }
           
           let seat = null;
@@ -1371,8 +937,9 @@ export class ChatServer {
           
           roomData.seats[seat] = {};
           
-          await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+          await this._saveToStorage(roomsData, undefined, undefined);
           
+          let userSeatData = await this._getUserSeatData();
           const seatInfo = { 
             room: multiRoomname, 
             seat: seat, 
@@ -1380,11 +947,8 @@ export class ChatServer {
             multiRoom: multiRoomname,
             multiSeat: seat
           };
-          this._userSeatDataCache[multiUsername] = seatInfo;
-          await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-          
-          this._onlineUsers.add(multiUsername);
-          await this._saveToStorage(undefined, undefined, undefined);
+          userSeatData[multiUsername] = seatInfo;
+          await this._saveToStorage(undefined, userSeatData, undefined);
           
           ws.serializeAttachment({
             username: multiUsername,
@@ -1458,10 +1022,12 @@ export class ChatServer {
             break;
           }
           
-          let userSeat = this._userSeatDataCache[targetUsername];
+          let userSeatData = await this._getUserSeatData();
+          let userSeat = userSeatData[targetUsername];
           
           if (!userSeat) {
-            for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+            const roomsData = await this._getRoomsData();
+            for (const [roomName, roomData] of Object.entries(roomsData)) {
               if (!roomData || !roomData.seats) continue;
               for (const [seat, data] of Object.entries(roomData.seats)) {
                 if (data && data.namauser === targetUsername) {
@@ -1485,14 +1051,14 @@ export class ChatServer {
           const roomName = userSeat.room;
           const seatNumber = userSeat.seat;
           
-          this._userSeatDataCache[targetUsername] = {
+          userSeatData[targetUsername] = {
             room: roomName,
             seat: seatNumber,
             isMulti: true,
             multiRoom: roomName,
             multiSeat: seatNumber
           };
-          await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
+          await this._saveToStorage(undefined, userSeatData, undefined);
           
           const webSockets = this._getActiveWebSockets();
           let foundAny = false;
@@ -1564,7 +1130,8 @@ export class ChatServer {
           }
           
           try {
-            const seatInfo = this._userSeatDataCache[targetUsername];
+            const userSeatData = await this._getUserSeatData();
+            const seatInfo = userSeatData[targetUsername];
             const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
             
             if (!isMulti) {
@@ -1572,7 +1139,8 @@ export class ChatServer {
               break;
             }
             
-            for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+            let roomsData = await this._getRoomsData();
+            for (const [roomName, roomData] of Object.entries(roomsData)) {
               if (!roomData || !roomData.seats) continue;
               
               let seatToRemove = null;
@@ -1591,23 +1159,14 @@ export class ChatServer {
                 
                 this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
                 await this.updateRoomCount(roomName);
-                await this._deleteRoomIfEmpty(roomName);
               }
             }
             
-            if (this._userSeatDataCache[targetUsername]) {
-              delete this._userSeatDataCache[targetUsername];
+            if (userSeatData[targetUsername]) {
+              delete userSeatData[targetUsername];
             }
             
-            if (this._onlineUsers.has(targetUsername)) {
-              this._onlineUsers.delete(targetUsername);
-            }
-            
-            await this._saveToStorage(
-              this._roomsDataCache,
-              this._userSeatDataCache,
-              this.currentNumber
-            );
+            await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
             
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
@@ -1656,7 +1215,8 @@ export class ChatServer {
           });
           
           if (updated) {
-            const roomData = this._roomsDataCache[kursiRoom];
+            const roomsData = await this._getRoomsData();
+            const roomData = roomsData[kursiRoom];
             const updatedSeat = roomData?.seats?.[kursiSeat];
             if (updatedSeat) {
               this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
@@ -1669,7 +1229,8 @@ export class ChatServer {
           const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
           if (!chatMsg || !ROOMS_SET.has(chatRoom)) break;
           
-          const userSeat = this._userSeatDataCache[chatUser];
+          const userSeatData = await this._getUserSeatData();
+          const userSeat = userSeatData[chatUser];
           if (!userSeat || userSeat.room !== chatRoom) {
             break;
           }
@@ -1692,7 +1253,8 @@ export class ChatServer {
         case "removeKursiAndPoint": {
           const [removeRoom, removeSeat] = args;
           
-          const roomData = this._roomsDataCache[removeRoom];
+          const roomsData = await this._getRoomsData();
+          const roomData = roomsData[removeRoom];
           let username = null;
           if (roomData && roomData.seats && roomData.seats[removeSeat]) {
             username = roomData.seats[removeSeat].namauser;
@@ -1707,7 +1269,8 @@ export class ChatServer {
         case "private": {
           const [privTarget, privNoimg, privMsg, privSender] = args;
           if (privTarget && privMsg) {
-            const userSeat = this._userSeatDataCache[privTarget];
+            const userSeatData = await this._getUserSeatData();
+            const userSeat = userSeatData[privTarget];
             if (userSeat) {
               const webSockets = this._getActiveWebSockets();
               for (const wsKey of webSockets) {
@@ -1729,7 +1292,8 @@ export class ChatServer {
         case "gift": {
           const [giftRoom, giftSender, giftReceiver, giftGiftName] = args;
           if (giftRoom && ROOMS_SET.has(giftRoom)) {
-            const receiverSeat = this._userSeatDataCache[giftReceiver];
+            const userSeatData = await this._getUserSeatData();
+            const receiverSeat = userSeatData[giftReceiver];
             if (!receiverSeat || receiverSeat.room !== giftRoom) break;
             this._broadcastToRoom(giftRoom, JSON.stringify(["gift", giftRoom, giftSender, giftReceiver, giftGiftName, Date.now()]));
           }
@@ -1739,7 +1303,8 @@ export class ChatServer {
         case "rollangak": {
           const [rollRoom, rollUser, rollAngka] = args;
           if (rollRoom && ROOMS_SET.has(rollRoom)) {
-            const userSeat = this._userSeatDataCache[rollUser];
+            const userSeatData = await this._getUserSeatData();
+            const userSeat = userSeatData[rollUser];
             if (!userSeat || userSeat.room !== rollRoom) break;
             this._broadcastToRoom(rollRoom, JSON.stringify(["rollangakBroadcast", rollRoom, rollUser, rollAngka]));
           }
@@ -1772,11 +1337,13 @@ export class ChatServer {
           let isOnline = false;
           
           if (onlineTarget) {
-            const userSeat = this._userSeatDataCache[onlineTarget];
+            const userSeatData = await this._getUserSeatData();
+            const userSeat = userSeatData[onlineTarget];
             
             if (userSeat) {
               if (userSeat.isMulti) {
-                const roomData = this._roomsDataCache[userSeat.room];
+                const roomsData = await this._getRoomsData();
+                const roomData = roomsData[userSeat.room];
                 if (roomData && roomData.seats && roomData.seats[userSeat.seat]) {
                   if (roomData.seats[userSeat.seat].namauser === onlineTarget) {
                     isOnline = true;
@@ -1804,40 +1371,17 @@ export class ChatServer {
         }
         
         case "getOnlineUsers": {
-          const users = [];
-          for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
-            if (!seatInfo) continue;
-            
-            if (seatInfo.isMulti) {
-              const roomData = this._roomsDataCache[seatInfo.room];
-              if (roomData && roomData.seats && roomData.seats[seatInfo.seat]) {
-                if (roomData.seats[seatInfo.seat].namauser === username) {
-                  users.push(username);
-                }
-              }
-            } else {
-              const webSockets = this._getActiveWebSockets();
-              for (const wsKey of webSockets) {
-                try {
-                  const uname = wsKey._cachedUsername || 
-                                wsKey.username || 
-                                wsKey.deserializeAttachment()?.username;
-                  if (uname === username && wsKey.readyState === 1 && !wsKey._isMulti) {
-                    users.push(username);
-                    break;
-                  }
-                } catch(e) {}
-              }
-            }
-          }
+          const userSeatData = await this._getUserSeatData();
+          const users = Object.keys(userSeatData);
           this.safeSend(ws, ["allOnlineUsers", users]);
           break;
         }
         
         case "getAllRoomsUserCount": {
+          const roomsData = await this._getRoomsData();
           const counts = {};
           for (const room of ROOMS) {
-            const roomData = this._roomsDataCache[room];
+            const roomData = roomsData[room];
             counts[room] = roomData?.seats ? Object.keys(roomData.seats).length : 0;
           }
           this.safeSend(ws, ["allRoomsUserCount", Object.entries(counts)]);
@@ -1847,7 +1391,8 @@ export class ChatServer {
         case "getRoomUserCount": {
           const roomName = args[0];
           if (roomName && ROOMS_SET.has(roomName)) {
-            const roomData = this._roomsDataCache[roomName];
+            const roomsData = await this._getRoomsData();
+            const roomData = roomsData[roomName];
             const count = roomData?.seats ? Object.keys(roomData.seats).length : 0;
             this.safeSend(ws, ["roomUserCount", roomName, count]);
           }
@@ -1858,10 +1403,11 @@ export class ChatServer {
           const [muteVal, muteRoom] = args;
           if (!muteRoom || !ROOMS_SET.has(muteRoom)) break;
           
-          const roomData = this._roomsDataCache[muteRoom];
+          const roomsData = await this._getRoomsData();
+          const roomData = roomsData[muteRoom];
           if (roomData) {
             roomData.muted = !!muteVal;
-            await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+            await this._saveToStorage(roomsData, undefined, undefined);
           }
           
           this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
@@ -1880,9 +1426,58 @@ export class ChatServer {
         case "getMuteType": {
           const getMuteRoom = args[0];
           if (getMuteRoom && ROOMS_SET.has(getMuteRoom)) {
-            const roomData = this._roomsDataCache[getMuteRoom];
+            const roomsData = await this._getRoomsData();
+            const roomData = roomsData[getMuteRoom];
             this.safeSend(ws, ["muteTypeResponse", roomData?.muted || false, getMuteRoom]);
           }
+          break;
+        }
+        
+        case "clearCacheTotal": {
+          // HAPUS SEMUA DATA DI STORAGE
+          await this.ctx.storage.delete("roomsData");
+          await this.ctx.storage.delete("userSeatData");
+          await this.ctx.storage.delete("currentNumber");
+          await this.ctx.storage.delete("userCounts");
+          await this.ctx.storage.delete("onlineUsers");
+          await this.ctx.storage.delete("lastReset");
+          await this.ctx.storage.delete("lastDeployVersion");
+          await this.ctx.storage.delete("lastDeployTime");
+          
+          // RESET MEMORY
+          this.currentNumber = 1;
+          this._onlineUsers.clear();
+          this._userCounts = {};
+          for (const room of ROOMS) {
+            this._userCounts[room] = 0;
+          }
+          for (const room of ROOMS) {
+            this.roomClients.set(room, new Set());
+          }
+          
+          // TUTUP SEMUA WEBSOCKET
+          const webSockets = this._getActiveWebSockets();
+          for (const ws of webSockets) {
+            try {
+              if (ws.readyState === 1) {
+                ws.send(JSON.stringify(["cacheClearedTotal", "Semua cache telah dihapus total"]));
+                ws.close(1000, "Cache cleared total");
+              }
+            } catch(e) {}
+          }
+          
+          this._refreshRoomClients(true);
+          
+          // SET ALARM BARU
+          if (!this.closing && !this.isDestroyed) {
+            await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+          }
+          
+          this.safeSend(ws, ["clearCacheTotalResult", { 
+            success: true, 
+            message: "Semua cache dan storage berhasil dihapus total",
+            timestamp: Date.now()
+          }]);
           break;
         }
         
@@ -1893,186 +1488,115 @@ export class ChatServer {
           this.safeSend(ws, ["error", `Unknown event: ${evt}`]);
           break;
       }
-    } catch(e) {}
+    } catch(e) {
+      this.safeSend(ws, ["error", e.message]);
+    }
   }
 
-  async _restoreAllState() {
-    if (this._isRestoring) return;
-    this._isRestoring = true;
+  // ============================================================
+  // ALARM
+  // ============================================================
+  async alarm() {
+    if (this.closing || this.isDestroyed) return;
     
+    await this._updateNumber();
+    await this._cleanupStorage();
+    
+    if (!this.closing && !this.isDestroyed) {
+      this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+    }
+  }
+
+  async _cleanupStorage() {
     try {
-      const roomsData = await this.ctx.storage.get("roomsData") || {};
-      const userSeatData = await this.ctx.storage.get("userSeatData") || {};
-      const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
-      const userCounts = await this.ctx.storage.get("userCounts") || {};
-      const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
-      const lastDeployVersion = await this.ctx.storage.get("lastDeployVersion") || "unknown";
-      const lastDeployTime = await this.ctx.storage.get("lastDeployTime") || "unknown";
+      const roomsData = await this._getRoomsData();
+      const userSeatData = await this._getUserSeatData();
       
-      this._roomsDataCache = roomsData;
-      this._userSeatDataCache = userSeatData;
-      this.currentNumber = currentNumber;
-      this._userCounts = userCounts;
-      this._onlineUsers = new Set(onlineUsers);
+      let changed = false;
       
-      if (lastDeployVersion !== this._version) {
-        // version changed
-      }
-      
-      for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
-        if (!seatInfo || !seatInfo.room) {
-          if (!seatInfo?.isMulti) {
-            delete this._userSeatDataCache[username];
-            this._onlineUsers.delete(username);
-          }
-          continue;
-        }
-        const roomData = this._roomsDataCache[seatInfo.room];
-        if (!roomData || !roomData.seats || !roomData.seats[seatInfo.seat]) {
-          if (!seatInfo.isMulti) {
-            delete this._userSeatDataCache[username];
-            this._onlineUsers.delete(username);
-          }
-        }
-      }
-      
-      const webSockets = this.ctx.getWebSockets();
+      const connectedUsers = new Set();
+      const webSockets = this._getActiveWebSockets();
       for (const ws of webSockets) {
         try {
-          const attachment = ws.deserializeAttachment();
-          if (attachment && attachment.username) {
-            const userSeat = this._userSeatDataCache[attachment.username];
-            if (userSeat) {
-              const isMulti = attachment.isMulti || userSeat.isMulti || false;
-              const roomName = attachment.room || userSeat.room;
-              const seatNumber = attachment.seat || userSeat.seat;
-              
-              ws.username = attachment.username;
-              ws.room = roomName;
-              ws.roomname = roomName;
-              ws.idtarget = attachment.username;
-              ws._closing = false;
-              ws._isMulti = isMulti;
-              ws._multiRoom = attachment.multiRoom || roomName;
-              ws._multiSeat = attachment.multiSeat || seatNumber;
-              ws._cachedUsername = attachment.username;
-              ws._cachedRoom = roomName;
-              
-              ws.serializeAttachment({
-                username: attachment.username,
-                room: roomName,
-                seat: seatNumber,
-                isMulti: isMulti,
-                multiRoom: attachment.multiRoom || roomName,
-                multiSeat: attachment.multiSeat || seatNumber,
-                seatInfo: userSeat,
-                serverVersion: this._version,
-                serverDeploy: this._deployTime
-              });
-              
-              this._onlineUsers.add(attachment.username);
-            }
+          const uname = ws._cachedUsername || ws.username || ws.deserializeAttachment()?.username;
+          if (uname) {
+            connectedUsers.add(uname);
           }
         } catch(e) {}
       }
       
-      this._refreshRoomClients(true);
-      
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userSeatDataCache,
-        this.currentNumber
-      );
-      
-      if (!this.closing && !this.isDestroyed) {
-        const existingAlarm = await this.ctx.storage.getAlarm();
-        if (!existingAlarm) {
-          this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+      for (const [username, seatInfo] of Object.entries(userSeatData)) {
+        if (!seatInfo || !seatInfo.room) {
+          delete userSeatData[username];
+          changed = true;
+          continue;
+        }
+        
+        if (seatInfo.isMulti) {
+          continue;
+        }
+        
+        if (!connectedUsers.has(username)) {
+          delete userSeatData[username];
+          changed = true;
         }
       }
       
-    } catch(e) {} finally {
-      this._isRestoring = false;
-    }
+      for (const [roomName, roomData] of Object.entries(roomsData)) {
+        const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
+        const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
+        
+        if (!hasSeats && !hasPoints) {
+          delete roomsData[roomName];
+          changed = true;
+        }
+      }
+      
+      if (changed) {
+        await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
+      }
+      
+    } catch(e) {}
   }
 
+  // ============================================================
+  // RESET ALL DATA
+  // ============================================================
   async resetAllData() {
     const timestamp = Date.now();
     
     try {
-      const multiUsersData = {};
-      const multiUsersSeatInfo = {};
+      // HAPUS SEMUA DATA DI STORAGE
+      await this.ctx.storage.delete("roomsData");
+      await this.ctx.storage.delete("userSeatData");
+      await this.ctx.storage.delete("currentNumber");
+      await this.ctx.storage.delete("userCounts");
+      await this.ctx.storage.delete("onlineUsers");
+      await this.ctx.storage.delete("lastReset");
       
-      for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
-        if (seatInfo && seatInfo.isMulti) {
-          multiUsersData[username] = seatInfo;
-          
-          const roomData = this._roomsDataCache[seatInfo.room];
-          if (roomData && roomData.seats && roomData.seats[seatInfo.seat]) {
-            multiUsersSeatInfo[seatInfo.room] = multiUsersSeatInfo[seatInfo.room] || {};
-            multiUsersSeatInfo[seatInfo.room][seatInfo.seat] = roomData.seats[seatInfo.seat];
-          }
-        }
-      }
-      
-      this._roomsDataCache = {};
-      this._userSeatDataCache = {};
+      // RESET MEMORY
       this.currentNumber = 1;
       this._onlineUsers.clear();
       this._userCounts = {};
       for (const room of ROOMS) {
         this._userCounts[room] = 0;
       }
-      
-      for (const [username, seatInfo] of Object.entries(multiUsersData)) {
-        this._userSeatDataCache[username] = seatInfo;
-        this._onlineUsers.add(username);
-        
-        const roomName = seatInfo.room;
-        const seatNumber = seatInfo.seat;
-        
-        if (!this._roomsDataCache[roomName]) {
-          this._roomsDataCache[roomName] = { seats: {}, points: {}, muted: false, number: 1 };
-        }
-        
-        if (multiUsersSeatInfo[roomName] && multiUsersSeatInfo[roomName][seatNumber]) {
-          this._roomsDataCache[roomName].seats[seatNumber] = multiUsersSeatInfo[roomName][seatNumber];
-        }
-        
-        this._userCounts[roomName] = (this._userCounts[roomName] || 0) + 1;
+      for (const room of ROOMS) {
+        this.roomClients.set(room, new Set());
       }
-      
-      await this.ctx.storage.delete("roomsData");
-      await this.ctx.storage.delete("userSeatData");
-      await this.ctx.storage.delete("currentNumber");
-      await this.ctx.storage.delete("userCounts");
-      await this.ctx.storage.delete("onlineUsers");
-      
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userSeatDataCache,
-        this.currentNumber
-      );
       
       await this.ctx.storage.put("lastDeployVersion", this._version);
       await this.ctx.storage.put("lastDeployTime", this._deployTime);
       await this.ctx.storage.put("lastReset", timestamp);
       
       const resetMessage = JSON.stringify(["serverReset", "Server di-reset pada: " + new Date(timestamp).toLocaleString()]);
-      const multiResetMessage = JSON.stringify(["serverResetMulti", "Server di-reset, data multi user tetap dipertahankan"]);
       
       const webSockets = this._getActiveWebSockets();
       for (const ws of webSockets) {
         try {
           if (ws.readyState === 1) {
-            const isMulti = ws._isMulti || false;
-            if (isMulti) {
-              ws.send(multiResetMessage);
-              ws.send(JSON.stringify(["serverVersion", this._version, this._deployTime]));
-            } else {
-              ws.send(resetMessage);
-              ws.close(1000, "Server reset - " + timestamp);
-            }
+            ws.send(resetMessage);
+            ws.close(1000, "Server reset - " + timestamp);
           }
         } catch(e) {}
       }
@@ -2085,8 +1609,7 @@ export class ChatServer {
       
       return {
         success: true,
-        message: "Reset data berhasil, multi user tetap dipertahankan",
-        multiUsersKept: Object.keys(multiUsersData),
+        message: "Reset data berhasil",
         timestamp: timestamp,
         resetTime: new Date(timestamp).toLocaleString(),
         serverVersion: this._version,
@@ -2103,6 +1626,9 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // FETCH
+  // ============================================================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -2119,44 +1645,66 @@ export class ChatServer {
         });
       }
       
-      if (url.pathname === "/cleanup-multi" && req.method === "POST") {
-        try {
-          const body = await req.json();
-          const username = body.username;
-          
-          if (!username) {
-            return new Response(JSON.stringify({ error: "Username required" }), {
-              status: 400,
-              headers: { "Content-Type": "application/json" }
-            });
-          }
-          
-          const result = await this._cleanupMultiWebSocket(username);
-          
-          return new Response(JSON.stringify({
-            success: result,
-            username: username,
-            message: "Multi WebSocket cleaned, data preserved",
-            timestamp: Date.now(),
-            serverVersion: this._version
-          }), {
-            status: result ? 200 : 404,
-            headers: { "Content-Type": "application/json" }
-          });
-        } catch(e) {
-          return new Response(JSON.stringify({ error: e.message }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" }
-          });
+      if (url.pathname === "/clear-cache-total" && req.method === "POST") {
+        // HAPUS SEMUA DATA DI STORAGE
+        await this.ctx.storage.delete("roomsData");
+        await this.ctx.storage.delete("userSeatData");
+        await this.ctx.storage.delete("currentNumber");
+        await this.ctx.storage.delete("userCounts");
+        await this.ctx.storage.delete("onlineUsers");
+        await this.ctx.storage.delete("lastReset");
+        await this.ctx.storage.delete("lastDeployVersion");
+        await this.ctx.storage.delete("lastDeployTime");
+        
+        // RESET MEMORY
+        this.currentNumber = 1;
+        this._onlineUsers.clear();
+        this._userCounts = {};
+        for (const room of ROOMS) {
+          this._userCounts[room] = 0;
         }
+        for (const room of ROOMS) {
+          this.roomClients.set(room, new Set());
+        }
+        
+        // TUTUP SEMUA WEBSOCKET
+        const webSockets = this._getActiveWebSockets();
+        for (const ws of webSockets) {
+          try {
+            if (ws.readyState === 1) {
+              ws.send(JSON.stringify(["cacheClearedTotal", "Semua cache telah dihapus total"]));
+              ws.close(1000, "Cache cleared total");
+            }
+          } catch(e) {}
+        }
+        
+        this._refreshRoomClients(true);
+        
+        if (!this.closing && !this.isDestroyed) {
+          await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+        }
+        
+        return new Response(JSON.stringify({
+          success: true,
+          message: "Semua cache dan storage berhasil dihapus total",
+          timestamp: Date.now()
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
       }
       
       if (url.pathname === "/status") {
         const webSockets = this._getActiveWebSockets();
+        const roomsData = await this._getRoomsData();
+        const userSeatData = await this._getUserSeatData();
+        const userCounts = await this._getUserCounts();
+        const onlineUsers = await this._getOnlineUsers();
+        
         const status = {
           activeConnections: webSockets.length,
-          rooms: this._userCounts,
-          totalUsers: this._onlineUsers.size,
+          rooms: userCounts,
+          totalUsers: onlineUsers.length,
           currentNumber: this.currentNumber,
           isClosing: this.closing,
           isDestroyed: this.isDestroyed,
@@ -2167,8 +1715,8 @@ export class ChatServer {
           environment: this._deployInfo.environment,
           versionTimestamp: this._deployInfo.timestamp,
           lastReset: await this.ctx.storage.get("lastReset") || null,
-          roomsDataKeys: Object.keys(this._roomsDataCache),
-          userSeatDataKeys: Object.keys(this._userSeatDataCache)
+          roomsDataKeys: Object.keys(roomsData),
+          userSeatDataKeys: Object.keys(userSeatData)
         };
         return new Response(JSON.stringify(status), {
           status: 200,
@@ -2193,7 +1741,7 @@ export class ChatServer {
       
       const upgrade = req.headers.get("Upgrade");
       if (upgrade !== "websocket") {
-        return new Response("Chat Server - No Ping/Pong", { 
+        return new Response("Chat Server - Real-time Storage", { 
           status: 200,
           headers: { "Cache-Control": "no-cache" }
         });
@@ -2242,6 +1790,9 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // DESTROY
+  // ============================================================
   async destroy() {
     if (this.isDestroyed) return;
     this.closing = true;
