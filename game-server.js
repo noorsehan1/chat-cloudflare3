@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-HIBERNATION-FULL-FIXED.js
-// VERSION: 7.0.0 - REAL-TIME SYNC, NO DELAY, TOTAL DELETE
+// VERSION: 7.1.0 - NO LOOP, CLEAN HIBERNATE
 // ============================================================
 
 const CONSTANTS = {
@@ -331,7 +331,7 @@ class CacheManager {
 
   getRecordingStatus(room) {
     if (!room) return false;
-    return this.recordingStatus.has(room) ? this.recordingStatus.get(room) : false;
+    return this.recordingStatus.has(room) ? true : false;
   }
 
   getWinners(room) {
@@ -342,12 +342,8 @@ class CacheManager {
   }
 
   clear() {
-    for (const key of this.recordingStatus.keys()) {
-      this.recordingStatus.delete(key);
-    }
-    for (const key of this.winnersCache.keys()) {
-      this.winnersCache.delete(key);
-    }
+    this.recordingStatus.clear();
+    this.winnersCache.clear();
     this._updateLocks.clear();
   }
 }
@@ -482,7 +478,7 @@ class DiceGameSystem {
 }
 
 // ============================================================
-// REAL-TIME SYNC MANAGER - NO DELAY
+// REAL-TIME SYNC MANAGER - NO LOOP, CLEAN
 // ============================================================
 class RealTimeSyncManager {
   constructor(env, state, cacheManager, diceGameSystem) {
@@ -501,6 +497,9 @@ class RealTimeSyncManager {
     };
   }
 
+  // ============================================================
+  // RECORDING - BOOLEAN ONLY (TRUE = SAVE, FALSE = DELETE)
+  // ============================================================
   async syncRecording(room, enabled) {
     const lockKey = `recording_${room}`;
     if (this._syncLocks.has(lockKey)) return false;
@@ -509,33 +508,28 @@ class RealTimeSyncManager {
     try {
       if (enabled) {
         this.cacheManager.recordingStatus.set(room, true);
+        
+        const recordingMap = await this.state.storage.get(this.KEYS.RECORDING_STATUS) || {};
+        recordingMap[room] = true;
+        await this.state.storage.put(this.KEYS.RECORDING_STATUS, recordingMap);
+        
+        const kvKey = CONSTANTS.LOWCARD_RECORDING_KEY + room;
+        await this.env.QUESTIONS.put(kvKey, 'true');
+        
       } else {
         this.cacheManager.recordingStatus.delete(room);
-        this.cacheManager.winnersCache.delete(room);
-      }
-      
-      const kvRecordingKey = CONSTANTS.LOWCARD_RECORDING_KEY + room;
-      const kvWinnerKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
-      
-      if (enabled) {
-        await this.env.QUESTIONS.put(kvRecordingKey, 'true');
-      } else {
-        await this.env.QUESTIONS.delete(kvRecordingKey);
-        await this.env.QUESTIONS.delete(kvWinnerKey);
-      }
-      
-      const recordingMap = await this.state.storage.get(this.KEYS.RECORDING_STATUS) || {};
-      const winnersMap = await this.state.storage.get(this.KEYS.WINNERS) || {};
-      
-      if (enabled) {
-        recordingMap[room] = true;
-      } else {
+        
+        const recordingMap = await this.state.storage.get(this.KEYS.RECORDING_STATUS) || {};
         delete recordingMap[room];
-        delete winnersMap[room];
+        if (Object.keys(recordingMap).length > 0) {
+          await this.state.storage.put(this.KEYS.RECORDING_STATUS, recordingMap);
+        } else {
+          await this.state.storage.delete(this.KEYS.RECORDING_STATUS);
+        }
+        
+        const kvKey = CONSTANTS.LOWCARD_RECORDING_KEY + room;
+        await this.env.QUESTIONS.delete(kvKey);
       }
-      
-      await this.state.storage.put(this.KEYS.RECORDING_STATUS, recordingMap);
-      await this.state.storage.put(this.KEYS.WINNERS, winnersMap);
       
       return true;
       
@@ -546,6 +540,9 @@ class RealTimeSyncManager {
     }
   }
 
+  // ============================================================
+  // WINNERS
+  // ============================================================
   async syncWinners(room, winners) {
     const lockKey = `winners_${room}`;
     if (this._syncLocks.has(lockKey)) return false;
@@ -554,24 +551,28 @@ class RealTimeSyncManager {
     try {
       if (winners && Object.keys(winners).length > 0) {
         this.cacheManager.winnersCache.set(room, { winners });
+        
+        const winnersMap = await this.state.storage.get(this.KEYS.WINNERS) || {};
+        winnersMap[room] = winners;
+        await this.state.storage.put(this.KEYS.WINNERS, winnersMap);
+        
+        const kvKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
+        await this.env.QUESTIONS.put(kvKey, JSON.stringify(winners));
+        
       } else {
         this.cacheManager.winnersCache.delete(room);
-      }
-      
-      const kvKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
-      if (winners && Object.keys(winners).length > 0) {
-        await this.env.QUESTIONS.put(kvKey, JSON.stringify(winners));
-      } else {
+        
+        const winnersMap = await this.state.storage.get(this.KEYS.WINNERS) || {};
+        delete winnersMap[room];
+        if (Object.keys(winnersMap).length > 0) {
+          await this.state.storage.put(this.KEYS.WINNERS, winnersMap);
+        } else {
+          await this.state.storage.delete(this.KEYS.WINNERS);
+        }
+        
+        const kvKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
         await this.env.QUESTIONS.delete(kvKey);
       }
-      
-      const winnersMap = await this.state.storage.get(this.KEYS.WINNERS) || {};
-      if (winners && Object.keys(winners).length > 0) {
-        winnersMap[room] = winners;
-      } else {
-        delete winnersMap[room];
-      }
-      await this.state.storage.put(this.KEYS.WINNERS, winnersMap);
       
       return true;
       
@@ -582,6 +583,9 @@ class RealTimeSyncManager {
     }
   }
 
+  // ============================================================
+  // DICE POINTS
+  // ============================================================
   async syncDicePoints(points) {
     const lockKey = 'dice_points';
     if (this._syncLocks.has(lockKey)) return false;
@@ -594,23 +598,16 @@ class RealTimeSyncManager {
         for (const [username, score] of Object.entries(points)) {
           this.diceGameSystem.userScores.set(username, score);
         }
+        await this.state.storage.put(this.KEYS.DICE_POINTS, points);
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
+        
       } else {
         this.diceGameSystem.userScores.clear();
         this.diceGameSystem.pointsCache.pointsCache.delete('points');
         this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
         this.diceGameSystem._isLoaded = false;
-      }
-      
-      if (points && Object.keys(points).length > 0) {
-        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
-      } else {
-        await this.env.QUESTIONS.delete(CONSTANTS.DICE_POINT_KEY);
-      }
-      
-      if (points && Object.keys(points).length > 0) {
-        await this.state.storage.put(this.KEYS.DICE_POINTS, points);
-      } else {
         await this.state.storage.delete(this.KEYS.DICE_POINTS);
+        await this.env.QUESTIONS.delete(CONSTANTS.DICE_POINT_KEY);
       }
       
       return true;
@@ -622,24 +619,24 @@ class RealTimeSyncManager {
     }
   }
 
+  // ============================================================
+  // LAST WEEK WINNER
+  // ============================================================
   async syncLastWeekWinner(winnerData) {
     const lockKey = 'last_winner';
     if (this._syncLocks.has(lockKey)) return false;
     this._syncLocks.set(lockKey, Date.now());
     
     try {
-      this.diceGameSystem._cachedLastWeekWinner = winnerData;
-      
       if (winnerData && Object.keys(winnerData).length > 0) {
-        await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winnerData));
-      } else {
-        await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
-      }
-      
-      if (winnerData && Object.keys(winnerData).length > 0) {
+        this.diceGameSystem._cachedLastWeekWinner = winnerData;
         await this.state.storage.put(this.KEYS.LAST_WEEK_WINNER, winnerData);
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winnerData));
+        
       } else {
+        this.diceGameSystem._cachedLastWeekWinner = null;
         await this.state.storage.delete(this.KEYS.LAST_WEEK_WINNER);
+        await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
       }
       
       return true;
@@ -651,44 +648,60 @@ class RealTimeSyncManager {
     }
   }
 
+  // ============================================================
+  // FULL SYNC FROM KV - NO RETRY, DEFAULT KOSONG
+  // ============================================================
   async fullSyncFromKV() {
     const lockKey = 'full_sync';
     if (this._syncLocks.has(lockKey)) return false;
     this._syncLocks.set(lockKey, Date.now());
     
     try {
+      // RECORDING
       const recordingKeys = await this.env.QUESTIONS.list({ 
         prefix: CONSTANTS.LOWCARD_RECORDING_KEY 
       });
       const recordingMap = {};
+      this.cacheManager.recordingStatus.clear();
+      
       for (const key of recordingKeys.keys) {
         const room = key.name.replace(CONSTANTS.LOWCARD_RECORDING_KEY, '');
         const status = await this.env.QUESTIONS.get(key.name);
         if (status === 'true') {
-          recordingMap[room] = true;
           this.cacheManager.recordingStatus.set(room, true);
-        } else {
-          await this.env.QUESTIONS.delete(key.name);
+          recordingMap[room] = true;
         }
       }
-      await this.state.storage.put(this.KEYS.RECORDING_STATUS, recordingMap);
       
+      if (Object.keys(recordingMap).length > 0) {
+        await this.state.storage.put(this.KEYS.RECORDING_STATUS, recordingMap);
+      } else {
+        await this.state.storage.delete(this.KEYS.RECORDING_STATUS);
+      }
+      
+      // WINNERS
       const winnerKeys = await this.env.QUESTIONS.list({ 
         prefix: CONSTANTS.LOWCARD_WINNER_KEY 
       });
       const winnersMap = {};
+      this.cacheManager.winnersCache.clear();
+      
       for (const key of winnerKeys.keys) {
         const room = key.name.replace(CONSTANTS.LOWCARD_WINNER_KEY, '');
         const winners = await this.env.QUESTIONS.get(key.name, 'json');
         if (winners && Object.keys(winners).length > 0) {
-          winnersMap[room] = winners;
           this.cacheManager.winnersCache.set(room, { winners });
-        } else {
-          await this.env.QUESTIONS.delete(key.name);
+          winnersMap[room] = winners;
         }
       }
-      await this.state.storage.put(this.KEYS.WINNERS, winnersMap);
       
+      if (Object.keys(winnersMap).length > 0) {
+        await this.state.storage.put(this.KEYS.WINNERS, winnersMap);
+      } else {
+        await this.state.storage.delete(this.KEYS.WINNERS);
+      }
+      
+      // DICE POINTS
       const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json');
       if (points && Object.keys(points).length > 0) {
         await this.diceGameSystem.pointsCache.setPoints(points, this.env);
@@ -698,31 +711,53 @@ class RealTimeSyncManager {
         }
         await this.state.storage.put(this.KEYS.DICE_POINTS, points);
       } else {
-        await this.env.QUESTIONS.delete(CONSTANTS.DICE_POINT_KEY);
+        this.diceGameSystem.userScores.clear();
+        this.diceGameSystem.pointsCache.pointsCache.delete('points');
+        this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
+        this.diceGameSystem._isLoaded = false;
         await this.state.storage.delete(this.KEYS.DICE_POINTS);
       }
       
+      // LAST WEEK WINNER
       const winner = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
       if (winner && Object.keys(winner).length > 0) {
         this.diceGameSystem._cachedLastWeekWinner = winner;
         await this.state.storage.put(this.KEYS.LAST_WEEK_WINNER, winner);
       } else {
-        await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+        this.diceGameSystem._cachedLastWeekWinner = null;
         await this.state.storage.delete(this.KEYS.LAST_WEEK_WINNER);
       }
       
       return true;
       
     } catch(e) {
+      // ✅ ERROR → SET DEFAULT KOSONG
+      this.cacheManager.recordingStatus.clear();
+      this.cacheManager.winnersCache.clear();
+      this.diceGameSystem.userScores.clear();
+      this.diceGameSystem.pointsCache.pointsCache.delete('points');
+      this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
+      this.diceGameSystem._isLoaded = false;
+      this.diceGameSystem._cachedLastWeekWinner = null;
+      
+      await this.state.storage.delete(this.KEYS.RECORDING_STATUS);
+      await this.state.storage.delete(this.KEYS.WINNERS);
+      await this.state.storage.delete(this.KEYS.DICE_POINTS);
+      await this.state.storage.delete(this.KEYS.LAST_WEEK_WINNER);
+      
       return false;
     } finally {
       this._syncLocks.delete(lockKey);
     }
   }
 
+  // ============================================================
+  // RESTORE FROM STORAGE - NO RETRY
+  // ============================================================
   async restoreFromStorage() {
     try {
       const recordingMap = await this.state.storage.get(this.KEYS.RECORDING_STATUS);
+      this.cacheManager.recordingStatus.clear();
       if (recordingMap) {
         for (const [room, status] of Object.entries(recordingMap)) {
           if (status === true) {
@@ -732,6 +767,7 @@ class RealTimeSyncManager {
       }
       
       const winnersMap = await this.state.storage.get(this.KEYS.WINNERS);
+      this.cacheManager.winnersCache.clear();
       if (winnersMap) {
         for (const [room, winners] of Object.entries(winnersMap)) {
           if (winners && Object.keys(winners).length > 0) {
@@ -747,11 +783,18 @@ class RealTimeSyncManager {
         for (const [username, score] of Object.entries(points)) {
           this.diceGameSystem.userScores.set(username, score);
         }
+      } else {
+        this.diceGameSystem.userScores.clear();
+        this.diceGameSystem.pointsCache.pointsCache.delete('points');
+        this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
+        this.diceGameSystem._isLoaded = false;
       }
       
       const winner = await this.state.storage.get(this.KEYS.LAST_WEEK_WINNER);
       if (winner) {
         this.diceGameSystem._cachedLastWeekWinner = winner;
+      } else {
+        this.diceGameSystem._cachedLastWeekWinner = null;
       }
       
       return true;
@@ -762,6 +805,9 @@ class RealTimeSyncManager {
     }
   }
 
+  // ============================================================
+  // GET SYNC STATUS
+  // ============================================================
   async getSyncStatus() {
     try {
       const recording = await this.state.storage.get(this.KEYS.RECORDING_STATUS);
@@ -769,8 +815,15 @@ class RealTimeSyncManager {
       const points = await this.state.storage.get(this.KEYS.DICE_POINTS);
       const winner = await this.state.storage.get(this.KEYS.LAST_WEEK_WINNER);
       
+      let recordingCount = 0;
+      if (recording) {
+        for (const [room, status] of Object.entries(recording)) {
+          if (status === true) recordingCount++;
+        }
+      }
+      
       return {
-        recordingCount: Object.keys(recording || {}).length,
+        recordingCount: recordingCount,
         winnersCount: Object.keys(winners || {}).length,
         dicePointsCount: Object.keys(points || {}).length,
         hasLastWinner: !!winner,
@@ -780,6 +833,48 @@ class RealTimeSyncManager {
       };
     } catch(e) {
       return { error: e.message };
+    }
+  }
+
+  // ============================================================
+  // CLEAR ALL
+  // ============================================================
+  async clearAll() {
+    try {
+      this.cacheManager.recordingStatus.clear();
+      this.cacheManager.winnersCache.clear();
+      this.diceGameSystem.userScores.clear();
+      this.diceGameSystem.pointsCache.pointsCache.delete('points');
+      this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
+      this.diceGameSystem._isLoaded = false;
+      this.diceGameSystem._cachedLastWeekWinner = null;
+      
+      await this.state.storage.delete(this.KEYS.RECORDING_STATUS);
+      await this.state.storage.delete(this.KEYS.WINNERS);
+      await this.state.storage.delete(this.KEYS.DICE_POINTS);
+      await this.state.storage.delete(this.KEYS.LAST_WEEK_WINNER);
+      await this.state.storage.delete(this.KEYS.RESET_FLAG);
+      
+      await this.env.QUESTIONS.delete(CONSTANTS.DICE_POINT_KEY);
+      await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+      
+      const recordingKeys = await this.env.QUESTIONS.list({ 
+        prefix: CONSTANTS.LOWCARD_RECORDING_KEY 
+      });
+      for (const key of recordingKeys.keys) {
+        await this.env.QUESTIONS.delete(key.name);
+      }
+      
+      const winnerKeys = await this.env.QUESTIONS.list({ 
+        prefix: CONSTANTS.LOWCARD_WINNER_KEY 
+      });
+      for (const key of winnerKeys.keys) {
+        await this.env.QUESTIONS.delete(key.name);
+      }
+      
+      return true;
+    } catch(e) {
+      return false;
     }
   }
 }
@@ -934,19 +1029,21 @@ export class GameServer {
         }
         await this.diceGameSystem.pointsCache.setPoints(data, this.env);
       } else if (key === 'recordingStatusMap') {
-        for (const [room, status] of Object.entries(data || {})) {
-          if (status) {
-            this.cacheManager.recordingStatus.set(room, true);
-          } else {
-            this.cacheManager.recordingStatus.delete(room);
+        this.cacheManager.recordingStatus.clear();
+        if (data) {
+          for (const [room, status] of Object.entries(data)) {
+            if (status === true) {
+              this.cacheManager.recordingStatus.set(room, true);
+            }
           }
         }
       } else if (key === 'winnersMap') {
-        for (const [room, winners] of Object.entries(data || {})) {
-          if (winners && Object.keys(winners).length > 0) {
-            this.cacheManager.winnersCache.set(room, { winners });
-          } else {
-            this.cacheManager.winnersCache.delete(room);
+        this.cacheManager.winnersCache.clear();
+        if (data) {
+          for (const [room, winners] of Object.entries(data)) {
+            if (winners && Object.keys(winners).length > 0) {
+              this.cacheManager.winnersCache.set(room, { winners });
+            }
           }
         }
       } else if (key === 'last_weekly_reset_week') {
@@ -983,7 +1080,9 @@ export class GameServer {
       } else if (key === 'recordingStatusMap') {
         const map = {};
         for (const [room, status] of this.cacheManager.recordingStatus) {
-          map[room] = status;
+          if (status === true) {
+            map[room] = true;
+          }
         }
         data = map;
       } else if (key === 'winnersMap') {
@@ -1016,7 +1115,9 @@ export class GameServer {
       } else if (key === 'recordingStatusMap') {
         const map = {};
         for (const [room, status] of this.cacheManager.recordingStatus) {
-          map[room] = status;
+          if (status === true) {
+            map[room] = true;
+          }
         }
         cacheData = map;
       } else if (key === 'winnersMap') {
@@ -1052,11 +1153,14 @@ export class GameServer {
         prefix: CONSTANTS.LOWCARD_RECORDING_KEY 
       });
       const recordingMap = {};
+      this.cacheManager.recordingStatus.clear();
+      
       for (const key of recordingKeys.keys) {
         const room = key.name.replace(CONSTANTS.LOWCARD_RECORDING_KEY, '');
         const status = await this.env.QUESTIONS.get(key.name);
         if (status === 'true') {
           recordingMap[room] = true;
+          this.cacheManager.recordingStatus.set(room, true);
         }
       }
       
@@ -1064,33 +1168,20 @@ export class GameServer {
         prefix: CONSTANTS.LOWCARD_WINNER_KEY 
       });
       const winnersMap = {};
+      this.cacheManager.winnersCache.clear();
+      
       for (const key of winnerKeys.keys) {
         const room = key.name.replace(CONSTANTS.LOWCARD_WINNER_KEY, '');
         const winners = await this.env.QUESTIONS.get(key.name, 'json');
         if (winners && Object.keys(winners).length > 0) {
           winnersMap[room] = winners;
+          this.cacheManager.winnersCache.set(room, { winners });
         }
       }
       
       const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json');
       const winner = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
       const resetWeek = await this.env.QUESTIONS.get('last_weekly_reset_week', 'json');
-      
-      for (const [room, status] of Object.entries(recordingMap)) {
-        if (status) {
-          this.cacheManager.recordingStatus.set(room, true);
-        } else {
-          this.cacheManager.recordingStatus.delete(room);
-        }
-      }
-      
-      for (const [room, winners] of Object.entries(winnersMap)) {
-        if (winners && Object.keys(winners).length > 0) {
-          this.cacheManager.winnersCache.set(room, { winners });
-        } else {
-          this.cacheManager.winnersCache.delete(room);
-        }
-      }
       
       if (points && Object.keys(points).length > 0) {
         await this.diceGameSystem.pointsCache.setPoints(points, this.env);
@@ -1099,9 +1190,8 @@ export class GameServer {
           this.diceGameSystem.userScores.set(username, score);
         }
       } else {
+        await this.diceGameSystem.pointsCache.setPoints({}, this.env);
         this.diceGameSystem.userScores.clear();
-        this.diceGameSystem.pointsCache.pointsCache.delete('points');
-        this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
         this.diceGameSystem._isLoaded = false;
       }
       
@@ -1115,10 +1205,21 @@ export class GameServer {
       
       if (resetWeek) {
         this._lastResetWeek = resetWeek;
+      } else {
+        this._lastResetWeek = this._getCurrentWeek();
       }
       
-      await this.ctx.storage.put('recordingStatusMap', recordingMap);
-      await this.ctx.storage.put('winnersMap', winnersMap);
+      if (Object.keys(recordingMap).length > 0) {
+        await this.ctx.storage.put('recordingStatusMap', recordingMap);
+      } else {
+        await this.ctx.storage.delete('recordingStatusMap');
+      }
+      
+      if (Object.keys(winnersMap).length > 0) {
+        await this.ctx.storage.put('winnersMap', winnersMap);
+      } else {
+        await this.ctx.storage.delete('winnersMap');
+      }
       
       if (points && Object.keys(points).length > 0) {
         await this.ctx.storage.put('dicePointsBackup', points);
@@ -1132,12 +1233,7 @@ export class GameServer {
         await this.ctx.storage.delete('cachedLastWeekWinner');
       }
       
-      if (resetWeek) {
-        await this.ctx.storage.put('last_weekly_reset_week', resetWeek);
-      } else {
-        const currentWeek = this._getCurrentWeek();
-        await this.ctx.storage.put('last_weekly_reset_week', currentWeek);
-      }
+      await this.ctx.storage.put('last_weekly_reset_week', this._lastResetWeek);
       
       const cleanupKeys = ['scheduled_alarms', 'last_sync_timestamp'];
       for (const key of cleanupKeys) {
@@ -1149,6 +1245,22 @@ export class GameServer {
       return true;
       
     } catch(e) {
+      // ✅ ERROR → SET DEFAULT KOSONG
+      this.cacheManager.recordingStatus.clear();
+      this.cacheManager.winnersCache.clear();
+      await this.diceGameSystem.pointsCache.setPoints({}, this.env);
+      this.diceGameSystem.userScores.clear();
+      this.diceGameSystem._isLoaded = false;
+      this._cachedLastWeekWinner = null;
+      this.diceGameSystem._cachedLastWeekWinner = null;
+      this._lastResetWeek = this._getCurrentWeek();
+      
+      await this.ctx.storage.delete('recordingStatusMap');
+      await this.ctx.storage.delete('winnersMap');
+      await this.ctx.storage.delete('dicePointsBackup');
+      await this.ctx.storage.delete('cachedLastWeekWinner');
+      await this.ctx.storage.put('last_weekly_reset_week', this._lastResetWeek);
+      
       return false;
     }
   }
@@ -1172,7 +1284,12 @@ export class GameServer {
       const currentDay = now.getUTCDay();
       const currentWeek = this._getCurrentWeek();
       
-      const lastResetWeek = await this.ctx.storage.get('last_weekly_reset_week');
+      let lastResetWeek = await this.ctx.storage.get('last_weekly_reset_week');
+      if (!lastResetWeek) {
+        lastResetWeek = currentWeek;
+        await this.ctx.storage.put('last_weekly_reset_week', currentWeek);
+        return true;
+      }
       
       if (lastResetWeek === currentWeek) {
         return true;
@@ -1181,11 +1298,12 @@ export class GameServer {
       if (currentDay === CONSTANTS.WEEKLY_RESET_DAY) {
         await this._handleWeeklyReset();
         await this.ctx.storage.put('last_weekly_reset_week', currentWeek);
-        await this.ctx.storage.put('force_reset_done', Date.now());
       }
       
       return true;
     } catch(e) {
+      const currentWeek = this._getCurrentWeek();
+      await this.ctx.storage.put('last_weekly_reset_week', currentWeek);
       return false;
     }
   }
@@ -1221,7 +1339,20 @@ export class GameServer {
       await this._setDataTo3Layer('dicePointsBackup', {});
       await this._setDataTo3Layer('last_weekly_reset_week', currentWeek);
       
-    } catch(e) {}
+      this.diceGameSystem.userScores.clear();
+      this.diceGameSystem.pointsCache.pointsCache.delete('points');
+      this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
+      this.diceGameSystem._isLoaded = false;
+      
+      return true;
+      
+    } catch(e) {
+      const currentWeek = this._getCurrentWeek();
+      await this._setDataTo3Layer('cachedLastWeekWinner', {});
+      await this._setDataTo3Layer('dicePointsBackup', {});
+      await this._setDataTo3Layer('last_weekly_reset_week', currentWeek);
+      return false;
+    }
   }
 
   _getCurrentWeek() {
@@ -1282,22 +1413,24 @@ export class GameServer {
     this._initialized = true;
     
     try {
-      this.diceGameSystem.loadScores().catch(() => {});
+      this.diceGameSystem.loadScores().catch(() => {
+        this.diceGameSystem.pointsCache.setPoints({}, this.env);
+        this.diceGameSystem.userScores.clear();
+        this.diceGameSystem._isLoaded = false;
+      });
+      
       this.alarmScheduler.scheduleAlarms().catch(() => {});
       
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed) {
-          this._checkAndStartCurrentSession();
-        }
-      }, 3000);
+      // ✅ CEK SEKALI, TIDAK BERULANG
+      if (!this.closing && !this.isDestroyed) {
+        this._checkAndStartCurrentSession();
+      }
       
     } catch(e) {
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed) {
-          this._initialized = false;
-          this._initLazy();
-        }
-      }, 30000);
+      this.diceGameSystem.pointsCache.setPoints({}, this.env);
+      this.diceGameSystem.userScores.clear();
+      this.diceGameSystem._isLoaded = false;
+      this._initialized = true;
     }
   }
 
@@ -3661,36 +3794,13 @@ export class GameServer {
       const timeLeft = this._getTimeLeftUntilNextDice();
       const isDiceTime = this.alarmScheduler.isDiceTime();
       
-      if (!isDiceTime || !this.diceAutoEnabled) {
-        setTimeout(() => {
-          if (!this.closing && !this.isDestroyed && ws && ws.readyState === 1) {
-            this._safeSend(ws, ["diceNotification", `Next dice game in: ${timeLeft.text}`]);
-          }
-        }, 5000);
-        
-        const waitTime = timeLeft.totalMs + 5000;
-        setTimeout(() => {
-          if (!this.closing && !this.isDestroyed && !this.currentDiceRoll && !this._isShowingDice) {
-            if (this.alarmScheduler.isDiceTime()) {
-              const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-              if (clients && clients.size > 0) {
-                this._startDiceFast();
-              }
-            }
-          }
-        }, waitTime);
-        return;
-      }
-      
-      if (isDiceTime && !this.currentDiceRoll && this.diceAutoEnabled) {
-        setTimeout(() => {
-          if (!this.closing && !this.isDestroyed && !this.currentDiceRoll && !this._isShowingDice) {
-            const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-            if (clients && clients.size > 0) {
-              this._startDiceFast();
-            }
-          }
-        }, 5000);
+      if (!isDiceTime) {
+        this._safeSend(ws, ["diceNotification", `Next dice game in: ${timeLeft.text}`]);
+      } else if (isDiceTime && !this.currentDiceRoll && !this._isShowingDice) {
+        this._safeSend(ws, ["diceNotification", "Dice game starting soon..."]);
+        if (this.alarmScheduler.isDiceTime()) {
+          this._startDiceFast();
+        }
       }
     } catch(e) {}
   }
@@ -3723,8 +3833,9 @@ export class GameServer {
         return;
       }
       
-      this._startDiceFast();
-      
+      if (this.alarmScheduler.isDiceTime()) {
+        this._startDiceFast();
+      }
     } catch(e) {}
   }
 
