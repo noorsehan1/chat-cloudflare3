@@ -589,6 +589,7 @@ export class ChatServer {
     let oldSeat = null;
     let oldRoomData = null;
     
+    // 1. CARI USER DI SEMUA ROOM
     for (const [roomNameKey, roomData] of Object.entries(this._roomsDataCache)) {
       if (!roomData || !roomData.seats) continue;
       for (const [seat, data] of Object.entries(roomData.seats)) {
@@ -602,36 +603,40 @@ export class ChatServer {
       if (oldRoom) break;
     }
     
+    // 2. HAPUS SEMUA DATA DARI ROOM LAMA
     if (oldRoom && oldSeat !== null && oldRoomData) {
+      // HAPUS KURSI
       delete oldRoomData.seats[oldSeat];
+      
+      // HAPUS POINTS
       if (oldRoomData.points) {
         delete oldRoomData.points[oldSeat];
       }
       
+      // HAPUS DARI USER SEAT DATA CACHE
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
       }
       
+      // HAPUS DARI ONLINE USERS
       if (this._onlineUsers.has(username)) {
         this._onlineUsers.delete(username);
       }
       
+      // CEK APAKAH ROOM KOSONG
       const hasSeats = oldRoomData.seats && Object.keys(oldRoomData.seats).length > 0;
       const hasPoints = oldRoomData.points && Object.keys(oldRoomData.points).length > 0;
       
+      // HAPUS ROOM JIKA KOSONG
       if (!hasSeats && !hasPoints) {
         delete this._roomsDataCache[oldRoom];
       }
       
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userSeatDataCache,
-        this.currentNumber
-      );
-      
+      // BROADCAST KE ROOM LAMA
       this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
       await this.updateRoomCount(oldRoom);
       
+      // HAPUS DARI roomClients
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
           clients.delete(ws);
@@ -639,18 +644,28 @@ export class ChatServer {
       }
     }
     
+    // 3. SIMPAN KE STORAGE - PASTIKAN DATA ROOM LAMA SUDAH TERHAPUS
+    await this._saveToStorage(
+      this._roomsDataCache,
+      this._userSeatDataCache,
+      this.currentNumber
+    );
+    
+    // 4. TAMBAHKAN KE ROOM BARU
     let newRoomData = this._roomsDataCache[roomName];
     if (!newRoomData) {
       newRoomData = { seats: {}, points: {}, muted: false, number: 1 };
       this._roomsDataCache[roomName] = newRoomData;
     }
     
+    // CEK ROOM PENUH
     const seatCount = Object.keys(newRoomData.seats).length;
     if (seatCount >= C.MAX_SEATS) {
       this.safeSend(ws, ["roomFull", roomName]);
       return false;
     }
     
+    // CARI KURSI KOSONG
     let newSeat = null;
     for (let s = 1; s <= C.MAX_SEATS; s++) {
       if (!newRoomData.seats[s]) {
@@ -664,6 +679,7 @@ export class ChatServer {
       return false;
     }
     
+    // TAMBAHKAN KE ROOM BARU
     newRoomData.seats[newSeat] = {
       noimageUrl: "",
       namauser: username,
@@ -682,12 +698,14 @@ export class ChatServer {
     this._userSeatDataCache[username] = newSeatInfo;
     this._onlineUsers.add(username);
     
+    // 5. SIMPAN KE STORAGE LAGI DENGAN DATA BARU
     await this._saveToStorage(
       this._roomsDataCache,
       this._userSeatDataCache,
       this.currentNumber
     );
     
+    // 6. UPDATE WEBSOCKET
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -713,6 +731,7 @@ export class ChatServer {
     
     this._refreshRoomClients(true);
     
+    // 7. KIRIM RESPONSE
     this.safeSend(ws, ["rooMasuk", newSeat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", newSeat]);
     this.safeSend(ws, ["muteTypeResponse", newRoomData.muted || false, roomName]);
