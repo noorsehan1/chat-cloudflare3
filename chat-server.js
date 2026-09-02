@@ -1,7 +1,7 @@
 // ==================== CHAT-SERVER-REAL-TIME-STORAGE.JS ====================
 // VERSION: Auto-generated with timestamp
 // DEPLOY: Auto-generated
-// SUPPORTS CLOUDFLARE HIBERNATION
+// SUPPORTS CLOUDFLARE HIBERNATION (AUTOMATIC)
 
 const C = {
   MAX_SEATS: 45,
@@ -72,156 +72,15 @@ export class ChatServer {
     this._isRestoring = false;
     this._lastRefreshTime = 0;
     
-    // ========== TAMBAHAN UNTUK HIBERNASI ==========
-    this._isHibernating = false;
-    this._lastActivityTime = Date.now();
-    this._hibernationTimer = null;
-    this._hibernationCheckInterval = 30000; // 30 detik
-    // ============================================
-    
-    this._initFromStorage().then(() => {
-      // ========== TAMBAHAN UNTUK HIBERNASI ==========
-      this._startHibernationCheck();
-      // ============================================
-    });
+    this._initFromStorage().then(() => {});
     this._autoResetOnDeploy().then(() => {});
   }
 
   // ============================================================
-  // TAMBAHAN: HIBERNATION MANAGEMENT
-  // ============================================================
-  _startHibernationCheck() {
-    if (this._hibernationTimer) {
-      clearTimeout(this._hibernationTimer);
-    }
-    
-    this._hibernationTimer = setTimeout(() => {
-      this._checkHibernation();
-    }, this._hibernationCheckInterval);
-  }
-
-  _resetHibernationTimer() {
-    this._lastActivityTime = Date.now();
-    if (this._isHibernating) {
-      this._wakeFromHibernation();
-    }
-    this._startHibernationCheck();
-  }
-
-  async _checkHibernation() {
-    if (this.closing || this.isDestroyed) return;
-    
-    const now = Date.now();
-    const inactiveTime = now - this._lastActivityTime;
-    
-    const webSockets = this._getActiveWebSockets();
-    const hasActiveConnections = webSockets.some(ws => ws.readyState === 1);
-    
-    // Jika tidak ada aktivitas selama 30 detik dan tidak ada koneksi aktif
-    if (inactiveTime > 30000 && !hasActiveConnections && !this._isHibernating) {
-      await this._enterHibernation();
-    } else if (hasActiveConnections) {
-      this._lastActivityTime = now;
-      this._startHibernationCheck();
-    } else {
-      this._startHibernationCheck();
-    }
-  }
-
-  async _enterHibernation() {
-    if (this._isHibernating || this.closing || this.isDestroyed) return;
-    
-    this._isHibernating = true;
-    
-    // Simpan semua state ke storage sebelum hibernasi
-    try {
-      const roomsData = await this._getRoomsData();
-      const userSeatData = await this._getUserSeatData();
-      
-      await this.ctx.storage.put({
-        "_hibernation_roomsData": roomsData,
-        "_hibernation_userSeatData": userSeatData,
-        "_hibernation_currentNumber": this.currentNumber,
-        "_hibernation_userCounts": this._userCounts,
-        "_hibernation_onlineUsers": Array.from(this._onlineUsers),
-        "_hibernation_timestamp": Date.now()
-      });
-    } catch(e) {}
-    
-    // Batalkan alarm
-    try {
-      await this.ctx.storage.deleteAlarm();
-    } catch(e) {}
-    
-    await this.ctx.storage.put("_hibernating", true);
-  }
-
-  async _wakeFromHibernation() {
-    if (!this._isHibernating) return;
-    
-    this._isHibernating = false;
-    this._lastActivityTime = Date.now();
-    
-    // Restore state dari storage
-    try {
-      const hiberData = await this.ctx.storage.get([
-        "_hibernation_roomsData",
-        "_hibernation_userSeatData",
-        "_hibernation_currentNumber",
-        "_hibernation_userCounts",
-        "_hibernation_onlineUsers"
-      ]);
-      
-      if (hiberData && hiberData["_hibernation_roomsData"]) {
-        await this.ctx.storage.put({
-          "roomsData": hiberData["_hibernation_roomsData"],
-          "userSeatData": hiberData["_hibernation_userSeatData"],
-          "currentNumber": hiberData["_hibernation_currentNumber"] || 1,
-          "userCounts": hiberData["_hibernation_userCounts"] || {},
-          "onlineUsers": hiberData["_hibernation_onlineUsers"] || []
-        });
-        
-        this.currentNumber = hiberData["_hibernation_currentNumber"] || 1;
-        this._userCounts = hiberData["_hibernation_userCounts"] || {};
-        this._onlineUsers = new Set(hiberData["_hibernation_onlineUsers"] || []);
-        
-        // Hapus data hibernasi
-        await this.ctx.storage.delete([
-          "_hibernation_roomsData",
-          "_hibernation_userSeatData",
-          "_hibernation_currentNumber",
-          "_hibernation_userCounts",
-          "_hibernation_onlineUsers",
-          "_hibernation_timestamp"
-        ]);
-      }
-    } catch(e) {}
-    
-    await this.ctx.storage.delete("_hibernating");
-    
-    // Set alarm
-    if (!this.closing && !this.isDestroyed) {
-      try {
-        await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
-      } catch(e) {}
-    }
-    
-    this._refreshRoomClients(true);
-  }
-
-  // ============================================================
-  // AUTO RESET ON DEPLOY (DITAMBAH DUKUNGAN HIBERNASI)
+  // AUTO RESET ON DEPLOY
   // ============================================================
   async _autoResetOnDeploy() {
     try {
-      // Cek apakah sedang hibernasi
-      const isHibernating = await this.ctx.storage.get("_hibernating");
-      if (isHibernating) {
-        this._isHibernating = true;
-        await this._wakeFromHibernation();
-        return;
-      }
-      
       const storedVersion = await this.ctx.storage.get("lastDeployVersion");
       
       if (storedVersion !== this._version) {
@@ -232,17 +91,6 @@ export class ChatServer {
         await this.ctx.storage.delete("userCounts");
         await this.ctx.storage.delete("onlineUsers");
         await this.ctx.storage.delete("lastReset");
-        
-        // Hapus data hibernasi
-        await this.ctx.storage.delete([
-          "_hibernation_roomsData",
-          "_hibernation_userSeatData",
-          "_hibernation_currentNumber",
-          "_hibernation_userCounts",
-          "_hibernation_onlineUsers",
-          "_hibernation_timestamp",
-          "_hibernating"
-        ]);
         
         // RESET MEMORY
         this.currentNumber = 1;
@@ -284,18 +132,10 @@ export class ChatServer {
   }
 
   // ============================================================
-  // INITIALIZE FROM STORAGE (DITAMBAH DUKUNGAN HIBERNASI)
+  // INITIALIZE FROM STORAGE
   // ============================================================
   async _initFromStorage() {
     try {
-      // Cek apakah ada data hibernasi
-      const isHibernating = await this.ctx.storage.get("_hibernating");
-      if (isHibernating) {
-        this._isHibernating = true;
-        await this._wakeFromHibernation();
-        return;
-      }
-      
       const roomsData = await this.ctx.storage.get("roomsData") || {};
       const userSeatData = await this.ctx.storage.get("userSeatData") || {};
       const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
@@ -376,12 +216,9 @@ export class ChatServer {
   }
 
   // ============================================================
-  // SAVE TO STORAGE (DITAMBAH RESET HIBERNASI)
+  // SAVE TO STORAGE
   // ============================================================
   async _saveToStorage(roomsData, userSeatData, currentNumber) {
-    // Reset hibernation timer karena ada aktivitas
-    this._resetHibernationTimer();
-    
     try {
       const updates = {};
       
@@ -475,19 +312,15 @@ export class ChatServer {
   }
 
   // ============================================================
-  // HANDLE JOIN - FIX MULTI USER (DITAMBAH RESET HIBERNASI)
+  // HANDLE JOIN
   // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
     }
     
-    // Reset hibernation timer
-    this._resetHibernationTimer();
-    
     const username = ws.username;
     
-    // 1. GET DATA LANGSUNG DARI STORAGE
     let roomsData = await this._getRoomsData();
     let userSeatData = await this._getUserSeatData();
     const currentNumber = await this._getCurrentNumber();
@@ -496,17 +329,14 @@ export class ChatServer {
     const seatInfo = userSeatData[username];
     const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
     
-    // 2. CLEANUP DUPLIKAT - PERBAIKAN UNTUK MULTI USER
     let oldRoom = null;
     let oldSeat = null;
     
-    // CEK DARI USER SEAT DATA (UNTUK SEMUA USER)
     if (seatInfo && seatInfo.room) {
       oldRoom = seatInfo.room;
       oldSeat = seatInfo.seat;
     }
     
-    // JIKA TIDAK DITEMUKAN, CEK DARI WEBSOCKET (UNTUK MULTI USER)
     if (!oldRoom) {
       if (ws._isMulti && ws._multiRoom && ws._multiSeat) {
         oldRoom = ws._multiRoom;
@@ -514,7 +344,6 @@ export class ChatServer {
       }
     }
     
-    // JIKA TIDAK DITEMUKAN, CEK SEMUA ROOM (UNTUK USER NORMAL)
     if (!oldRoom) {
       for (const [roomNameKey, roomData] of Object.entries(roomsData)) {
         if (!roomData || !roomData.seats) continue;
@@ -533,38 +362,31 @@ export class ChatServer {
       }
     }
     
-    // 3. HAPUS DARI ROOM LAMA DI STORAGE
     if (oldRoom && oldSeat !== null && roomsData[oldRoom]) {
       const roomData = roomsData[oldRoom];
       
-      // HAPUS KURSI
       delete roomData.seats[oldSeat];
       if (roomData.points) {
         delete roomData.points[oldSeat];
       }
       
-      // HAPUS DARI USER SEAT DATA
       if (userSeatData[username]) {
         delete userSeatData[username];
       }
       
-      // HAPUS DARI ONLINE USERS
       if (this._onlineUsers.has(username)) {
         this._onlineUsers.delete(username);
       }
       
-      // HAPUS ROOM JIKA KOSONG
       const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
       const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
       if (!hasSeats && !hasPoints) {
         delete roomsData[oldRoom];
       }
       
-      // BROADCAST HAPUS KURSI
       this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
       await this.updateRoomCount(oldRoom);
       
-      // HAPUS DARI ROOM CLIENTS
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
           clients.delete(ws);
@@ -572,10 +394,8 @@ export class ChatServer {
       }
     }
     
-    // 4. SIMPAN PERUBAHAN KE STORAGE
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
-    // 5. TAMBAHKAN KE ROOM BARU DI STORAGE
     let newRoomData = roomsData[roomName];
     if (!newRoomData) {
       newRoomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -601,10 +421,8 @@ export class ChatServer {
       return false;
     }
     
-    // KURSI KOSONG
     newRoomData.seats[newSeat] = {};
     
-    // 6. UPDATE USER SEAT DATA DI STORAGE
     userSeatData[username] = {
       room: roomName,
       seat: newSeat,
@@ -613,10 +431,8 @@ export class ChatServer {
       multiSeat: isMulti ? newSeat : null
     };
     
-    // 7. SIMPAN KE STORAGE
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
-    // 8. UPDATE WEBSOCKET
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -642,7 +458,6 @@ export class ChatServer {
     
     this._refreshRoomClients(true);
     
-    // 9. KIRIM RESPONSE
     this.safeSend(ws, ["rooMasuk", newSeat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", newSeat]);
     this.safeSend(ws, ["muteTypeResponse", newRoomData.muted || false, roomName]);
@@ -921,13 +736,10 @@ export class ChatServer {
   }
 
   // ============================================================
-  // WEBSOCKET EVENTS (DITAMBAH RESET HIBERNASI)
+  // WEBSOCKET EVENTS
   // ============================================================
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
-    
-    // Reset hibernation timer karena ada aktivitas
-    this._resetHibernationTimer();
     
     try {
       let attachment = null;
@@ -1057,7 +869,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // HANDLE MESSAGE (DITAMBAH RESET HIBERNASI)
+  // HANDLE MESSAGE
   // ============================================================
   async handleMessage(ws, raw) {
     if (!ws) return;
@@ -1066,9 +878,6 @@ export class ChatServer {
         return;
       }
     } catch(e) { return; }
-    
-    // Reset hibernation timer
-    this._resetHibernationTimer();
     
     try {
       let str = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
@@ -1706,7 +1515,6 @@ export class ChatServer {
         }
         
         case "clearCacheTotal": {
-          // HAPUS SEMUA DATA DI STORAGE
           await this.ctx.storage.delete("roomsData");
           await this.ctx.storage.delete("userSeatData");
           await this.ctx.storage.delete("currentNumber");
@@ -1716,18 +1524,6 @@ export class ChatServer {
           await this.ctx.storage.delete("lastDeployVersion");
           await this.ctx.storage.delete("lastDeployTime");
           
-          // Hapus data hibernasi
-          await this.ctx.storage.delete([
-            "_hibernation_roomsData",
-            "_hibernation_userSeatData",
-            "_hibernation_currentNumber",
-            "_hibernation_userCounts",
-            "_hibernation_onlineUsers",
-            "_hibernation_timestamp",
-            "_hibernating"
-          ]);
-          
-          // RESET MEMORY
           this.currentNumber = 1;
           this._onlineUsers.clear();
           this._userCounts = {};
@@ -1738,7 +1534,6 @@ export class ChatServer {
             this.roomClients.set(room, new Set());
           }
           
-          // TUTUP SEMUA WEBSOCKET
           const webSockets = this._getActiveWebSockets();
           for (const ws of webSockets) {
             try {
@@ -1776,15 +1571,10 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ALARM (DITAMBAH CEK HIBERNASI)
+  // ALARM
   // ============================================================
   async alarm() {
     if (this.closing || this.isDestroyed) return;
-    
-    // Jangan jalankan alarm jika hibernasi
-    if (this._isHibernating) {
-      return;
-    }
     
     await this._updateNumber();
     await this._cleanupStorage();
@@ -1853,7 +1643,6 @@ export class ChatServer {
     const timestamp = Date.now();
     
     try {
-      // HAPUS SEMUA DATA DI STORAGE
       await this.ctx.storage.delete("roomsData");
       await this.ctx.storage.delete("userSeatData");
       await this.ctx.storage.delete("currentNumber");
@@ -1861,18 +1650,6 @@ export class ChatServer {
       await this.ctx.storage.delete("onlineUsers");
       await this.ctx.storage.delete("lastReset");
       
-      // Hapus data hibernasi
-      await this.ctx.storage.delete([
-        "_hibernation_roomsData",
-        "_hibernation_userSeatData",
-        "_hibernation_currentNumber",
-        "_hibernation_userCounts",
-        "_hibernation_onlineUsers",
-        "_hibernation_timestamp",
-        "_hibernating"
-      ]);
-      
-      // RESET MEMORY
       this.currentNumber = 1;
       this._onlineUsers.clear();
       this._userCounts = {};
@@ -1925,20 +1702,12 @@ export class ChatServer {
   }
 
   // ============================================================
-  // FETCH (DITAMBAH DUKUNGAN HIBERNASI)
+  // FETCH
   // ============================================================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
     }
-    
-    // Jika hibernasi, wake up
-    if (this._isHibernating) {
-      await this._wakeFromHibernation();
-    }
-    
-    // Reset hibernation timer
-    this._resetHibernationTimer();
     
     try {
       const url = new URL(req.url);
@@ -1960,17 +1729,6 @@ export class ChatServer {
         await this.ctx.storage.delete("lastReset");
         await this.ctx.storage.delete("lastDeployVersion");
         await this.ctx.storage.delete("lastDeployTime");
-        
-        // Hapus data hibernasi
-        await this.ctx.storage.delete([
-          "_hibernation_roomsData",
-          "_hibernation_userSeatData",
-          "_hibernation_currentNumber",
-          "_hibernation_userCounts",
-          "_hibernation_onlineUsers",
-          "_hibernation_timestamp",
-          "_hibernating"
-        ]);
         
         this.currentNumber = 1;
         this._onlineUsers.clear();
@@ -2030,10 +1788,7 @@ export class ChatServer {
           versionTimestamp: this._deployInfo.timestamp,
           lastReset: await this.ctx.storage.get("lastReset") || null,
           roomsDataKeys: Object.keys(roomsData),
-          userSeatDataKeys: Object.keys(userSeatData),
-          // Tambahan info hibernasi
-          isHibernating: this._isHibernating,
-          lastActivityTime: this._lastActivityTime
+          userSeatDataKeys: Object.keys(userSeatData)
         };
         return new Response(JSON.stringify(status), {
           status: 200,
@@ -2108,33 +1863,12 @@ export class ChatServer {
   }
 
   // ============================================================
-  // DESTROY (DITAMBAH SAVE HIBERNASI)
+  // DESTROY
   // ============================================================
   async destroy() {
     if (this.isDestroyed) return;
     this.closing = true;
     this.isDestroyed = true;
-    
-    // Simpan state untuk hibernasi
-    try {
-      const roomsData = await this._getRoomsData();
-      const userSeatData = await this._getUserSeatData();
-      
-      await this.ctx.storage.put({
-        "_hibernation_roomsData": roomsData,
-        "_hibernation_userSeatData": userSeatData,
-        "_hibernation_currentNumber": this.currentNumber,
-        "_hibernation_userCounts": this._userCounts,
-        "_hibernation_onlineUsers": Array.from(this._onlineUsers),
-        "_hibernation_timestamp": Date.now()
-      });
-    } catch(e) {}
-    
-    // Hapus timer hibernasi
-    if (this._hibernationTimer) {
-      clearTimeout(this._hibernationTimer);
-      this._hibernationTimer = null;
-    }
     
     await this._cleanupStorage();
     
