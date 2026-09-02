@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-HIBERNATION-FULL-FIXED.js
-// VERSION: 7.1.0 - NO LOOP, CLEAN HIBERNATE
+// VERSION: 7.2.0 - CACHE ONLY, NO KV/STORAGE ON READ
 // ============================================================
 
 const CONSTANTS = {
@@ -1001,7 +1001,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // 3 LAYER DATA FUNCTIONS
+  // 3 LAYER DATA FUNCTIONS - WRITE ONLY
   // ============================================================
   
   _getKVKey(key) {
@@ -1015,6 +1015,9 @@ export class GameServer {
     return keyMap[key] || key;
   }
 
+  // ============================================================
+  // WRITE: CACHE -> STORAGE -> KV
+  // ============================================================
   async _setDataTo3Layer(key, data) {
     try {
       if (key === 'cachedLastWeekWinner') {
@@ -1069,14 +1072,15 @@ export class GameServer {
     }
   }
 
-  async _getDataFrom3Layer(key) {
+  // ============================================================
+  // READ: LANGSUNG DARI CACHE (NO STORAGE/KV)
+  // ============================================================
+  _getDataFromCache(key) {
     try {
-      let data = null;
-      
       if (key === 'cachedLastWeekWinner') {
-        data = this._cachedLastWeekWinner;
+        return this._cachedLastWeekWinner || this.diceGameSystem._cachedLastWeekWinner;
       } else if (key === 'dicePointsBackup') {
-        data = this.diceGameSystem.pointsCache.getPoints();
+        return this.diceGameSystem.pointsCache.getPoints();
       } else if (key === 'recordingStatusMap') {
         const map = {};
         for (const [room, status] of this.cacheManager.recordingStatus) {
@@ -1084,54 +1088,38 @@ export class GameServer {
             map[room] = true;
           }
         }
-        data = map;
+        return map;
       } else if (key === 'winnersMap') {
         const map = {};
         for (const [room, cache] of this.cacheManager.winnersCache) {
           map[room] = cache.winners;
         }
-        data = map;
+        return map;
       } else if (key === 'last_weekly_reset_week') {
-        data = this._lastResetWeek;
+        return this._lastResetWeek;
       }
-      
-      if (!data || Object.keys(data).length === 0) {
-        return null;
-      }
-      
-      return data;
+      return null;
     } catch(e) {
       return null;
     }
   }
 
+  // ============================================================
+  // VERIFY 3 LAYER (OPTIONAL, DEBUGGING SAJA)
+  // ============================================================
   async _verify3Layer(key) {
     try {
-      let cacheData = null;
-      if (key === 'cachedLastWeekWinner') {
-        cacheData = this._cachedLastWeekWinner;
-      } else if (key === 'dicePointsBackup') {
-        cacheData = this.diceGameSystem.pointsCache.getPoints();
-      } else if (key === 'recordingStatusMap') {
-        const map = {};
-        for (const [room, status] of this.cacheManager.recordingStatus) {
-          if (status === true) {
-            map[room] = true;
-          }
-        }
-        cacheData = map;
-      } else if (key === 'winnersMap') {
-        const map = {};
-        for (const [room, cache] of this.cacheManager.winnersCache) {
-          map[room] = cache.winners;
-        }
-        cacheData = map;
-      }
+      // CACHE
+      let cacheData = this._getDataFromCache(key);
       
+      // STORAGE
       const storageData = await this.ctx.storage.get(key);
+      
+      // KV
       const kvKey = this._getKVKey(key);
       const kvData = await this.env.QUESTIONS.get(kvKey, 'json');
       
+      // ✅ HANYA UNTUK DEBUG, TIDAK UNTUK GET DATA
       return {
         cache: cacheData,
         storage: storageData,
@@ -1310,6 +1298,7 @@ export class GameServer {
 
   async _handleWeeklyReset() {
     try {
+      // READ FROM CACHE
       const points = this.diceGameSystem.pointsCache.getPoints() || {};
       
       let winner = null;
@@ -1421,7 +1410,6 @@ export class GameServer {
       
       this.alarmScheduler.scheduleAlarms().catch(() => {});
       
-      // ✅ CEK SEKALI, TIDAK BERULANG
       if (!this.closing && !this.isDestroyed) {
         this._checkAndStartCurrentSession();
       }
@@ -1885,6 +1873,7 @@ export class GameServer {
           this._safeSend(ws, ["recordingError", "Room name required"]);
           return;
         }
+        // ✅ LANGSUNG DARI CACHE
         const isRecording = this.cacheManager.getRecordingStatus(roomName);
         this._safeSend(ws, ["recordingStatus", isRecording]);
         return;
@@ -1926,6 +1915,7 @@ export class GameServer {
           this._safeSend(ws, ["recordingError", "Room name required"]);
           return;
         }
+        // ✅ LANGSUNG DARI CACHE
         const isRecording = this.cacheManager.getRecordingStatus(room);
         const winners = this.cacheManager.getWinners(room);
         this._safeSend(ws, ["roomWinners", { winners: winners || {}, room, recording: isRecording || false }]);
@@ -1937,6 +1927,9 @@ export class GameServer {
         return;
       }
 
+      // ============================================================
+      // ✅ GET DICE LAST WEEK WINNER - LANGSUNG DARI CACHE
+      // ============================================================
       if (evt === "getDiceLastWeekWinner") {
         try {
           const wsId = ws._wsId;
@@ -1949,7 +1942,8 @@ export class GameServer {
           }
           this._lastWinnerRequestTime.set(wsId, now);
           
-          const winner = await this._getDataFrom3Layer('cachedLastWeekWinner');
+          // ✅ LANGSUNG DARI CACHE
+          const winner = this._cachedLastWeekWinner || this.diceGameSystem._cachedLastWeekWinner;
           
           if (winner && winner.username) {
             this._safeSend(ws, ["diceLastWeekWinner", winner.username, winner.score || 0, winner.week || ""]);
@@ -1972,30 +1966,44 @@ export class GameServer {
         return;
       }
 
+      // ============================================================
+      // ✅ GET DICE LEADERBOARD - LANGSUNG DARI CACHE
+      // ============================================================
       if (evt === "getDiceLeaderboard") {
         try {
           let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
-          const points = await this._getDataFrom3Layer('dicePointsBackup');
+          
+          // ✅ LANGSUNG DARI CACHE
+          const points = this.diceGameSystem.pointsCache.getPoints();
+          
           if (!points || Object.keys(points).length === 0) {
             this._safeSend(ws, ["diceLeaderboard", []]);
             return;
           }
+          
           const sorted = Object.entries(points).sort((a, b) => b[1] - a[1]);
           const leaderboard = sorted.slice(0, limit);
           this._safeSend(ws, ["diceLeaderboard", leaderboard.map(([u, s]) => `${u}|${s}`)]);
+          
         } catch(e) { 
           this._safeSend(ws, ["diceLeaderboard", []]);
         }
         return;
       }
 
+      // ============================================================
+      // ✅ GET DICE POINTS - LANGSUNG DARI CACHE
+      // ============================================================
       if (evt === "getDicePoints") {
         try {
-          const points = await this._getDataFrom3Layer('dicePointsBackup');
+          // ✅ LANGSUNG DARI CACHE
+          const points = this.diceGameSystem.pointsCache.getPoints();
+          
           if (!points || Object.keys(points).length === 0) {
             this._safeSend(ws, ["dicePoints", {}]);
             return;
           }
+          
           this._safeSend(ws, ["dicePoints", points]);
         } catch(e) { 
           this._safeSend(ws, ["dicePoints", {}]);
@@ -2051,6 +2059,9 @@ export class GameServer {
         return;
       }
 
+      // ============================================================
+      // VERIFY 3 LAYER - DEBUGGING SAJA
+      // ============================================================
       if (evt === "verify3Layer") {
         try {
           const key = data[1] || 'dicePointsBackup';
