@@ -614,7 +614,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // HANDLE JOIN - PERBAIKAN: SEMUA USER (TERMASUK MULTI) KEHILANGAN DATA
+  // HANDLE JOIN - FIX TOTAL: SEMUA USER KEHILANGAN DATA
   // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -628,25 +628,41 @@ export class ChatServer {
     // 1. CLEANUP DUPLIKAT
     await this._cleanupDuplicateUser(username);
     
-    // 2. CARI DAN HAPUS USER DARI SEMUA ROOM - PERBAIKAN UNTUK MULTI USER
+    // 2. CARI DAN HAPUS USER DARI SEMUA ROOM - FIX UNTUK SEMUA USER
     let oldRoom = null;
     let oldSeat = null;
     let oldRoomData = null;
     
-    // CEK DARI CACHE USER SEAT DATA (UNTUK MULTI USER)
+    // CEK DARI CACHE USER SEAT DATA (UNTUK SEMUA USER)
     const seatInfoCache = this._userSeatDataCache[username];
     if (seatInfoCache && seatInfoCache.room) {
       oldRoom = seatInfoCache.room;
       oldSeat = seatInfoCache.seat;
       oldRoomData = this._roomsDataCache[oldRoom];
+      
+      // VERIFIKASI: Pastikan data benar-benar ada di room
+      if (oldRoomData && oldRoomData.seats && oldRoomData.seats[oldSeat]) {
+        // Data ditemukan di cache
+      } else {
+        // Cache tidak valid, reset
+        oldRoom = null;
+        oldSeat = null;
+        oldRoomData = null;
+        delete this._userSeatDataCache[username];
+      }
     }
     
-    // JIKA TIDAK DITEMUKAN DI CACHE, CEK SEMUA ROOM (UNTUK USER NORMAL)
+    // JIKA TIDAK DITEMUKAN DI CACHE, CEK SEMUA ROOM
     if (!oldRoom) {
       for (const [roomNameKey, roomData] of Object.entries(this._roomsDataCache)) {
         if (!roomData || !roomData.seats) continue;
         for (const [seat, data] of Object.entries(roomData.seats)) {
-          if (data && data.namauser === username) {
+          // CEK: data.namauser ATAU data kosong dengan seatInfo di cache
+          const isUserHere = 
+            (data && data.namauser === username) ||
+            (seatInfoCache && parseInt(seat) === seatInfoCache.seat && roomNameKey === seatInfoCache.room);
+          
+          if (isUserHere) {
             oldRoom = roomNameKey;
             oldSeat = parseInt(seat);
             oldRoomData = roomData;
@@ -657,28 +673,36 @@ export class ChatServer {
       }
     }
     
-    // 3. HAPUS DARI ROOM LAMA - SEKARANG MULTI USER JUGA TERHAPUS
+    // 3. HAPUS DARI ROOM LAMA - TERMASUK HAPUS DARI CACHE DAN STORAGE
     if (oldRoom && oldSeat !== null && oldRoomData) {
+      // HAPUS DARI ROOM
       delete oldRoomData.seats[oldSeat];
       if (oldRoomData.points) {
         delete oldRoomData.points[oldSeat];
       }
+      
+      // HAPUS DARI CACHE USER SEAT DATA
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
       }
+      
+      // HAPUS DARI ONLINE USERS
       if (this._onlineUsers.has(username)) {
         this._onlineUsers.delete(username);
       }
       
+      // HAPUS ROOM JIKA KOSONG
       const hasSeats = oldRoomData.seats && Object.keys(oldRoomData.seats).length > 0;
       const hasPoints = oldRoomData.points && Object.keys(oldRoomData.points).length > 0;
       if (!hasSeats && !hasPoints) {
         delete this._roomsDataCache[oldRoom];
       }
       
+      // BROADCAST HAPUS KURSI
       this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
       await this.updateRoomCount(oldRoom);
       
+      // HAPUS DARI ROOM CLIENTS
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
           clients.delete(ws);
@@ -686,7 +710,7 @@ export class ChatServer {
       }
     }
     
-    // 4. SIMPAN KE STORAGE
+    // 4. SIMPAN KE STORAGE - PASTIKAN DATA TERHAPUS DI STORAGE
     await this._saveToStorage(
       this._roomsDataCache,
       this._userSeatDataCache,
@@ -720,7 +744,7 @@ export class ChatServer {
     }
     
     // ============================================================
-    // ✅ HANYA KURSI KOSONG - TANPA DATA (SAMA UNTUK SEMUA USER)
+    // ✅ KURSI KOSONG - TANPA DATA (SAMA UNTUK SEMUA USER)
     // ============================================================
     newRoomData.seats[newSeat] = {};
     
