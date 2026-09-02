@@ -1,5 +1,6 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.14 - FIX RESET DATA - MULTI USER TETAP
+// VERSION: 9.3.15 - AUTO VERSION WITH TIMESTAMP
+// DEPLOY: 2026-09-02 14:30:00 UTC
 
 const C = {
   MAX_SEATS: 45,
@@ -17,6 +18,20 @@ const ROOMS = [
 
 const ROOMS_SET = new Set(ROOMS);
 
+// ============================================================
+// AUTO VERSION GENERATOR
+// ============================================================
+const DEPLOY_VERSION = {
+  version: "9.3.15",
+  timestamp: Date.now(),
+  deployDate: new Date().toISOString(),
+  buildId: Math.random().toString(36).substring(2, 8).toUpperCase(),
+  environment: process.env.ENVIRONMENT || "production"
+};
+
+// GENERATE UNIQUE VERSION PER DEPLOY
+const SERVER_VERSION = `v${DEPLOY_VERSION.version}-${DEPLOY_VERSION.buildId}-${DEPLOY_VERSION.timestamp}`;
+
 export class ChatServer {
   constructor(state, env) {
     this.state = state;
@@ -25,6 +40,11 @@ export class ChatServer {
     this.closing = false;
     this.isDestroyed = false;
     this._startTime = Date.now();
+    
+    // VERSION INFO
+    this._version = SERVER_VERSION;
+    this._deployInfo = DEPLOY_VERSION;
+    this._deployTime = new Date().toISOString();
     
     this.roomClients = new Map();
     for (const room of ROOMS) {
@@ -44,6 +64,11 @@ export class ChatServer {
     this._isNumberUpdating = false;
     this._isRestoring = false;
     this._lastRefreshTime = 0;
+    
+    // LOG DEPLOY
+    console.log(`[${this._deployTime}] Server deployed: ${this._version}`);
+    console.log(`[${this._deployTime}] Build ID: ${this._deployInfo.buildId}`);
+    console.log(`[${this._deployTime}] Environment: ${this._deployInfo.environment}`);
     
     this._restoreAllState().then(() => {});
   }
@@ -107,6 +132,10 @@ export class ChatServer {
         updates.currentNumber = currentNumber;
       }
       
+      // SIMPAN VERSION JUGA
+      updates.lastDeployVersion = this._version;
+      updates.lastDeployTime = this._deployTime;
+      
       if (Object.keys(updates).length > 0) {
         await this.ctx.storage.put(updates);
       }
@@ -143,7 +172,9 @@ export class ChatServer {
       
       await this.ctx.storage.put({
         userCounts: this._userCounts,
-        onlineUsers: Array.from(this._onlineUsers)
+        onlineUsers: Array.from(this._onlineUsers),
+        lastDeployVersion: this._version,
+        lastDeployTime: this._deployTime
       });
       
       return { counts: newCounts, total: totalUsers };
@@ -163,12 +194,24 @@ export class ChatServer {
         const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
         const userCounts = await this.ctx.storage.get("userCounts") || {};
         const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
+        const lastDeployVersion = await this.ctx.storage.get("lastDeployVersion") || "unknown";
+        const lastDeployTime = await this.ctx.storage.get("lastDeployTime") || "unknown";
         
         this._roomsDataCache = roomsData;
         this._userSeatDataCache = userSeatData;
         this.currentNumber = currentNumber;
         this._userCounts = userCounts;
         this._onlineUsers = new Set(onlineUsers);
+        
+        // LOG STORAGE VERSION
+        console.log(`[${this._deployTime}] Storage version: ${lastDeployVersion}`);
+        console.log(`[${this._deployTime}] Storage deploy time: ${lastDeployTime}`);
+        console.log(`[${this._deployTime}] Current version: ${this._version}`);
+        
+        // CEK APAKAH ADA PERUBAHAN VERSION
+        if (lastDeployVersion !== this._version) {
+          console.log(`[${this._deployTime}] VERSION CHANGED: ${lastDeployVersion} -> ${this._version}`);
+        }
       }
       
       return {
@@ -176,7 +219,9 @@ export class ChatServer {
         userSeatData: this._userSeatDataCache,
         currentNumber: this.currentNumber,
         userCounts: this._userCounts,
-        onlineUsers: Array.from(this._onlineUsers)
+        onlineUsers: Array.from(this._onlineUsers),
+        lastDeployVersion: this._version,
+        lastDeployTime: this._deployTime
       };
     } catch(e) {
       return { 
@@ -184,7 +229,9 @@ export class ChatServer {
         userSeatData: {}, 
         currentNumber: 1,
         userCounts: {},
-        onlineUsers: []
+        onlineUsers: [],
+        lastDeployVersion: this._version,
+        lastDeployTime: this._deployTime
       };
     }
   }
@@ -622,7 +669,9 @@ export class ChatServer {
       isMulti: isMulti,
       multiRoom: isMulti ? roomName : null,
       multiSeat: isMulti ? seat : null,
-      seatInfo: newSeatInfo
+      seatInfo: newSeatInfo,
+      serverVersion: this._version,
+      serverDeploy: this._deployTime
     });
     
     ws._cachedRoom = roomName;
@@ -647,6 +696,7 @@ export class ChatServer {
     this.safeSend(ws, ["rooMasuk", seat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", seat]);
     this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
+    this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
     
     const count = Object.keys(roomData.seats).length;
     this.safeSend(ws, ["roomUserCount", roomName, count]);
@@ -806,6 +856,7 @@ export class ChatServer {
       
       const count = Object.keys(allSeats).length;
       this.safeSend(ws, ["roomUserCount", room, count]);
+      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
       
       if (allSeats && Object.keys(allSeats).length > 0) {
         if (excludeSelf && selfSeat && allSeats[selfSeat]) {
@@ -1116,12 +1167,18 @@ export class ChatServer {
     ws._cachedUsername = username;
     ws._cachedRoom = null;
     
-    ws.serializeAttachment({ username: username });
+    ws.serializeAttachment({ 
+      username: username,
+      serverVersion: this._version,
+      serverDeploy: this._deployTime
+    });
     
     if (isNewUser) { 
       this.safeSend(ws, ["joinroomawal"]); 
+      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
     } else { 
       this.safeSend(ws, ["needJoinRoom"]); 
+      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
     }
   }
 
@@ -1172,6 +1229,10 @@ export class ChatServer {
           this.safeSend(ws, ["currentNumber", this.currentNumber]);
           break;
         
+        case "getServerVersion":
+          this.safeSend(ws, ["serverVersion", this._version, this._deployTime, this._deployInfo]);
+          break;
+        
         // ============================================================
         // setIdTarget2 - FIX MULTI USER
         // ============================================================
@@ -1203,7 +1264,9 @@ export class ChatServer {
                 isMulti: true,
                 multiRoom: seatInfo.room,
                 multiSeat: seatInfo.seat,
-                seatInfo: seatInfo
+                seatInfo: seatInfo,
+                serverVersion: this._version,
+                serverDeploy: this._deployTime
               });
               
               // TAMBAHKAN KE roomClients
@@ -1213,6 +1276,7 @@ export class ChatServer {
               }
               
               // ✅ HANYA needJoinRoom (TANPA EVENT TAMBAHAN LAIN)
+              this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
               
               this._refreshRoomClients(true);
               return;  // ← LANGSUNG RETURN
@@ -1307,7 +1371,9 @@ export class ChatServer {
             isMulti: true,
             multiRoom: multiRoomname,
             multiSeat: seat,
-            seatInfo: seatInfo
+            seatInfo: seatInfo,
+            serverVersion: this._version,
+            serverDeploy: this._deployTime
           });
           
           ws._cachedUsername = multiUsername;
@@ -1335,7 +1401,9 @@ export class ChatServer {
                   isMulti: true,
                   multiRoom: multiRoomname,
                   multiSeat: seat,
-                  seatInfo: seatInfo
+                  seatInfo: seatInfo,
+                  serverVersion: this._version,
+                  serverDeploy: this._deployTime
                 });
                 wsKey._cachedUsername = multiUsername;
                 wsKey._cachedRoom = multiRoomname;
@@ -1354,6 +1422,7 @@ export class ChatServer {
           this._refreshRoomClients(true);
           
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
+          this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
           this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
           
           break;
@@ -1426,7 +1495,9 @@ export class ChatServer {
                     isMulti: true,
                     multiRoom: roomName,
                     multiSeat: seatNumber
-                  }
+                  },
+                  serverVersion: this._version,
+                  serverDeploy: this._deployTime
                 });
                 
                 wsKey._cachedUsername = targetUsername;
@@ -1443,6 +1514,7 @@ export class ChatServer {
                 foundAny = true;
                 
                 this.safeSend(wsKey, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
+                this.safeSend(wsKey, ["serverVersion", this._version, this._deployTime]);
                 
                 if (wsKey !== ws) {
                   this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
@@ -1817,12 +1889,23 @@ export class ChatServer {
       const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
       const userCounts = await this.ctx.storage.get("userCounts") || {};
       const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
+      const lastDeployVersion = await this.ctx.storage.get("lastDeployVersion") || "unknown";
+      const lastDeployTime = await this.ctx.storage.get("lastDeployTime") || "unknown";
       
       this._roomsDataCache = roomsData;
       this._userSeatDataCache = userSeatData;
       this.currentNumber = currentNumber;
       this._userCounts = userCounts;
       this._onlineUsers = new Set(onlineUsers);
+      
+      // LOG VERSION INFO
+      console.log(`[${this._deployTime}] Storage version: ${lastDeployVersion}`);
+      console.log(`[${this._deployTime}] Storage deploy time: ${lastDeployTime}`);
+      console.log(`[${this._deployTime}] Current version: ${this._version}`);
+      
+      if (lastDeployVersion !== this._version) {
+        console.log(`[${this._deployTime}] ⚠️ VERSION CHANGED: ${lastDeployVersion} -> ${this._version}`);
+      }
       
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
@@ -1870,7 +1953,9 @@ export class ChatServer {
                 isMulti: isMulti,
                 multiRoom: attachment.multiRoom || roomName,
                 multiSeat: attachment.multiSeat || seatNumber,
-                seatInfo: userSeat
+                seatInfo: userSeat,
+                serverVersion: this._version,
+                serverDeploy: this._deployTime
               });
               
               this._onlineUsers.add(attachment.username);
@@ -1978,6 +2063,10 @@ export class ChatServer {
       await this.ctx.storage.put("userCounts", this._userCounts);
       await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       
+      // SIMPAN VERSION
+      await this.ctx.storage.put("lastDeployVersion", this._version);
+      await this.ctx.storage.put("lastDeployTime", this._deployTime);
+      
       // ✅ 5. KIRIM PESAN RESET KE SEMUA USER (KECUALI MULTI)
       const resetMessage = JSON.stringify(["serverReset", "Server di-reset pada: " + new Date(timestamp).toLocaleString()]);
       const multiResetMessage = JSON.stringify(["serverResetMulti", "Server di-reset, data multi user tetap dipertahankan"]);
@@ -1990,6 +2079,7 @@ export class ChatServer {
             if (isMulti) {
               // MULTI USER: KIRIM PESAN KHUSUS
               ws.send(multiResetMessage);
+              ws.send(JSON.stringify(["serverVersion", this._version, this._deployTime]));
             } else {
               // USER BIASA: KIRIM PESAN RESET + CLOSE
               ws.send(resetMessage);
@@ -2014,14 +2104,17 @@ export class ChatServer {
         message: "Reset data berhasil, multi user tetap dipertahankan",
         multiUsersKept: Object.keys(multiUsersData),
         timestamp: timestamp,
-        resetTime: new Date(timestamp).toLocaleString()
+        resetTime: new Date(timestamp).toLocaleString(),
+        serverVersion: this._version,
+        deployTime: this._deployTime
       };
       
     } catch(e) {
       return {
         success: false,
         error: e.message,
-        timestamp: timestamp
+        timestamp: timestamp,
+        serverVersion: this._version
       };
     }
   }
@@ -2062,7 +2155,8 @@ export class ChatServer {
             success: result,
             username: username,
             message: "Multi WebSocket cleaned, data preserved",
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            serverVersion: this._version
           }), {
             status: result ? 200 : 404,
             headers: { "Content-Type": "application/json" }
@@ -2084,9 +2178,26 @@ export class ChatServer {
           currentNumber: this.currentNumber,
           isClosing: this.closing,
           isDestroyed: this.isDestroyed,
-          uptime: Date.now() - this._startTime
+          uptime: Date.now() - this._startTime,
+          serverVersion: this._version,
+          deployTime: this._deployTime,
+          buildId: this._deployInfo.buildId,
+          environment: this._deployInfo.environment
         };
         return new Response(JSON.stringify(status), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      
+      if (url.pathname === "/version") {
+        return new Response(JSON.stringify({
+          version: this._version,
+          deployTime: this._deployTime,
+          buildId: this._deployInfo.buildId,
+          environment: this._deployInfo.environment,
+          timestamp: Date.now()
+        }), {
           status: 200,
           headers: { "Content-Type": "application/json" }
         });
@@ -2126,7 +2237,10 @@ export class ChatServer {
       server._cachedUsername = null;
       server._cachedRoom = null;
       
-      server.serializeAttachment({});
+      server.serializeAttachment({
+        serverVersion: this._version,
+        serverDeploy: this._deployTime
+      });
       
       this._refreshRoomClients(true);
       
@@ -2153,8 +2267,8 @@ export class ChatServer {
     const webSockets = this._getActiveWebSockets();
     for (const ws of webSockets) {
       if (ws?.readyState === 1) {
-        try { ws.send(JSON.stringify(["serverShutdown", "Server shutting down"])); } catch(e) {}
-        try { ws.close(1000, "Shutdown"); } catch(e) {}
+        try { ws.send(JSON.stringify(["serverShutdown", "Server shutting down", this._version])); } catch(e) {}
+        try { ws.close(1000, "Shutdown - " + this._version); } catch(e) {}
       }
     }
     
