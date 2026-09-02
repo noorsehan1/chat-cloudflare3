@@ -85,9 +85,7 @@ export class ChatServer {
     console.log(`[${this._deployTime}] Environment: ${this._deployInfo.environment}`);
     console.log(`[${this._deployTime}] Timestamp: ${this._deployInfo.timestamp}`);
     
-    // ============================================================
-    // AUTO RESET PADA SETIAP DEPLOY
-    // ============================================================
+    // AUTO RESET ON DEPLOY
     this._autoResetOnDeploy().then(() => {});
   }
 
@@ -96,24 +94,17 @@ export class ChatServer {
   // ============================================================
   async _autoResetOnDeploy() {
     try {
-      // CEK VERSION SEBELUMNYA DI STORAGE
       const storedVersion = await this.ctx.storage.get("lastDeployVersion");
       
-      // LOG UNTUK DEBUG
       console.log(`[${this._deployTime}] Stored version: ${storedVersion}`);
       console.log(`[${this._deployTime}] Current version: ${this._version}`);
       
-      // ============================================================
-      // RESET DATA JIKA VERSION BERBEDA (DEPLOY BARU)
-      // ============================================================
       if (storedVersion !== this._version) {
         console.log(`[${this._deployTime}] 🔄 NEW DEPLOY DETECTED! Resetting all data...`);
         console.log(`[${this._deployTime}] Old version: ${storedVersion}`);
         console.log(`[${this._deployTime}] New version: ${this._version}`);
         
-        // === RESET SEMUA DATA ===
-        
-        // 1. RESET CACHE
+        // RESET SEMUA DATA
         this._roomsDataCache = {};
         this._userSeatDataCache = {};
         this.currentNumber = 1;
@@ -123,7 +114,7 @@ export class ChatServer {
           this._userCounts[room] = 0;
         }
         
-        // 2. HAPUS DARI STORAGE
+        // HAPUS DARI STORAGE
         await this.ctx.storage.delete("roomsData");
         await this.ctx.storage.delete("userSeatData");
         await this.ctx.storage.delete("currentNumber");
@@ -131,17 +122,17 @@ export class ChatServer {
         await this.ctx.storage.delete("onlineUsers");
         await this.ctx.storage.delete("lastReset");
         
-        // 3. SIMPAN VERSION BARU
+        // SIMPAN VERSION BARU
         await this.ctx.storage.put("lastDeployVersion", this._version);
         await this.ctx.storage.put("lastDeployTime", this._deployTime);
         await this.ctx.storage.put("lastReset", Date.now());
         
-        // 4. SET ALARM
+        // SET ALARM
         if (!this.closing && !this.isDestroyed) {
           await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
         }
         
-        // 5. KIRIM PESAN KE SEMUA CONNECTION
+        // KIRIM PESAN KE SEMUA CONNECTION
         const resetMessage = JSON.stringify(["serverReset", `Server di-reset pada: ${new Date().toLocaleString()}`]);
         const webSockets = this._getActiveWebSockets();
         for (const ws of webSockets) {
@@ -153,21 +144,16 @@ export class ChatServer {
           } catch(e) {}
         }
         
-        // 6. REFRESH ROOM CLIENTS
         this._refreshRoomClients(true);
         
         console.log(`[${this._deployTime}] ✅ Reset completed successfully!`);
-        console.log(`[${this._deployTime}] All data cleared for new deploy`);
       } else {
         console.log(`[${this._deployTime}] ℹ️ Same version, restoring existing data...`);
-        
-        // RESTORE DATA DARI STORAGE (VERSION SAMA)
         await this._restoreAllState();
       }
       
     } catch(e) {
       console.error(`[${this._deployTime}] Auto reset error:`, e);
-      // JIKA ERROR, RESTORE DATA
       await this._restoreAllState();
     }
   }
@@ -213,46 +199,89 @@ export class ChatServer {
     }
   }
 
-  // ============ CORE: UPDATE CACHE + STORAGE ============
-
+  // ============================================================
+  // REAL-TIME SAVE TO STORAGE - SEMUA DATA SINKRON
+  // ============================================================
   async _saveToStorage(roomsData, userSeatData, currentNumber) {
     try {
       const updates = {};
+      
+      // UPDATE ROOMS DATA
       if (roomsData !== undefined) {
         this._roomsDataCache = roomsData;
         updates.roomsData = roomsData;
       }
+      
+      // UPDATE USER SEAT DATA
       if (userSeatData !== undefined) {
         this._userSeatDataCache = userSeatData;
         updates.userSeatData = userSeatData;
       }
+      
+      // UPDATE CURRENT NUMBER
       if (currentNumber !== undefined) {
         this.currentNumber = currentNumber;
         updates.currentNumber = currentNumber;
       }
       
-      // SIMPAN VERSION JUGA
+      // SELALU UPDATE VERSION
       updates.lastDeployVersion = this._version;
       updates.lastDeployTime = this._deployTime;
       
+      // SELALU UPDATE USER COUNTS (REAL-TIME)
+      const userCounts = {};
+      let totalUsers = 0;
+      for (const room of ROOMS) {
+        const roomData = this._roomsDataCache[room];
+        const count = roomData?.seats ? Object.keys(roomData.seats).length : 0;
+        userCounts[room] = count;
+        totalUsers += count;
+      }
+      this._userCounts = userCounts;
+      updates.userCounts = userCounts;
+      
+      // SELALU UPDATE ONLINE USERS (REAL-TIME)
+      this._onlineUsers.clear();
+      for (const [username] of Object.entries(this._userSeatDataCache)) {
+        this._onlineUsers.add(username);
+      }
+      updates.onlineUsers = Array.from(this._onlineUsers);
+      
+      // SIMPAN SEMUA KE STORAGE
       if (Object.keys(updates).length > 0) {
         await this.ctx.storage.put(updates);
+        console.log(`[${this._deployTime}] ✅ Real-time save: ${Object.keys(updates).join(', ')}`);
       }
+      
+      return {
+        roomsData: this._roomsDataCache,
+        userSeatData: this._userSeatDataCache,
+        currentNumber: this.currentNumber,
+        userCounts: this._userCounts,
+        onlineUsers: Array.from(this._onlineUsers)
+      };
+      
     } catch(e) {
+      console.error(`[${this._deployTime}] Save to storage error:`, e);
+      // JIKA ERROR, COBA RECOVER
       try {
         const storage = await this.ctx.storage.get(["roomsData", "userSeatData", "currentNumber"]);
         if (storage.roomsData !== undefined) this._roomsDataCache = storage.roomsData;
         if (storage.userSeatData !== undefined) this._userSeatDataCache = storage.userSeatData;
         if (storage.currentNumber !== undefined) this.currentNumber = storage.currentNumber;
-      } catch(err) {}
+      } catch(err) {
+        console.error(`[${this._deployTime}] Recovery failed:`, err);
+      }
       throw e;
     }
   }
 
-  // ============ USER COUNT MANAGEMENT ============
-
+  // ============================================================
+  // REAL-TIME UPDATE USER COUNTS
+  // ============================================================
   async _updateUserCounts() {
     try {
+      // HITUNG DARI CACHE
       const newCounts = {};
       let totalUsers = 0;
       
@@ -264,11 +293,14 @@ export class ChatServer {
       }
       
       this._userCounts = newCounts;
+      
+      // UPDATE ONLINE USERS DARI CACHE
       this._onlineUsers.clear();
       for (const [username] of Object.entries(this._userSeatDataCache)) {
         this._onlineUsers.add(username);
       }
       
+      // SIMPAN KE STORAGE
       await this.ctx.storage.put({
         userCounts: this._userCounts,
         onlineUsers: Array.from(this._onlineUsers),
@@ -276,8 +308,12 @@ export class ChatServer {
         lastDeployTime: this._deployTime
       });
       
+      console.log(`[${this._deployTime}] ✅ User counts updated:`, this._userCounts);
+      
       return { counts: newCounts, total: totalUsers };
+      
     } catch(e) {
+      console.error(`[${this._deployTime}] Update user counts error:`, e);
       return { counts: this._userCounts, total: this._onlineUsers.size };
     }
   }
@@ -286,32 +322,27 @@ export class ChatServer {
 
   async _loadFromStorage() {
     try {
-      if (Object.keys(this._roomsDataCache).length === 0 && 
-          Object.keys(this._userSeatDataCache).length === 0) {
-        const roomsData = await this.ctx.storage.get("roomsData") || {};
-        const userSeatData = await this.ctx.storage.get("userSeatData") || {};
-        const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
-        const userCounts = await this.ctx.storage.get("userCounts") || {};
-        const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
-        const lastDeployVersion = await this.ctx.storage.get("lastDeployVersion") || "unknown";
-        const lastDeployTime = await this.ctx.storage.get("lastDeployTime") || "unknown";
-        
-        this._roomsDataCache = roomsData;
-        this._userSeatDataCache = userSeatData;
-        this.currentNumber = currentNumber;
-        this._userCounts = userCounts;
-        this._onlineUsers = new Set(onlineUsers);
-        
-        // LOG STORAGE VERSION
-        console.log(`[${this._deployTime}] Storage version: ${lastDeployVersion}`);
-        console.log(`[${this._deployTime}] Storage deploy time: ${lastDeployTime}`);
-        console.log(`[${this._deployTime}] Current version: ${this._version}`);
-        
-        // CEK APAKAH ADA PERUBAHAN VERSION
-        if (lastDeployVersion !== this._version) {
-          console.log(`[${this._deployTime}] VERSION CHANGED: ${lastDeployVersion} -> ${this._version}`);
-        }
-      }
+      // SELALU LOAD DARI STORAGE
+      const roomsData = await this.ctx.storage.get("roomsData") || {};
+      const userSeatData = await this.ctx.storage.get("userSeatData") || {};
+      const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
+      const userCounts = await this.ctx.storage.get("userCounts") || {};
+      const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
+      const lastDeployVersion = await this.ctx.storage.get("lastDeployVersion") || "unknown";
+      const lastDeployTime = await this.ctx.storage.get("lastDeployTime") || "unknown";
+      
+      // UPDATE CACHE
+      this._roomsDataCache = roomsData;
+      this._userSeatDataCache = userSeatData;
+      this.currentNumber = currentNumber;
+      this._userCounts = userCounts;
+      this._onlineUsers = new Set(onlineUsers);
+      
+      console.log(`[${this._deployTime}] Storage version: ${lastDeployVersion}`);
+      console.log(`[${this._deployTime}] Storage deploy time: ${lastDeployTime}`);
+      console.log(`[${this._deployTime}] Current version: ${this._version}`);
+      console.log(`[${this._deployTime}] Loaded rooms: ${Object.keys(roomsData).length}`);
+      console.log(`[${this._deployTime}] Loaded users: ${Object.keys(userSeatData).length}`);
       
       return {
         roomsData: this._roomsDataCache,
@@ -319,10 +350,12 @@ export class ChatServer {
         currentNumber: this.currentNumber,
         userCounts: this._userCounts,
         onlineUsers: Array.from(this._onlineUsers),
-        lastDeployVersion: this._version,
-        lastDeployTime: this._deployTime
+        lastDeployVersion: lastDeployVersion,
+        lastDeployTime: lastDeployTime
       };
+      
     } catch(e) {
+      console.error(`[${this._deployTime}] Load from storage error:`, e);
       return { 
         roomsData: {}, 
         userSeatData: {}, 
@@ -435,15 +468,13 @@ export class ChatServer {
       removed = true;
     }
     
-    // 4. SIMPAN KE STORAGE (DATA SUDAH DI-DELETE)
+    // 4. SIMPAN KE STORAGE (REAL-TIME)
     if (removed) {
       await this._saveToStorage(
         this._roomsDataCache,
         this._userSeatDataCache,
         this.currentNumber
       );
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-      await this._updateUserCounts();
     }
     
     return removed;
@@ -503,8 +534,6 @@ export class ChatServer {
       if (!seatInfo.isMulti) {
         delete this._userSeatDataCache[username];
         await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-        this._onlineUsers.delete(username);
-        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       }
     }
     
@@ -518,8 +547,6 @@ export class ChatServer {
             isMulti: false 
           };
           await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-          this._onlineUsers.add(username);
-          await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
           return { room: roomName, seat: parseInt(seat), isMulti: false };
         }
       }
@@ -562,9 +589,6 @@ export class ChatServer {
       this._userSeatDataCache,
       this.currentNumber
     );
-    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-    
-    await this._updateUserCounts();
     
     this.broadcast(roomName, ["removeKursi", roomName, seat]);
     await this.updateRoomCount(roomName);
@@ -588,6 +612,7 @@ export class ChatServer {
       viptanda: data.viptanda || 0
     };
     
+    // SIMPAN KE STORAGE REAL-TIME
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     return true;
   }
@@ -597,9 +622,9 @@ export class ChatServer {
     if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
     
     if (!roomData.points) roomData.points = {};
-    // REPLACE data points
     roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
     
+    // SIMPAN KE STORAGE REAL-TIME
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     return true;
   }
@@ -608,8 +633,7 @@ export class ChatServer {
     delete this._userSeatDataCache[username];
     await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
     this._onlineUsers.delete(username);
-    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-    await this._updateUserCounts();
+    await this._saveToStorage(undefined, undefined, undefined);
   }
 
   async _deleteRoomIfEmpty(roomName) {
@@ -620,20 +644,13 @@ export class ChatServer {
     const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
     
     if (!hasSeats && !hasPoints) {
-      // DELETE room
       delete this._roomsDataCache[roomName];
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-      await this._updateUserCounts();
     }
   }
 
   // ============ JOIN HANDLING ============
 
-  // ========================================
-  // HANDLE JOIN - PINDAH ROOM
-  // FIX: MULTI USER - STORAGE DAN CACHE SINKRON
-  // VERSION: Auto-generated
-  // ========================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -645,9 +662,7 @@ export class ChatServer {
     const seatInfo = this._userSeatDataCache[username];
     const isMulti = seatInfo ? (seatInfo.isMulti || false) : false;
     
-    // ============================================================
     // 1. CARI DATA USER DI SEMUA ROOM
-    // ============================================================
     let oldRoom = null;
     let oldSeat = null;
     
@@ -663,45 +678,33 @@ export class ChatServer {
       if (oldRoom) break;
     }
     
-    // ============================================================
     // 2. HAPUS DARI ROOM LAMA
-    // ============================================================
     if (isMulti && oldRoom && oldSeat !== null) {
-      // MULTI USER: HANYA HAPUS DARI ROOM LAMA
       const oldRoomData = this._roomsDataCache[oldRoom];
       if (oldRoomData && oldRoomData.seats && oldRoomData.seats[oldSeat]) {
-        // HAPUS DARI ROOM LAMA
         delete oldRoomData.seats[oldSeat];
         if (oldRoomData.points) {
           delete oldRoomData.points[oldSeat];
         }
         
-        // ✅ SIMPAN KE STORAGE
         await this._saveToStorage(this._roomsDataCache, undefined, undefined);
         
-        // BROADCAST
         this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
         await this.updateRoomCount(oldRoom);
         await this._deleteRoomIfEmpty(oldRoom);
       }
       
-      // ✅ HAPUS DARI roomClients
       for (const [room, clients] of this.roomClients) {
         if (clients.has(ws)) {
           clients.delete(ws);
         }
       }
       
-      // ✅ PERTAHANKAN _userSeatDataCache DAN _onlineUsers UNTUK MULTI
-      
     } else if (!isMulti && oldRoom && oldSeat !== null) {
-      // USER BIASA: HAPUS DARI SEMUA ROOM
       await this._removeUserFromAllRooms(username);
     }
     
-    // ============================================================
     // 3. TAMBAHKAN KE ROOM BARU
-    // ============================================================
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -739,10 +742,10 @@ export class ChatServer {
       viptanda: 0
     };
     
-    // ✅ SIMPAN KE STORAGE
+    // SIMPAN KE STORAGE REAL-TIME
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     
-    // ✅ UPDATE USER SEAT DATA
+    // UPDATE USER SEAT DATA
     const newSeatInfo = { 
       room: roomName, 
       seat: seat, 
@@ -751,16 +754,11 @@ export class ChatServer {
     this._userSeatDataCache[username] = newSeatInfo;
     await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
     
-    // ✅ UPDATE ONLINE USERS
+    // UPDATE ONLINE USERS
     this._onlineUsers.add(username);
-    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+    await this._saveToStorage(undefined, undefined, undefined);
     
-    // ✅ UPDATE USER COUNTS
-    await this._updateUserCounts();
-    
-    // ============================================================
-    // 4. UPDATE WEBSOCKET PROPERTIES
-    // ============================================================
+    // UPDATE WEBSOCKET PROPERTIES
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -784,14 +782,9 @@ export class ChatServer {
     ws._multiSeat = isMulti ? seat : null;
     ws._closing = false;
     
-    // ============================================================
-    // 5. REFRESH ROOM CLIENTS
-    // ============================================================
     this._refreshRoomClients(true);
     
-    // ============================================================
-    // 6. KIRIM RESPONSE
-    // ============================================================
+    // KIRIM RESPONSE
     this.safeSend(ws, ["rooMasuk", seat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", seat]);
     this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
@@ -855,8 +848,6 @@ export class ChatServer {
         this.currentNumber
       );
       
-      await this._updateUserCounts();
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       this._refreshRoomClients(true);
       
     } catch(e) {
@@ -1131,8 +1122,6 @@ export class ChatServer {
           this._userSeatDataCache,
           this.currentNumber
         );
-        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-        await this._updateUserCounts();
       }
     } catch(e) {
       console.error("Cleanup orphaned users error:", e);
@@ -1254,7 +1243,6 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    // ✅ LANGSUNG SETOR WS TANPA REMOVE
     ws.username = username;
     ws.idtarget = username;
     ws.room = null;
@@ -1332,9 +1320,6 @@ export class ChatServer {
           this.safeSend(ws, ["serverVersion", this._version, this._deployTime, this._deployInfo]);
           break;
         
-        // ============================================================
-        // setIdTarget2 - FIX MULTI USER
-        // ============================================================
         case "setIdTarget2": {
           const username = args[0];
           const isNewUser = args[1];
@@ -1342,9 +1327,7 @@ export class ChatServer {
           if (username) {
             const seatInfo = this._userSeatDataCache[username];
             
-            // KHUSUS MULTI + isNewUser=false: SETOR WS AJA, LANGSUNG RETURN
             if (seatInfo && seatInfo.isMulti && !isNewUser) {
-              // SETOR WS TANPA HAPUS DATA
               ws.username = username;
               ws.idtarget = username;
               ws.room = seatInfo.room;
@@ -1368,24 +1351,20 @@ export class ChatServer {
                 serverDeploy: this._deployTime
               });
               
-              // TAMBAHKAN KE roomClients
               const roomClients = this.roomClients.get(seatInfo.room);
               if (roomClients) {
                 roomClients.add(ws);
               }
               
-              // ✅ HANYA needJoinRoom (TANPA EVENT TAMBAHAN LAIN)
               this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
               
               this._refreshRoomClients(true);
-              return;  // ← LANGSUNG RETURN
+              return;
             }
             
-            // USER BIASA: HAPUS DATA DULU
             await this._removeUserFromAllRooms(username);
           }
           
-          // USER BIASA: SETOR WS
           await this._handleSetId(ws, username, isNewUser);
           break;
         }
@@ -1460,8 +1439,7 @@ export class ChatServer {
           await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
           
           this._onlineUsers.add(multiUsername);
-          await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-          await this._updateUserCounts();
+          await this._saveToStorage(undefined, undefined, undefined);
           
           ws.serializeAttachment({
             username: multiUsername,
@@ -1685,8 +1663,6 @@ export class ChatServer {
               this._userSeatDataCache,
               this.currentNumber
             );
-            await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-            await this._updateUserCounts();
             
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
@@ -1997,15 +1973,17 @@ export class ChatServer {
       this._userCounts = userCounts;
       this._onlineUsers = new Set(onlineUsers);
       
-      // LOG VERSION INFO
       console.log(`[${this._deployTime}] Storage version: ${lastDeployVersion}`);
       console.log(`[${this._deployTime}] Storage deploy time: ${lastDeployTime}`);
       console.log(`[${this._deployTime}] Current version: ${this._version}`);
+      console.log(`[${this._deployTime}] Restored rooms: ${Object.keys(roomsData).length}`);
+      console.log(`[${this._deployTime}] Restored users: ${Object.keys(userSeatData).length}`);
       
       if (lastDeployVersion !== this._version) {
         console.log(`[${this._deployTime}] ⚠️ VERSION CHANGED: ${lastDeployVersion} -> ${this._version}`);
       }
       
+      // VALIDASI DATA
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
           if (!seatInfo?.isMulti) {
@@ -2064,14 +2042,13 @@ export class ChatServer {
       }
       
       this._refreshRoomClients(true);
-      await this._updateUserCounts();
       
+      // SYNC KE STORAGE
       await this._saveToStorage(
         this._roomsDataCache,
         this._userSeatDataCache,
         this.currentNumber
       );
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       
       if (!this.closing && !this.isDestroyed) {
         const existingAlarm = await this.ctx.storage.getAlarm();
@@ -2088,23 +2065,19 @@ export class ChatServer {
   }
 
   // ============ RESET ALL DATA ============
-  // FIX: RESET HANYA UNTUK USER BIASA, MULTI USER TETAP
-  // VERSION: Auto-generated
 
   async resetAllData() {
     const timestamp = Date.now();
     
     try {
-      // ✅ 1. KUMPULKAN DATA MULTI USER YANG HARUS DI-PERTAHANKAN
+      // KUMPULKAN DATA MULTI USER
       const multiUsersData = {};
       const multiUsersSeatInfo = {};
       
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (seatInfo && seatInfo.isMulti) {
-          // SIMPAN DATA MULTI USER
           multiUsersData[username] = seatInfo;
           
-          // SIMPAN JUGA DATA KURSI MULTI USER
           const roomData = this._roomsDataCache[seatInfo.room];
           if (roomData && roomData.seats && roomData.seats[seatInfo.seat]) {
             multiUsersSeatInfo[seatInfo.room] = multiUsersSeatInfo[seatInfo.room] || {};
@@ -2113,7 +2086,7 @@ export class ChatServer {
         }
       }
       
-      // ✅ 2. RESET DATA NON-MULTI
+      // RESET DATA NON-MULTI
       this._roomsDataCache = {};
       this._userSeatDataCache = {};
       this.currentNumber = 1;
@@ -2123,12 +2096,11 @@ export class ChatServer {
         this._userCounts[room] = 0;
       }
       
-      // ✅ 3. KEMBALIKAN DATA MULTI USER
+      // KEMBALIKAN DATA MULTI USER
       for (const [username, seatInfo] of Object.entries(multiUsersData)) {
         this._userSeatDataCache[username] = seatInfo;
         this._onlineUsers.add(username);
         
-        // KEMBALIKAN DATA KURSI MULTI USER
         const roomName = seatInfo.room;
         const seatNumber = seatInfo.seat;
         
@@ -2140,33 +2112,27 @@ export class ChatServer {
           this._roomsDataCache[roomName].seats[seatNumber] = multiUsersSeatInfo[roomName][seatNumber];
         }
         
-        // UPDATE USER COUNTS
         this._userCounts[roomName] = (this._userCounts[roomName] || 0) + 1;
       }
       
-      // ✅ 4. SIMPAN KE STORAGE
+      // SIMPAN KE STORAGE
       await this.ctx.storage.delete("roomsData");
       await this.ctx.storage.delete("userSeatData");
       await this.ctx.storage.delete("currentNumber");
       await this.ctx.storage.delete("userCounts");
       await this.ctx.storage.delete("onlineUsers");
       
-      // SIMPAN DATA MULTI USER
-      if (Object.keys(this._roomsDataCache).length > 0) {
-        await this.ctx.storage.put("roomsData", this._roomsDataCache);
-      }
-      if (Object.keys(this._userSeatDataCache).length > 0) {
-        await this.ctx.storage.put("userSeatData", this._userSeatDataCache);
-      }
-      await this.ctx.storage.put("currentNumber", this.currentNumber);
-      await this.ctx.storage.put("userCounts", this._userCounts);
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+      await this._saveToStorage(
+        this._roomsDataCache,
+        this._userSeatDataCache,
+        this.currentNumber
+      );
       
-      // SIMPAN VERSION
       await this.ctx.storage.put("lastDeployVersion", this._version);
       await this.ctx.storage.put("lastDeployTime", this._deployTime);
+      await this.ctx.storage.put("lastReset", timestamp);
       
-      // ✅ 5. KIRIM PESAN RESET KE SEMUA USER (KECUALI MULTI)
+      // KIRIM PESAN RESET
       const resetMessage = JSON.stringify(["serverReset", "Server di-reset pada: " + new Date(timestamp).toLocaleString()]);
       const multiResetMessage = JSON.stringify(["serverResetMulti", "Server di-reset, data multi user tetap dipertahankan"]);
       
@@ -2176,11 +2142,9 @@ export class ChatServer {
           if (ws.readyState === 1) {
             const isMulti = ws._isMulti || false;
             if (isMulti) {
-              // MULTI USER: KIRIM PESAN KHUSUS
               ws.send(multiResetMessage);
               ws.send(JSON.stringify(["serverVersion", this._version, this._deployTime]));
             } else {
-              // USER BIASA: KIRIM PESAN RESET + CLOSE
               ws.send(resetMessage);
               ws.close(1000, "Server reset - " + timestamp);
             }
@@ -2188,15 +2152,11 @@ export class ChatServer {
         } catch(e) {}
       }
       
-      // ✅ 6. REFRESH ROOM CLIENTS
       this._refreshRoomClients(true);
       
-      // ✅ 7. SET ALARM
       if (!this.closing && !this.isDestroyed) {
         await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
       }
-      
-      await this.ctx.storage.put("lastReset", timestamp);
       
       return {
         success: true,
@@ -2283,7 +2243,9 @@ export class ChatServer {
           buildId: this._deployInfo.buildId,
           environment: this._deployInfo.environment,
           versionTimestamp: this._deployInfo.timestamp,
-          lastReset: await this.ctx.storage.get("lastReset") || null
+          lastReset: await this.ctx.storage.get("lastReset") || null,
+          roomsDataKeys: Object.keys(this._roomsDataCache),
+          userSeatDataKeys: Object.keys(this._userSeatDataCache)
         };
         return new Response(JSON.stringify(status), {
           status: 200,
