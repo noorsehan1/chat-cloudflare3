@@ -77,7 +77,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // AUTO RESET ON DEPLOY
+  // AUTO RESET ON DEPLOY - TIDAK HAPUS MULTI USER
   // ============================================================
   async _autoResetOnDeploy() {
     try {
@@ -114,7 +114,15 @@ export class ChatServer {
               }
               
               if (seatInfo.seat && !roomsData[seatInfo.room].seats[seatInfo.seat]) {
-                roomsData[seatInfo.room].seats[seatInfo.seat] = {};
+                roomsData[seatInfo.room].seats[seatInfo.seat] = {
+                  namauser: username,
+                  noimageUrl: "",
+                  color: "",
+                  itembawah: 0,
+                  itematas: 0,
+                  vip: 0,
+                  viptanda: 0
+                };
               }
               
               restoredUserSeatData[username] = {
@@ -359,7 +367,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // HANDLE JOIN
+  // HANDLE JOIN - SUPPORT MULTI USER PINDAH ROOM
   // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -379,11 +387,13 @@ export class ChatServer {
     let oldRoom = null;
     let oldSeat = null;
     
+    // CEK DARI SEAT INFO
     if (seatInfo && seatInfo.room) {
       oldRoom = seatInfo.room;
       oldSeat = seatInfo.seat;
     }
     
+    // CEK DARI WS
     if (!oldRoom) {
       if (ws._isMulti && ws._multiRoom && ws._multiSeat) {
         oldRoom = ws._multiRoom;
@@ -391,6 +401,7 @@ export class ChatServer {
       }
     }
     
+    // CEK DARI ROOMS DATA
     if (!oldRoom) {
       for (const [roomNameKey, roomData] of Object.entries(roomsData)) {
         if (!roomData || !roomData.seats) continue;
@@ -409,6 +420,7 @@ export class ChatServer {
       }
     }
     
+    // HAPUS DARI ROOM LAMA (JIKA ADA) - SAMA UNTUK SEMUA USER
     if (oldRoom && oldSeat !== null && roomsData[oldRoom]) {
       const roomData = roomsData[oldRoom];
       
@@ -417,8 +429,25 @@ export class ChatServer {
         delete roomData.points[oldSeat];
       }
       
+      // HAPUS DARI USER SEAT DATA (TAPI SIMPAN FLAG MULTI JIKA ADA)
       if (userSeatData[username]) {
+        // SIMPAN INFO MULTI SEBELUM DIHAPUS
+        const isMultiUser = userSeatData[username].isMulti || false;
+        const multiRoom = userSeatData[username].multiRoom || null;
+        const multiSeat = userSeatData[username].multiSeat || null;
+        
         delete userSeatData[username];
+        
+        // JIKA MULTI USER, SIMPAN ULANG DENGAN FLAG MULTI (AKAN DIUPDATE NANTI)
+        if (isMultiUser) {
+          userSeatData[username] = {
+            room: roomName,
+            seat: null,
+            isMulti: true,
+            multiRoom: multiRoom || roomName,
+            multiSeat: multiSeat || null
+          };
+        }
       }
       
       if (this._onlineUsers.has(username)) {
@@ -443,6 +472,7 @@ export class ChatServer {
     
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
+    // JOIN KE ROOM BARU
     let newRoomData = roomsData[roomName];
     if (!newRoomData) {
       newRoomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -468,25 +498,40 @@ export class ChatServer {
       return false;
     }
     
-    newRoomData.seats[newSeat] = {};
+    // SET KURSI BARU DENGAN NAMA USER
+    newRoomData.seats[newSeat] = {
+      namauser: username,
+      noimageUrl: "",
+      color: "",
+      itembawah: 0,
+      itematas: 0,
+      vip: 0,
+      viptanda: 0
+    };
+    
+    // UPDATE USER SEAT DATA - PERTAHANKAN FLAG MULTI JIKA ADA
+    const isStillMulti = userSeatData[username]?.isMulti || isMulti || false;
+    const multiRoom = userSeatData[username]?.multiRoom || (isStillMulti ? roomName : null);
+    const multiSeat = userSeatData[username]?.multiSeat || (isStillMulti ? newSeat : null);
     
     userSeatData[username] = {
       room: roomName,
       seat: newSeat,
-      isMulti: isMulti,
-      multiRoom: isMulti ? roomName : null,
-      multiSeat: isMulti ? newSeat : null
+      isMulti: isStillMulti,
+      multiRoom: isStillMulti ? roomName : null,
+      multiSeat: isStillMulti ? newSeat : null
     };
     
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
+    // UPDATE WS ATTACHMENT
     ws.serializeAttachment({
       username: username,
       room: roomName,
       seat: newSeat,
-      isMulti: isMulti,
-      multiRoom: isMulti ? roomName : null,
-      multiSeat: isMulti ? newSeat : null,
+      isMulti: isStillMulti,
+      multiRoom: isStillMulti ? roomName : null,
+      multiSeat: isStillMulti ? newSeat : null,
       seatInfo: userSeatData[username],
       serverVersion: this._version,
       serverDeploy: this._deployTime
@@ -498,17 +543,22 @@ export class ChatServer {
     ws.room = roomName;
     ws.roomname = roomName;
     ws.idtarget = username;
-    ws._isMulti = isMulti;
-    ws._multiRoom = isMulti ? roomName : null;
-    ws._multiSeat = isMulti ? newSeat : null;
+    ws._isMulti = isStillMulti;
+    ws._multiRoom = isStillMulti ? roomName : null;
+    ws._multiSeat = isStillMulti ? newSeat : null;
     ws._closing = false;
     
     this._refreshRoomClients(true);
     
+    // KIRIM RESPONSE - SAMA UNTUK SEMUA USER
     this.safeSend(ws, ["rooMasuk", newSeat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", newSeat]);
     this.safeSend(ws, ["muteTypeResponse", newRoomData.muted || false, roomName]);
-    this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+    
+    // KIRIM INFO MULTI JIKA MULTI USER
+    if (isStillMulti) {
+      this.safeSend(ws, ["multiRoomChanged", username, roomName, newSeat]);
+    }
     
     const count = Object.keys(newRoomData.seats).length;
     this.safeSend(ws, ["roomUserCount", roomName, count]);
@@ -756,7 +806,6 @@ export class ChatServer {
       
       const count = Object.keys(allSeats).length;
       this.safeSend(ws, ["roomUserCount", room, count]);
-      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
       
       if (allSeats && Object.keys(allSeats).length > 0) {
         if (excludeSelf && selfSeat && allSeats[selfSeat]) {
@@ -917,10 +966,8 @@ export class ChatServer {
     
     if (isNewUser) { 
       this.safeSend(ws, ["joinroomawal"]); 
-      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
     } else { 
       this.safeSend(ws, ["needJoinRoom"]); 
-      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
     }
   }
 
@@ -1013,7 +1060,6 @@ export class ChatServer {
                 roomClients.add(ws);
               }
               
-              this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
               this._refreshRoomClients(true);
               return;
             }
@@ -1025,9 +1071,33 @@ export class ChatServer {
           break;
         }
         
-        case "joinRoom":
-          await this._handleJoin(ws, args[0]);
+        case "joinRoom": {
+          const roomName = args[0];
+          if (!roomName) {
+            this.safeSend(ws, ["joinRoomError", "Room name required"]);
+            break;
+          }
+          
+          if (!ROOMS_SET.has(roomName)) {
+            this.safeSend(ws, ["joinRoomError", "Invalid room"]);
+            break;
+          }
+          
+          // CEK APAKAH USER SUDAH ADA DI ROOM TERSEBUT
+          const userSeatData = await this._getUserSeatData();
+          const seatInfo = userSeatData[ws.username];
+          
+          if (seatInfo && seatInfo.room === roomName) {
+            this.safeSend(ws, ["joinRoomError", "Anda sudah di room ini"]);
+            break;
+          }
+          
+          const result = await this._handleJoin(ws, roomName);
+          if (!result) {
+            this.safeSend(ws, ["joinRoomError", "Gagal join room"]);
+          }
           break;
+        }
         
         case "multiJoin": {
           const multiUsername = args[0];
@@ -1157,7 +1227,6 @@ export class ChatServer {
           this._refreshRoomClients(true);
           
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-          this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
           this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
           
           break;
@@ -1251,7 +1320,6 @@ export class ChatServer {
                 foundAny = true;
                 
                 this.safeSend(wsKey, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
-                this.safeSend(wsKey, ["serverVersion", this._version, this._deployTime]);
                 
                 if (wsKey !== ws) {
                   this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
