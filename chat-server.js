@@ -1,4 +1,4 @@
-// ==================== CHAT-SERVER-HIBERNATION-FULL.js ====================
+// ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
 // VERSION: 10.0.1 - FIXED CONST ERROR - FULL HIBERNATION SUPPORT
 
 const C = {
@@ -484,7 +484,6 @@ export class ChatServer {
   }
 
   async _updateKursi(roomName, seat, data) {
-    // ✅ FIX: let bukan const
     let roomData = this._roomsDataCache[roomName];
     if (!roomData || !roomData.seats) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -557,7 +556,6 @@ export class ChatServer {
     }
     this._onlineUsers.delete(username);
     
-    // ✅ FIX: let bukan const
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -565,7 +563,6 @@ export class ChatServer {
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     }
     
-    // UPDATE WEBSOCKET KE ROOM BARU (TANPA KURSI)
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -1252,7 +1249,6 @@ export class ChatServer {
           }
           this._onlineUsers.delete(multiUsername);
           
-          // ✅ FIX: let bukan const
           let roomData = this._roomsDataCache[multiRoomname];
           if (!roomData) {
             roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -1260,7 +1256,6 @@ export class ChatServer {
             await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           }
           
-          // UPDATE WEBSOCKET KE ROOM BARU (TANPA KURSI)
           const seatInfo = {
             room: multiRoomname,
             seat: null,
@@ -1298,7 +1293,6 @@ export class ChatServer {
           
           await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
           
-          // UPDATE WEBSOCKET LAIN
           const webSockets = this._getActiveWebSockets();
           for (const wsKey of webSockets) {
             if (wsKey === ws) continue;
