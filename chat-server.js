@@ -80,6 +80,12 @@ export class ChatServer {
     this._isNumberUpdating = false;
     this._lastRefreshTime = 0;
     
+    // Cache untuk menyimpan data storage
+    this._cacheRoomsData = {};
+    this._cacheUserSeatData = {};
+    this._cacheUserCounts = {};
+    this._cacheOnlineUsers = [];
+    
     this._initializeServer();
   }
 
@@ -262,7 +268,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // INITIALIZE FROM STORAGE
+  // INITIALIZE FROM STORAGE - LOAD KE CACHE
   // ============================================================
   async _initFromStorage() {
     try {
@@ -276,18 +282,19 @@ export class ChatServer {
       
       const [roomsDataResult, userSeatDataResult, currentNumberResult, userCountsResult, onlineUsersResult] = results;
       
-      const roomsData = roomsDataResult.status === 'fulfilled' ? roomsDataResult.value : {};
-      const userSeatData = userSeatDataResult.status === 'fulfilled' ? userSeatDataResult.value : {};
+      // LOAD KE CACHE
+      this._cacheRoomsData = roomsDataResult.status === 'fulfilled' ? roomsDataResult.value : {};
+      this._cacheUserSeatData = userSeatDataResult.status === 'fulfilled' ? userSeatDataResult.value : {};
       const currentNumber = currentNumberResult.status === 'fulfilled' ? currentNumberResult.value : 1;
-      const userCounts = userCountsResult.status === 'fulfilled' ? userCountsResult.value : {};
-      const onlineUsers = onlineUsersResult.status === 'fulfilled' ? onlineUsersResult.value : [];
+      this._cacheUserCounts = userCountsResult.status === 'fulfilled' ? userCountsResult.value : {};
+      this._cacheOnlineUsers = onlineUsersResult.status === 'fulfilled' ? onlineUsersResult.value : [];
       
       this.currentNumber = currentNumber;
-      this._userCounts = userCounts;
-      this._onlineUsers = new Set(onlineUsers);
+      this._userCounts = this._cacheUserCounts;
+      this._onlineUsers = new Set(this._cacheOnlineUsers);
       
       for (const room of ROOMS) {
-        const roomData = roomsData[room];
+        const roomData = this._cacheRoomsData[room];
         if (roomData && roomData.muted !== undefined) {
           this._muteStates.set(room, roomData.muted);
         } else {
@@ -300,7 +307,7 @@ export class ChatServer {
         try {
           const attachment = ws.deserializeAttachment();
           if (attachment && attachment.username) {
-            const userSeat = userSeatData[attachment.username];
+            const userSeat = this._cacheUserSeatData[attachment.username];
             if (userSeat) {
               ws.username = attachment.username;
               ws.room = userSeat.room;
@@ -334,7 +341,7 @@ export class ChatServer {
       
       this._refreshRoomClients(true);
       
-      console.log('Init from storage completed');
+      console.log('Init from storage completed - Cache loaded');
       
     } catch(e) {
       console.error('Init from storage error:', e);
@@ -343,23 +350,96 @@ export class ChatServer {
   }
 
   // ============================================================
-  // GET DATA FROM STORAGE
+  // RESTORE FROM CACHE
+  // ============================================================
+  async _restoreFromCache() {
+    try {
+      // Restore dari cache ke memory
+      this._roomsData = this._cacheRoomsData;
+      this._userSeatData = this._cacheUserSeatData;
+      this._userCounts = this._cacheUserCounts;
+      this._onlineUsers = new Set(this._cacheOnlineUsers);
+      
+      for (const room of ROOMS) {
+        const roomData = this._cacheRoomsData[room];
+        if (roomData && roomData.muted !== undefined) {
+          this._muteStates.set(room, roomData.muted);
+        }
+      }
+      
+      console.log('Restore from cache completed');
+      return true;
+    } catch(e) {
+      console.error('Restore from cache error:', e);
+      return false;
+    }
+  }
+
+  // ============================================================
+  // REFRESH CACHE FROM STORAGE
+  // ============================================================
+  async _refreshCacheFromStorage() {
+    try {
+      const results = await Promise.allSettled([
+        this.ctx.storage.get("roomsData"),
+        this.ctx.storage.get("userSeatData"),
+        this.ctx.storage.get("currentNumber"),
+        this.ctx.storage.get("userCounts"),
+        this.ctx.storage.get("onlineUsers")
+      ]);
+      
+      const [roomsDataResult, userSeatDataResult, currentNumberResult, userCountsResult, onlineUsersResult] = results;
+      
+      this._cacheRoomsData = roomsDataResult.status === 'fulfilled' ? roomsDataResult.value : {};
+      this._cacheUserSeatData = userSeatDataResult.status === 'fulfilled' ? userSeatDataResult.value : {};
+      this.currentNumber = currentNumberResult.status === 'fulfilled' ? currentNumberResult.value : 1;
+      this._cacheUserCounts = userCountsResult.status === 'fulfilled' ? userCountsResult.value : {};
+      this._cacheOnlineUsers = onlineUsersResult.status === 'fulfilled' ? onlineUsersResult.value : [];
+      
+      // Update memory
+      this._userCounts = this._cacheUserCounts;
+      this._onlineUsers = new Set(this._cacheOnlineUsers);
+      
+      console.log('Cache refreshed from storage');
+      return true;
+    } catch(e) {
+      console.error('Refresh cache error:', e);
+      return false;
+    }
+  }
+
+  // ============================================================
+  // GET DATA FROM STORAGE - DENGAN CACHE
   // ============================================================
   async _getRoomsData() {
     try {
-      return await this.ctx.storage.get("roomsData") || {};
+      // Cek cache dulu
+      if (this._cacheRoomsData && Object.keys(this._cacheRoomsData).length > 0) {
+        return this._cacheRoomsData;
+      }
+      
+      // Jika cache kosong, ambil dari storage
+      const data = await this.ctx.storage.get("roomsData") || {};
+      this._cacheRoomsData = data;
+      return data;
     } catch(e) {
       console.error('Get rooms data error:', e);
-      return {};
+      return this._cacheRoomsData || {};
     }
   }
 
   async _getUserSeatData() {
     try {
-      return await this.ctx.storage.get("userSeatData") || {};
+      if (this._cacheUserSeatData && Object.keys(this._cacheUserSeatData).length > 0) {
+        return this._cacheUserSeatData;
+      }
+      
+      const data = await this.ctx.storage.get("userSeatData") || {};
+      this._cacheUserSeatData = data;
+      return data;
     } catch(e) {
       console.error('Get user seat data error:', e);
-      return {};
+      return this._cacheUserSeatData || {};
     }
   }
 
@@ -374,24 +454,36 @@ export class ChatServer {
 
   async _getUserCounts() {
     try {
-      return await this.ctx.storage.get("userCounts") || {};
+      if (this._cacheUserCounts && Object.keys(this._cacheUserCounts).length > 0) {
+        return this._cacheUserCounts;
+      }
+      
+      const data = await this.ctx.storage.get("userCounts") || {};
+      this._cacheUserCounts = data;
+      return data;
     } catch(e) {
       console.error('Get user counts error:', e);
-      return {};
+      return this._cacheUserCounts || {};
     }
   }
 
   async _getOnlineUsers() {
     try {
-      return await this.ctx.storage.get("onlineUsers") || [];
+      if (this._cacheOnlineUsers && this._cacheOnlineUsers.length > 0) {
+        return this._cacheOnlineUsers;
+      }
+      
+      const data = await this.ctx.storage.get("onlineUsers") || [];
+      this._cacheOnlineUsers = data;
+      return data;
     } catch(e) {
       console.error('Get online users error:', e);
-      return [];
+      return this._cacheOnlineUsers || [];
     }
   }
 
   // ============================================================
-  // SAVE TO STORAGE
+  // SAVE TO STORAGE - UPDATE CACHE JUGA
   // ============================================================
   async _saveToStorage(roomsData, userSeatData, currentNumber) {
     if (this.closing || this.isDestroyed) return null;
@@ -415,10 +507,12 @@ export class ChatServer {
         
         if (roomsData !== undefined) {
           updates.roomsData = roomsData;
+          this._cacheRoomsData = roomsData; // Update cache
         }
         
         if (userSeatData !== undefined) {
           updates.userSeatData = userSeatData;
+          this._cacheUserSeatData = userSeatData; // Update cache
         }
         
         if (currentNumber !== undefined) {
@@ -439,11 +533,13 @@ export class ChatServer {
           totalUsers += count;
         }
         this._userCounts = userCounts;
+        this._cacheUserCounts = userCounts; // Update cache
         updates.userCounts = userCounts;
         
         const currentUserSeatData = userSeatData || await this._getUserSeatData();
         const onlineUsers = Object.keys(currentUserSeatData);
         this._onlineUsers = new Set(onlineUsers);
+        this._cacheOnlineUsers = onlineUsers; // Update cache
         updates.onlineUsers = onlineUsers;
         
         if (Object.keys(updates).length > 0) {
@@ -658,6 +754,11 @@ export class ChatServer {
     }
     
     const username = ws.username;
+    
+    // ============================================================
+    // REFRESH CACHE DARI STORAGE SEBELUM JOIN
+    // ============================================================
+    await this._refreshCacheFromStorage();
     
     let roomsData = await this._getRoomsData();
     let userSeatData = await this._getUserSeatData();
@@ -1007,6 +1108,7 @@ export class ChatServer {
       const count = Object.keys(roomData.seats).length;
       
       this._userCounts[room] = count;
+      this._cacheUserCounts[room] = count;
       await this.ctx.storage.put("userCounts", this._userCounts);
       
       this.broadcast(room, ["roomUserCount", room, count]);
@@ -1083,6 +1185,11 @@ export class ChatServer {
     if (ws.readyState !== 1) return;
     
     // ============================================================
+    // REFRESH CACHE DARI STORAGE
+    // ============================================================
+    await this._refreshCacheFromStorage();
+    
+    // ============================================================
     // CEK APAKAH USER MULTI DARI STORAGE
     // ============================================================
     const userSeatData = await this._getUserSeatData();
@@ -1095,6 +1202,7 @@ export class ChatServer {
     if (isMulti && !isNewUser) {
       console.log(`[MULTI] Restoring WS for multi user: ${username}`);
       
+      // RESTORE DATA DARI CACHE KE WS
       ws.username = username;
       ws.idtarget = username;
       ws.room = seatInfo.room;
@@ -1125,6 +1233,10 @@ export class ChatServer {
         roomClients.add(ws);
       }
       
+      // Tambahkan ke online users
+      this._onlineUsers.add(username);
+      this._cacheOnlineUsers = Array.from(this._onlineUsers);
+      
       this._refreshRoomClients(true);
       
       // Kirim response
@@ -1132,7 +1244,7 @@ export class ChatServer {
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
       this.safeSend(ws, ["rooMasukMulti", seatInfo.seat, seatInfo.room]);
       
-      // Kirim state room
+      // Kirim semua data dari cache ke client
       setTimeout(() => {
         try {
           if (ws && ws.readyState === 1) {
@@ -1275,6 +1387,11 @@ export class ChatServer {
       }
       
       // ============================================================
+      // REFRESH CACHE DARI STORAGE
+      // ============================================================
+      await this._refreshCacheFromStorage();
+      
+      // ============================================================
       // CEK APAKAH USER MULTI DARI STORAGE
       // ============================================================
       const userSeatData = await this._getUserSeatData();
@@ -1297,6 +1414,7 @@ export class ChatServer {
         // Hapus dari online users sementara (akan di-restore saat reconnect)
         if (this._onlineUsers.has(username)) {
           this._onlineUsers.delete(username);
+          this._cacheOnlineUsers = Array.from(this._onlineUsers);
         }
         
         this._refreshRoomClients(true);
@@ -1317,6 +1435,7 @@ export class ChatServer {
         
         if (this._onlineUsers.has(username)) {
           this._onlineUsers.delete(username);
+          this._cacheOnlineUsers = Array.from(this._onlineUsers);
         }
         
         this._refreshRoomClients(true);
@@ -1353,6 +1472,8 @@ export class ChatServer {
         return;
       }
       
+      await this._refreshCacheFromStorage();
+      
       const userSeatData = await this._getUserSeatData();
       const seatInfo = userSeatData[username];
       const isMultiFromStorage = seatInfo?.isMulti || false;
@@ -1369,6 +1490,7 @@ export class ChatServer {
         
         if (this._onlineUsers.has(username)) {
           this._onlineUsers.delete(username);
+          this._cacheOnlineUsers = Array.from(this._onlineUsers);
         }
         
         this._refreshRoomClients(true);
@@ -2105,6 +2227,12 @@ export class ChatServer {
           await this.ctx.storage.delete("lastDeployVersion");
           await this.ctx.storage.delete("lastDeployTime");
           
+          // Clear cache juga
+          this._cacheRoomsData = {};
+          this._cacheUserSeatData = {};
+          this._cacheUserCounts = {};
+          this._cacheOnlineUsers = [];
+          
           this.currentNumber = 1;
           this._onlineUsers.clear();
           this._userCounts = {};
@@ -2260,6 +2388,12 @@ export class ChatServer {
       await this.ctx.storage.delete("onlineUsers");
       await this.ctx.storage.delete("lastReset");
       
+      // Clear cache juga
+      this._cacheRoomsData = {};
+      this._cacheUserSeatData = {};
+      this._cacheUserCounts = {};
+      this._cacheOnlineUsers = [];
+      
       this.currentNumber = 1;
       this._onlineUsers.clear();
       this._userCounts = {};
@@ -2333,7 +2467,12 @@ export class ChatServer {
           restoreComplete: this._restoreComplete,
           isInitialized: this._isInitialized,
           roomsCount: ROOMS.length,
-          totalUsers: this._onlineUsers.size
+          totalUsers: this._onlineUsers.size,
+          cacheSize: {
+            roomsData: Object.keys(this._cacheRoomsData).length,
+            userSeatData: Object.keys(this._cacheUserSeatData).length,
+            onlineUsers: this._cacheOnlineUsers.length
+          }
         };
         return new Response(JSON.stringify(status), {
           status: this._isInitialized ? 200 : 503,
@@ -2358,6 +2497,11 @@ export class ChatServer {
         await this.ctx.storage.delete("lastReset");
         await this.ctx.storage.delete("lastDeployVersion");
         await this.ctx.storage.delete("lastDeployTime");
+        
+        this._cacheRoomsData = {};
+        this._cacheUserSeatData = {};
+        this._cacheUserCounts = {};
+        this._cacheOnlineUsers = [];
         
         this.currentNumber = 1;
         this._onlineUsers.clear();
@@ -2421,7 +2565,12 @@ export class ChatServer {
           userSeatDataKeys: Object.keys(userSeatData),
           muteStates: Object.fromEntries(this._muteStates),
           restoreComplete: this._restoreComplete,
-          isInitialized: this._isInitialized
+          isInitialized: this._isInitialized,
+          cache: {
+            roomsDataSize: Object.keys(this._cacheRoomsData).length,
+            userSeatDataSize: Object.keys(this._cacheUserSeatData).length,
+            onlineUsersSize: this._cacheOnlineUsers.length
+          }
         };
         return new Response(JSON.stringify(status), {
           status: 200,
