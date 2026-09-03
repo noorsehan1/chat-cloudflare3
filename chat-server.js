@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.6.0 - CRASH-PROOF + OPTIMIZED + ALL FIXES
+// VERSION: 10.6.2 - NO AUTO DATA ON JOIN (EMPTY SEAT)
 
 const C = {
   MAX_SEATS: 45,
@@ -30,12 +30,10 @@ export class ChatServer {
     this._isRestoring = false;
     this._isNumberUpdating = false;
     
-    // ✅ HANYA 2 CACHE
     this._roomsDataCache = {};
     this._userSeatDataCache = {};
     this.currentNumber = 1;
     
-    // ✅ ERROR HANDLING DI CONSTRUCTOR
     this._restoreAllState().catch(() => {});
   }
 
@@ -118,7 +116,6 @@ export class ChatServer {
       return true;
       
     } catch(e) {
-      // ✅ ROLLBACK TANPA THROW
       try {
         const storage = await this.ctx.storage.get(["roomsData", "userSeatData", "currentNumber"]);
         if (storage.roomsData !== undefined) this._roomsDataCache = storage.roomsData;
@@ -457,7 +454,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ JOIN HANDLING ============
+  // ============ JOIN HANDLING - KOSONGKAN SEMUA ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -498,15 +495,8 @@ export class ChatServer {
         return false;
       }
       
-      roomData.seats[seat] = {
-        noimageUrl: "",
-        namauser: username,
-        color: "",
-        itembawah: 0,
-        itematas: 0,
-        vip: 0,
-        viptanda: 0
-      };
+      // KOSONGKAN - TIDAK ADA DATA APAPUN
+      roomData.seats[seat] = {};
       
       if (roomData.points && roomData.points[seat]) {
         delete roomData.points[seat];
@@ -1070,9 +1060,6 @@ export class ChatServer {
           const username = args[0];
           const isNewUser = args[1];
           
-          // ✅ FIX: Jika user MULTI dan isNewUser=false
-          // 1. SETOR WS KE STORAGE DULU
-          // 2. LANGSUNG RETURN!
           if (!isNewUser && this._isUserMulti(username)) {
             try {
               const currentSeat = this._userSeatDataCache[username];
@@ -1086,7 +1073,7 @@ export class ChatServer {
                 await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
               }
             } catch(e) {}
-            return;  // ← LANGSUNG RETURN!
+            return;
           }
           
           if (username) {
@@ -1144,15 +1131,8 @@ export class ChatServer {
             break;
           }
           
-          roomData.seats[seat] = {
-            noimageUrl: "",
-            namauser: multiUsername,
-            color: "",
-            itembawah: 0,
-            itematas: 0,
-            vip: 0,
-            viptanda: 0
-          };
+          // KOSONGKAN - TIDAK ADA DATA APAPUN
+          roomData.seats[seat] = {};
           
           await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           
