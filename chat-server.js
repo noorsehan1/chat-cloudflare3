@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-OPTIMIZED.js ====================
-// VERSION: 10.3.0 - TANPA MAP MUBBAZIR (roomClients, _userCounts, _onlineUsers)
+// VERSION: 10.4.0 - FIX setIdTarget2 + TANPA MAP MUBBAZIR
 
 const C = {
   MAX_SEATS: 45,
@@ -64,6 +64,12 @@ export class ChatServer {
 
   _getUserSeat(username) {
     return this._userSeatDataCache[username] || null;
+  }
+
+  _isUserMulti(username) {
+    if (!username) return false;
+    const seatInfo = this._userSeatDataCache[username];
+    return seatInfo ? (seatInfo.isMulti || false) : false;
   }
 
   // ============ CORE: UPDATE CACHE + STORAGE ============
@@ -306,12 +312,6 @@ export class ChatServer {
     }
     
     return null;
-  }
-
-  _isUserMulti(username) {
-    if (!username) return false;
-    const seatInfo = this._userSeatDataCache[username];
-    return seatInfo ? (seatInfo.isMulti || false) : false;
   }
 
   async _removeUserFromRoom(username, roomName) {
@@ -1000,6 +1000,13 @@ export class ChatServer {
         case "setIdTarget2": {
           const username = args[0];
           const isNewUser = args[1];
+          
+          // ============================================
+          // ✅ FIX: Jika user MULTI dan isNewUser=false → RETURN!
+          // ============================================
+          if (!isNewUser && this._isUserMulti(username)) {
+            return;  // ← LANGSUNG RETURN!
+          }
           
           if (username) {
             await this._removeUserFromAllRooms(username);
