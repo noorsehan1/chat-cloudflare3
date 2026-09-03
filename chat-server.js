@@ -1,6 +1,6 @@
 // ==================== CHAT-SERVER-STORAGE-ONLY-OPTIMIZED.js ====================
-// VERSION: 3.0.0 - OPTIMIZED: HAPUS onlineUsers, userCounts, serverVersion
-// NO CACHE - Semua data langsung dari storage
+// VERSION: 4.0.0 - FINAL: STORAGE ONLY, NO CACHE, NO serverVersion
+// AUTO RESTORE AFTER HIBERNATE
 
 const C = {
   MAX_SEATS: 45,
@@ -73,7 +73,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // STORAGE HELPERS - HANYA 2 KEY SAJA!
+  // STORAGE HELPERS
   // ============================================================
   
   async _getRoomsData() {
@@ -149,7 +149,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // GET ROOM COUNT - LANGSUNG DARI roomsData
+  // GET ROOM COUNT
   // ============================================================
   
   async _getRoomCount(room) {
@@ -168,17 +168,13 @@ export class ChatServer {
     return counts;
   }
 
-  // ============================================================
-  // GET ONLINE USERS - LANGSUNG DARI userSeatData
-  // ============================================================
-  
   async _getOnlineUsers() {
     const userSeatData = await this._getUserSeatData();
     return Object.keys(userSeatData);
   }
 
   // ============================================================
-  // RESTORE AFTER HIBERNATE - SIMPLIFIED
+  // RESTORE AFTER HIBERNATE
   // ============================================================
   
   async _restoreAfterHibernate() {
@@ -298,7 +294,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // SEND CURRENT STATE TO WS - SIMPLIFIED
+  // SEND CURRENT STATE TO WS
   // ============================================================
   
   async _sendCurrentStateToWS(ws) {
@@ -584,7 +580,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // UPDATE ROOM COUNT - LANGSUNG DARI STORAGE
+  // UPDATE ROOM COUNT
   // ============================================================
   
   async updateRoomCount(room) {
@@ -597,7 +593,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // SEND ALL STATE - LANGSUNG DARI STORAGE
+  // SEND ALL STATE
   // ============================================================
   
   async sendAllStateTo(ws, room, excludeSelf = false) {
@@ -657,7 +653,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // CHECK DUPLICATE USERNAME IN ROOM
+  // CHECK DUPLICATE USERNAME
   // ============================================================
   
   async _isUsernameInRoom(roomsData, roomName, username, excludeSeat = null) {
@@ -1981,9 +1977,13 @@ export class ChatServer {
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     
+    // ✅ Update number
     await this._updateNumber();
+    
+    // ✅ Cleanup storage dari data stale
     await this._cleanupStorage();
     
+    // ✅ Set alarm berikutnya
     if (!this.closing && !this.isDestroyed) {
       this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
     }
