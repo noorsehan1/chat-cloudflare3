@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.6.2 - NO AUTO DATA ON JOIN (EMPTY SEAT)
+// VERSION: 10.6.3 - RESET DATA ON JOIN
 
 const C = {
   MAX_SEATS: 45,
@@ -454,7 +454,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ JOIN HANDLING - KOSONGKAN SEMUA ============
+  // ============ JOIN HANDLING - RESET DATA LAMA ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -464,12 +464,15 @@ export class ChatServer {
     const username = ws.username;
     
     try {
+      // HAPUS USER DARI SEMUA ROOM (TERMASUK DATA KURSI & POINT LAMA)
       await this._removeUserFromAllRooms(username);
       
+      // HAPUS DARI USER SEAT CACHE
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
       }
       
+      // AMBIL ATAU BUAT ROOM DATA
       let roomData = this._roomsDataCache[roomName];
       if (!roomData) {
         roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -477,6 +480,7 @@ export class ChatServer {
         await this._saveToStorage(this._roomsDataCache, undefined, undefined);
       }
       
+      // CARI KURSI KOSONG
       let seat = null;
       if (Object.keys(roomData.seats).length >= C.MAX_SEATS) {
         this.safeSend(ws, ["roomFull", roomName]);
@@ -495,17 +499,20 @@ export class ChatServer {
         return false;
       }
       
-      // KOSONGKAN - TIDAK ADA DATA APAPUN
+      // KOSONGKAN KURSI - RESET SEMUA DATA
       roomData.seats[seat] = {};
       
+      // HAPUS POINT LAMA JIKA ADA
       if (roomData.points && roomData.points[seat]) {
         delete roomData.points[seat];
       }
       
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
       
+      // UPDATE WEBSOCKET
       await this._updateWebSocketRoom(ws, roomName, username, seat, false);
       
+      // KIRIM RESPONSE
       this.safeSend(ws, ["rooMasuk", seat, roomName]);
       this.safeSend(ws, ["numberKursiSaya", seat]);
       this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
@@ -514,6 +521,7 @@ export class ChatServer {
       this.safeSend(ws, ["roomUserCount", roomName, count]);
       this.broadcast(roomName, ["roomUserCount", roomName, count]);
       
+      // KIRIM STATE KE USER
       setTimeout(() => {
         try {
           if (ws && ws.readyState === 1) {
@@ -1102,6 +1110,7 @@ export class ChatServer {
             break;
           }
           
+          // HAPUS USER DARI SEMUA ROOM (TERMASUK DATA KURSI & POINT LAMA)
           await this._removeUserFromAllRooms(multiUsername);
           
           let roomData = this._roomsDataCache[multiRoomname];
@@ -1131,8 +1140,13 @@ export class ChatServer {
             break;
           }
           
-          // KOSONGKAN - TIDAK ADA DATA APAPUN
+          // KOSONGKAN KURSI - RESET SEMUA DATA
           roomData.seats[seat] = {};
+          
+          // HAPUS POINT LAMA JIKA ADA
+          if (roomData.points && roomData.points[seat]) {
+            delete roomData.points[seat];
+          }
           
           await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           
