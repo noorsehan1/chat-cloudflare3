@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-FULL.js ====================
-// VERSION: 10.0.0 - FULL HIBERNATION SUPPORT - NO AUTO SEAT
+// VERSION: 10.0.1 - FIXED CONST ERROR - FULL HIBERNATION SUPPORT
 
 const C = {
   MAX_SEATS: 45,
@@ -484,7 +484,8 @@ export class ChatServer {
   }
 
   async _updateKursi(roomName, seat, data) {
-    const roomData = this._roomsDataCache[roomName];
+    // ✅ FIX: let bukan const
+    let roomData = this._roomsDataCache[roomName];
     if (!roomData || !roomData.seats) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
       this._roomsDataCache[roomName] = roomData;
@@ -556,6 +557,7 @@ export class ChatServer {
     }
     this._onlineUsers.delete(username);
     
+    // ✅ FIX: let bukan const
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -563,10 +565,7 @@ export class ChatServer {
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     }
     
-    // ============================================
-    // ✅ UPDATE WEBSOCKET KE ROOM BARU
-    // TANPA TAMBAH KURSI!
-    // ============================================
+    // UPDATE WEBSOCKET KE ROOM BARU (TANPA KURSI)
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -596,9 +595,6 @@ export class ChatServer {
     this._refreshRoomClients(true);
     this._resetHibernationTimer();
     
-    // ============================================
-    // ✅ SEND RESPONSE
-    // ============================================
     this.safeSend(ws, ["roomChanged", roomName]);
     this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
     
@@ -1256,6 +1252,7 @@ export class ChatServer {
           }
           this._onlineUsers.delete(multiUsername);
           
+          // ✅ FIX: let bukan const
           let roomData = this._roomsDataCache[multiRoomname];
           if (!roomData) {
             roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -1263,10 +1260,7 @@ export class ChatServer {
             await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           }
           
-          // ============================================
-          // ✅ UPDATE WEBSOCKET KE ROOM BARU
-          // TANPA TAMBAH KURSI!
-          // ============================================
+          // UPDATE WEBSOCKET KE ROOM BARU (TANPA KURSI)
           const seatInfo = {
             room: multiRoomname,
             seat: null,
@@ -1335,9 +1329,6 @@ export class ChatServer {
           
           this._refreshRoomClients(true);
           
-          // ============================================
-          // ✅ SEND RESPONSE
-          // ============================================
           this.safeSend(ws, ["multiRoomChanged", multiRoomname]);
           this.safeSend(ws, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
           
