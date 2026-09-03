@@ -1,5 +1,5 @@
-// ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 10.0.1 - FIXED CONST ERROR - FULL HIBERNATION SUPPORT
+// ==================== CHAT-SERVER-HIBERNATION-FULL.js ====================
+// VERSION: 10.1.0 - FULL HIBERNATION (CLOUDFLARE AUTO)
 
 const C = {
   MAX_SEATS: 45,
@@ -7,7 +7,6 @@ const C = {
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 900000,
   MAX_NUMBER: 6,
-  HIBERNATION_IDLE_MS: 10000,
 };
 
 const ROOMS = [
@@ -29,8 +28,6 @@ export class ChatServer {
     this._isRefreshing = false;
     this._isRestoring = false;
     this._isNumberUpdating = false;
-    this._hibernationTimer = null;
-    this._lastActivityTime = Date.now();
     
     this.roomClients = new Map();
     for (const room of ROOMS) {
@@ -105,67 +102,6 @@ export class ChatServer {
     }
   }
 
-  // ============ HIBERNATION MANAGEMENT ============
-
-  _resetHibernationTimer() {
-    this._lastActivityTime = Date.now();
-    
-    if (this._hibernationTimer) {
-      clearTimeout(this._hibernationTimer);
-      this._hibernationTimer = null;
-    }
-    
-    const wsCount = this._getActiveWebSockets().length;
-    if (wsCount > 0 && !this.closing && !this.isDestroyed) {
-      this._hibernationTimer = setTimeout(() => {
-        this._checkIdleAndHibernate();
-      }, C.HIBERNATION_IDLE_MS);
-    }
-  }
-
-  async _checkIdleAndHibernate() {
-    if (this.closing || this.isDestroyed) return;
-    
-    const hasActiveUsers = this._onlineUsers.size > 0;
-    const wsCount = this._getActiveWebSockets().length;
-    const idleTime = Date.now() - this._lastActivityTime;
-    
-    if (!hasActiveUsers || (wsCount > 0 && idleTime > C.HIBERNATION_IDLE_MS)) {
-      try {
-        await this._saveToStorage(
-          this._roomsDataCache,
-          this._userSeatDataCache,
-          this.currentNumber
-        );
-        await this.ctx.storage.put("userCounts", this._userCounts);
-        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-        
-        try {
-          await this.ctx.storage.deleteAlarm();
-        } catch(e) {}
-        
-        const webSockets = this._getActiveWebSockets();
-        for (const ws of webSockets) {
-          try {
-            if (ws.readyState === 1) {
-              ws.serializeAttachment({
-                username: ws._cachedUsername || ws.username,
-                room: ws._cachedRoom || ws.room,
-                seat: ws._cachedSeat,
-                isMulti: ws._isMulti || false,
-                multiRoom: ws._multiRoom,
-                multiSeat: ws._multiSeat,
-                seatInfo: this._userSeatDataCache[ws._cachedUsername || ws.username]
-              });
-            }
-          } catch(e) {}
-        }
-      } catch(e) {}
-    }
-    
-    this._hibernationTimer = null;
-  }
-
   // ============ CORE: UPDATE CACHE + STORAGE ============
 
   async _saveToStorage(roomsData, userSeatData, currentNumber) {
@@ -187,8 +123,6 @@ export class ChatServer {
       if (Object.keys(updates).length > 0) {
         await this.ctx.storage.put(updates);
       }
-      
-      this._resetHibernationTimer();
       
     } catch(e) {
       try {
@@ -225,8 +159,6 @@ export class ChatServer {
         userCounts: this._userCounts,
         onlineUsers: Array.from(this._onlineUsers)
       });
-      
-      this._resetHibernationTimer();
       
       return { counts: newCounts, total: totalUsers };
     } catch(e) {
@@ -317,9 +249,9 @@ export class ChatServer {
       this._onlineUsers.add(username);
       
       await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
+      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       
       this._refreshRoomClients(true);
-      this._resetHibernationTimer();
       
       return true;
     } catch(e) {
@@ -372,8 +304,9 @@ export class ChatServer {
         this._userSeatDataCache,
         this.currentNumber
       );
+      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       await this._updateUserCounts();
-      this._resetHibernationTimer();
+      await this._stopAlarmIfNoUsers();
     }
     
     return removed;
@@ -413,7 +346,8 @@ export class ChatServer {
         delete this._userSeatDataCache[username];
         await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
         this._onlineUsers.delete(username);
-        this._resetHibernationTimer();
+        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+        await this._stopAlarmIfNoUsers();
       }
     }
     
@@ -429,7 +363,7 @@ export class ChatServer {
           };
           await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
           this._onlineUsers.add(username);
-          this._resetHibernationTimer();
+          await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
           return { room: roomName, seat: parseInt(seat), isMulti: isMulti };
         }
       }
@@ -472,23 +406,21 @@ export class ChatServer {
       this._userSeatDataCache,
       this.currentNumber
     );
+    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     
     await this._updateUserCounts();
     
     this.broadcast(roomName, ["removeKursi", roomName, seat]);
     await this.updateRoomCount(roomName);
     await this._deleteRoomIfEmpty(roomName);
-    this._resetHibernationTimer();
+    await this._stopAlarmIfNoUsers();
     
     return true;
   }
 
   async _updateKursi(roomName, seat, data) {
-    let roomData = this._roomsDataCache[roomName];
-    if (!roomData || !roomData.seats) {
-      roomData = { seats: {}, points: {}, muted: false, number: 1 };
-      this._roomsDataCache[roomName] = roomData;
-    }
+    const roomData = this._roomsDataCache[roomName];
+    if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
     
     roomData.seats[seat] = {
       noimageUrl: data.noimageUrl || "",
@@ -501,7 +433,6 @@ export class ChatServer {
     };
     
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-    this._resetHibernationTimer();
     return true;
   }
 
@@ -513,7 +444,6 @@ export class ChatServer {
     roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
     
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-    this._resetHibernationTimer();
     return true;
   }
 
@@ -521,8 +451,9 @@ export class ChatServer {
     delete this._userSeatDataCache[username];
     await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
     this._onlineUsers.delete(username);
+    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this._updateUserCounts();
-    this._resetHibernationTimer();
+    await this._stopAlarmIfNoUsers();
   }
 
   async _deleteRoomIfEmpty(roomName) {
@@ -536,11 +467,10 @@ export class ChatServer {
       delete this._roomsDataCache[roomName];
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
       await this._updateUserCounts();
-      this._resetHibernationTimer();
     }
   }
 
-  // ============ JOIN HANDLING ============
+  // ============ JOIN HANDLING (CLEAN JOIN) ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -549,6 +479,7 @@ export class ChatServer {
     
     const username = ws.username;
     
+    // HAPUS SEMUA DATA USER SEBELUMNYA
     await this._removeUserFromAllRooms(username);
     
     if (this._userSeatDataCache[username]) {
@@ -563,36 +494,44 @@ export class ChatServer {
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     }
     
-    ws.serializeAttachment({
-      username: username,
-      room: roomName,
-      seat: null,
-      isMulti: false,
-      seatInfo: null
-    });
-    
-    ws._cachedUsername = username;
-    ws._cachedRoom = roomName;
-    ws._cachedSeat = null;
-    ws.username = username;
-    ws.idtarget = username;
-    ws.room = roomName;
-    ws.roomname = roomName;
-    ws._isMulti = false;
-    ws._multiRoom = null;
-    ws._multiSeat = null;
-    ws._closing = false;
-    
-    if (this._userSeatDataCache[username]) {
-      delete this._userSeatDataCache[username];
+    let seat = null;
+    if (Object.keys(roomData.seats).length >= C.MAX_SEATS) {
+      this.safeSend(ws, ["roomFull", roomName]);
+      return false;
     }
-    this._onlineUsers.add(username);
     
-    await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-    this._refreshRoomClients(true);
-    this._resetHibernationTimer();
+    for (let s = 1; s <= C.MAX_SEATS; s++) {
+      if (!roomData.seats[s]) {
+        seat = s;
+        break;
+      }
+    }
     
-    this.safeSend(ws, ["roomChanged", roomName]);
+    if (!seat) {
+      this.safeSend(ws, ["roomFull", roomName]);
+      return false;
+    }
+    
+    roomData.seats[seat] = {
+      noimageUrl: "",
+      namauser: username,
+      color: "",
+      itembawah: 0,
+      itematas: 0,
+      vip: 0,
+      viptanda: 0
+    };
+    
+    if (roomData.points && roomData.points[seat]) {
+      delete roomData.points[seat];
+    }
+    
+    await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+    
+    await this._updateWebSocketRoom(ws, roomName, username, seat, false);
+    
+    this.safeSend(ws, ["rooMasuk", seat, roomName]);
+    this.safeSend(ws, ["numberKursiSaya", seat]);
     this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
     
     const count = Object.keys(roomData.seats).length;
@@ -604,10 +543,10 @@ export class ChatServer {
     setTimeout(() => {
       try {
         if (ws && ws.readyState === 1) {
-          this.sendAllStateTo(ws, roomName, false);
+          this.sendAllStateTo(ws, roomName, true);
         }
       } catch(e) {}
-    }, 500);
+    }, 1000);
     
     return true;
   }
@@ -638,25 +577,26 @@ export class ChatServer {
       
       if (isMulti && hasSeat) {
         this._onlineUsers.add(username);
+        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
         return;
       }
       
       if (!hasSeat) {
         this._onlineUsers.delete(username);
+        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
         
         if (this._userSeatDataCache[username]) {
           delete this._userSeatDataCache[username];
           await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
         }
-        this._resetHibernationTimer();
+        await this._stopAlarmIfNoUsers();
         return;
       }
       
       if (hasSeat && !isMulti) {
         this._onlineUsers.add(username);
+        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       }
-      
-      this._resetHibernationTimer();
       
     } catch(e) {
     } finally {
@@ -712,8 +652,6 @@ export class ChatServer {
         try { clients.delete(ws); } catch(e) {}
       }
     }
-    
-    this._resetHibernationTimer();
   }
 
   broadcast(room, msg) {
@@ -728,7 +666,6 @@ export class ChatServer {
         return false;
       }
       ws.send(JSON.stringify(msg));
-      this._resetHibernationTimer();
       return true;
     } catch(e) {
       return false;
@@ -748,7 +685,6 @@ export class ChatServer {
       await this.ctx.storage.put("userCounts", this._userCounts);
       
       this.broadcast(room, ["roomUserCount", room, count]);
-      this._resetHibernationTimer();
       return count;
     } catch(e) { return 0; }
   }
@@ -800,8 +736,6 @@ export class ChatServer {
           this.safeSend(ws, ["allPointsList", room, filteredPoints]);
         }
       }
-      
-      this._resetHibernationTimer();
     } catch(e) {}
   }
 
@@ -825,8 +759,6 @@ export class ChatServer {
         await this.ctx.storage.deleteAlarm();
       } catch(e) {}
     }
-    
-    this._resetHibernationTimer();
   }
 
   async _updateNumber() {
@@ -860,8 +792,6 @@ export class ChatServer {
           this._broadcastToRoom(room, numberMsg);
         }
       }
-      
-      this._resetHibernationTimer();
       
     } catch(e) {
       const storage = await this.ctx.storage.get(["currentNumber", "roomsData"]);
@@ -959,8 +889,7 @@ export class ChatServer {
       
       if (changed) {
         await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
-        await this._updateUserCounts();
-        this._resetHibernationTimer();
+        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       }
       
     } catch(e) {}
@@ -1031,7 +960,6 @@ export class ChatServer {
       
       if (changed) {
         await this._saveToStorage(roomsData, userSeatData, storage.currentNumber);
-        this._resetHibernationTimer();
       }
       
     } catch(e) {}
@@ -1100,8 +1028,6 @@ export class ChatServer {
     if (!ws) return;
     try {
       await this._cleanupUserOnDisconnect(ws);
-      this._resetHibernationTimer();
-      await this._stopAlarmIfNoUsers();
     } catch(e) {}
   }
 
@@ -1109,8 +1035,6 @@ export class ChatServer {
     if (!ws) return;
     try {
       await this._cleanupUserOnDisconnect(ws);
-      this._resetHibernationTimer();
-      await this._stopAlarmIfNoUsers();
     } catch(e) {}
   }
 
@@ -1136,7 +1060,7 @@ export class ChatServer {
       this._userSeatDataCache,
       this.currentNumber
     );
-    await this._updateUserCounts();
+    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     
     ws.username = username;
     ws.idtarget = username;
@@ -1154,9 +1078,6 @@ export class ChatServer {
       username: username,
       isMulti: false 
     });
-    
-    this._resetHibernationTimer();
-    await this._stopAlarmIfNoUsers();
     
     if (isNewUser) { 
       this.safeSend(ws, ["joinroomawal"]); 
@@ -1244,11 +1165,6 @@ export class ChatServer {
           
           await this._removeUserFromAllRooms(multiUsername);
           
-          if (this._userSeatDataCache[multiUsername]) {
-            delete this._userSeatDataCache[multiUsername];
-          }
-          this._onlineUsers.delete(multiUsername);
-          
           let roomData = this._roomsDataCache[multiRoomname];
           if (!roomData) {
             roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -1256,42 +1172,39 @@ export class ChatServer {
             await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           }
           
-          const seatInfo = {
-            room: multiRoomname,
-            seat: null,
-            isMulti: true,
-            multiRoom: multiRoomname,
-            multiSeat: null
+          let seat = null;
+          
+          const seatCount = Object.keys(roomData.seats).length;
+          if (seatCount >= C.MAX_SEATS) {
+            this.safeSend(ws, ["multiJoinError", "Room penuh"]);
+            break;
+          }
+          
+          for (let s = 1; s <= C.MAX_SEATS; s++) {
+            if (!roomData.seats[s]) {
+              seat = s;
+              break;
+            }
+          }
+          
+          if (!seat) {
+            this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
+            break;
+          }
+          
+          roomData.seats[seat] = {
+            noimageUrl: "",
+            namauser: multiUsername,
+            color: "",
+            itembawah: 0,
+            itematas: 0,
+            vip: 0,
+            viptanda: 0
           };
           
-          ws.serializeAttachment({
-            username: multiUsername,
-            room: multiRoomname,
-            seat: null,
-            isMulti: true,
-            multiRoom: multiRoomname,
-            multiSeat: null,
-            seatInfo: seatInfo
-          });
+          await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           
-          ws._cachedUsername = multiUsername;
-          ws._cachedRoom = multiRoomname;
-          ws._cachedSeat = null;
-          ws.username = multiUsername;
-          ws.idtarget = multiUsername;
-          ws.room = multiRoomname;
-          ws.roomname = multiRoomname;
-          ws._isMulti = true;
-          ws._multiRoom = multiRoomname;
-          ws._multiSeat = null;
-          ws._closing = false;
-          
-          if (this._userSeatDataCache[multiUsername]) {
-            delete this._userSeatDataCache[multiUsername];
-          }
-          this._onlineUsers.add(multiUsername);
-          
-          await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
+          await this._updateWebSocketRoom(ws, multiRoomname, multiUsername, seat, true);
           
           const webSockets = this._getActiveWebSockets();
           for (const wsKey of webSockets) {
@@ -1301,32 +1214,16 @@ export class ChatServer {
                             wsKey.username || 
                             wsKey.deserializeAttachment()?.username;
               if (uname === multiUsername && wsKey.readyState === 1) {
-                wsKey._cachedRoom = multiRoomname;
-                wsKey.room = multiRoomname;
-                wsKey.roomname = multiRoomname;
-                wsKey._cachedSeat = null;
-                wsKey._multiRoom = multiRoomname;
-                wsKey._multiSeat = null;
-                
-                wsKey.serializeAttachment({
-                  username: multiUsername,
-                  room: multiRoomname,
-                  seat: null,
-                  isMulti: true,
-                  multiRoom: multiRoomname,
-                  multiSeat: null,
-                  seatInfo: seatInfo
-                });
+                await this._updateWebSocketRoom(wsKey, multiRoomname, multiUsername, seat, true);
               }
             } catch(e) {}
           }
           
           this._refreshRoomClients(true);
           
-          this.safeSend(ws, ["multiRoomChanged", multiRoomname]);
-          this.safeSend(ws, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
+          this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
+          this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
           
-          this._resetHibernationTimer();
           await this._startAlarmIfNeeded();
           
           break;
@@ -1406,8 +1303,6 @@ export class ChatServer {
           this.broadcast(roomName, ["userActiveChanged", targetUsername, seatNumber]);
           this._refreshRoomClients(true);
           
-          this._resetHibernationTimer();
-          
           break;
         }
         
@@ -1433,7 +1328,6 @@ export class ChatServer {
                   wsKey._multiRoom = null;
                   wsKey._multiSeat = null;
                   wsKey._cachedRoom = null;
-                  wsKey._cachedSeat = null;
                   wsKey.room = null;
                   wsKey.roomname = null;
                   wsKey.idtarget = null;
@@ -1449,9 +1343,6 @@ export class ChatServer {
             
             this._refreshRoomClients(true);
             this.safeSend(ws, ["exitMultiSuccess", targetUsername, null, null]);
-            
-            this._resetHibernationTimer();
-            await this._stopAlarmIfNoUsers();
             
           } catch(e) {
             this.safeSend(ws, ["exitMultiError", e.message]);
@@ -1649,6 +1540,7 @@ export class ChatServer {
                   
                   await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
                   this._onlineUsers.add(onlineTarget);
+                  await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
                   
                   isOnline = true;
                   break;
@@ -1899,6 +1791,7 @@ export class ChatServer {
         this._userSeatDataCache,
         this.currentNumber
       );
+      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       
       if (!this.closing && !this.isDestroyed) {
         const hasActiveUsers = this._onlineUsers.size > 0 || this._getActiveWebSockets().length > 0;
@@ -1914,8 +1807,6 @@ export class ChatServer {
           } catch(e) {}
         }
       }
-      
-      this._resetHibernationTimer();
       
     } catch(e) {
     } finally {
@@ -1973,8 +1864,6 @@ export class ChatServer {
       }
       
       await this.ctx.storage.put("lastReset", timestamp);
-      
-      this._resetHibernationTimer();
       
       return {
         success: true,
@@ -2066,7 +1955,6 @@ export class ChatServer {
       server.serializeAttachment({});
       
       this._refreshRoomClients(true);
-      this._resetHibernationTimer();
       
       return new Response(null, { 
         status: 101, 
@@ -2090,11 +1978,6 @@ export class ChatServer {
     try {
       await this.ctx.storage.deleteAlarm();
     } catch(e) {}
-    
-    if (this._hibernationTimer) {
-      clearTimeout(this._hibernationTimer);
-      this._hibernationTimer = null;
-    }
     
     const webSockets = this._getActiveWebSockets();
     for (const ws of webSockets) {
