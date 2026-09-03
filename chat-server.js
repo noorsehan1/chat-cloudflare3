@@ -542,21 +542,6 @@ export class ChatServer {
   }
 
   // ============================================================
-  // FIND MULTI USER IN ALL ROOMS
-  // ============================================================
-  _findMultiUserInAllRooms(roomsData, username) {
-    for (const [roomName, roomData] of Object.entries(roomsData)) {
-      if (!roomData || !roomData.seats) continue;
-      for (const [seat, data] of Object.entries(roomData.seats)) {
-        if (data && data.namauser === username) {
-          return { room: roomName, seat: parseInt(seat) };
-        }
-      }
-    }
-    return null;
-  }
-
-  // ============================================================
   // REMOVE USER FROM SPECIFIC ROOM
   // ============================================================
   async _removeUserFromRoom(roomName, username) {
@@ -606,7 +591,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // REMOVE USER FROM ALL ROOMS
+  // REMOVE USER FROM ALL ROOMS - KHUSUS NON-MULTI
   // ============================================================
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
@@ -614,6 +599,15 @@ export class ChatServer {
     let removed = false;
     const roomsData = await this._getRoomsData();
     const userSeatData = await this._getUserSeatData();
+    
+    // CEK APAKAH USER MULTI
+    const isMulti = userSeatData[username]?.isMulti || false;
+    
+    // JIKA MULTI, JANGAN HAPUS DATA
+    if (isMulti) {
+      console.log(`[MULTI] User ${username} adalah multi - TIDAK dihapus dari storage`);
+      return false;
+    }
     
     for (const [roomName, roomData] of Object.entries(roomsData)) {
       if (!roomData || !roomData.seats) continue;
@@ -671,32 +665,87 @@ export class ChatServer {
     this.currentNumber = currentNumber;
     
     // ============================================================
-    // FIX: HAPUS SEMUA DATA USERNAME YANG SAMA DI SEMUA KURSI
+    // CEK APAKAH USER MULTI DARI STORAGE
     // ============================================================
+    const isMultiFromStorage = userSeatData[username]?.isMulti || false;
+    
+    // JIKA MULTI, JANGAN HAPUS DATA, TAPI TAMBAHKAN WS KE ROOM
+    if (isMultiFromStorage) {
+      console.log(`[MULTI] User ${username} adalah multi - Menambahkan WS ke room ${roomName}`);
+      
+      const seatInfo = userSeatData[username];
+      const seat = seatInfo.seat;
+      
+      // Update WS attachment
+      ws.serializeAttachment({
+        username: username,
+        room: roomName,
+        seat: seat,
+        isMulti: true,
+        multiRoom: roomName,
+        multiSeat: seat,
+        seatInfo: seatInfo,
+        serverVersion: this._version,
+        serverDeploy: this._deployTime,
+        muteStates: Object.fromEntries(this._muteStates)
+      });
+      
+      ws._cachedRoom = roomName;
+      ws._cachedUsername = username;
+      ws.username = username;
+      ws.room = roomName;
+      ws.roomname = roomName;
+      ws.idtarget = username;
+      ws._isMulti = true;
+      ws._multiRoom = roomName;
+      ws._multiSeat = seat;
+      ws._closing = false;
+      
+      // Tambahkan ke roomClients
+      const roomClients = this.roomClients.get(roomName);
+      if (roomClients) {
+        roomClients.add(ws);
+      }
+      
+      this._refreshRoomClients(true);
+      
+      // Kirim response ke client
+      this.safeSend(ws, ["rooMasukMulti", seat, roomName]);
+      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+      this.safeSend(ws, ["currentNumber", this.currentNumber]);
+      
+      // Kirim state room
+      setTimeout(() => {
+        try {
+          if (ws && ws.readyState === 1) {
+            this.sendAllStateTo(ws, roomName, true);
+          }
+        } catch(e) {}
+      }, 1000);
+      
+      return true;
+    }
+    
+    // ============================================================
+    // UNTUK NON-MULTI: HAPUS SEMUA DATA USERNAME YANG SAMA
+    // ============================================================
+    
     // Cek apakah username sudah ada di room tujuan
     if (this._isUsernameInRoom(roomsData, roomName, username)) {
-      // Hapus username dari room tujuan
       await this._removeUserFromRoom(roomName, username);
-      
-      // Refresh data setelah hapus
       roomsData = await this._getRoomsData();
       userSeatData = await this._getUserSeatData();
     }
     
-    // Cek apakah username ada di room lain (termasuk multi)
+    // Cek apakah username ada di room lain
     const existingUser = this._findUserInAllRooms(roomsData, username);
     if (existingUser) {
-      // Hapus dari room lain
       await this._removeUserFromRoom(existingUser.room, username);
-      
-      // Refresh data setelah hapus
       roomsData = await this._getRoomsData();
       userSeatData = await this._getUserSeatData();
     }
     
-    // ============================================================
-    // HAPUS USER SEAT DATA LAMA
-    // ============================================================
+    // Hapus user seat data lama
     if (userSeatData[username]) {
       delete userSeatData[username];
       await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
@@ -704,35 +753,27 @@ export class ChatServer {
       userSeatData = await this._getUserSeatData();
     }
     
-    // ============================================================
     // CEK KEMBALI APAKAH USERNAME SUDAH ADA
-    // ============================================================
     if (this._isUsernameInRoom(roomsData, roomName, username)) {
       this.safeSend(ws, ["joinError", `Username "${username}" sudah ada di room ini!`]);
       return false;
     }
     
-    // ============================================================
     // BUAT ROOM DATA JIKA BELUM ADA
-    // ============================================================
     let newRoomData = roomsData[roomName];
     if (!newRoomData) {
       newRoomData = { seats: {}, points: {}, muted: this._muteStates.get(roomName) || false, number: 1 };
       roomsData[roomName] = newRoomData;
     }
     
-    // ============================================================
     // CEK APAKAH ROOM PENUH
-    // ============================================================
     const seatCount = Object.keys(newRoomData.seats).length;
     if (seatCount >= C.MAX_SEATS) {
       this.safeSend(ws, ["roomFull", roomName]);
       return false;
     }
     
-    // ============================================================
     // CARI KURSI KOSONG
-    // ============================================================
     let newSeat = null;
     for (let s = 1; s <= C.MAX_SEATS; s++) {
       if (!newRoomData.seats[s]) {
@@ -746,9 +787,7 @@ export class ChatServer {
       return false;
     }
     
-    // ============================================================
     // TAMBAHKAN USER KE KURSI
-    // ============================================================
     newRoomData.seats[newSeat] = {};
     
     userSeatData[username] = {
@@ -761,9 +800,7 @@ export class ChatServer {
     
     await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
     
-    // ============================================================
     // UPDATE WEBSOCKET ATTACHMENT
-    // ============================================================
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -790,9 +827,7 @@ export class ChatServer {
     
     this._refreshRoomClients(true);
     
-    // ============================================================
     // KIRIM RESPONSE KE KLIEN
-    // ============================================================
     this.safeSend(ws, ["rooMasuk", newSeat, roomName]);
     this.safeSend(ws, ["numberKursiSaya", newSeat]);
     this.safeSend(ws, ["muteTypeResponse", newRoomData.muted || false, roomName]);
@@ -1048,14 +1083,75 @@ export class ChatServer {
     if (ws.readyState !== 1) return;
     
     // ============================================================
-    // FIX: JIKA ISNEWUSER TRUE, HAPUS SEMUA DATA USERNAME
+    // CEK APAKAH USER MULTI DARI STORAGE
+    // ============================================================
+    const userSeatData = await this._getUserSeatData();
+    const seatInfo = userSeatData[username];
+    const isMulti = seatInfo?.isMulti || false;
+    
+    // ============================================================
+    // JIKA MULTI DAN BUKAN NEW USER, RESTORE WS SAJA
+    // ============================================================
+    if (isMulti && !isNewUser) {
+      console.log(`[MULTI] Restoring WS for multi user: ${username}`);
+      
+      ws.username = username;
+      ws.idtarget = username;
+      ws.room = seatInfo.room;
+      ws.roomname = seatInfo.room;
+      ws._closing = false;
+      ws._isMulti = true;
+      ws._multiRoom = seatInfo.room;
+      ws._multiSeat = seatInfo.seat;
+      ws._cachedUsername = username;
+      ws._cachedRoom = seatInfo.room;
+      
+      ws.serializeAttachment({
+        username: username,
+        room: seatInfo.room,
+        seat: seatInfo.seat,
+        isMulti: true,
+        multiRoom: seatInfo.room,
+        multiSeat: seatInfo.seat,
+        seatInfo: seatInfo,
+        serverVersion: this._version,
+        serverDeploy: this._deployTime,
+        muteStates: Object.fromEntries(this._muteStates)
+      });
+      
+      // Tambahkan ke roomClients
+      const roomClients = this.roomClients.get(seatInfo.room);
+      if (roomClients) {
+        roomClients.add(ws);
+      }
+      
+      this._refreshRoomClients(true);
+      
+      // Kirim response
+      this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
+      this.safeSend(ws, ["currentNumber", this.currentNumber]);
+      this.safeSend(ws, ["rooMasukMulti", seatInfo.seat, seatInfo.room]);
+      
+      // Kirim state room
+      setTimeout(() => {
+        try {
+          if (ws && ws.readyState === 1) {
+            this.sendAllStateTo(ws, seatInfo.room, true);
+          }
+        } catch(e) {}
+      }, 1000);
+      
+      return;
+    }
+    
+    // ============================================================
+    // JIKA ISNEWUSER TRUE, HAPUS SEMUA DATA USERNAME (NON-MULTI)
     // ============================================================
     if (isNewUser) {
       // Hapus semua data username dari semua room
       await this._removeUserFromAllRooms(username);
       
       // Hapus dari userSeatData
-      const userSeatData = await this._getUserSeatData();
       if (userSeatData[username]) {
         delete userSeatData[username];
         await this._saveToStorage(undefined, userSeatData, undefined);
@@ -1166,12 +1262,11 @@ export class ChatServer {
   }
 
   // ============================================================
-  // FIX: WEBSOCKET CLOSE - MULTI TIDAK DIHAPUS
+  // FIX: WEBSOCKET CLOSE - MULTI TIDAK DIHAPUS DATANYA
   // ============================================================
   async webSocketClose(ws, code, reason, wasClean) {
     if (!ws) return;
     try {
-      const isMulti = ws._isMulti || false;
       const username = ws._cachedUsername || ws.username;
       
       if (!username) {
@@ -1180,43 +1275,58 @@ export class ChatServer {
       }
       
       // ============================================================
-      // FIX: JIKA MULTI, JANGAN HAPUS DATA
+      // CEK APAKAH USER MULTI DARI STORAGE
       // ============================================================
-      if (isMulti) {
-        console.log(`Multi user ${username} disconnected - Data NOT deleted`);
-        // Hanya hapus dari roomClients, tidak hapus data storage
-        for (const [room, clients] of this.roomClients) {
-          if (clients.has(ws)) {
-            clients.delete(ws);
-          }
-        }
-        this._refreshRoomClients(true);
-        return;
-      }
-      
-      // Cek dari userSeatData apakah multi
       const userSeatData = await this._getUserSeatData();
-      const seatInfo = username ? userSeatData[username] : null;
-      const isMultiFromCache = seatInfo ? (seatInfo.isMulti || false) : false;
+      const seatInfo = userSeatData[username];
+      const isMultiFromStorage = seatInfo?.isMulti || false;
       
       // ============================================================
-      // FIX: JIKA MULTI DARI CACHE, JANGAN HAPUS DATA
+      // JIKA MULTI: HANYA HAPUS WS, TIDAK HAPUS DATA
       // ============================================================
-      if (isMultiFromCache) {
-        console.log(`Multi user ${username} (from cache) disconnected - Data NOT deleted`);
+      if (isMultiFromStorage) {
+        console.log(`[MULTI] User ${username} disconnected - HANYA HAPUS WS, DATA TETAP`);
+        
+        // Hanya hapus dari roomClients
         for (const [room, clients] of this.roomClients) {
           if (clients.has(ws)) {
             clients.delete(ws);
           }
         }
+        
+        // Hapus dari online users sementara (akan di-restore saat reconnect)
+        if (this._onlineUsers.has(username)) {
+          this._onlineUsers.delete(username);
+        }
+        
         this._refreshRoomClients(true);
         return;
       }
       
       // ============================================================
-      // HANYA NON-MULTI YANG DIHAPUS DATANYA
+      // JIKA MULTI DARI WS PROPERTY
       // ============================================================
-      console.log(`Non-multi user ${username} disconnected - Data deleted`);
+      if (ws._isMulti) {
+        console.log(`[MULTI] User ${username} (from ws property) disconnected - HANYA HAPUS WS, DATA TETAP`);
+        
+        for (const [room, clients] of this.roomClients) {
+          if (clients.has(ws)) {
+            clients.delete(ws);
+          }
+        }
+        
+        if (this._onlineUsers.has(username)) {
+          this._onlineUsers.delete(username);
+        }
+        
+        this._refreshRoomClients(true);
+        return;
+      }
+      
+      // ============================================================
+      // NON-MULTI: HAPUS SEMUA DATA
+      // ============================================================
+      console.log(`[NON-MULTI] User ${username} disconnected - HAPUS DATA`);
       await this._removeUserFromAllRooms(username);
       
       for (const [room, clients] of this.roomClients) {
@@ -1226,6 +1336,7 @@ export class ChatServer {
       }
       
       this._refreshRoomClients(true);
+      
     } catch(e) {
       console.error('WebSocket close error:', e);
       this._refreshRoomClients(true);
@@ -1235,7 +1346,6 @@ export class ChatServer {
   async webSocketError(ws, error) {
     if (!ws) return;
     try {
-      const isMulti = ws._isMulti || false;
       const username = ws._cachedUsername || ws.username;
       
       if (!username) {
@@ -1243,34 +1353,30 @@ export class ChatServer {
         return;
       }
       
-      // JIKA MULTI, JANGAN HAPUS DATA
-      if (isMulti) {
-        console.log(`Multi user ${username} error - Data NOT deleted`);
-        for (const [room, clients] of this.roomClients) {
-          if (clients.has(ws)) {
-            clients.delete(ws);
-          }
-        }
-        this._refreshRoomClients(true);
-        return;
-      }
-      
       const userSeatData = await this._getUserSeatData();
-      const seatInfo = username ? userSeatData[username] : null;
-      const isMultiFromCache = seatInfo ? (seatInfo.isMulti || false) : false;
+      const seatInfo = userSeatData[username];
+      const isMultiFromStorage = seatInfo?.isMulti || false;
       
-      if (isMultiFromCache) {
-        console.log(`Multi user ${username} (from cache) error - Data NOT deleted`);
+      // JIKA MULTI: HANYA HAPUS WS
+      if (isMultiFromStorage || ws._isMulti) {
+        console.log(`[MULTI] User ${username} error - HANYA HAPUS WS, DATA TETAP`);
+        
         for (const [room, clients] of this.roomClients) {
           if (clients.has(ws)) {
             clients.delete(ws);
           }
         }
+        
+        if (this._onlineUsers.has(username)) {
+          this._onlineUsers.delete(username);
+        }
+        
         this._refreshRoomClients(true);
         return;
       }
       
-      console.log(`Non-multi user ${username} error - Data deleted`);
+      // NON-MULTI: HAPUS DATA
+      console.log(`[NON-MULTI] User ${username} error - HAPUS DATA`);
       await this._removeUserFromAllRooms(username);
       
       for (const [room, clients] of this.roomClients) {
@@ -1280,6 +1386,7 @@ export class ChatServer {
       }
       
       this._refreshRoomClients(true);
+      
     } catch(e) {
       console.error('WebSocket error handler error:', e);
     }
@@ -1410,23 +1517,18 @@ export class ChatServer {
           
           let roomsData = await this._getRoomsData();
           
-          // ============================================================
-          // FIX: CEK DAN HAPUS USERNAME YANG SAMA UNTUK MULTI
-          // ============================================================
+          // CEK DAN HAPUS USERNAME YANG SAMA UNTUK MULTI
           if (this._isUsernameInRoom(roomsData, multiRoomname, multiUsername)) {
-            // Hapus username dari room tujuan
             await this._removeUserFromRoom(multiRoomname, multiUsername);
             roomsData = await this._getRoomsData();
           }
           
-          // Cek di room lain
           const existingMultiUser = this._findUserInAllRooms(roomsData, multiUsername);
           if (existingMultiUser) {
             await this._removeUserFromRoom(existingMultiUser.room, multiUsername);
             roomsData = await this._getRoomsData();
           }
           
-          // Hapus dari userSeatData
           let userSeatData = await this._getUserSeatData();
           if (userSeatData[multiUsername]) {
             delete userSeatData[multiUsername];
@@ -1435,9 +1537,6 @@ export class ChatServer {
             userSeatData = await this._getUserSeatData();
           }
           
-          // ============================================================
-          // CEK KEMBALI APAKAH USERNAME SUDAH ADA
-          // ============================================================
           if (this._isUsernameInRoom(roomsData, multiRoomname, multiUsername)) {
             this.safeSend(ws, ["multiJoinError", `Username "${multiUsername}" sudah ada di room ini!`]);
             break;
@@ -2116,10 +2215,9 @@ export class ChatServer {
           continue;
         }
         
-        // ============================================================
-        // FIX: MULTI USER TETAP DISIMPAN
-        // ============================================================
+        // MULTI USER TETAP DISIMPAN WALAUPUN TIDAK TERKONEKSI
         if (seatInfo.isMulti) {
+          console.log(`[MULTI] Keeping multi user data: ${username}`);
           continue;
         }
         
