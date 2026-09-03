@@ -80,7 +80,6 @@ export class ChatServer {
     this._isNumberUpdating = false;
     this._lastRefreshTime = 0;
     
-    // Cache untuk menyimpan data storage
     this._cacheRoomsData = {};
     this._cacheUserSeatData = {};
     this._cacheUserCounts = {};
@@ -89,9 +88,6 @@ export class ChatServer {
     this._initializeServer();
   }
 
-  // ============================================================
-  // INITIALIZE SEQUENTIALLY
-  // ============================================================
   async _initializeServer() {
     if (this._initLock) return;
     this._initLock = true;
@@ -113,15 +109,7 @@ export class ChatServer {
       this._restoreComplete = true;
       this._isInitialized = true;
       
-      console.log('Server initialized successfully:', {
-        version: this._version,
-        deployTime: this._deployTime,
-        rooms: ROOMS.length,
-        restoreComplete: this._restoreComplete
-      });
-      
     } catch(e) {
-      console.error('Initialization error:', e);
       await this._recoverDefaultState();
     } finally {
       this._isRestoring = false;
@@ -129,9 +117,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // RECOVER DEFAULT STATE
-  // ============================================================
   async _recoverDefaultState() {
     try {
       this.currentNumber = 1;
@@ -153,18 +138,12 @@ export class ChatServer {
       
       this._restoreComplete = true;
       this._isInitialized = true;
-      
-      console.log('Default state recovered successfully');
     } catch(e) {
-      console.error('Recovery failed:', e);
       this._isInitialized = true;
       this._restoreComplete = true;
     }
   }
 
-  // ============================================================
-  // RESTORE AFTER HIBERNATE
-  // ============================================================
   async _restoreAfterHibernate() {
     try {
       const roomsData = await this._getRoomsData();
@@ -210,27 +189,16 @@ export class ChatServer {
           }
         } catch(e) {}
       }
-      
-      console.log('Restore after hibernate completed');
-      
-    } catch(e) {
-      console.error('Restore after hibernate error:', e);
-    }
+    } catch(e) {}
   }
 
-  // ============================================================
-  // AUTO RESET ON DEPLOY - TANPA HAPUS STORAGE
-  // ============================================================
   async _autoResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("lastDeployVersion");
       
       if (storedVersion !== this._version) {
         const lock = await this.ctx.storage.get("resetLock");
-        if (lock) {
-          console.log('Reset already in progress, skipping');
-          return;
-        }
+        if (lock) return;
         
         await this.ctx.storage.put("resetLock", Date.now());
         
@@ -255,21 +223,13 @@ export class ChatServer {
               }
             } catch(e) {}
           }
-          
-          console.log('Auto update deploy version completed - Storage NOT cleared');
         } finally {
           await this.ctx.storage.delete("resetLock");
         }
       }
-      
-    } catch(e) {
-      console.error('Auto reset error:', e);
-    }
+    } catch(e) {}
   }
 
-  // ============================================================
-  // INITIALIZE FROM STORAGE - LOAD KE CACHE
-  // ============================================================
   async _initFromStorage() {
     try {
       const results = await Promise.allSettled([
@@ -333,24 +293,15 @@ export class ChatServer {
               });
             }
           }
-        } catch(e) {
-          console.warn('Failed to restore websocket attachment:', e);
-        }
+        } catch(e) {}
       }
       
       this._refreshRoomClients(true);
-      
-      console.log('Init from storage completed - Cache loaded');
-      
     } catch(e) {
-      console.error('Init from storage error:', e);
       throw e;
     }
   }
 
-  // ============================================================
-  // REFRESH CACHE FROM STORAGE
-  // ============================================================
   async _refreshCacheFromStorage() {
     try {
       const results = await Promise.allSettled([
@@ -372,17 +323,12 @@ export class ChatServer {
       this._userCounts = this._cacheUserCounts;
       this._onlineUsers = new Set(this._cacheOnlineUsers);
       
-      console.log('Cache refreshed from storage');
       return true;
     } catch(e) {
-      console.error('Refresh cache error:', e);
       return false;
     }
   }
 
-  // ============================================================
-  // GET DATA FROM STORAGE - DENGAN CACHE
-  // ============================================================
   async _getRoomsData() {
     try {
       if (this._cacheRoomsData && Object.keys(this._cacheRoomsData).length > 0) {
@@ -392,7 +338,6 @@ export class ChatServer {
       this._cacheRoomsData = data;
       return data;
     } catch(e) {
-      console.error('Get rooms data error:', e);
       return this._cacheRoomsData || {};
     }
   }
@@ -406,7 +351,6 @@ export class ChatServer {
       this._cacheUserSeatData = data;
       return data;
     } catch(e) {
-      console.error('Get user seat data error:', e);
       return this._cacheUserSeatData || {};
     }
   }
@@ -415,7 +359,6 @@ export class ChatServer {
     try {
       return await this.ctx.storage.get("currentNumber") || 1;
     } catch(e) {
-      console.error('Get current number error:', e);
       return 1;
     }
   }
@@ -429,7 +372,6 @@ export class ChatServer {
       this._cacheUserCounts = data;
       return data;
     } catch(e) {
-      console.error('Get user counts error:', e);
       return this._cacheUserCounts || {};
     }
   }
@@ -443,14 +385,10 @@ export class ChatServer {
       this._cacheOnlineUsers = data;
       return data;
     } catch(e) {
-      console.error('Get online users error:', e);
       return this._cacheOnlineUsers || [];
     }
   }
 
-  // ============================================================
-  // SAVE TO STORAGE - UPDATE CACHE JUGA
-  // ============================================================
   async _saveToStorage(roomsData, userSeatData, currentNumber) {
     if (this.closing || this.isDestroyed) return null;
     
@@ -522,9 +460,7 @@ export class ChatServer {
       } finally {
         await this.ctx.storage.delete("writeLock");
       }
-      
     } catch(e) {
-      console.error('Save to storage error:', e);
       throw e;
     }
   }
@@ -560,37 +496,25 @@ export class ChatServer {
           }
           
           if (room && username) {
-            // CEK APAKAH USER ADA DI STORAGE/CACHE
             const userSeatData = this._cacheUserSeatData[username];
             if (userSeatData) {
               const roomClients = this.roomClients.get(room);
               if (roomClients) {
                 roomClients.add(ws);
               }
-            } else {
-              // USER SILUMAN - TIDAK ADA DI STORAGE
-              console.log(`[SILUMAN] User ${username} tidak ada di storage, skip from room clients`);
             }
           }
         } catch(e) {}
       }
-    } catch(e) {
-      console.error('Refresh room clients error:', e);
-    }
+    } catch(e) {}
   }
 
-  // ============================================================
-  // CHECK APAKAH USER VALID (ADA DI STORAGE)
-  // ============================================================
   _isUserValid(username) {
     if (!username) return false;
     const userSeatData = this._cacheUserSeatData[username];
     return !!userSeatData;
   }
 
-  // ============================================================
-  // CHECK DUPLICATE USERNAME IN ROOM
-  // ============================================================
   _isUsernameInRoom(roomsData, roomName, username, excludeSeat = null) {
     const roomData = roomsData[roomName];
     if (!roomData || !roomData.seats) return false;
@@ -604,9 +528,6 @@ export class ChatServer {
     return false;
   }
 
-  // ============================================================
-  // FIND USER IN ALL ROOMS - TERMASUK MULTI
-  // ============================================================
   _findUserInAllRooms(roomsData, username) {
     for (const [roomName, roomData] of Object.entries(roomsData)) {
       if (!roomData || !roomData.seats) continue;
@@ -619,9 +540,6 @@ export class ChatServer {
     return null;
   }
 
-  // ============================================================
-  // REMOVE USER FROM SPECIFIC ROOM
-  // ============================================================
   async _removeUserFromRoom(roomName, username) {
     if (!roomName || !username) return false;
     
@@ -668,9 +586,6 @@ export class ChatServer {
     return removed;
   }
 
-  // ============================================================
-  // REMOVE USER FROM ALL ROOMS - KHUSUS NON-MULTI
-  // ============================================================
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
     
@@ -678,14 +593,9 @@ export class ChatServer {
     const roomsData = await this._getRoomsData();
     const userSeatData = await this._getUserSeatData();
     
-    // CEK APAKAH USER MULTI
     const isMulti = userSeatData[username]?.isMulti || false;
     
-    // JIKA MULTI, JANGAN HAPUS DATA
-    if (isMulti) {
-      console.log(`[MULTI] User ${username} adalah multi - TIDAK dihapus dari storage`);
-      return false;
-    }
+    if (isMulti) return false;
     
     for (const [roomName, roomData] of Object.entries(roomsData)) {
       if (!roomData || !roomData.seats) continue;
@@ -727,9 +637,6 @@ export class ChatServer {
     return removed;
   }
 
-  // ============================================================
-  // HANDLE JOIN - FIX: USER SILUMAN & MULTI RECONNECT
-  // ============================================================
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -737,9 +644,6 @@ export class ChatServer {
     
     const username = ws.username;
     
-    // ============================================================
-    // REFRESH CACHE DARI STORAGE SEBELUM JOIN
-    // ============================================================
     await this._refreshCacheFromStorage();
     
     let roomsData = await this._getRoomsData();
@@ -747,27 +651,16 @@ export class ChatServer {
     const currentNumber = await this._getCurrentNumber();
     this.currentNumber = currentNumber;
     
-    // ============================================================
-    // CEK APAKAH USER VALID (ADA DI STORAGE/CACHE)
-    // ============================================================
     const isValidUser = this._isUserValid(username);
     const isMultiFromStorage = userSeatData[username]?.isMulti || false;
     
-    // ============================================================
-    // JIKA USER TIDAK VALID (SILUMAN) DAN BUKAN MULTI
-    // ============================================================
     if (!isValidUser && !isMultiFromStorage) {
-      console.log(`[SILUMAN] User ${username} tidak ada di storage - Proses sebagai user baru`);
-      
-      // Proses sebagai user baru (join normal)
-      // Hapus jika ada data lama di room
       if (this._isUsernameInRoom(roomsData, roomName, username)) {
         await this._removeUserFromRoom(roomName, username);
         roomsData = await this._getRoomsData();
         userSeatData = await this._getUserSeatData();
       }
       
-      // Cek di room lain
       const existingUser = this._findUserInAllRooms(roomsData, username);
       if (existingUser) {
         await this._removeUserFromRoom(existingUser.room, username);
@@ -775,7 +668,6 @@ export class ChatServer {
         userSeatData = await this._getUserSeatData();
       }
       
-      // Hapus dari userSeatData jika ada
       if (userSeatData[username]) {
         delete userSeatData[username];
         await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
@@ -783,13 +675,11 @@ export class ChatServer {
         userSeatData = await this._getUserSeatData();
       }
       
-      // CEK KEMBALI
       if (this._isUsernameInRoom(roomsData, roomName, username)) {
         this.safeSend(ws, ["joinError", `Username "${username}" sudah ada di room ini!`]);
         return false;
       }
       
-      // BUAT ROOM DATA
       let newRoomData = roomsData[roomName];
       if (!newRoomData) {
         newRoomData = { seats: {}, points: {}, muted: this._muteStates.get(roomName) || false, number: 1 };
@@ -874,16 +764,10 @@ export class ChatServer {
       return true;
     }
     
-    // ============================================================
-    // JIKA MULTI: RESTORE WS SAJA, TANPA EVENT BARU
-    // ============================================================
     if (isMultiFromStorage) {
-      console.log(`[MULTI] User ${username} adalah multi - RESTORE WS SAJA, tanpa event baru`);
-      
       const seatInfo = userSeatData[username];
       const seat = seatInfo.seat;
       
-      // UPDATE WS ATTACHMENT
       ws.serializeAttachment({
         username: username,
         room: roomName,
@@ -908,24 +792,21 @@ export class ChatServer {
       ws._multiSeat = seat;
       ws._closing = false;
       
-      // TAMBAHKAN KE ROOM CLIENTS
       const roomClients = this.roomClients.get(roomName);
       if (roomClients) {
         roomClients.add(ws);
       }
       
-      // TAMBAHKAN KE ONLINE USERS
       this._onlineUsers.add(username);
       this._cacheOnlineUsers = Array.from(this._onlineUsers);
       
       this._refreshRoomClients(true);
       
-      // KIRIM RESPONSE - LANGSUNG RESTORE, TANPA EVENT JOIN BARU
       this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
       this.safeSend(ws, ["muteTypeResponse", this._muteStates.get(roomName) || false, roomName]);
+      this.safeSend(ws, ["rooMasukMulti", seat, roomName]);
       
-      // KIRIM STATE ROOM LENGKAP
       setTimeout(() => {
         try {
           if (ws && ws.readyState === 1) {
@@ -937,21 +818,18 @@ export class ChatServer {
       return true;
     }
     
-    // ============================================================
-    // UNTUK NON-MULTI YANG VALID: PROSES JOIN NORMAL
-    // ============================================================
-    console.log(`[NON-MULTI] User ${username} valid - Proses join normal`);
-    
-    // Hapus jika ada data di room
-    if (this._isUsernameInRoom(roomsData, roomName, username)) {
-      await this._removeUserFromRoom(roomName, username);
-      roomsData = await this._getRoomsData();
-      userSeatData = await this._getUserSeatData();
-    }
-    
     const existingUser = this._findUserInAllRooms(roomsData, username);
     if (existingUser) {
-      await this._removeUserFromRoom(existingUser.room, username);
+      const roomLama = existingUser.room;
+      if (roomLama !== roomName) {
+        await this._removeUserFromRoom(roomLama, username);
+        roomsData = await this._getRoomsData();
+        userSeatData = await this._getUserSeatData();
+      }
+    }
+    
+    if (this._isUsernameInRoom(roomsData, roomName, username)) {
+      await this._removeUserFromRoom(roomName, username);
       roomsData = await this._getRoomsData();
       userSeatData = await this._getUserSeatData();
     }
@@ -1052,9 +930,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // UPDATE KURSI
-  // ============================================================
   async _updateKursi(roomName, seat, data) {
     const roomsData = await this._getRoomsData();
     const roomData = roomsData[roomName];
@@ -1084,9 +959,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // UPDATE POINT
-  // ============================================================
   async _updatePoint(roomName, seat, x, y, fast) {
     const roomsData = await this._getRoomsData();
     const roomData = roomsData[roomName];
@@ -1099,9 +971,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // UPDATE NUMBER
-  // ============================================================
   async _updateNumber() {
     if (this._isNumberUpdating || this.closing || this.isDestroyed) return;
     this._isNumberUpdating = true;
@@ -1134,9 +1003,7 @@ export class ChatServer {
           this._broadcastToRoom(room, numberMsg);
         }
       }
-      
     } catch(e) {
-      console.error('Update number error:', e);
       const currentNumber = await this._getCurrentNumber();
       this.currentNumber = currentNumber;
     } finally {
@@ -1144,9 +1011,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // BROADCAST
-  // ============================================================
   _broadcastToRoom(room, msgStr) {
     if (this.closing || this.isDestroyed || !room) return;
     
@@ -1275,9 +1139,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // HANDLE SET ID
-  // ============================================================
   async _handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
       try { if (ws?.readyState === 1) ws.close(1000, "Invalid username"); } catch(e) {}
@@ -1286,26 +1147,14 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    // ============================================================
-    // REFRESH CACHE DARI STORAGE
-    // ============================================================
     await this._refreshCacheFromStorage();
     
-    // ============================================================
-    // CEK APAKAH USER MULTI DARI STORAGE
-    // ============================================================
     const userSeatData = await this._getUserSeatData();
     const seatInfo = userSeatData[username];
     const isMulti = seatInfo?.isMulti || false;
     const isValidUser = this._isUserValid(username);
     
-    // ============================================================
-    // JIKA MULTI DAN BUKAN NEW USER, RESTORE WS SAJA
-    // TANPA EVENT BARU
-    // ============================================================
     if (isMulti && !isNewUser && isValidUser) {
-      console.log(`[MULTI] Restoring WS for multi user: ${username} - TANPA EVENT BARU`);
-      
       ws.username = username;
       ws.idtarget = username;
       ws.room = seatInfo.room;
@@ -1330,25 +1179,21 @@ export class ChatServer {
         muteStates: Object.fromEntries(this._muteStates)
       });
       
-      // TAMBAHKAN KE ROOM CLIENTS
       const roomClients = this.roomClients.get(seatInfo.room);
       if (roomClients) {
         roomClients.add(ws);
       }
       
-      // TAMBAHKAN KE ONLINE USERS
       this._onlineUsers.add(username);
       this._cacheOnlineUsers = Array.from(this._onlineUsers);
       
       this._refreshRoomClients(true);
       
-      // KIRIM RESPONSE - LANGSUNG RESTORE, TANPA EVENT BARU
       this.safeSend(ws, ["serverVersion", this._version, this._deployTime]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
       this.safeSend(ws, ["muteTypeResponse", this._muteStates.get(seatInfo.room) || false, seatInfo.room]);
       this.safeSend(ws, ["rooMasukMulti", seatInfo.seat, seatInfo.room]);
       
-      // KIRIM STATE ROOM LENGKAP
       setTimeout(() => {
         try {
           if (ws && ws.readyState === 1) {
@@ -1360,9 +1205,6 @@ export class ChatServer {
       return;
     }
     
-    // ============================================================
-    // JIKA ISNEWUSER TRUE, HAPUS SEMUA DATA USERNAME (NON-MULTI)
-    // ============================================================
     if (isNewUser) {
       await this._removeUserFromAllRooms(username);
       
@@ -1390,9 +1232,7 @@ export class ChatServer {
         serverDeploy: this._deployTime,
         muteStates: Object.fromEntries(this._muteStates)
       });
-    } catch(e) {
-      console.warn('Failed to serialize attachment for user:', username);
-    }
+    } catch(e) {}
     
     if (isNewUser) { 
       this.safeSend(ws, ["joinroomawal"]); 
@@ -1405,9 +1245,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // WEBSOCKET EVENTS
-  // ============================================================
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
@@ -1470,14 +1307,10 @@ export class ChatServer {
       
       await this.handleMessage(ws, message);
     } catch(e) {
-      console.error('WebSocket message error:', e);
       this.safeSend(ws, ["error", "Terjadi kesalahan internal"]);
     }
   }
 
-  // ============================================================
-  // FIX: WEBSOCKET CLOSE - MULTI TIDAK DIHAPUS DATANYA
-  // ============================================================
   async webSocketClose(ws, code, reason, wasClean) {
     if (!ws) return;
     try {
@@ -1488,24 +1321,13 @@ export class ChatServer {
         return;
       }
       
-      // ============================================================
-      // REFRESH CACHE DARI STORAGE
-      // ============================================================
       await this._refreshCacheFromStorage();
       
-      // ============================================================
-      // CEK APAKAH USER MULTI DARI STORAGE
-      // ============================================================
       const userSeatData = await this._getUserSeatData();
       const seatInfo = userSeatData[username];
       const isMultiFromStorage = seatInfo?.isMulti || false;
       
-      // ============================================================
-      // JIKA MULTI: HANYA HAPUS WS, TIDAK HAPUS DATA
-      // ============================================================
-      if (isMultiFromStorage) {
-        console.log(`[MULTI] User ${username} disconnected - HANYA HAPUS WS, DATA TETAP`);
-        
+      if (isMultiFromStorage || ws._isMulti) {
         for (const [room, clients] of this.roomClients) {
           if (clients.has(ws)) {
             clients.delete(ws);
@@ -1521,31 +1343,6 @@ export class ChatServer {
         return;
       }
       
-      // ============================================================
-      // JIKA MULTI DARI WS PROPERTY
-      // ============================================================
-      if (ws._isMulti) {
-        console.log(`[MULTI] User ${username} (from ws property) disconnected - HANYA HAPUS WS, DATA TETAP`);
-        
-        for (const [room, clients] of this.roomClients) {
-          if (clients.has(ws)) {
-            clients.delete(ws);
-          }
-        }
-        
-        if (this._onlineUsers.has(username)) {
-          this._onlineUsers.delete(username);
-          this._cacheOnlineUsers = Array.from(this._onlineUsers);
-        }
-        
-        this._refreshRoomClients(true);
-        return;
-      }
-      
-      // ============================================================
-      // NON-MULTI: HAPUS SEMUA DATA
-      // ============================================================
-      console.log(`[NON-MULTI] User ${username} disconnected - HAPUS DATA`);
       await this._removeUserFromAllRooms(username);
       
       for (const [room, clients] of this.roomClients) {
@@ -1555,9 +1352,7 @@ export class ChatServer {
       }
       
       this._refreshRoomClients(true);
-      
     } catch(e) {
-      console.error('WebSocket close error:', e);
       this._refreshRoomClients(true);
     }
   }
@@ -1579,8 +1374,6 @@ export class ChatServer {
       const isMultiFromStorage = seatInfo?.isMulti || false;
       
       if (isMultiFromStorage || ws._isMulti) {
-        console.log(`[MULTI] User ${username} error - HANYA HAPUS WS, DATA TETAP`);
-        
         for (const [room, clients] of this.roomClients) {
           if (clients.has(ws)) {
             clients.delete(ws);
@@ -1596,7 +1389,6 @@ export class ChatServer {
         return;
       }
       
-      console.log(`[NON-MULTI] User ${username} error - HAPUS DATA`);
       await this._removeUserFromAllRooms(username);
       
       for (const [room, clients] of this.roomClients) {
@@ -1606,15 +1398,11 @@ export class ChatServer {
       }
       
       this._refreshRoomClients(true);
-      
     } catch(e) {
-      console.error('WebSocket error handler error:', e);
+      this._refreshRoomClients(true);
     }
   }
 
-  // ============================================================
-  // HANDLE MESSAGE
-  // ============================================================
   async handleMessage(ws, raw) {
     if (!ws) return;
     try {
@@ -1639,9 +1427,7 @@ export class ChatServer {
       }
       
       await this._handleEventInternal(ws, [evt, ...args]);
-    } catch(e) {
-      console.error('Handle message error:', e);
-    }
+    } catch(e) {}
   }
 
   async _handleEventInternal(ws, data) {
@@ -2372,14 +2158,10 @@ export class ChatServer {
           break;
       }
     } catch(e) {
-      console.error('Event handler error:', e);
       this.safeSend(ws, ["error", e.message]);
     }
   }
 
-  // ============================================================
-  // ALARM
-  // ============================================================
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     
@@ -2405,7 +2187,6 @@ export class ChatServer {
         await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
       }
     } catch(e) {
-      console.error('Alarm error:', e);
       if (!this.closing && !this.isDestroyed) {
         try {
           await this.ctx.storage.setAlarm(Date.now() + 5000);
@@ -2439,9 +2220,7 @@ export class ChatServer {
           continue;
         }
         
-        // MULTI USER TETAP DISIMPAN
         if (seatInfo.isMulti) {
-          console.log(`[MULTI] Keeping multi user data: ${username}`);
           continue;
         }
         
@@ -2464,15 +2243,9 @@ export class ChatServer {
       if (changed) {
         await this._saveToStorage(roomsData, userSeatData, this.currentNumber);
       }
-      
-    } catch(e) {
-      console.error('Cleanup storage error:', e);
-    }
+    } catch(e) {}
   }
 
-  // ============================================================
-  // RESET ALL DATA
-  // ============================================================
   async resetAllData() {
     const timestamp = Date.now();
     
@@ -2530,7 +2303,6 @@ export class ChatServer {
         serverVersion: this._version,
         deployTime: this._deployTime
       };
-      
     } catch(e) {
       return {
         success: false,
@@ -2541,9 +2313,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // FETCH
-  // ============================================================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -2745,16 +2514,11 @@ export class ChatServer {
         status: 101, 
         webSocket: client
       });
-      
     } catch(e) {
-      console.error('Fetch error:', e);
       return new Response("Internal Server Error", { status: 500 });
     }
   }
 
-  // ============================================================
-  // DESTROY
-  // ============================================================
   async destroy() {
     if (this.isDestroyed) return;
     this.closing = true;
@@ -2782,11 +2546,7 @@ export class ChatServer {
       try {
         await this.ctx.storage.deleteAlarm();
       } catch(e) {}
-      
-      console.log('Server destroyed successfully');
-    } catch(e) {
-      console.error('Destroy error:', e);
-    }
+    } catch(e) {}
   }
 }
 
