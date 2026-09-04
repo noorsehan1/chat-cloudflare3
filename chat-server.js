@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.8.0 - FINAL: COMPLETE WEBSOCKET CLEANUP
+// VERSION: 10.9.0 - FINAL: CLEANUP KURSI & POINT ONLY, NO WEBSOCKET RESET
 
 const C = {
   MAX_SEATS: 45,
@@ -194,36 +194,6 @@ export class ChatServer {
     } catch(e) {
       return false;
     }
-  }
-
-  async _resetWebSocketState(ws, username) {
-    if (!ws) return;
-    
-    try {
-      ws._isMulti = false;
-      ws._multiRoom = null;
-      ws._multiSeat = null;
-      ws._cachedRoom = null;
-      ws._cachedSeat = null;
-      ws.room = null;
-      ws.roomname = null;
-      ws._cachedUsername = username || null;
-      
-      ws.serializeAttachment({
-        username: username || null,
-        isMulti: false,
-        room: null,
-        seat: null,
-        multiRoom: null,
-        multiSeat: null,
-        seatInfo: null
-      });
-      
-      if (username && this._userSeatDataCache[username]) {
-        delete this._userSeatDataCache[username];
-        await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
-      }
-    } catch(e) {}
   }
 
   async _updateWebSocketRoom(ws, roomName, username, seat, isMulti = false) {
@@ -496,6 +466,8 @@ export class ChatServer {
     }
   }
 
+  // ============ CLEANUP USER TOTAL (KURSI & POINT ONLY) ============
+
   async _cleanupUserTotal(username) {
     if (!username) return false;
     if (this._cleaningUsers.has(username)) return false;
@@ -645,19 +617,6 @@ export class ChatServer {
     
     try {
       await this._cleanupUserTotal(username);
-      
-      await this._resetWebSocketState(ws, username);
-      
-      const webSockets = this._getActiveWebSockets();
-      for (const wsKey of webSockets) {
-        if (wsKey === ws) continue;
-        try {
-          const uname = wsKey._cachedUsername || wsKey.username || wsKey.deserializeAttachment()?.username;
-          if (uname === username) {
-            await this._resetWebSocketState(wsKey, username);
-          }
-        } catch(e) {}
-      }
       
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
@@ -1447,7 +1406,18 @@ export class ChatServer {
                               wsKey.username || 
                               wsKey.deserializeAttachment()?.username;
                 if (uname === targetUsername) {
-                  await this._resetWebSocketState(wsKey, targetUsername);
+                  wsKey._isMulti = false;
+                  wsKey._multiRoom = null;
+                  wsKey._multiSeat = null;
+                  wsKey._cachedRoom = null;
+                  wsKey.room = null;
+                  wsKey.roomname = null;
+                  wsKey.idtarget = null;
+                  wsKey.serializeAttachment({ 
+                    username: targetUsername,
+                    isMulti: false
+                  });
+                  
                   this.safeSend(wsKey, ["exitMultiSuccess", targetUsername, null, null]);
                 }
               } catch(e) {}
