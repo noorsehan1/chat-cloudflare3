@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.8.0 - STORAGE PER KURSI DENGAN CACHE SINKRON & FIX MULTI USER
+// VERSION: 10.9.0 - FULL COMPATIBLE WITH ANDROID CLIENT
 
 const C = {
   MAX_SEATS: 45,
@@ -93,10 +93,8 @@ export class ChatServer {
     }
   }
 
-  // ============ SINKRONISASI CACHE DAN STORAGE (TEKNIK SAMA) ============
+  // ============ SINKRONISASI CACHE DAN STORAGE ============
 
-  // === SYNC DATA - Update cache dan storage sekaligus ===
-  
   async _syncData(type, identifier1, identifier2, data) {
     try {
       switch(type) {
@@ -175,8 +173,6 @@ export class ChatServer {
     }
   }
 
-  // === UNSYNC DATA - Hapus dari cache dan storage sekaligus ===
-
   async _unsyncData(type, identifier1, identifier2) {
     try {
       switch(type) {
@@ -238,23 +234,6 @@ export class ChatServer {
           const key = `muted_${roomName}`;
           await this.ctx.storage.delete(key);
           break;
-        }
-      }
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  // === BATCH SYNC - Update banyak data sekaligus ===
-
-  async _batchSync(operations) {
-    try {
-      for (const op of operations) {
-        if (op.type === 'delete') {
-          await this._unsyncData(op.dataType, op.room, op.seat);
-        } else {
-          await this._syncData(op.type, op.room, op.seat, op.data);
         }
       }
       return true;
@@ -414,7 +393,7 @@ export class ChatServer {
     }
   }
 
-  // ============ REMOVE USER FROM ALL ROOMS (FIX MULTI USER) ============
+  // ============ REMOVE USER FROM ALL ROOMS ============
 
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
@@ -604,7 +583,7 @@ export class ChatServer {
     }
   }
 
-  // ============ UPDATE KURSI - DENGAN NUMBER SENDIRI ============
+  // ============ UPDATE KURSI ============
 
   async _updateKursi(roomName, seat, data) {
     try {
@@ -673,7 +652,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ JOIN HANDLING - AMBIL NUMBER KURSI ============
+  // ============ JOIN HANDLING ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -930,7 +909,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ ALARM - UPDATE NUMBER 1-6 ============
+  // ============ ALARM ============
 
   async alarm() {
     if (this.closing || this.isDestroyed) return;
@@ -948,7 +927,7 @@ export class ChatServer {
     }
   }
 
-  // ============ UPDATE NUMBER 1-6 (BUKAN UNTUK KURSI) ============
+  // ============ UPDATE NUMBER ============
 
   async _updateNumber() {
     if (this._isNumberUpdating || this.closing || this.isDestroyed) return;
@@ -1278,6 +1257,8 @@ export class ChatServer {
       const [evt, ...args] = data;
       
       switch(evt) {
+        // ============ CHAT EVENTS ============
+        
         case "resetServer": {
           const result = await this.resetAllData();
           this.safeSend(ws, ["resetResult", result]);
@@ -1313,6 +1294,13 @@ export class ChatServer {
           }
           
           await this._handleSetId(ws, username, isNewUser);
+          break;
+        }
+        
+        case "isInRoom": {
+          const userSeat = this._userSeatDataCache[ws.username];
+          const isInRoom = userSeat && userSeat.room ? true : false;
+          this.safeSend(ws, ["inRoomStatus", isInRoom]);
           break;
         }
         
@@ -1546,7 +1534,7 @@ export class ChatServer {
         }
         
         case "updateKursi": {
-          const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt, kursiNumber] = args;
+          const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           
           const updated = await this._updateKursi(kursiRoom, kursiSeat, {
             noimageUrl: kursiNoimg || "",
@@ -1556,7 +1544,7 @@ export class ChatServer {
             itematas: kursiAtas || 0,
             vip: kursiVip || 0,
             viptanda: kursiVt || 0,
-            number: kursiNumber || 0
+            number: kursiSeat
           });
           
           if (updated) {
@@ -1604,6 +1592,26 @@ export class ChatServer {
           
           if (username) {
             await this._removeUserFromAllRooms(username);
+          }
+          break;
+        }
+        
+        case "resetRoom": {
+          const resetRoomName = args[0];
+          if (resetRoomName && ROOMS_SET.has(resetRoomName)) {
+            // Hapus semua data di room
+            const roomData = this._roomsDataCache[resetRoomName];
+            if (roomData) {
+              const seats = Object.keys(roomData.seats);
+              for (const seat of seats) {
+                await this._unsyncData('seat', resetRoomName, parseInt(seat));
+                await this._unsyncData('kursiNumber', resetRoomName, parseInt(seat));
+                await this._unsyncData('point', resetRoomName, parseInt(seat));
+              }
+              delete this._roomsDataCache[resetRoomName];
+              await this._updateUserCounts();
+            }
+            this.broadcast(resetRoomName, ["resetRoom", resetRoomName]);
           }
           break;
         }
@@ -1688,7 +1696,9 @@ export class ChatServer {
           for (const room of ROOMS) {
             counts[room] = this._getRoomCount(room);
           }
-          this.safeSend(ws, ["allRoomsUserCount", Object.entries(counts)]);
+          // Kirim sebagai array of objects
+          const result = Object.entries(counts).map(([roomName, userCount]) => ({ roomName, userCount }));
+          this.safeSend(ws, ["allRoomsUserCount", JSON.stringify(result)]);
           break;
         }
         
@@ -1733,77 +1743,20 @@ export class ChatServer {
           break;
         }
         
-        case "debugCheckData": {
-          await this._debugCheckAllData();
-          this.safeSend(ws, ["debugResult", "Check console for data"]);
+        case "onDestroy": {
+          // Client disconnecting
+          const username = ws.username || ws._cachedUsername;
+          if (username) {
+            await this._removeUserFromAllRooms(username);
+          }
           break;
         }
-        
-        case "onDestroy":
-          break;
         
         default:
           this.safeSend(ws, ["error", `Unknown event: ${evt}`]);
           break;
       }
     } catch(e) {}
-  }
-
-  // ============ DEBUG FUNCTION ============
-
-  async _debugCheckAllData() {
-    console.log("\n🔍 DEBUG ALL DATA:");
-    
-    const keys = await this.ctx.storage.list({ prefix: "" });
-    console.log(`Total keys in storage: ${keys.length}`);
-    
-    const roomData = {};
-    for (const key of keys) {
-      const value = await this.ctx.storage.get(key);
-      if (key.includes('_seat_') && !key.startsWith('kursiNumber_') && !key.startsWith('point_') && !key.startsWith('user_') && !key.startsWith('muted_')) {
-        const parts = key.split('_seat_');
-        const roomName = parts[0];
-        if (!roomData[roomName]) roomData[roomName] = { seats: [], points: [] };
-        roomData[roomName].seats.push({ key, value });
-      } else if (key.startsWith('point_')) {
-        const parts = key.split('_');
-        const roomName = parts[1];
-        if (!roomData[roomName]) roomData[roomName] = { seats: [], points: [] };
-        roomData[roomName].points.push({ key, value });
-      }
-    }
-    
-    console.log("\n📊 ROOM DATA:");
-    for (const [roomName, data] of Object.entries(roomData)) {
-      console.log(`  Room ${roomName}:`);
-      console.log(`    Seats: ${data.seats.length}`);
-      for (const seat of data.seats) {
-        console.log(`      ${seat.key}:`, seat.value);
-      }
-      console.log(`    Points: ${data.points.length}`);
-      for (const point of data.points) {
-        console.log(`      ${point.key}:`, point.value);
-      }
-    }
-    
-    console.log("\n👥 USER DATA:");
-    const userKeys = keys.filter(k => k.startsWith('user_'));
-    for (const key of userKeys) {
-      const value = await this.ctx.storage.get(key);
-      console.log(`  ${key}:`, value);
-    }
-    
-    console.log("\n🔢 KURSI NUMBER:");
-    const numberKeys = keys.filter(k => k.startsWith('kursiNumber_'));
-    for (const key of numberKeys) {
-      const value = await this.ctx.storage.get(key);
-      console.log(`  ${key}:`, value);
-    }
-    
-    console.log("\n📦 CACHE:");
-    console.log("  roomsDataCache:", Object.keys(this._roomsDataCache));
-    console.log("  userSeatDataCache:", Object.keys(this._userSeatDataCache));
-    console.log("  kursiNumber:", Object.keys(this._kursiNumber));
   }
 
   // ============ RESTORE STATE ============
