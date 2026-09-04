@@ -923,7 +923,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ HANDLE SET ID - TANPA CEK ws.readyState
+  // ✅ HANDLE SET ID - MULTI ID LANGSUNG RETURN
   // ============================================================
   
   async _handleSetId(ws, username, isNewUser) {
@@ -936,50 +936,9 @@ export class ChatServer {
     const userSeat = await this._getUserSeat(username);
     const isMultiUser = userSeat !== null && userSeat !== undefined;
     
-    // MULTI ID: isNewUser = false → HANYA SETOR WS, JANGAN HAPUS DATA
+    // MULTI ID: isNewUser = false → LANGSUNG RETURN
+    // TIDAK SETOR WS, TIDAK HAPUS DATA
     if (isMultiUser && isNewUser === false) {
-      ws.username = username;
-      ws.idtarget = username;
-      ws.room = userSeat.room;
-      ws.roomname = userSeat.room;
-      ws._closing = false;
-      
-      ws.serializeAttachment({ 
-        username: username,
-        seatInfo: userSeat 
-      });
-      
-      let connections = this.userConnections.get(username);
-      if (!connections) {
-        connections = new Set();
-        this.userConnections.set(username, connections);
-      }
-      if (!connections.has(ws)) connections.add(ws);
-      
-      if (!this.wsSet.has(ws)) this.wsSet.add(ws);
-      
-      if (userSeat.room) {
-        const roomClients = this.roomClients.get(userSeat.room);
-        if (roomClients) {
-          if (!roomClients.has(ws)) roomClients.add(ws);
-        }
-      }
-      
-      this.wsActiveMulti.set(ws, { username: username, room: userSeat.room });
-      
-      this.safeSend(ws, ["setIdSuccess", username, userSeat.seat, userSeat.room]);
-      this.safeSend(ws, ["rooMasukMulti", userSeat.seat, userSeat.room]);
-      this.safeSend(ws, ["numberKursiSaya", userSeat.seat]);
-      
-      setTimeout(() => {
-        try {
-          if (ws && ws.readyState === 1) {
-            this.sendAllStateTo(ws, userSeat.room, true);
-          }
-        } catch(e) {}
-      }, 500);
-      
-      this.broadcast(userSeat.room, ["userOnline", username, userSeat.seat]);
       return;
     }
     
