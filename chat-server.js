@@ -1694,16 +1694,16 @@ export class ChatServer {
               counts[room] = this._getRoomCount(room);
             }
             
-            // Format untuk client Java: array of objects dengan roomName dan userCount
+            // Format: array of objects dengan roomName dan userCount
+            // Client Java: data.getJSONArray(1) akan langsung dapat array
             const result = Object.entries(counts).map(([roomName, userCount]) => ({ 
               roomName: roomName,
               userCount: userCount 
             }));
             
-            // Kirim sebagai JSON string
-            this.safeSend(ws, ["allRoomsUserCount", JSON.stringify(result)]);
+            this.safeSend(ws, ["allRoomsUserCount", result]);
           } catch(e) {
-            this.safeSend(ws, ["allRoomsUserCount", "[]"]);
+            this.safeSend(ws, ["allRoomsUserCount", []]);
           }
           break;
         }
