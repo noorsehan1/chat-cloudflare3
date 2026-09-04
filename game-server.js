@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-STORAGE-ONLY.js
-// VERSION: 9.0.1 - STORAGE ONLY (NO CACHE, NO KV)
+// VERSION: 9.0.2 - FIXED (NO NEW EVENTS)
 // ============================================================
 
 // ============================================================
@@ -621,7 +621,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - STORAGE ONLY
+// GAME SERVER - STORAGE ONLY (FIXED)
 // ============================================================
 
 export class GameServer {
@@ -836,7 +836,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // PROCESS ALARM - DENGAN POINT 2 (dice_session_end)
+  // PROCESS ALARM
   // ============================================================
   async _processAlarm(name) {
     switch(name) {
@@ -857,7 +857,6 @@ export class GameServer {
       case 'dice_session_end':
         this.diceAutoEnabled = false;
         
-        // 🔥 POINT 2: KIRIM NOTIFIKASI SESSION ENDED + NEXT GAME TIME
         const timeUntilNext = this._getTimeLeftUntilNextDice();
         if (timeUntilNext.totalMs > 0) {
           this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", `⏰ Dice session ended. Next game in: ${timeUntilNext.text}`]);
@@ -969,7 +968,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // WEBSOCKET HANDLERS
+  // WEBSOCKET HANDLERS (FIXED)
   // ============================================================
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
@@ -1000,6 +999,20 @@ export class GameServer {
       const data = JSON.parse(message);
       if (Array.isArray(data) && data.length > 0) {
         await this._processWithTimeout(ws, data);
+        
+        // 🔥 FIX: Re-sync state setelah event tertentu
+        const evt = data[0];
+        const syncEvents = ['switchRoom', 'gameLowCardJoin', 'gameLowCardStart', 'gameLowCardNumber', 'checkGameRunning', 'gameLowCardLeave'];
+        if (syncEvents.includes(evt)) {
+          const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
+          if (room) {
+            setTimeout(() => {
+              if (ws && ws.readyState === 1) {
+                this._sendGameStateToClient(ws, room);
+              }
+            }, 100);
+          }
+        }
       }
     } catch(e) {}
   }
@@ -1162,7 +1175,7 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
-      // SWITCH ROOM
+      // SWITCH ROOM (FIXED)
       if (evt === "switchRoom") {
         await this.switchRoom(ws, data[1], data[2]);
         return;
@@ -1419,7 +1432,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // ROOM SWITCHING
+  // ROOM SWITCHING (FIXED)
   // ============================================================
   async switchRoom(ws, room, username = null) {
     try {
@@ -1442,6 +1455,7 @@ export class GameServer {
       
       const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
       
+      // 🔥 FIX 1: Jika sudah di room yang sama, kirim state
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
@@ -1463,7 +1477,15 @@ export class GameServer {
           return;
         }
         this._switchRetries.set(lockKey, retryCount + 1);
-        this._safeSend(ws, ["switchRoomSuccess", currentRoom || roomName]);
+        
+        // 🔥 FIX 2: Kirim state untuk room yang diminta
+        this._safeSend(ws, ["switchRoomSuccess", roomName]);
+        this._sendGameStateToClient(ws, roomName);
+        
+        if (roomName === CONSTANTS.DICE_ROOM) {
+          this._sendDiceNotificationOnSwitch(ws, wsId);
+          this._checkAndStartDiceIfNeeded(ws);
+        }
         return;
       }
       
@@ -1539,7 +1561,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: START
+  // GAME: START (FIXED)
   // ============================================================
   async startGame(ws, bet, username) {
     try {
@@ -1612,6 +1634,12 @@ export class GameServer {
         this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
         this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._startRegistration(room, game);
+        
+        // 🔥 FIX: Broadcast state ke semua client
+        setTimeout(() => {
+          this._broadcastGameStateToRoom(room);
+        }, 100);
+        
       } finally {
         setTimeout(() => { this._gameLocks.delete(lockKey); }, 3000);
       }
@@ -1656,6 +1684,9 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // GAME: CLOSE REGISTRATION (FIXED)
+  // ============================================================
   _closeRegistration(room, game) {
     try {
       if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
@@ -1674,6 +1705,12 @@ export class GameServer {
       }
       if (this._isGameActuallyRunning(game) && game.players.size >= 2) {
         this._startDrawPhase(room, game);
+        
+        // 🔥 FIX: Kirim state ke semua client di room
+        setTimeout(() => {
+          this._broadcastGameStateToRoom(room);
+        }, 500);
+        
       } else {
         game._gameEnded = true;
         game._isActive = false;
@@ -2108,7 +2145,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: JOIN / LEAVE
+  // GAME: JOIN (FIXED)
   // ============================================================
   async joinGame(ws, username) {
     try {
@@ -2163,12 +2200,21 @@ export class GameServer {
         this._addClient(room, ws, usernameClean);
         game.playerWsId.set(usernameClean, wsId);
         this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
+        
+        // 🔥 FIX: Broadcast state ke semua client
+        setTimeout(() => {
+          this._broadcastGameStateToRoom(room);
+        }, 100);
+        
       } finally {
         setTimeout(() => { this._joinLocks.delete(lockKey); }, 2000);
       }
     } catch(e) {}
   }
 
+  // ============================================================
+  // GAME: SUBMIT NUMBER (FIXED)
+  // ============================================================
   async submitNumber(ws, number, tanda, username) {
     try {
       if (this.isDestroyed) {
@@ -2236,6 +2282,9 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // GAME: LEAVE (FIXED)
+  // ============================================================
   async leaveGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -2262,6 +2311,12 @@ export class GameServer {
         return;
       }
       this._removePlayerFromGame(usernameClean, room);
+      
+      // 🔥 FIX: Broadcast state ke semua client
+      setTimeout(() => {
+        this._broadcastGameStateToRoom(room);
+      }, 100);
+      
     } catch(e) {}
   }
 
@@ -2322,21 +2377,49 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // GAME: CHECK GAME RUNNING (FIXED)
+  // ============================================================
   async checkGameRunning(ws, roomname) {
     try {
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameStatus", "false"]);
+        // 🔥 FIX: Kirim state kosong
+        this._safeSend(ws, ["gameState", { 
+          room: roomname || 'unknown', 
+          hasGame: false, 
+          gameType: 'lowcard',
+          isActive: false 
+        }]);
         return;
       }
       let room = roomname || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room || typeof room !== 'string' || room.trim() === '') {
         this._safeSend(ws, ["gameStatus", "false"]);
+        this._safeSend(ws, ["gameState", { 
+          room: room || 'unknown', 
+          hasGame: false, 
+          gameType: 'lowcard',
+          isActive: false 
+        }]);
         return;
       }
+      
       const game = this.activeGames.get(room);
       const isRunning = game?._isActive && !game._gameEnded && game.players?.size > 0;
       this._safeSend(ws, ["gameStatus", isRunning ? "true" : "false"]);
-      if (isRunning) this._sendGameStateToClient(ws, room);
+      
+      if (isRunning) {
+        this._sendGameStateToClient(ws, room);
+      } else {
+        // 🔥 FIX: Kirim state kosong agar client tahu tidak ada game
+        this._safeSend(ws, ["gameState", { 
+          room: room, 
+          hasGame: false, 
+          gameType: 'lowcard',
+          isActive: false 
+        }]);
+      }
     } catch(e) {}
   }
 
@@ -2391,6 +2474,12 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
       this._broadcastToRoom(room, ["gameLowCardStartSuccess", username, betAmount]);
       this._startRegistration(room, game);
+      
+      // 🔥 FIX: Broadcast state ke semua client
+      setTimeout(() => {
+        this._broadcastGameStateToRoom(room);
+      }, 100);
+      
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
     }
@@ -2742,7 +2831,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // DICE: NOTIFICATION HELPERS - DENGAN POINT 1 (DELAY 5 DETIK)
+  // DICE: NOTIFICATION HELPERS
   // ============================================================
   _sendDiceNotificationOnSwitch(ws, wsId) {
     try {
@@ -2763,12 +2852,9 @@ export class GameServer {
       const isDiceTime = this.alarmScheduler.isDiceTime();
       const timeLeft = this._getTimeLeftUntilNextDice();
       
-      // 🔥 POINT 1: HANYA KIRIM JIKA TIDAK DALAM SESI DICE
       if (!isDiceTime && !isGameActive && timeLeft.totalMs > 0) {
-        // Schedule notifikasi dengan delay 5 detik
         const notificationKey = `nextgame_${wsId}`;
         
-        // Cancel existing timer untuk client ini
         for (const timer of this._notificationTimers) {
           if (timer._key === notificationKey) {
             clearTimeout(timer);
@@ -2784,14 +2870,13 @@ export class GameServer {
             }
           }
           this._notificationTimers.delete(timer);
-        }, 5000); // Delay 5 detik
+        }, 5000);
         
         timer._key = notificationKey;
         this._notificationTimers.add(timer);
         this._trackTimer(timer);
         
       } else if (isDiceTime && !this.currentDiceRoll && !this._isShowingDice && !this._diceLock && !this._diceTimeUpCooldown) {
-        // Jika dalam sesi tapi belum mulai
         this._safeSend(ws, ["diceNotification", "Dice game starting soon..."]);
         if (this.alarmScheduler.isDiceTime()) {
           this._startDiceFast();
@@ -2802,9 +2887,9 @@ export class GameServer {
 
   _checkAndStartDiceIfNeeded(ws) {
     try {
-  if (!this.alarmScheduler.isDiceTime()) {
-    return;
-  }
+      if (!this.alarmScheduler.isDiceTime()) {
+        return;
+      }
 
       if (this.currentDiceRoll && this._canSubmitDiceAnswer) {
         const elapsed = (Date.now() - this._diceStartTime) / 1000;
@@ -2857,6 +2942,86 @@ export class GameServer {
       return await this.dataManager.addWinner(room, username);
     } catch(e) { 
       return false; 
+    }
+  }
+
+  // ============================================================
+  // BROADCAST GAME STATE TO ROOM (NEW HELPER - NO NEW EVENT)
+  // ============================================================
+  _broadcastGameStateToRoom(room) {
+    try {
+      if (!room) return;
+      const wsIds = this.wsClients.get(room);
+      if (!wsIds?.size) return;
+      
+      for (const wsId of wsIds) {
+        const ws = this.wsMap.get(wsId);
+        if (ws && ws.readyState === 1) {
+          this._sendGameStateToClient(ws, room);
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // SEND GAME STATE TO CLIENT (FIXED)
+  // ============================================================
+  _sendGameStateToClient(ws, room) {
+    try {
+      if (!ws || ws.readyState !== 1 || !room) return;
+      
+      const game = this.activeGames.get(room);
+      
+      // 🔥 FIX: Selalu kirim state, baik ada game atau tidak
+      if (!game || !game._isActive || game._gameEnded) {
+        this._safeSend(ws, ["gameState", { 
+          room, 
+          hasGame: false, 
+          gameType: 'lowcard',
+          isActive: false 
+        }]);
+        return;
+      }
+      
+      // 🔥 FIX: Pastikan data yang dikirim lengkap
+      const activePlayers = this._getActivePlayers(game);
+      const allPlayers = Array.from(game.players?.values() || []).map(p => p.name);
+      const eliminated = Array.from(game.eliminated || []);
+      const submitted = Array.from(game.numbers?.keys() || []);
+      
+      this._safeSend(ws, ["gameState", {
+        room, 
+        hasGame: true, 
+        gameType: 'lowcard',
+        isActive: game._isActive || false,
+        phase: game._phase || 'registration',
+        round: game.round || 1, 
+        bet: game.betAmount || 0,
+        host: game.hostName || 'Unknown',
+        registrationOpen: game.registrationOpen || false,
+        players: allPlayers, 
+        activePlayers: activePlayers.map(p => p.name),
+        eliminated, 
+        submitted, 
+        playerCount: game.players?.size || 0,
+        activeCount: activePlayers.length,
+        isEvaluating: game._isEvaluating || false,
+        evaluationLocked: game.evaluationLocked || false,
+        drawTimeExpired: game.drawTimeExpired || false,
+        gameStatus: game._gameEnded ? 'ended' : (game._isActive ? 'active' : 'inactive'),
+        totalPlayers: game.players?.size || 0
+      }]);
+    } catch(e) {
+      // 🔥 FIX: Jika error, kirim state kosong
+      try {
+        this._safeSend(ws, ["gameState", { 
+          room: room || 'unknown', 
+          hasGame: false, 
+          gameType: 'lowcard',
+          isActive: false,
+          error: true
+        }]);
+      } catch(err) {}
     }
   }
 
@@ -3044,36 +3209,8 @@ export class GameServer {
 
   _getWsId(ws) { return ws?._wsId || null; }
 
-  _sendGameStateToClient(ws, room) {
-    try {
-      if (!ws || ws.readyState !== 1 || !room) return;
-      const game = this.activeGames.get(room);
-      if (!game || !game._isActive || game._gameEnded) {
-        this._safeSend(ws, ["gameState", { room, hasGame: false, gameType: 'lowcard' }]);
-        return;
-      }
-      const activePlayers = this._getActivePlayers(game);
-      const allPlayers = Array.from(game.players.values()).map(p => p.name);
-      const eliminated = Array.from(game.eliminated || []);
-      const submitted = Array.from(game.numbers?.keys() || []);
-      this._safeSend(ws, ["gameState", {
-        room, hasGame: true, gameType: 'lowcard',
-        isActive: game._isActive, phase: game._phase || 'registration',
-        round: game.round || 1, bet: game.betAmount || 0,
-        host: game.hostName || 'Unknown',
-        registrationOpen: game.registrationOpen || false,
-        players: allPlayers, activePlayers: activePlayers.map(p => p.name),
-        eliminated, submitted, playerCount: game.players.size,
-        activeCount: activePlayers.length,
-        isEvaluating: game._isEvaluating || false,
-        evaluationLocked: game.evaluationLocked || false,
-        drawTimeExpired: game.drawTimeExpired || false
-      }]);
-    } catch(e) {}
-  }
-
   // ============================================================
-  // GAME: CLEANUP
+  // GAME: CLEANUP (FIXED)
   // ============================================================
   _scheduleGameCleanup(room, game) {
     try {
@@ -3171,7 +3308,11 @@ export class GameServer {
         this._clearTimer(this._cleanupTimers.get(room));
         this._cleanupTimers.delete(room);
       }
+      
+      // 🔥 FIX: Broadcast state kosong
       this._broadcastToRoom(room, ["gameLowCardEnd", []]);
+      this._broadcastGameStateToRoom(room);
+      
       this._releaseLock(this._cleanupLocks, lockKey);
     } catch(e) {
       this._releaseLock(this._cleanupLocks, lockKey);
@@ -3196,7 +3337,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // DESTROY - DENGAN CLEANUP NOTIFICATION TIMERS
+  // DESTROY
   // ============================================================
   async destroy() {
     try {
@@ -3204,7 +3345,6 @@ export class GameServer {
       this.isDestroyed = true;
       this.closing = true;
       
-      // 🆕 Cleanup notification timers (POINT 1)
       if (this._notificationTimers) {
         for (const timer of this._notificationTimers) {
           clearTimeout(timer);
