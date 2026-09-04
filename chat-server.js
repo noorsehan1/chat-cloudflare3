@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.6.9 - FIXED REMOVE USER DATA ON ROOM CHANGE
+// VERSION: 10.7.1 - FORCE DELETE ALL USER DATA ON ROOM CHANGE
 
 const C = {
   MAX_SEATS: 45,
@@ -18,7 +18,6 @@ const ROOMS = [
 const ROOMS_SET = new Set(ROOMS);
 
 export class ChatServer {
-  // ============ CONSTRUCTOR ============
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -38,8 +37,6 @@ export class ChatServer {
     this._restoreAllState().catch(() => {});
   }
 
-  // ============ WEBSOCKET MANAGEMENT ============
-
   _getActiveWebSockets() {
     try {
       return this.ctx.getWebSockets();
@@ -47,8 +44,6 @@ export class ChatServer {
       return [];
     }
   }
-
-  // ============ HELPER FUNCTIONS ============
 
   _getRoomCount(roomName) {
     try {
@@ -93,8 +88,7 @@ export class ChatServer {
     }
   }
 
-  // ============ CORE: UPDATE CACHE + STORAGE ============
-
+  // ✅ SAVE KE STORAGE DENGAN FORCE
   async _saveToStorage(roomsData, userSeatData, currentNumber, kursiNumber) {
     try {
       const updates = {};
@@ -132,7 +126,17 @@ export class ChatServer {
     }
   }
 
-  // ============ USER COUNT MANAGEMENT ============
+  // ✅ FORCE DELETE DARI STORAGE
+  async _forceDeleteFromStorage(keys) {
+    try {
+      for (const key of keys) {
+        await this.ctx.storage.delete(key);
+      }
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
 
   async _updateUserCounts() {
     try {
@@ -155,8 +159,6 @@ export class ChatServer {
       return { counts: {}, total: 0 };
     }
   }
-
-  // ============ STORAGE OPERATIONS ============
 
   async _loadFromStorage() {
     try {
@@ -188,8 +190,6 @@ export class ChatServer {
       };
     }
   }
-
-  // ============ USER MANAGEMENT ============
 
   _isUsernameExists(username) {
     try {
@@ -245,57 +245,76 @@ export class ChatServer {
     }
   }
 
-  // ✅ PERBAIKAN: Hapus user dari semua room dengan penghapusan langsung ke storage
+  // ✅ HAPUS USER DARI SEMUA ROOM - FORCE DELETE
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
     
     let removed = false;
+    const roomsToClean = [];
+    const seatsToRemove = {};
     
     try {
-      // Cari dan hapus dari semua room
+      // 1. Cari semua room dan seat yang digunakan user
       for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
         if (!roomData || !roomData.seats) continue;
         
-        let seatToRemove = null;
         for (const [seat, data] of Object.entries(roomData.seats)) {
           if (data && data.namauser === username) {
-            seatToRemove = parseInt(seat);
+            const seatNum = parseInt(seat);
+            seatsToRemove[roomName] = seatNum;
+            roomsToClean.push(roomName);
+            
+            // Hapus kursi number
+            const key = `${roomName}-${seatNum}`;
+            delete this._kursiNumber[key];
+            
+            // Hapus data kursi
+            delete roomData.seats[seatNum];
+            
+            // Hapus point
+            if (roomData.points) {
+              delete roomData.points[seatNum];
+            }
+            
+            removed = true;
+            
+            // Broadcast ke room
+            this.broadcast(roomName, ["removeKursi", roomName, seatNum]);
             break;
           }
         }
-        
-        if (seatToRemove !== null) {
-          // Hapus kursi number
-          const key = `${roomName}-${seatToRemove}`;
-          if (this._kursiNumber[key]) {
-            delete this._kursiNumber[key];
+      }
+      
+      // 2. Hapus room yang kosong
+      for (const roomName of roomsToClean) {
+        const roomData = this._roomsDataCache[roomName];
+        if (roomData) {
+          const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
+          const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
+          
+          if (!hasSeats && !hasPoints) {
+            // Hapus semua kursi number untuk room ini
+            for (const key of Object.keys(this._kursiNumber)) {
+              if (key.startsWith(`${roomName}-`)) {
+                delete this._kursiNumber[key];
+              }
+            }
+            delete this._roomsDataCache[roomName];
+          } else {
+            await this.updateRoomCount(roomName);
           }
-          
-          // Hapus data kursi
-          delete roomData.seats[seatToRemove];
-          
-          // Hapus point
-          if (roomData.points) {
-            delete roomData.points[seatToRemove];
-          }
-          
-          removed = true;
-          
-          // Broadcast ke room
-          this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
-          await this.updateRoomCount(roomName);
-          await this._deleteRoomIfEmpty(roomName);
         }
       }
       
-      // Hapus dari userSeatDataCache
+      // 3. Hapus dari userSeatDataCache
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
         removed = true;
       }
       
-      // ✅ SIMPAN LANGSUNG KE STORAGE
+      // 4. ✅ FORCE DELETE DARI STORAGE
       if (removed) {
+        // Simpan perubahan ke storage
         await this._saveToStorage(
           this._roomsDataCache,
           this._userSeatDataCache,
@@ -304,6 +323,17 @@ export class ChatServer {
         );
         await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
         await this._updateUserCounts();
+        
+        // ✅ DELETE LANGSUNG DARI STORAGE UNTUK MEMASTIKAN
+        await this._forceDeleteFromStorage(["roomsData", "userSeatData", "kursiNumber"]);
+        
+        // ✅ SIMPAN ULANG DENGAN DATA TERBARU
+        await this._saveToStorage(
+          this._roomsDataCache,
+          this._userSeatDataCache,
+          this.currentNumber,
+          this._kursiNumber
+        );
       }
       
       return removed;
@@ -373,7 +403,6 @@ export class ChatServer {
     }
   }
 
-  // ✅ PERBAIKAN: Hapus user dari room tertentu dengan penghapusan langsung ke storage
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
     
@@ -408,7 +437,7 @@ export class ChatServer {
       // Hapus dari userSeatDataCache
       delete this._userSeatDataCache[username];
       
-      // ✅ SIMPAN LANGSUNG KE STORAGE
+      // ✅ FORCE DELETE DARI STORAGE
       await this._saveToStorage(
         this._roomsDataCache,
         this._userSeatDataCache,
@@ -423,13 +452,20 @@ export class ChatServer {
       await this.updateRoomCount(roomName);
       await this._deleteRoomIfEmpty(roomName);
       
+      // ✅ DELETE LANGSUNG DARI STORAGE
+      await this._forceDeleteFromStorage(["roomsData", "userSeatData", "kursiNumber"]);
+      await this._saveToStorage(
+        this._roomsDataCache,
+        this._userSeatDataCache,
+        this.currentNumber,
+        this._kursiNumber
+      );
+      
       return true;
     } catch(e) {
       return false;
     }
   }
-
-  // ============ UPDATE KURSI - DENGAN NUMBER SENDIRI ============
 
   async _updateKursi(roomName, seat, data) {
     try {
@@ -492,7 +528,6 @@ export class ChatServer {
       const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
       
       if (!hasSeats && !hasPoints) {
-        // Hapus semua kursi number untuk room ini
         for (const key of Object.keys(this._kursiNumber)) {
           if (key.startsWith(`${roomName}-`)) {
             delete this._kursiNumber[key];
@@ -502,13 +537,15 @@ export class ChatServer {
         delete this._roomsDataCache[roomName];
         await this._saveToStorage(this._roomsDataCache, undefined, undefined, this._kursiNumber);
         await this._updateUserCounts();
+        
+        // ✅ DELETE DARI STORAGE
+        await this._forceDeleteFromStorage(["roomsData", "kursiNumber"]);
+        await this._saveToStorage(this._roomsDataCache, undefined, undefined, this._kursiNumber);
       }
     } catch(e) {}
   }
 
-  // ============ JOIN HANDLING - AMBIL NUMBER KURSI ============
-
-  // ✅ PERBAIKAN: Pastikan data lama dihapus sebelum join room baru
+  // ✅ JOIN HANDLING - HAPUS TOTAL SEMUA DATA
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -517,15 +554,30 @@ export class ChatServer {
     const username = ws.username;
     
     try {
-      // ✅ HAPUS USER DARI SEMUA ROOM (termasuk data kursi dan point)
+      // ✅ STEP 1: Hapus user dari semua room
       await this._removeUserFromAllRooms(username);
       
-      // ✅ PASTIKAN USER SEAT DATA CACHE DIHAPUS
+      // ✅ STEP 2: Hapus dari semua cache
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
       }
       
-      // ✅ SIMPAN PERUBAHAN KE STORAGE
+      // ✅ STEP 3: Hapus semua kursi number yang terkait
+      const keysToDelete = [];
+      for (const key of Object.keys(this._kursiNumber)) {
+        const [room, seat] = key.split('-');
+        if (this._roomsDataCache[room]?.seats?.[parseInt(seat)]?.namauser === username) {
+          keysToDelete.push(key);
+        }
+      }
+      for (const key of keysToDelete) {
+        delete this._kursiNumber[key];
+      }
+      
+      // ✅ STEP 4: DELETE LANGSUNG DARI STORAGE
+      await this._forceDeleteFromStorage(["roomsData", "userSeatData", "kursiNumber"]);
+      
+      // ✅ STEP 5: Simpan ulang data terbaru
       await this._saveToStorage(
         this._roomsDataCache,
         this._userSeatDataCache,
@@ -533,6 +585,7 @@ export class ChatServer {
         this._kursiNumber
       );
       
+      // ✅ STEP 6: Siapkan room baru
       let roomData = this._roomsDataCache[roomName];
       if (!roomData) {
         roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -540,6 +593,7 @@ export class ChatServer {
         await this._saveToStorage(this._roomsDataCache, undefined, undefined, undefined);
       }
       
+      // ✅ STEP 7: Cari seat kosong
       let seat = null;
       if (Object.keys(roomData.seats).length >= C.MAX_SEATS) {
         this.safeSend(ws, ["roomFull", roomName]);
@@ -558,28 +612,28 @@ export class ChatServer {
         return false;
       }
       
-      // Kosongkan kursi
+      // ✅ STEP 8: Kosongkan kursi
       roomData.seats[seat] = {};
       
-      // Hapus number kursi lama jika ada
+      // ✅ STEP 9: Simpan number kursi
       const key = `${roomName}-${seat}`;
       if (this._kursiNumber[key]) {
         delete this._kursiNumber[key];
       }
-      
-      // Simpan number kursi dari nomor kursi yang didapat
       this._kursiNumber[key] = seat;
       
-      // Hapus point lama jika ada
+      // ✅ STEP 10: Hapus point lama jika ada
       if (roomData.points && roomData.points[seat]) {
         delete roomData.points[seat];
       }
       
-      // ✅ SIMPAN KE STORAGE
+      // ✅ STEP 11: Simpan ke storage
       await this._saveToStorage(this._roomsDataCache, undefined, undefined, this._kursiNumber);
       
+      // ✅ STEP 12: Update WebSocket
       await this._updateWebSocketRoom(ws, roomName, username, seat, false);
       
+      // ✅ STEP 13: Kirim response
       this.safeSend(ws, ["rooMasuk", seat, roomName]);
       this.safeSend(ws, ["numberKursiSaya", seat]);
       this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
@@ -588,6 +642,7 @@ export class ChatServer {
       this.safeSend(ws, ["roomUserCount", roomName, count]);
       this.broadcast(roomName, ["roomUserCount", roomName, count]);
       
+      // ✅ STEP 14: Kirim state
       setTimeout(() => {
         try {
           if (ws && ws.readyState === 1) {
@@ -596,13 +651,20 @@ export class ChatServer {
         } catch(e) {}
       }, 1000);
       
+      // ✅ STEP 15: Verifikasi terakhir
+      await this._forceDeleteFromStorage(["roomsData", "userSeatData", "kursiNumber"]);
+      await this._saveToStorage(
+        this._roomsDataCache,
+        this._userSeatDataCache,
+        this.currentNumber,
+        this._kursiNumber
+      );
+      
       return true;
     } catch(e) {
       return false;
     }
   }
-
-  // ============ CLEANUP ============
 
   async _cleanupUserOnDisconnect(ws) {
     if (!ws || ws._isCleaningUp) return;
@@ -651,8 +713,6 @@ export class ChatServer {
     }
   }
 
-  // ============ BROADCAST ============
-
   _broadcastToRoom(room, msgStr) {
     if (this.closing || this.isDestroyed || !room) return;
     
@@ -700,8 +760,6 @@ export class ChatServer {
       return false;
     }
   }
-
-  // ============ STATE MANAGEMENT ============
 
   async updateRoomCount(room) {
     if (this.closing || this.isDestroyed || !room) return 0;
@@ -769,8 +827,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ ALARM - UPDATE NUMBER 1-6 ============
-
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     
@@ -786,8 +842,6 @@ export class ChatServer {
       } catch(e) {}
     }
   }
-
-  // ============ UPDATE NUMBER 1-6 (BUKAN UNTUK KURSI) ============
 
   async _updateNumber() {
     if (this._isNumberUpdating || this.closing || this.isDestroyed) return;
@@ -983,8 +1037,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ WEBSOCKET EVENT HANDLERS ============
-
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
@@ -1028,8 +1080,6 @@ export class ChatServer {
       await this._cleanupUserOnDisconnect(ws);
     } catch(e) {}
   }
-
-  // ============ HANDLE SET ID ============
 
   async _handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
@@ -1079,8 +1129,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ HANDLE MESSAGE ============
-
   async handleMessage(ws, raw) {
     if (!ws) return;
     try {
@@ -1107,8 +1155,6 @@ export class ChatServer {
       await this._handleEventInternal(ws, [evt, ...args]);
     } catch(e) {}
   }
-
-  // ============ EVENT HANDLER INTERNAL ============
 
   async _handleEventInternal(ws, data) {
     try {
@@ -1208,7 +1254,6 @@ export class ChatServer {
             delete this._kursiNumber[key];
           }
           
-          // Simpan number kursi dari nomor kursi yang didapat
           this._kursiNumber[key] = seat;
           
           if (roomData.points && roomData.points[seat]) {
@@ -1555,8 +1600,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ RESTORE STATE ============
-
   async _restoreAllState() {
     if (this._isRestoring) return;
     this._isRestoring = true;
@@ -1663,8 +1706,6 @@ export class ChatServer {
     }
   }
 
-  // ============ RESET ALL DATA ============
-
   async resetAllData() {
     const timestamp = Date.now();
     
@@ -1724,8 +1765,6 @@ export class ChatServer {
       };
     }
   }
-
-  // ============ FETCH ============
 
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
@@ -1810,8 +1849,6 @@ export class ChatServer {
       return new Response("Internal Server Error", { status: 500 });
     }
   }
-
-  // ============ DESTROY ============
 
   async destroy() {
     if (this.isDestroyed) return;
