@@ -1688,12 +1688,23 @@ export class ChatServer {
         }
         
         case "getAllRoomsUserCount": {
-          const counts = {};
-          for (const room of ROOMS) {
-            counts[room] = this._getRoomCount(room);
+          try {
+            const counts = {};
+            for (const room of ROOMS) {
+              counts[room] = this._getRoomCount(room);
+            }
+            
+            // Format untuk client Java: array of objects dengan roomName dan userCount
+            const result = Object.entries(counts).map(([roomName, userCount]) => ({ 
+              roomName: roomName,
+              userCount: userCount 
+            }));
+            
+            // Kirim sebagai JSON string
+            this.safeSend(ws, ["allRoomsUserCount", JSON.stringify(result)]);
+          } catch(e) {
+            this.safeSend(ws, ["allRoomsUserCount", "[]"]);
           }
-          const result = Object.entries(counts).map(([roomName, userCount]) => ({ roomName, userCount }));
-          this.safeSend(ws, ["allRoomsUserCount", JSON.stringify(result)]);
           break;
         }
         
@@ -1702,6 +1713,8 @@ export class ChatServer {
           if (roomName && ROOMS_SET.has(roomName)) {
             const count = this._getRoomCount(roomName);
             this.safeSend(ws, ["roomUserCount", roomName, count]);
+          } else {
+            this.safeSend(ws, ["roomUserCount", roomName || "", 0]);
           }
           break;
         }
