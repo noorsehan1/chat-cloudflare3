@@ -242,21 +242,6 @@ export class ChatServer {
     }
   }
 
-  async _batchSync(operations) {
-    try {
-      for (const op of operations) {
-        if (op.type === 'delete') {
-          await this._unsyncData(op.dataType, op.room, op.seat);
-        } else {
-          await this._syncData(op.type, op.room, op.seat, op.data);
-        }
-      }
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-
   // ============ CORE: UPDATE CACHE + STORAGE ============
 
   async _saveToStorage(roomsData, userSeatData, currentNumber, kursiNumber) {
@@ -408,8 +393,6 @@ export class ChatServer {
     }
   }
 
-  // ============ REMOVE USER FROM ALL ROOMS ============
-
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
     
@@ -461,8 +444,6 @@ export class ChatServer {
       return removed;
     }
   }
-
-  // ============ FORCE CLEANUP MULTI USER ============
 
   async _forceCleanupMultiUser(username) {
     if (!username) return false;
@@ -1337,10 +1318,8 @@ export class ChatServer {
             break;
           }
           
-          // ✅ FORCE CLEANUP - Hapus semua data user dari room sebelumnya
           await this._forceCleanupMultiUser(multiUsername);
           
-          // ✅ Reset flag multi di websocket
           ws._isMulti = true;
           ws._multiRoom = multiRoomname;
           ws._multiSeat = null;
@@ -1359,7 +1338,6 @@ export class ChatServer {
             break;
           }
           
-          // ✅ CARI NOMOR KURSI KOSONG (1-45)
           for (let s = 1; s <= C.MAX_SEATS; s++) {
             if (!roomData.seats[s]) {
               seat = s;
@@ -1372,7 +1350,6 @@ export class ChatServer {
             break;
           }
           
-          // ✅ Kosongkan kursi - sync ke cache dan storage
           const emptySeatData = {
             noimageUrl: "",
             namauser: "",
@@ -1387,7 +1364,6 @@ export class ChatServer {
           await this._syncData('kursiNumber', multiRoomname, seat, seat);
           await this._unsyncData('point', multiRoomname, seat);
           
-          // ✅ Simpan user data dengan isMulti = true
           const seatInfo = {
             room: multiRoomname,
             seat: seat,
@@ -1397,10 +1373,8 @@ export class ChatServer {
           };
           await this._syncData('user', multiUsername, null, seatInfo);
           
-          // ✅ Update websocket
           await this._updateWebSocketRoom(ws, multiRoomname, multiUsername, seat, true);
           
-          // ✅ Update semua websocket untuk user yang sama
           const webSockets = this._getActiveWebSockets();
           for (const wsKey of webSockets) {
             if (wsKey === ws) continue;
@@ -1414,11 +1388,7 @@ export class ChatServer {
             } catch(e) {}
           }
           
-          // ✅ Kirim response ke client dengan NOMOR KURSI
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-          //                                    ↑      ↑
-          //                              NOMOR KURSI  ROOM NAME
-          
           this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
           
           break;
@@ -1626,7 +1596,6 @@ export class ChatServer {
         case "resetRoom": {
           const resetRoomName = args[0];
           if (resetRoomName && ROOMS_SET.has(resetRoomName)) {
-            // Hapus semua data di room
             const roomData = this._roomsDataCache[resetRoomName];
             if (roomData) {
               const seats = Object.keys(roomData.seats);
@@ -1723,11 +1692,7 @@ export class ChatServer {
           for (const room of ROOMS) {
             counts[room] = this._getRoomCount(room);
           }
-          // Kirim sebagai array of objects untuk client Java
-          const result = Object.entries(counts).map(([roomName, userCount]) => ({ 
-            roomName, 
-            userCount 
-          }));
+          const result = Object.entries(counts).map(([roomName, userCount]) => ({ roomName, userCount }));
           this.safeSend(ws, ["allRoomsUserCount", JSON.stringify(result)]);
           break;
         }
@@ -1774,7 +1739,6 @@ export class ChatServer {
         }
         
         case "onDestroy": {
-          // Client disconnecting
           const username = ws.username || ws._cachedUsername;
           if (username) {
             await this._removeUserFromAllRooms(username);
