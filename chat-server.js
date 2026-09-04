@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.12.0 - FINAL: CLEANUP BY USERNAME IN ALL ROOMS
+// VERSION: 10.13.0 - FINAL: CLEANUP ALL SEATS WITH SAME USERNAME
 
 const C = {
   MAX_SEATS: 45,
@@ -467,7 +467,7 @@ export class ChatServer {
     }
   }
 
-  // ============ CLEANUP USER TOTAL (BY USERNAME IN ALL ROOMS) ============
+  // ============ CLEANUP USER TOTAL (ALL SEATS WITH SAME USERNAME) ============
 
   async _cleanupUserTotal(username) {
     if (!username) return false;
@@ -477,20 +477,23 @@ export class ChatServer {
     
     try {
       let cleaned = false;
+      const roomsToDelete = [];
       
-      // ✅ CEK SEMUA ROOM BERDASARKAN NAMA USER
+      // ✅ CEK SEMUA ROOM, HAPUS SEMUA KURSI DENGAN USERNAME YANG SAMA
       for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
         if (!roomData || !roomData.seats) continue;
         
-        let seatToRemove = null;
+        const seatsToRemove = [];
+        
+        // ✅ KUMPULKAN SEMUA KURSI DENGAN USERNAME YANG SAMA
         for (const [seat, data] of Object.entries(roomData.seats)) {
           if (data && data.namauser === username) {
-            seatToRemove = parseInt(seat);
-            break;
+            seatsToRemove.push(parseInt(seat));
           }
         }
         
-        if (seatToRemove !== null) {
+        // ✅ HAPUS SEMUA KURSI YANG DITEMUKAN
+        for (const seatToRemove of seatsToRemove) {
           const key = `${roomName}-${seatToRemove}`;
           if (this._kursiNumber[key]) {
             delete this._kursiNumber[key];
@@ -505,18 +508,40 @@ export class ChatServer {
           cleaned = true;
           
           this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
+        }
+        
+        // ✅ UPDATE ROOM COUNT
+        if (seatsToRemove.length > 0) {
           await this.updateRoomCount(roomName);
-          await this._deleteRoomIfEmpty(roomName);
+          
+          const hasSeats = roomData.seats && Object.keys(roomData.seats).length > 0;
+          const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
+          
+          if (!hasSeats && !hasPoints) {
+            roomsToDelete.push(roomName);
+          }
         }
       }
       
-      // ✅ HAPUS DARI CACHE
+      // ✅ HAPUS ROOM YANG KOSONG
+      for (const roomName of roomsToDelete) {
+        for (const key of Object.keys(this._kursiNumber)) {
+          if (key.startsWith(`${roomName}-`)) {
+            delete this._kursiNumber[key];
+          }
+        }
+        
+        delete this._roomsDataCache[roomName];
+        cleaned = true;
+      }
+      
+      // ✅ HAPUS DARI CACHE USER SEAT DATA
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
         cleaned = true;
       }
       
-      // ✅ RESET SEMUA WEBSOCKET DENGAN NAMA YANG SAMA
+      // ✅ RESET SEMUA WEBSOCKET DENGAN USERNAME YANG SAMA
       const webSockets = this._getActiveWebSockets();
       for (const ws of webSockets) {
         try {
@@ -655,6 +680,7 @@ export class ChatServer {
     this._joinLock.add(lockKey);
     
     try {
+      // ✅ CLEANUP SEMUA DATA USER DENGAN USERNAME YANG SAMA
       await this._cleanupUserTotal(username);
       
       if (this._userSeatDataCache[username]) {
