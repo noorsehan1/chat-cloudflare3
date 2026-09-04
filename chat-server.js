@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.6.8 - AMBIL NUMBER KURSI DARI JOIN ROOM
+// VERSION: 10.6.9 - CLEANUP CACHE & STORAGE
 
 const C = {
   MAX_SEATS: 45,
@@ -411,7 +411,66 @@ export class ChatServer {
     }
   }
 
-  // ============ UPDATE KURSI - DENGAN NUMBER SENDIRI ============
+  // ============ CLEANUP USER FROM ROOM ============
+
+  async _cleanupUserFromRoom(username, roomName) {
+    if (!username || !roomName) return false;
+    
+    try {
+      const roomData = this._roomsDataCache[roomName];
+      if (!roomData || !roomData.seats) return false;
+      
+      let seatToRemove = null;
+      for (const [seat, data] of Object.entries(roomData.seats)) {
+        if (data && data.namauser === username) {
+          seatToRemove = parseInt(seat);
+          break;
+        }
+      }
+      
+      if (seatToRemove === null) return false;
+      
+      const key = `${roomName}-${seatToRemove}`;
+      if (this._kursiNumber[key]) {
+        delete this._kursiNumber[key];
+      }
+      
+      delete roomData.seats[seatToRemove];
+      
+      if (roomData.points) {
+        delete roomData.points[seatToRemove];
+      }
+      
+      if (this._userSeatDataCache[username]) {
+        delete this._userSeatDataCache[username];
+      }
+      
+      const onlineUsers = this._getOnlineUsers();
+      if (onlineUsers.includes(username)) {
+        const updatedOnlineUsers = onlineUsers.filter(u => u !== username);
+        await this.ctx.storage.put("onlineUsers", updatedOnlineUsers);
+      }
+      
+      await this._saveToStorage(
+        this._roomsDataCache,
+        this._userSeatDataCache,
+        this.currentNumber,
+        this._kursiNumber
+      );
+      
+      await this._updateUserCounts();
+      
+      this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
+      await this.updateRoomCount(roomName);
+      await this._deleteRoomIfEmpty(roomName);
+      
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  // ============ UPDATE KURSI ============
 
   async _updateKursi(roomName, seat, data) {
     try {
@@ -487,7 +546,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ JOIN HANDLING - AMBIL NUMBER KURSI ============
+  // ============ JOIN HANDLING ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -497,7 +556,25 @@ export class ChatServer {
     const username = ws.username;
     
     try {
-      await this._removeUserFromAllRooms(username);
+      const currentSeatInfo = this._userSeatDataCache[username];
+      
+      if (currentSeatInfo && currentSeatInfo.room) {
+        await this._cleanupUserFromRoom(username, currentSeatInfo.room);
+      } else {
+        for (const [roomNameCheck, roomData] of Object.entries(this._roomsDataCache)) {
+          if (!roomData || !roomData.seats) continue;
+          
+          let found = false;
+          for (const [seat, data] of Object.entries(roomData.seats)) {
+            if (data && data.namauser === username) {
+              await this._cleanupUserFromRoom(username, roomNameCheck);
+              found = true;
+              break;
+            }
+          }
+          if (found) break;
+        }
+      }
       
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
@@ -528,24 +605,25 @@ export class ChatServer {
         return false;
       }
       
-      // KOSONGKAN KURSI
       roomData.seats[seat] = {};
       
-      // HAPUS NUMBER KURSI LAMA JIKA ADA
       const key = `${roomName}-${seat}`;
       if (this._kursiNumber[key]) {
         delete this._kursiNumber[key];
       }
       
-      // ✅ SIMPAN NUMBER KURSI DARI NOMOR KURSI YANG DIDAPAT
       this._kursiNumber[key] = seat;
       
-      // HAPUS POINT LAMA JIKA ADA
       if (roomData.points && roomData.points[seat]) {
         delete roomData.points[seat];
       }
       
-      await this._saveToStorage(this._roomsDataCache, undefined, undefined, this._kursiNumber);
+      await this._saveToStorage(
+        this._roomsDataCache, 
+        this._userSeatDataCache, 
+        this.currentNumber, 
+        this._kursiNumber
+      );
       
       await this._updateWebSocketRoom(ws, roomName, username, seat, false);
       
@@ -756,7 +834,7 @@ export class ChatServer {
     }
   }
 
-  // ============ UPDATE NUMBER 1-6 (BUKAN UNTUK KURSI) ============
+  // ============ UPDATE NUMBER 1-6 ============
 
   async _updateNumber() {
     if (this._isNumberUpdating || this.closing || this.isDestroyed) return;
@@ -1141,7 +1219,29 @@ export class ChatServer {
             break;
           }
           
-          await this._removeUserFromAllRooms(multiUsername);
+          const currentSeatInfo = this._userSeatDataCache[multiUsername];
+          
+          if (currentSeatInfo && currentSeatInfo.room) {
+            await this._cleanupUserFromRoom(multiUsername, currentSeatInfo.room);
+          } else {
+            for (const [roomNameCheck, roomData] of Object.entries(this._roomsDataCache)) {
+              if (!roomData || !roomData.seats) continue;
+              
+              let found = false;
+              for (const [seat, data] of Object.entries(roomData.seats)) {
+                if (data && data.namauser === multiUsername) {
+                  await this._cleanupUserFromRoom(multiUsername, roomNameCheck);
+                  found = true;
+                  break;
+                }
+              }
+              if (found) break;
+            }
+          }
+          
+          if (this._userSeatDataCache[multiUsername]) {
+            delete this._userSeatDataCache[multiUsername];
+          }
           
           let roomData = this._roomsDataCache[multiRoomname];
           if (!roomData) {
@@ -1151,7 +1251,6 @@ export class ChatServer {
           }
           
           let seat = null;
-          
           const seatCount = Object.keys(roomData.seats).length;
           if (seatCount >= C.MAX_SEATS) {
             this.safeSend(ws, ["multiJoinError", "Room penuh"]);
@@ -1177,7 +1276,6 @@ export class ChatServer {
             delete this._kursiNumber[key];
           }
           
-          // ✅ SIMPAN NUMBER KURSI DARI NOMOR KURSI YANG DIDAPAT
           this._kursiNumber[key] = seat;
           
           if (roomData.points && roomData.points[seat]) {
