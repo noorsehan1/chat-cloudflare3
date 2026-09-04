@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.7.0 - CLEANUP CACHE & STORAGE, REMOVE REDUNDANT onlineUsers
+// VERSION: 10.7.1 - FINAL: CLEANUP CACHE & STORAGE, REMOVE REDUNDANT DATA
 
 const C = {
   MAX_SEATS: 45,
@@ -145,8 +145,6 @@ export class ChatServer {
         counts[room] = count;
         totalUsers += count;
       }
-      
-      await this.ctx.storage.put({ userCounts: counts });
       
       return { counts, total: totalUsers };
     } catch(e) {
@@ -738,13 +736,6 @@ export class ChatServer {
     if (this.closing || this.isDestroyed || !room) return 0;
     try {
       const count = this._getRoomCount(room);
-      
-      const counts = {};
-      for (const r of ROOMS) {
-        counts[r] = this._getRoomCount(r);
-      }
-      await this.ctx.storage.put("userCounts", counts);
-      
       this.broadcast(room, ["roomUserCount", room, count]);
       return count;
     } catch(e) { return 0; }
@@ -1724,7 +1715,6 @@ export class ChatServer {
       await this.ctx.storage.delete("roomsData");
       await this.ctx.storage.delete("userSeatData");
       await this.ctx.storage.delete("currentNumber");
-      await this.ctx.storage.delete("userCounts");
       await this.ctx.storage.delete("kursiNumber");
       
       const resetMessage = JSON.stringify(["serverReset", "Server di-reset pada: " + new Date(timestamp).toLocaleString()]);
