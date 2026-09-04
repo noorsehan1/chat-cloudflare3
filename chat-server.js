@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.6.9 - CLEANUP CACHE & STORAGE
+// VERSION: 10.7.0 - CLEANUP CACHE & STORAGE, REMOVE REDUNDANT onlineUsers
 
 const C = {
   MAX_SEATS: 45,
@@ -29,6 +29,7 @@ export class ChatServer {
     this._isRefreshing = false;
     this._isRestoring = false;
     this._isNumberUpdating = false;
+    this._cleaningUsers = new Set();
     
     this._roomsDataCache = {};
     this._userSeatDataCache = {};
@@ -145,10 +146,7 @@ export class ChatServer {
         totalUsers += count;
       }
       
-      await this.ctx.storage.put({
-        userCounts: counts,
-        onlineUsers: this._getOnlineUsers()
-      });
+      await this.ctx.storage.put({ userCounts: counts });
       
       return { counts, total: totalUsers };
     } catch(e) {
@@ -237,7 +235,6 @@ export class ChatServer {
       this._userSeatDataCache[username] = seatInfo;
       
       await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
-      await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
       
       return true;
     } catch(e) {
@@ -292,7 +289,6 @@ export class ChatServer {
           this.currentNumber,
           this._kursiNumber
         );
-        await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
         await this._updateUserCounts();
       }
       
@@ -336,7 +332,6 @@ export class ChatServer {
         if (!hasWS && !seatInfo.isMulti) {
           delete this._userSeatDataCache[username];
           await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
-          await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
         }
       }
       
@@ -351,7 +346,6 @@ export class ChatServer {
               isMulti: isMulti
             };
             await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
-            await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
             return { room: roomName, seat: parseInt(seat), isMulti: isMulti };
           }
         }
@@ -397,7 +391,6 @@ export class ChatServer {
         this.currentNumber,
         this._kursiNumber
       );
-      await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
       
       await this._updateUserCounts();
       
@@ -415,6 +408,9 @@ export class ChatServer {
 
   async _cleanupUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
+    if (this._cleaningUsers.has(username)) return false;
+    
+    this._cleaningUsers.add(username);
     
     try {
       const roomData = this._roomsDataCache[roomName];
@@ -445,12 +441,6 @@ export class ChatServer {
         delete this._userSeatDataCache[username];
       }
       
-      const onlineUsers = this._getOnlineUsers();
-      if (onlineUsers.includes(username)) {
-        const updatedOnlineUsers = onlineUsers.filter(u => u !== username);
-        await this.ctx.storage.put("onlineUsers", updatedOnlineUsers);
-      }
-      
       await this._saveToStorage(
         this._roomsDataCache,
         this._userSeatDataCache,
@@ -467,6 +457,8 @@ export class ChatServer {
       return true;
     } catch(e) {
       return false;
+    } finally {
+      this._cleaningUsers.delete(username);
     }
   }
 
@@ -516,7 +508,6 @@ export class ChatServer {
     try {
       delete this._userSeatDataCache[username];
       await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
-      await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
       await this._updateUserCounts();
       return true;
     } catch(e) {
@@ -674,22 +665,15 @@ export class ChatServer {
       }
       
       if (isMulti && hasSeat) {
-        await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
         return;
       }
       
       if (!hasSeat) {
-        await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
-        
         if (this._userSeatDataCache[username]) {
           delete this._userSeatDataCache[username];
           await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
         }
         return;
-      }
-      
-      if (hasSeat && !isMulti) {
-        await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
       }
       
     } catch(e) {
@@ -945,7 +929,6 @@ export class ChatServer {
       
       if (changed) {
         await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
-        await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
       }
       
     } catch(e) {}
@@ -1099,7 +1082,6 @@ export class ChatServer {
         this.currentNumber,
         this._kursiNumber
       );
-      await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
       
       ws.username = username;
       ws.idtarget = username;
@@ -1187,7 +1169,6 @@ export class ChatServer {
                   _wsId: ws._wsId || null
                 };
                 await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
-                await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
               }
             } catch(e) {}
             return;
@@ -1715,7 +1696,6 @@ export class ChatServer {
         this.currentNumber,
         this._kursiNumber
       );
-      await this.ctx.storage.put("onlineUsers", this._getOnlineUsers());
       
       if (!this.closing && !this.isDestroyed) {
         const existingAlarm = await this.ctx.storage.getAlarm();
@@ -1745,7 +1725,6 @@ export class ChatServer {
       await this.ctx.storage.delete("userSeatData");
       await this.ctx.storage.delete("currentNumber");
       await this.ctx.storage.delete("userCounts");
-      await this.ctx.storage.delete("onlineUsers");
       await this.ctx.storage.delete("kursiNumber");
       
       const resetMessage = JSON.stringify(["serverReset", "Server di-reset pada: " + new Date(timestamp).toLocaleString()]);
