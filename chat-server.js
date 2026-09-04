@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.7.1 - FINAL: CLEANUP CACHE & STORAGE, REMOVE REDUNDANT DATA
+// VERSION: 10.8.0 - FINAL: COMPLETE WEBSOCKET CLEANUP
 
 const C = {
   MAX_SEATS: 45,
@@ -194,6 +194,36 @@ export class ChatServer {
     } catch(e) {
       return false;
     }
+  }
+
+  async _resetWebSocketState(ws, username) {
+    if (!ws) return;
+    
+    try {
+      ws._isMulti = false;
+      ws._multiRoom = null;
+      ws._multiSeat = null;
+      ws._cachedRoom = null;
+      ws._cachedSeat = null;
+      ws.room = null;
+      ws.roomname = null;
+      ws._cachedUsername = username || null;
+      
+      ws.serializeAttachment({
+        username: username || null,
+        isMulti: false,
+        room: null,
+        seat: null,
+        multiRoom: null,
+        multiSeat: null,
+        seatInfo: null
+      });
+      
+      if (username && this._userSeatDataCache[username]) {
+        delete this._userSeatDataCache[username];
+        await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
+      }
+    } catch(e) {}
   }
 
   async _updateWebSocketRoom(ws, roomName, username, seat, isMulti = false) {
@@ -422,7 +452,13 @@ export class ChatServer {
         }
       }
       
-      if (seatToRemove === null) return false;
+      if (seatToRemove === null) {
+        if (this._userSeatDataCache[username]) {
+          delete this._userSeatDataCache[username];
+          await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
+        }
+        return false;
+      }
       
       const key = `${roomName}-${seatToRemove}`;
       if (this._kursiNumber[key]) {
@@ -453,6 +489,69 @@ export class ChatServer {
       await this._deleteRoomIfEmpty(roomName);
       
       return true;
+    } catch(e) {
+      return false;
+    } finally {
+      this._cleaningUsers.delete(username);
+    }
+  }
+
+  async _cleanupUserTotal(username) {
+    if (!username) return false;
+    if (this._cleaningUsers.has(username)) return false;
+    
+    this._cleaningUsers.add(username);
+    
+    try {
+      let cleaned = false;
+      
+      for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+        if (!roomData || !roomData.seats) continue;
+        
+        let seatToRemove = null;
+        for (const [seat, data] of Object.entries(roomData.seats)) {
+          if (data && data.namauser === username) {
+            seatToRemove = parseInt(seat);
+            break;
+          }
+        }
+        
+        if (seatToRemove !== null) {
+          const key = `${roomName}-${seatToRemove}`;
+          if (this._kursiNumber[key]) {
+            delete this._kursiNumber[key];
+          }
+          
+          delete roomData.seats[seatToRemove];
+          
+          if (roomData.points) {
+            delete roomData.points[seatToRemove];
+          }
+          
+          cleaned = true;
+          
+          this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
+          await this.updateRoomCount(roomName);
+          await this._deleteRoomIfEmpty(roomName);
+        }
+      }
+      
+      if (this._userSeatDataCache[username]) {
+        delete this._userSeatDataCache[username];
+        cleaned = true;
+      }
+      
+      if (cleaned) {
+        await this._saveToStorage(
+          this._roomsDataCache,
+          this._userSeatDataCache,
+          this.currentNumber,
+          this._kursiNumber
+        );
+        await this._updateUserCounts();
+      }
+      
+      return cleaned;
     } catch(e) {
       return false;
     } finally {
@@ -545,28 +644,24 @@ export class ChatServer {
     const username = ws.username;
     
     try {
-      const currentSeatInfo = this._userSeatDataCache[username];
+      await this._cleanupUserTotal(username);
       
-      if (currentSeatInfo && currentSeatInfo.room) {
-        await this._cleanupUserFromRoom(username, currentSeatInfo.room);
-      } else {
-        for (const [roomNameCheck, roomData] of Object.entries(this._roomsDataCache)) {
-          if (!roomData || !roomData.seats) continue;
-          
-          let found = false;
-          for (const [seat, data] of Object.entries(roomData.seats)) {
-            if (data && data.namauser === username) {
-              await this._cleanupUserFromRoom(username, roomNameCheck);
-              found = true;
-              break;
-            }
+      await this._resetWebSocketState(ws, username);
+      
+      const webSockets = this._getActiveWebSockets();
+      for (const wsKey of webSockets) {
+        if (wsKey === ws) continue;
+        try {
+          const uname = wsKey._cachedUsername || wsKey.username || wsKey.deserializeAttachment()?.username;
+          if (uname === username) {
+            await this._resetWebSocketState(wsKey, username);
           }
-          if (found) break;
-        }
+        } catch(e) {}
       }
       
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
+        await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
       }
       
       let roomData = this._roomsDataCache[roomName];
@@ -600,7 +695,6 @@ export class ChatServer {
       if (this._kursiNumber[key]) {
         delete this._kursiNumber[key];
       }
-      
       this._kursiNumber[key] = seat;
       
       if (roomData.points && roomData.points[seat]) {
@@ -1017,15 +1111,15 @@ export class ChatServer {
       
       if (attachment && attachment.username) {
         ws.username = attachment.username;
-        ws.room = attachment.room;
-        ws.roomname = attachment.room;
+        ws.room = attachment.room || null;
+        ws.roomname = attachment.room || null;
         ws.idtarget = attachment.username;
         ws._isMulti = attachment.isMulti || false;
         ws._multiRoom = attachment.multiRoom || null;
         ws._multiSeat = attachment.multiSeat || null;
         ws._cachedUsername = attachment.username;
-        ws._cachedRoom = attachment.room;
-        ws._cachedSeat = attachment.seat;
+        ws._cachedRoom = attachment.room || null;
+        ws._cachedSeat = attachment.seat || null;
         
         if (attachment.seatInfo) {
           this._userSeatDataCache[attachment.username] = attachment.seatInfo;
@@ -1061,7 +1155,7 @@ export class ChatServer {
     if (ws.readyState !== 1) return;
     
     try {
-      await this._removeUserFromAllRooms(username);
+      await this._cleanupUserTotal(username);
       
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
@@ -1166,7 +1260,7 @@ export class ChatServer {
           }
           
           if (username) {
-            await this._removeUserFromAllRooms(username);
+            await this._cleanupUserTotal(username);
           }
           
           await this._handleSetId(ws, username, isNewUser);
@@ -1191,25 +1285,7 @@ export class ChatServer {
             break;
           }
           
-          const currentSeatInfo = this._userSeatDataCache[multiUsername];
-          
-          if (currentSeatInfo && currentSeatInfo.room) {
-            await this._cleanupUserFromRoom(multiUsername, currentSeatInfo.room);
-          } else {
-            for (const [roomNameCheck, roomData] of Object.entries(this._roomsDataCache)) {
-              if (!roomData || !roomData.seats) continue;
-              
-              let found = false;
-              for (const [seat, data] of Object.entries(roomData.seats)) {
-                if (data && data.namauser === multiUsername) {
-                  await this._cleanupUserFromRoom(multiUsername, roomNameCheck);
-                  found = true;
-                  break;
-                }
-              }
-              if (found) break;
-            }
-          }
+          await this._cleanupUserTotal(multiUsername);
           
           if (this._userSeatDataCache[multiUsername]) {
             delete this._userSeatDataCache[multiUsername];
@@ -1362,7 +1438,7 @@ export class ChatServer {
           }
           
           try {
-            await this._removeUserFromAllRooms(targetUsername);
+            await this._cleanupUserTotal(targetUsername);
             
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
@@ -1371,18 +1447,7 @@ export class ChatServer {
                               wsKey.username || 
                               wsKey.deserializeAttachment()?.username;
                 if (uname === targetUsername) {
-                  wsKey._isMulti = false;
-                  wsKey._multiRoom = null;
-                  wsKey._multiSeat = null;
-                  wsKey._cachedRoom = null;
-                  wsKey.room = null;
-                  wsKey.roomname = null;
-                  wsKey.idtarget = null;
-                  wsKey.serializeAttachment({ 
-                    username: targetUsername,
-                    isMulti: false
-                  });
-                  
+                  await this._resetWebSocketState(wsKey, targetUsername);
                   this.safeSend(wsKey, ["exitMultiSuccess", targetUsername, null, null]);
                 }
               } catch(e) {}
@@ -1454,7 +1519,7 @@ export class ChatServer {
           }
           
           if (username) {
-            await this._removeUserFromAllRooms(username);
+            await this._cleanupUserTotal(username);
           }
           break;
         }
