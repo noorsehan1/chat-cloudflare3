@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.11.0 - FINAL: REALTIME SYNC, NO lastSeen/wsId
+// VERSION: 10.12.0 - FINAL: CLEANUP BY USERNAME IN ALL ROOMS
 
 const C = {
   MAX_SEATS: 45,
@@ -467,7 +467,7 @@ export class ChatServer {
     }
   }
 
-  // ============ CLEANUP USER TOTAL (KURSI & POINT ONLY) ============
+  // ============ CLEANUP USER TOTAL (BY USERNAME IN ALL ROOMS) ============
 
   async _cleanupUserTotal(username) {
     if (!username) return false;
@@ -478,6 +478,7 @@ export class ChatServer {
     try {
       let cleaned = false;
       
+      // ✅ CEK SEMUA ROOM BERDASARKAN NAMA USER
       for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
         if (!roomData || !roomData.seats) continue;
         
@@ -509,11 +510,40 @@ export class ChatServer {
         }
       }
       
+      // ✅ HAPUS DARI CACHE
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
         cleaned = true;
       }
       
+      // ✅ RESET SEMUA WEBSOCKET DENGAN NAMA YANG SAMA
+      const webSockets = this._getActiveWebSockets();
+      for (const ws of webSockets) {
+        try {
+          const uname = ws._cachedUsername || ws.username || ws.deserializeAttachment()?.username;
+          if (uname === username) {
+            ws._isMulti = false;
+            ws._multiRoom = null;
+            ws._multiSeat = null;
+            ws._cachedRoom = null;
+            ws._cachedSeat = null;
+            ws.room = null;
+            ws.roomname = null;
+            
+            ws.serializeAttachment({
+              username: username,
+              isMulti: false,
+              room: null,
+              seat: null,
+              multiRoom: null,
+              multiSeat: null,
+              seatInfo: null
+            });
+          }
+        } catch(e) {}
+      }
+      
+      // ✅ SIMPAN KE STORAGE
       if (cleaned) {
         await this._saveToStorage(
           this._roomsDataCache,
