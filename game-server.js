@@ -2801,14 +2801,11 @@ export class GameServer {
   }
 
   _checkAndStartDiceIfNeeded(ws) {
-    try {
-      if (!this.alarmScheduler.isDiceTime()) {
-        const timeLeft = this._getTimeLeftUntilNextDice();
-        if (timeLeft.totalMs > 0) {
-          this._safeSend(ws, ["diceNotification", `Next dice game in: ${timeLeft.text}`]);
-        }
-        return;
-      }
+   try {
+  if (!this.alarmScheduler.isDiceTime()) {
+    return;
+  }
+}
       if (this.currentDiceRoll && this._canSubmitDiceAnswer) {
         const elapsed = (Date.now() - this._diceStartTime) / 1000;
         const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
