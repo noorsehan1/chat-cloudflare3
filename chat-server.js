@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-FULL.js ====================
-// VERSION: 10.13.0 - FINAL: CLEANUP ALL SEATS WITH SAME USERNAME
+// VERSION: 10.14.0 - FINAL: CLEANUP ALL ROOMS IN CACHE & STORAGE
 
 const C = {
   MAX_SEATS: 45,
@@ -467,7 +467,7 @@ export class ChatServer {
     }
   }
 
-  // ============ CLEANUP USER TOTAL (ALL SEATS WITH SAME USERNAME) ============
+  // ============ CLEANUP USER TOTAL (ALL SEATS WITH SAME USERNAME IN ALL ROOMS) ============
 
   async _cleanupUserTotal(username) {
     if (!username) return false;
@@ -479,13 +479,13 @@ export class ChatServer {
       let cleaned = false;
       const roomsToDelete = [];
       
-      // ✅ CEK SEMUA ROOM, HAPUS SEMUA KURSI DENGAN USERNAME YANG SAMA
+      // ✅ 1. CEK SEMUA ROOM DI CACHE, HAPUS SEMUA KURSI DENGAN USERNAME YANG SAMA
       for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
         if (!roomData || !roomData.seats) continue;
         
         const seatsToRemove = [];
         
-        // ✅ KUMPULKAN SEMUA KURSI DENGAN USERNAME YANG SAMA
+        // ✅ KUMPULKAN SEMUA KURSI DENGAN USERNAME YANG SAMA DI ROOM INI
         for (const [seat, data] of Object.entries(roomData.seats)) {
           if (data && data.namauser === username) {
             seatsToRemove.push(parseInt(seat));
@@ -523,8 +523,9 @@ export class ChatServer {
         }
       }
       
-      // ✅ HAPUS ROOM YANG KOSONG
+      // ✅ 2. HAPUS ROOM YANG KOSONG DARI CACHE
       for (const roomName of roomsToDelete) {
+        // HAPUS SEMUA KURSI NUMBER UNTUK ROOM INI
         for (const key of Object.keys(this._kursiNumber)) {
           if (key.startsWith(`${roomName}-`)) {
             delete this._kursiNumber[key];
@@ -535,13 +536,13 @@ export class ChatServer {
         cleaned = true;
       }
       
-      // ✅ HAPUS DARI CACHE USER SEAT DATA
+      // ✅ 3. HAPUS DARI CACHE USER SEAT DATA
       if (this._userSeatDataCache[username]) {
         delete this._userSeatDataCache[username];
         cleaned = true;
       }
       
-      // ✅ RESET SEMUA WEBSOCKET DENGAN USERNAME YANG SAMA
+      // ✅ 4. RESET SEMUA WEBSOCKET DENGAN USERNAME YANG SAMA
       const webSockets = this._getActiveWebSockets();
       for (const ws of webSockets) {
         try {
@@ -568,7 +569,7 @@ export class ChatServer {
         } catch(e) {}
       }
       
-      // ✅ SIMPAN KE STORAGE
+      // ✅ 5. SIMPAN KE STORAGE - PASTIKAN SEMUA PERUBAHAN TERSIMPAN
       if (cleaned) {
         await this._saveToStorage(
           this._roomsDataCache,
@@ -576,7 +577,21 @@ export class ChatServer {
           this.currentNumber,
           this._kursiNumber
         );
+        
         await this._updateUserCounts();
+        
+        // ✅ 6. VERIFIKASI - PASTIKAN DATA DI STORAGE SUDAH SAMA DENGAN CACHE
+        const verifyStorage = await this.ctx.storage.get(["roomsData", "userSeatData", "kursiNumber"]);
+        
+        if (verifyStorage.roomsData && JSON.stringify(verifyStorage.roomsData) !== JSON.stringify(this._roomsDataCache)) {
+          await this._saveToStorage(this._roomsDataCache, undefined, undefined, undefined);
+        }
+        if (verifyStorage.userSeatData && JSON.stringify(verifyStorage.userSeatData) !== JSON.stringify(this._userSeatDataCache)) {
+          await this._saveToStorage(undefined, this._userSeatDataCache, undefined, undefined);
+        }
+        if (verifyStorage.kursiNumber && JSON.stringify(verifyStorage.kursiNumber) !== JSON.stringify(this._kursiNumber)) {
+          await this._saveToStorage(undefined, undefined, undefined, this._kursiNumber);
+        }
       }
       
       return cleaned;
@@ -680,7 +695,7 @@ export class ChatServer {
     this._joinLock.add(lockKey);
     
     try {
-      // ✅ CLEANUP SEMUA DATA USER DENGAN USERNAME YANG SAMA
+      // ✅ CLEANUP SEMUA DATA USER DENGAN USERNAME YANG SAMA DI SEMUA ROOM
       await this._cleanupUserTotal(username);
       
       if (this._userSeatDataCache[username]) {
