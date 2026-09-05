@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 8.0.4 - FIXED MULTI USER ONLINE CHECK
+// VERSION: 8.0.3 - AUTO-RESTORE CACHE SAAT HIBERNASI
 
 const C = {
   MAX_SEATS: 45,
@@ -52,7 +52,7 @@ export class ChatServer {
       currentNumber: 1
     };
     this._cacheInitialized = false;
-    this._cacheLoading = false;
+    this._cacheLoading = false; // Flag untuk mencegah multiple load
     
     // ========== INIT ROOMS ==========
     for (const room of ROOMS) {
@@ -68,99 +68,20 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ HELPER: CEK USER ONLINE (DENGAN MULTI USER LOGIC)
-  // ============================================================
-
-  async _isUserOnline(username) {
-    if (!username) return false;
-    
-    // 1. Cek data di storage
-    const userSeat = await this._getUserSeat(username);
-    if (!userSeat) return false;
-    
-    // 2. Cek koneksi WebSocket
-    const connections = this.userConnections.get(username);
-    if (!connections || connections.size === 0) {
-      // Jika multi user dan tidak ada WS → OFFLINE
-      if (userSeat.isMulti === true) {
-        return false;
-      }
-      return false;
-    }
-    
-    // 3. Cek apakah ada WS yang aktif
-    let hasActiveWS = false;
-    for (const conn of connections) {
-      if (conn && conn.readyState === 1 && !conn._closing) {
-        hasActiveWS = true;
-        break;
-      }
-    }
-    
-    // 4. Jika multi user dan tidak ada WS aktif → OFFLINE
-    if (userSeat.isMulti === true && !hasActiveWS) {
-      return false;
-    }
-    
-    return hasActiveWS;
-  }
-
-  // ============================================================
-  // ✅ HELPER: GET ONLINE USERS (DENGAN MULTI USER LOGIC)
-  // ============================================================
-
-  async _getOnlineUsers() {
-    const onlineUsers = [];
-    await this._ensureCacheInitialized();
-    const userSeatData = this._storageCache.userSeatData || {};
-    
-    for (const [username, seatInfo] of Object.entries(userSeatData)) {
-      if (!seatInfo) continue;
-      
-      // Cek koneksi WebSocket
-      const connections = this.userConnections.get(username);
-      if (!connections || connections.size === 0) {
-        // Multi user tanpa WS → skip
-        if (seatInfo.isMulti === true) {
-          continue;
-        }
-        continue;
-      }
-      
-      // Cek apakah ada WS aktif
-      let isOnline = false;
-      for (const conn of connections) {
-        if (conn && conn.readyState === 1 && !conn._closing) {
-          isOnline = true;
-          break;
-        }
-      }
-      
-      // Multi user harus punya WS aktif
-      if (seatInfo.isMulti === true && !isOnline) {
-        continue;
-      }
-      
-      if (isOnline) {
-        onlineUsers.push(username);
-      }
-    }
-    
-    return onlineUsers;
-  }
-
-  // ============================================================
   // ✅ AUTO-RESTORE CACHE SAAT HIBERNASI
   // ============================================================
 
   async _ensureCacheInitialized() {
+    // Jika cache sudah terisi, langsung return
     if (this._cacheInitialized && this._storageCache && 
         this._storageCache.roomsData && 
         Object.keys(this._storageCache.roomsData).length > 0) {
       return this._storageCache;
     }
     
+    // Jika sedang loading, tunggu
     if (this._cacheLoading) {
+      // Tunggu max 5 detik
       let waitCount = 0;
       while (this._cacheLoading && waitCount < 50) {
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -169,6 +90,7 @@ export class ChatServer {
       return this._storageCache;
     }
     
+    // Load dari storage
     this._cacheLoading = true;
     try {
       console.log('[CACHE] Loading cache from storage...');
@@ -210,6 +132,7 @@ export class ChatServer {
 
   async _updateCacheAndStorage(updates) {
     try {
+      // 1. UPDATE CACHE
       if (updates.roomsData !== undefined) {
         this._storageCache.roomsData = updates.roomsData;
       }
@@ -221,6 +144,7 @@ export class ChatServer {
         this.currentNumber = updates.currentNumber;
       }
       
+      // 2. SAVE KE STORAGE
       if (updates.roomsData !== undefined) {
         await this.ctx.storage.put("roomsData", updates.roomsData);
       }
@@ -652,7 +576,6 @@ export class ChatServer {
       const isMulti = this.wsActiveMulti.has(ws);
       
       if (isMulti) {
-        // ✅ MULTI USER: HANYA CLEANUP WS, TIDAK HAPUS DARI STORAGE
         const connections = this.userConnections.get(username);
         if (connections) {
           connections.delete(ws);
@@ -679,7 +602,6 @@ export class ChatServer {
         return;
       }
       
-      // ✅ USER BIASA: HAPUS DARI STORAGE
       if (roomName) {
         await this._removeUserFromRoom(username, roomName);
       } else {
@@ -954,11 +876,6 @@ export class ChatServer {
           continue;
         }
         
-        // SKIP MULTI USER - jangan hapus dari storage
-        if (seatInfo.isMulti === true) {
-          continue;
-        }
-        
         const roomData = roomsData[seatInfo.room];
         if (!roomData || !roomData.seats || !roomData.seats[seatInfo.seat]) {
           delete userSeatData[username];
@@ -1093,7 +1010,7 @@ export class ChatServer {
     }
     
     const userSeat = await this._getUserSeat(username);
-    const isMultiUser = userSeat !== null && userSeat !== undefined && userSeat.isMulti === true;
+    const isMultiUser = userSeat !== null && userSeat !== undefined;
     
     if (isMultiUser && isNewUser === false) {
       return;
@@ -1177,6 +1094,7 @@ export class ChatServer {
       if (!ws || !data || !data[0]) return;
       const [evt, ...args] = data;
       
+      // ✅ PASTIKAN CACHE INITIALIZED UNTUK SEMUA EVENT
       await this._ensureCacheInitialized();
       
       switch(evt) {
@@ -1677,23 +1595,64 @@ export class ChatServer {
           break;
         }
         
-        // ✅ PERBAIKAN: isUserOnline dengan MULTI USER LOGIC
         case "isUserOnline": {
           const [onlineTarget, onlineCallback] = args;
-          const isOnline = await this._isUserOnline(onlineTarget);
+          let isOnline = false;
           
-          // Kirim juga status isMulti
           const userSeat = await this._getUserSeat(onlineTarget);
-          const isMulti = userSeat ? userSeat.isMulti === true : false;
+          if (userSeat) {
+            // ✅ Jika multi user → SELALU ONLINE (tanpa cek WS)
+            if (userSeat.isMulti === true) {
+              isOnline = true;
+            } else {
+              // User biasa → cek koneksi WebSocket
+              const connections = this.userConnections.get(onlineTarget);
+              if (connections) {
+                for (const conn of connections) {
+                  if (conn?.readyState === 1) {
+                    isOnline = true;
+                    break;
+                  }
+                }
+              }
+            }
+          }
           
-          this.safeSend(ws, ["userOnlineStatus", onlineTarget, isOnline, isMulti, onlineCallback || ""]);
+          this.safeSend(ws, ["userOnlineStatus", onlineTarget, isOnline, onlineCallback || ""]);
           break;
         }
         
-        // ✅ PERBAIKAN: getOnlineUsers dengan MULTI USER LOGIC
         case "getOnlineUsers": {
-          const onlineUsers = await this._getOnlineUsers();
-          this.safeSend(ws, ["allOnlineUsers", onlineUsers]);
+          const users = [];
+          await this._ensureCacheInitialized();
+          const userSeatData = this._storageCache.userSeatData || {};
+          
+          for (const [username, seatInfo] of Object.entries(userSeatData)) {
+            if (seatInfo) {
+              let isOnline = false;
+              
+              // ✅ Jika multi user → SELALU ONLINE (tanpa cek WS)
+              if (seatInfo.isMulti === true) {
+                isOnline = true;
+              } else {
+                // User biasa → cek koneksi WebSocket
+                const connections = this.userConnections.get(username);
+                if (connections) {
+                  for (const conn of connections) {
+                    if (conn?.readyState === 1) {
+                      isOnline = true;
+                      break;
+                    }
+                  }
+                }
+              }
+              
+              if (isOnline) {
+                users.push(username);
+              }
+            }
+          }
+          this.safeSend(ws, ["allOnlineUsers", users]);
           break;
         }
         
@@ -1784,14 +1743,6 @@ export class ChatServer {
               conns.add(ws);
               this.userConnections.set(attachment.username, conns);
               
-              // Jika multi user, tambahkan ke wsActiveMulti
-              if (userSeat.isMulti === true) {
-                this.wsActiveMulti.set(ws, { 
-                  username: attachment.username, 
-                  room: userSeat.room 
-                });
-              }
-              
               this.wsSet.add(ws);
             }
           }
@@ -1816,6 +1767,7 @@ export class ChatServer {
       return new Response("Shutting down", { status: 503 });
     }
     
+    // ✅ PASTIKAN CACHE INITIALIZED SEBELUM PROSES
     await this._ensureCacheInitialized();
     
     try {
