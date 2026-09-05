@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 8.0.5 - SILENT MODE (NO LOGS)
+// VERSION: 8.0.6 - WITH DEBUG ENDPOINTS
 
 const C = {
   MAX_SEATS: 45,
@@ -1499,11 +1499,9 @@ export class ChatServer {
           
           const userSeat = await this._getUserSeat(onlineTarget);
           if (userSeat) {
-            // ✅ MULTI ID → LANGSUNG ONLINE (tanpa cek apapun)
             if (userSeat.isMulti === true) {
               isOnline = true;
             } else {
-              // User biasa → cek koneksi WebSocket
               const connections = this.userConnections.get(onlineTarget);
               if (connections) {
                 for (const conn of connections) {
@@ -1529,11 +1527,9 @@ export class ChatServer {
             if (seatInfo) {
               let isOnline = false;
               
-              // ✅ MULTI ID → LANGSUNG ONLINE (tanpa cek apapun)
               if (seatInfo.isMulti === true) {
                 isOnline = true;
               } else {
-                // User biasa → cek koneksi WebSocket
                 const connections = this.userConnections.get(username);
                 if (connections) {
                   for (const conn of connections) {
@@ -1655,6 +1651,280 @@ export class ChatServer {
     
     await this._ensureCacheInitialized();
     
+    // ============================================================
+    // DEBUG ENDPOINTS - TANPA LOOP
+    // ============================================================
+    const url = new URL(req.url);
+    
+    // Endpoint: Ambil SEMUA data (tanpa loop)
+    if (url.pathname === '/debug/storage/all') {
+      try {
+        const allData = await this.ctx.storage.list();
+        const result = Object.fromEntries(allData);
+        return new Response(JSON.stringify(result, null, 2), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      } catch(e) {
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+    
+    // Endpoint: Ambil 1 KEY (langsung, tanpa loop)
+    if (url.pathname === '/debug/storage/get') {
+      const keyName = url.searchParams.get('key');
+      if (!keyName) {
+        return new Response(JSON.stringify({ 
+          error: 'Missing parameter: ?key=roomsData' 
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      try {
+        const value = await this.ctx.storage.get(keyName);
+        return new Response(JSON.stringify({ 
+          key: keyName, 
+          value: value || null 
+        }, null, 2), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      } catch(e) {
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+    
+    // Endpoint: Ambil MULTIPLE KEY (tanpa loop)
+    if (url.pathname === '/debug/storage/multi') {
+      const keys = url.searchParams.get('keys');
+      if (!keys) {
+        return new Response(JSON.stringify({ 
+          error: 'Missing parameter: ?keys=roomsData,userSeatData' 
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      try {
+        const keyArray = keys.split(',').map(k => k.trim());
+        const values = await this.ctx.storage.get(keyArray);
+        const result = Object.fromEntries(values);
+        return new Response(JSON.stringify(result, null, 2), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      } catch(e) {
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+    
+    // Endpoint: HTML Viewer (seperti Firebase)
+    if (url.pathname === '/debug/viewer') {
+      try {
+        const allData = await this.ctx.storage.list();
+        const result = Object.fromEntries(allData);
+        
+        const html = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Storage Viewer</title>
+          <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+              font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+              background: #0d1117;
+              color: #c9d1d9;
+              padding: 20px;
+              min-height: 100vh;
+            }
+            .container { max-width: 1200px; margin: 0 auto; }
+            .header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              border-bottom: 2px solid #30363d;
+              padding-bottom: 15px;
+              margin-bottom: 20px;
+              flex-wrap: wrap;
+              gap: 10px;
+            }
+            h1 {
+              color: #58a6ff;
+              font-size: 24px;
+              display: flex;
+              align-items: center;
+              gap: 10px;
+            }
+            h1 span {
+              background: #238636;
+              font-size: 12px;
+              padding: 2px 10px;
+              border-radius: 12px;
+              color: #fff;
+            }
+            .btn {
+              background: #238636;
+              color: #fff;
+              border: none;
+              padding: 8px 16px;
+              border-radius: 6px;
+              cursor: pointer;
+              font-size: 14px;
+              transition: background 0.2s;
+            }
+            .btn:hover { background: #2ea043; }
+            .btn-secondary { background: #1f6feb; }
+            .btn-secondary:hover { background: #388bfd; }
+            .stats {
+              background: #161b22;
+              padding: 12px 18px;
+              border-radius: 8px;
+              border: 1px solid #30363d;
+              margin-bottom: 20px;
+              display: flex;
+              gap: 20px;
+              flex-wrap: wrap;
+            }
+            .stats-item {
+              display: flex;
+              align-items: center;
+              gap: 8px;
+            }
+            .stats-item .label { color: #8b949e; font-size: 13px; }
+            .stats-item .value { color: #3fb950; font-weight: bold; }
+            .key-card {
+              background: #161b22;
+              border: 1px solid #30363d;
+              border-radius: 8px;
+              margin-bottom: 15px;
+              overflow: hidden;
+            }
+            .key-header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              padding: 12px 18px;
+              background: #0d1117;
+              border-bottom: 1px solid #30363d;
+              cursor: pointer;
+            }
+            .key-header:hover { background: #161b22; }
+            .key-name { color: #f0883e; font-weight: 600; font-size: 15px; }
+            .key-body {
+              padding: 15px 18px;
+              overflow: auto;
+              max-height: 500px;
+            }
+            pre {
+              margin: 0;
+              font-family: 'Courier New', monospace;
+              font-size: 13px;
+              line-height: 1.6;
+              white-space: pre-wrap;
+              word-wrap: break-word;
+            }
+            .json-key { color: #f0883e; }
+            .json-string { color: #3fb950; }
+            .json-number { color: #58a6ff; }
+            .json-boolean { color: #d2a8ff; }
+            .json-null { color: #f85149; }
+            .json-bracket { color: #8b949e; }
+            .empty-state {
+              text-align: center;
+              padding: 60px 20px;
+              color: #8b949e;
+            }
+            .empty-state .icon { font-size: 48px; margin-bottom: 15px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>📦 Storage Viewer <span>Durable Object</span></h1>
+              <div>
+                <button class="btn" onclick="location.reload()">🔄 Refresh</button>
+                <button class="btn btn-secondary" onclick="window.open('/debug/storage/all', '_blank')">📄 Raw JSON</button>
+              </div>
+            </div>
+            <div class="stats">
+              <div class="stats-item"><span class="label">Keys:</span><span class="value">${Object.keys(result).length}</span></div>
+              <div class="stats-item"><span class="label">Size:</span><span class="value">${(JSON.stringify(result).length / 1024).toFixed(2)} KB</span></div>
+              <div class="stats-item"><span class="label">Updated:</span><span class="value">${new Date().toLocaleString()}</span></div>
+            </div>
+            ${Object.keys(result).length === 0 ? `
+              <div class="empty-state">
+                <div class="icon">📭</div>
+                <h3>No data stored</h3>
+                <p>Join a room first to start storing data</p>
+              </div>
+            ` : ''}
+            ${Object.entries(result).map(([key, value]) => {
+              const highlighted = JSON.stringify(value, null, 2)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(
+                  /("(?:[^"\\\\]|\\\\.)*")(?=\\s*:)|("(?:[^"\\\\]|\\\\.)*")|(\\b\\d+\\.?\\d*\\b)|(\\btrue\\b|\\bfalse\\b|\\bnull\\b)|([{}\\[\\],])/g,
+                  function(match, key, string, number, bool, bracket) {
+                    if (key) return '<span class="json-key">' + key + '</span>';
+                    if (string) return '<span class="json-string">' + string + '</span>';
+                    if (number) return '<span class="json-number">' + number + '</span>';
+                    if (bool) return '<span class="json-boolean">' + bool + '</span>';
+                    if (bracket) return '<span class="json-bracket">' + bracket + '</span>';
+                    return match;
+                  }
+                );
+              return `
+                <div class="key-card">
+                  <div class="key-header" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'">
+                    <span class="key-name">🔑 ${key}</span>
+                    <span style="color:#8b949e;font-size:12px;">${(JSON.stringify(value).length / 1024).toFixed(2)} KB</span>
+                  </div>
+                  <div class="key-body">
+                    <pre>${highlighted}</pre>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </body>
+        </html>
+        `;
+        
+        return new Response(html, {
+          headers: { 
+            'Content-Type': 'text/html',
+            'Cache-Control': 'no-cache'
+          }
+        });
+      } catch(e) {
+        return new Response(`Error: ${e.message}`, { status: 500 });
+      }
+    }
+    
+    // ============================================================
+    // LANJUTKAN KODE WEBSOCKET YANG SUDAH ADA
+    // ============================================================
     try {
       const upgrade = req.headers.get("Upgrade");
       if (upgrade !== "websocket") {
