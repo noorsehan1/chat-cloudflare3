@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 8.0.5 - SILENT MODE (NO LOGS)
+// VERSION: 8.0.6 - MULTI USER PERSISTENCE FIX
 
 const C = {
   MAX_SEATS: 45,
@@ -247,8 +247,11 @@ export class ChatServer {
           }
         }
       }
-      delete userSeatData[username];
-      await this._updateCacheAndStorage({ userSeatData: userSeatData });
+      // Jika data tidak konsisten, hapus
+      if (!seatInfo.isMulti) {
+        delete userSeatData[username];
+        await this._updateCacheAndStorage({ userSeatData: userSeatData });
+      }
     }
     
     for (const [roomName, roomData] of Object.entries(roomsData)) {
@@ -295,6 +298,12 @@ export class ChatServer {
 
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
+    
+    // CEK: Jika user adalah multi, JANGAN hapus!
+    const userSeat = await this._getUserSeat(username);
+    if (userSeat && userSeat.isMulti === true) {
+      return false; // Multi user tidak boleh dihapus
+    }
     
     await this._ensureCacheInitialized();
     
@@ -526,6 +535,7 @@ export class ChatServer {
       
       const isMulti = this.wsActiveMulti.has(ws);
       
+      // ✅ JIKA MULTI: HANYA HAPUS DARI KONEKSI, JANGAN SENTUH STORAGE
       if (isMulti) {
         const connections = this.userConnections.get(username);
         if (connections) {
@@ -550,9 +560,10 @@ export class ChatServer {
         
         this.wsActiveMulti.delete(ws);
         this.wsSet.delete(ws);
-        return;
+        return; // ⚠️ JANGAN LANJUT KE PENGHAPUSAN STORAGE
       }
       
+      // ✅ UNTUK USER BIASA: HAPUS DARI STORAGE
       if (roomName) {
         await this._removeUserFromRoom(username, roomName);
       } else {
@@ -600,7 +611,28 @@ export class ChatServer {
   async webSocketClose(ws) { 
     if (!ws) return;
     try {
-      await this._cleanupUserOnDisconnect(ws);
+      const isMulti = this.wsActiveMulti.has(ws);
+      
+      if (isMulti) {
+        // ✅ MULTI: HANYA HAPUS DARI KONEKSI
+        const username = ws.username;
+        const roomName = ws.room || ws.roomname;
+        
+        const connections = this.userConnections.get(username);
+        if (connections) connections.delete(ws);
+        if (connections?.size === 0) this.userConnections.delete(username);
+        
+        if (roomName) {
+          const rc = this.roomClients.get(roomName);
+          if (rc) rc.delete(ws);
+        }
+        
+        this.wsActiveMulti.delete(ws);
+        this.wsSet.delete(ws);
+      } else {
+        // ✅ USER BIASA: BERSIHKAN SEMUA
+        await this._cleanupUserOnDisconnect(ws);
+      }
       this.cleanup(ws);
     } catch(e) {
       // Silent
@@ -610,7 +642,28 @@ export class ChatServer {
   async webSocketError(ws) { 
     if (!ws) return;
     try {
-      await this._cleanupUserOnDisconnect(ws);
+      const isMulti = this.wsActiveMulti.has(ws);
+      
+      if (isMulti) {
+        // ✅ MULTI: HANYA HAPUS DARI KONEKSI
+        const username = ws.username;
+        const roomName = ws.room || ws.roomname;
+        
+        const connections = this.userConnections.get(username);
+        if (connections) connections.delete(ws);
+        if (connections?.size === 0) this.userConnections.delete(username);
+        
+        if (roomName) {
+          const rc = this.roomClients.get(roomName);
+          if (rc) rc.delete(ws);
+        }
+        
+        this.wsActiveMulti.delete(ws);
+        this.wsSet.delete(ws);
+      } else {
+        // ✅ USER BIASA: BERSIHKAN SEMUA
+        await this._cleanupUserOnDisconnect(ws);
+      }
       this.cleanup(ws);
     } catch(e) {
       // Silent
@@ -793,6 +846,11 @@ export class ChatServer {
       let changed = false;
       
       for (const [username, seatInfo] of Object.entries(userSeatData)) {
+        // ✅ JANGAN HAPUS MULTI USER
+        if (seatInfo && seatInfo.isMulti === true) {
+          continue; // Skip multi user
+        }
+        
         if (!seatInfo || !seatInfo.room) {
           delete userSeatData[username];
           changed = true;
@@ -878,29 +936,54 @@ export class ChatServer {
     try {
       const username = ws.username;
       const room = ws.room;
+      const isMulti = this.wsActiveMulti.has(ws);
       
-      if (room) {
-        try { this.roomClients.get(room)?.delete(ws); } catch(e) {}
-      }
-      
-      try {
-        const activeData = this.wsActiveMulti.get(ws);
-        if (activeData?.room) {
-          this.roomClients.get(activeData.room)?.delete(ws);
-        }
-        this.wsActiveMulti.delete(ws);
-      } catch(e) {}
-      
-      if (username) {
+      if (isMulti) {
+        // ✅ MULTI: HANYA HAPUS DARI COLLECTIONS
         try {
-          const connections = this.userConnections.get(username);
-          if (connections) {
-            connections.delete(ws);
-            if (connections.size === 0) {
-              this.userConnections.delete(username);
-            }
+          const activeData = this.wsActiveMulti.get(ws);
+          if (activeData?.room) {
+            this.roomClients.get(activeData.room)?.delete(ws);
           }
+          this.wsActiveMulti.delete(ws);
         } catch(e) {}
+        
+        if (username) {
+          try {
+            const connections = this.userConnections.get(username);
+            if (connections) {
+              connections.delete(ws);
+              if (connections.size === 0) {
+                this.userConnections.delete(username);
+              }
+            }
+          } catch(e) {}
+        }
+      } else {
+        // ✅ USER BIASA: BERSIHKAN SEMUA
+        if (room) {
+          try { this.roomClients.get(room)?.delete(ws); } catch(e) {}
+        }
+        
+        try {
+          const activeData = this.wsActiveMulti.get(ws);
+          if (activeData?.room) {
+            this.roomClients.get(activeData.room)?.delete(ws);
+          }
+          this.wsActiveMulti.delete(ws);
+        } catch(e) {}
+        
+        if (username) {
+          try {
+            const connections = this.userConnections.get(username);
+            if (connections) {
+              connections.delete(ws);
+              if (connections.size === 0) {
+                this.userConnections.delete(username);
+              }
+            }
+          } catch(e) {}
+        }
       }
       
       try { this.wsSet.delete(ws); } catch(e) {}
@@ -1115,6 +1198,7 @@ export class ChatServer {
             const roomName = userSeat.room;
             const seatNumber = userSeat.seat;
             
+            // ✅ HAPUS MULTI USER DARI STORAGE (INI SATU-SATUNYA CARA HAPUS MULTI)
             await this._removeUserFromRoom(targetUsername, roomName);
             await this._deleteUserSeat(targetUsername);
             
@@ -1616,6 +1700,7 @@ export class ChatServer {
           if (attachment && attachment.username) {
             const userSeat = userSeatData[attachment.username];
             if (userSeat) {
+              // ✅ MULTI USER SELALU DIANGGAP ONLINE
               attachment.seatInfo = userSeat;
               ws.serializeAttachment(attachment);
               
@@ -1632,6 +1717,13 @@ export class ChatServer {
               if (!conns) conns = new Set();
               conns.add(ws);
               this.userConnections.set(attachment.username, conns);
+              
+              if (userSeat.isMulti) {
+                this.wsActiveMulti.set(ws, { 
+                  username: attachment.username, 
+                  room: userSeat.room 
+                });
+              }
               
               this.wsSet.add(ws);
             }
@@ -1696,6 +1788,7 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
+    // ✅ SIMPAN SEMUA DATA TERMASUK MULTI USER
     await this._cleanupStorage();
     await this._saveAllState();
     
@@ -1709,7 +1802,32 @@ export class ChatServer {
         try { ws.send(JSON.stringify(["serverShutdown", "Server shutting down"])); } catch(e) {}
         try { ws.close(1000, "Shutdown"); } catch(e) {}
       }
-      try { this.cleanup(ws); } catch(e) {}
+      try { 
+        // ✅ JANGAN HAPUS DATA MULTI USER DI DESTROY
+        const isMulti = this.wsActiveMulti.has(ws);
+        if (!isMulti) {
+          this.cleanup(ws);
+        } else {
+          // Multi: hanya hapus dari memory, jangan sentuh storage
+          try {
+            const username = ws.username;
+            const room = ws.room;
+            if (room) {
+              const rc = this.roomClients.get(room);
+              if (rc) rc.delete(ws);
+            }
+            this.wsActiveMulti.delete(ws);
+            this.wsSet.delete(ws);
+            if (username) {
+              const conns = this.userConnections.get(username);
+              if (conns) {
+                conns.delete(ws);
+                if (conns.size === 0) this.userConnections.delete(username);
+              }
+            }
+          } catch(e) {}
+        }
+      } catch(e) {}
     }
     
     this.wsSet.clear();
