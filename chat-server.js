@@ -1595,40 +1595,89 @@ export class ChatServer {
           break;
         }
         
+        // ============================================================
+        // ✅ CEK ONLINE USER - DENGAN MULTI USER WAJIB ONLINE
+        // ============================================================
         case "isUserOnline": {
           const [onlineTarget, onlineCallback] = args;
           let isOnline = false;
+          
+          // CEK APAKAH USER ADA DI SEAT
           const userSeat = await this._getUserSeat(onlineTarget);
           if (userSeat) {
-            const connections = this.userConnections.get(onlineTarget);
-            if (connections) {
-              for (const conn of connections) {
-                if (conn?.readyState === 1) { isOnline = true; break; }
+            // CEK APAKAH USER TERDAFTAR SEBAGAI MULTI USER
+            let isMultiUser = false;
+            for (const [wsKey, data] of this.wsActiveMulti) {
+              if (data && data.username === onlineTarget) {
+                isMultiUser = true;
+                break;
               }
             }
-          }
-          this.safeSend(ws, ["userOnlineStatus", onlineTarget, isOnline, onlineCallback || ""]);
-          break;
-        }
-        
-        case "getOnlineUsers": {
-          const users = [];
-          await this._ensureCacheInitialized();
-          const userSeatData = this._storageCache.userSeatData || {};
-          
-          for (const [username, seatInfo] of Object.entries(userSeatData)) {
-            if (seatInfo) {
-              const connections = this.userConnections.get(username);
+            
+            // JIKA MULTI USER, WAJIB ONLINE
+            if (isMultiUser) {
+              isOnline = true;
+              console.log(`[isUserOnline] ${onlineTarget} adalah MULTI USER, status ONLINE = true`);
+            } else {
+              // JIKA BUKAN MULTI USER, CEK CONNECTIONS SEPERTI BIASA
+              const connections = this.userConnections.get(onlineTarget);
               if (connections) {
                 for (const conn of connections) {
                   if (conn?.readyState === 1) {
-                    users.push(username);
+                    isOnline = true;
                     break;
                   }
                 }
               }
             }
           }
+          
+          this.safeSend(ws, ["userOnlineStatus", onlineTarget, isOnline, onlineCallback || ""]);
+          break;
+        }
+        
+        // ============================================================
+        // ✅ GET ALL ONLINE USERS - DENGAN MULTI USER WAJIB ONLINE
+        // ============================================================
+        case "getOnlineUsers": {
+          const users = [];
+          await this._ensureCacheInitialized();
+          const userSeatData = this._storageCache.userSeatData || {};
+          
+          // BUAT SET UNTUK MULTI USERS
+          const multiUsers = new Set();
+          for (const [wsKey, data] of this.wsActiveMulti) {
+            if (data && data.username) {
+              multiUsers.add(data.username);
+            }
+          }
+          
+          for (const [username, seatInfo] of Object.entries(userSeatData)) {
+            if (seatInfo) {
+              let isOnline = false;
+              
+              // CEK APAKAH MULTI USER
+              if (multiUsers.has(username)) {
+                isOnline = true; // MULTI USER WAJIB ONLINE
+              } else {
+                // CEK CONNECTIONS SEPERTI BIASA
+                const connections = this.userConnections.get(username);
+                if (connections) {
+                  for (const conn of connections) {
+                    if (conn?.readyState === 1) {
+                      isOnline = true;
+                      break;
+                    }
+                  }
+                }
+              }
+              
+              if (isOnline) {
+                users.push(username);
+              }
+            }
+          }
+          
           this.safeSend(ws, ["allOnlineUsers", users]);
           break;
         }
