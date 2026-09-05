@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 8.0.6 - WITH DEBUG ENDPOINTS (JSON ONLY)
+// VERSION: 8.0.5 - SILENT MODE (NO LOGS)
 
 const C = {
   MAX_SEATS: 45,
@@ -1499,9 +1499,11 @@ export class ChatServer {
           
           const userSeat = await this._getUserSeat(onlineTarget);
           if (userSeat) {
+            // ✅ MULTI ID → LANGSUNG ONLINE (tanpa cek apapun)
             if (userSeat.isMulti === true) {
               isOnline = true;
             } else {
+              // User biasa → cek koneksi WebSocket
               const connections = this.userConnections.get(onlineTarget);
               if (connections) {
                 for (const conn of connections) {
@@ -1527,9 +1529,11 @@ export class ChatServer {
             if (seatInfo) {
               let isOnline = false;
               
+              // ✅ MULTI ID → LANGSUNG ONLINE (tanpa cek apapun)
               if (seatInfo.isMulti === true) {
                 isOnline = true;
               } else {
+                // User biasa → cek koneksi WebSocket
                 const connections = this.userConnections.get(username);
                 if (connections) {
                   for (const conn of connections) {
@@ -1651,97 +1655,6 @@ export class ChatServer {
     
     await this._ensureCacheInitialized();
     
-    // ============================================================
-    // DEBUG ENDPOINTS - JSON ONLY (TANPA HTML)
-    // ============================================================
-    const url = new URL(req.url);
-    
-    // Endpoint: Ambil SEMUA data
-    if (url.pathname === '/debug/storage/all') {
-      try {
-        const allData = await this.ctx.storage.list();
-        const result = Object.fromEntries(allData);
-        return new Response(JSON.stringify(result, null, 2), {
-          headers: { 
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-cache',
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-      } catch(e) {
-        return new Response(JSON.stringify({ error: e.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-    }
-    
-    // Endpoint: Ambil 1 KEY
-    if (url.pathname === '/debug/storage/get') {
-      const keyName = url.searchParams.get('key');
-      if (!keyName) {
-        return new Response(JSON.stringify({ 
-          error: 'Missing parameter: ?key=roomsData' 
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      try {
-        const value = await this.ctx.storage.get(keyName);
-        return new Response(JSON.stringify({ 
-          key: keyName, 
-          value: value || null 
-        }, null, 2), {
-          headers: { 
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-cache',
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-      } catch(e) {
-        return new Response(JSON.stringify({ error: e.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-    }
-    
-    // Endpoint: Ambil MULTIPLE KEY
-    if (url.pathname === '/debug/storage/multi') {
-      const keys = url.searchParams.get('keys');
-      if (!keys) {
-        return new Response(JSON.stringify({ 
-          error: 'Missing parameter: ?keys=roomsData,userSeatData' 
-        }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      try {
-        const keyArray = keys.split(',').map(k => k.trim());
-        const values = await this.ctx.storage.get(keyArray);
-        const result = Object.fromEntries(values);
-        return new Response(JSON.stringify(result, null, 2), {
-          headers: { 
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-cache',
-            'Access-Control-Allow-Origin': '*'
-          }
-        });
-      } catch(e) {
-        return new Response(JSON.stringify({ error: e.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-    }
-    
-    // ============================================================
-    // LANJUTKAN KODE WEBSOCKET
-    // ============================================================
     try {
       const upgrade = req.headers.get("Upgrade");
       if (upgrade !== "websocket") {
