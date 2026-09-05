@@ -323,6 +323,31 @@ export class ChatServer {
   }
 
   // ============================================================
+  // ✅ FUNGSI HELPER MULTI USER
+  // ============================================================
+
+  _isMultiUser(username) {
+    if (!username) return false;
+    
+    for (const [wsKey, data] of this.wsActiveMulti) {
+      if (data && data.username === username) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _getAllMultiUsers() {
+    const users = new Set();
+    for (const [wsKey, data] of this.wsActiveMulti) {
+      if (data && data.username) {
+        users.add(data.username);
+      }
+    }
+    return users;
+  }
+
+  // ============================================================
   // ✅ REMOVE USER (LANGSUNG DARI STORAGE + CACHE)
   // ============================================================
   
@@ -1596,30 +1621,20 @@ export class ChatServer {
         }
         
         // ============================================================
-        // ✅ CEK ONLINE USER - DENGAN MULTI USER WAJIB ONLINE
+        // ✅ CEK ONLINE USER - MULTI USER WAJIB ONLINE
         // ============================================================
         case "isUserOnline": {
           const [onlineTarget, onlineCallback] = args;
           let isOnline = false;
           
-          // CEK APAKAH USER ADA DI SEAT
-          const userSeat = await this._getUserSeat(onlineTarget);
-          if (userSeat) {
-            // CEK APAKAH USER TERDAFTAR SEBAGAI MULTI USER
-            let isMultiUser = false;
-            for (const [wsKey, data] of this.wsActiveMulti) {
-              if (data && data.username === onlineTarget) {
-                isMultiUser = true;
-                break;
-              }
-            }
-            
-            // JIKA MULTI USER, WAJIB ONLINE
-            if (isMultiUser) {
-              isOnline = true;
-              console.log(`[isUserOnline] ${onlineTarget} adalah MULTI USER, status ONLINE = true`);
-            } else {
-              // JIKA BUKAN MULTI USER, CEK CONNECTIONS SEPERTI BIASA
+          // CEK APAKAH USER TERDAFTAR SEBAGAI MULTI USER
+          if (this._isMultiUser(onlineTarget)) {
+            // MULTI USER → WAJIB ONLINE
+            isOnline = true;
+          } else {
+            // BUKAN MULTI USER → CEK USER SEAT & CONNECTIONS
+            const userSeat = await this._getUserSeat(onlineTarget);
+            if (userSeat) {
               const connections = this.userConnections.get(onlineTarget);
               if (connections) {
                 for (const conn of connections) {
@@ -1637,43 +1652,35 @@ export class ChatServer {
         }
         
         // ============================================================
-        // ✅ GET ALL ONLINE USERS - DENGAN MULTI USER WAJIB ONLINE
+        // ✅ GET ALL ONLINE USERS - MULTI USER WAJIB ONLINE
         // ============================================================
         case "getOnlineUsers": {
           const users = [];
           await this._ensureCacheInitialized();
-          const userSeatData = this._storageCache.userSeatData || {};
           
-          // BUAT SET UNTUK MULTI USERS
-          const multiUsers = new Set();
-          for (const [wsKey, data] of this.wsActiveMulti) {
-            if (data && data.username) {
-              multiUsers.add(data.username);
-            }
+          // DAPATKAN SEMUA MULTI USER (WAJIB ONLINE)
+          const multiUsers = this._getAllMultiUsers();
+          
+          // TAMBAHKAN SEMUA MULTI USER KE LIST ONLINE
+          for (const username of multiUsers) {
+            users.push(username);
           }
           
+          // CEK USER BIASA DARI userSeatData
+          const userSeatData = this._storageCache.userSeatData || {};
           for (const [username, seatInfo] of Object.entries(userSeatData)) {
+            // LEWATI JIKA SUDAH ADA DI multiUsers
+            if (multiUsers.has(username)) continue;
+            
             if (seatInfo) {
-              let isOnline = false;
-              
-              // CEK APAKAH MULTI USER
-              if (multiUsers.has(username)) {
-                isOnline = true; // MULTI USER WAJIB ONLINE
-              } else {
-                // CEK CONNECTIONS SEPERTI BIASA
-                const connections = this.userConnections.get(username);
-                if (connections) {
-                  for (const conn of connections) {
-                    if (conn?.readyState === 1) {
-                      isOnline = true;
-                      break;
-                    }
+              const connections = this.userConnections.get(username);
+              if (connections) {
+                for (const conn of connections) {
+                  if (conn?.readyState === 1) {
+                    users.push(username);
+                    break;
                   }
                 }
-              }
-              
-              if (isOnline) {
-                users.push(username);
               }
             }
           }
