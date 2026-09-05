@@ -1,11 +1,11 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 8.0.3 - AUTO-RESTORE CACHE SAAT HIBERNASI
+// VERSION: 8.0.5 - SILENT MODE (NO LOGS)
 
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
-  NUMBER_INTERVAL_MS: 900000, // 15 MENIT
+  NUMBER_INTERVAL_MS: 900000,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
   USER_JOIN_LOCK_TIMEOUT: 10000,
@@ -19,7 +19,6 @@ const ROOMS = [
 
 const ROOMS_SET = new Set(ROOMS);
 
-// ==================== CHAT SERVER ====================
 export class ChatServer {
   constructor(state, env) {
     this.state = state;
@@ -30,36 +29,30 @@ export class ChatServer {
     this._startTime = Date.now();
     this._restored = false;
     
-    // ========== WEBSOCKET ==========
     this.wsSet = new Set();
     this.userConnections = new Map();
     this.roomClients = new Map();
     this.wsActiveMulti = new Map();
     
-    // ========== LOCKS ==========
     this._joinLocks = new Map();
     this._kursiLocks = new Map();
     this._userJoinLock = new Map();
     
-    // ========== NUMBER ==========
     this.currentNumber = 1;
     this._isNumberUpdating = false;
     
-    // ========== STORAGE CACHE (REAL-TIME) ==========
     this._storageCache = {
       roomsData: {},
       userSeatData: {},
       currentNumber: 1
     };
     this._cacheInitialized = false;
-    this._cacheLoading = false; // Flag untuk mencegah multiple load
+    this._cacheLoading = false;
     
-    // ========== INIT ROOMS ==========
     for (const room of ROOMS) {
       this.roomClients.set(room, new Set());
     }
     
-    // ========== RESTORE STATE ==========
     this._restoreAllState().then(() => {
       this._restored = true;
     }).catch(() => {
@@ -67,21 +60,14 @@ export class ChatServer {
     });
   }
 
-  // ============================================================
-  // ✅ AUTO-RESTORE CACHE SAAT HIBERNASI
-  // ============================================================
-
   async _ensureCacheInitialized() {
-    // Jika cache sudah terisi, langsung return
     if (this._cacheInitialized && this._storageCache && 
         this._storageCache.roomsData && 
         Object.keys(this._storageCache.roomsData).length > 0) {
       return this._storageCache;
     }
     
-    // Jika sedang loading, tunggu
     if (this._cacheLoading) {
-      // Tunggu max 5 detik
       let waitCount = 0;
       while (this._cacheLoading && waitCount < 50) {
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -90,24 +76,17 @@ export class ChatServer {
       return this._storageCache;
     }
     
-    // Load dari storage
     this._cacheLoading = true;
     try {
-      console.log('[CACHE] Loading cache from storage...');
       await this._loadFromStorage();
-      console.log('[CACHE] Cache loaded successfully');
     } catch(e) {
-      console.error('[CACHE] Failed to load cache:', e.message);
+      // Silent
     } finally {
       this._cacheLoading = false;
     }
     
     return this._storageCache;
   }
-
-  // ============================================================
-  // ✅ STORAGE OPERATIONS (REAL-TIME CACHE)
-  // ============================================================
 
   async _loadFromStorage() {
     try {
@@ -121,7 +100,6 @@ export class ChatServer {
       
       return this._storageCache;
     } catch(e) {
-      console.error('[LOAD STORAGE] Error:', e.message);
       return { roomsData: {}, userSeatData: {}, currentNumber: 1 };
     }
   }
@@ -132,7 +110,6 @@ export class ChatServer {
 
   async _updateCacheAndStorage(updates) {
     try {
-      // 1. UPDATE CACHE
       if (updates.roomsData !== undefined) {
         this._storageCache.roomsData = updates.roomsData;
       }
@@ -144,7 +121,6 @@ export class ChatServer {
         this.currentNumber = updates.currentNumber;
       }
       
-      // 2. SAVE KE STORAGE
       if (updates.roomsData !== undefined) {
         await this.ctx.storage.put("roomsData", updates.roomsData);
       }
@@ -160,7 +136,6 @@ export class ChatServer {
       return this._storageCache;
       
     } catch(e) {
-      console.error('[UPDATE CACHE & STORAGE] Error:', e.message);
       return this._storageCache;
     }
   }
@@ -290,10 +265,6 @@ export class ChatServer {
     return null;
   }
 
-  // ============================================================
-  // ✅ FUNGSI VALIDASI ROOM
-  // ============================================================
-
   async _validateUserInRoom(username, roomName) {
     if (!username || !roomName) return false;
     
@@ -322,10 +293,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // ✅ REMOVE USER (LANGSUNG DARI STORAGE + CACHE)
-  // ============================================================
-  
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
     
@@ -364,10 +331,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // ✅ UPDATE KURSI (LANGSUNG KE STORAGE + CACHE)
-  // ============================================================
-  
   async _updateKursi(roomName, seat, data) {
     if (!roomName || !ROOMS_SET.has(roomName)) {
       return { success: false, error: 'Invalid room' };
@@ -410,10 +373,6 @@ export class ChatServer {
     return { success: true, data: roomData.seats[seat] };
   }
 
-  // ============================================================
-  // ✅ UPDATE POINT (LANGSUNG KE STORAGE + CACHE)
-  // ============================================================
-  
   async _updatePoint(roomName, seat, x, y, fast) {
     await this._ensureCacheInitialized();
     
@@ -431,10 +390,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // ✅ JOIN ROOM (LANGSUNG KE STORAGE + CACHE)
-  // ============================================================
-  
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -562,10 +517,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // ✅ CLEANUP USER ON DISCONNECT (WS CLOSE/ERROR)
-  // ============================================================
-  
   async _cleanupUserOnDisconnect(ws) {
     try {
       const username = ws.username;
@@ -633,20 +584,16 @@ export class ChatServer {
       this.wsSet.delete(ws);
       
     } catch(e) {
-      console.error('[DISCONNECT] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ WEBSOCKET HANDLERS
-  // ============================================================
-  
   async webSocketMessage(ws, msg) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     try { 
       await this.handleMessage(ws, msg); 
     } catch(e) {
-      console.error('[WS MESSAGE] Error:', e.message);
+      // Silent
     }
   }
 
@@ -656,7 +603,7 @@ export class ChatServer {
       await this._cleanupUserOnDisconnect(ws);
       this.cleanup(ws);
     } catch(e) {
-      console.error('[WS CLOSE] Error:', e.message);
+      // Silent
     }
   }
 
@@ -666,14 +613,10 @@ export class ChatServer {
       await this._cleanupUserOnDisconnect(ws);
       this.cleanup(ws);
     } catch(e) {
-      console.error('[WS ERROR] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ BROADCAST
-  // ============================================================
-  
   broadcast(room, msg) {
     if (this.closing || this.isDestroyed || !room || !msg) return;
     
@@ -711,14 +654,10 @@ export class ChatServer {
         }
       }
     } catch(e) {
-      console.error('[BROADCAST] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ SAFE SEND
-  // ============================================================
-  
   safeSend(ws, msg) {
     if (!ws) return false;
     try {
@@ -733,10 +672,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ UPDATE ROOM COUNT (DARI STORAGE + CACHE)
-  // ============================================================
-  
   async updateRoomCount(room) {
     if (this.closing || this.isDestroyed || !room) return 0;
     try {
@@ -751,10 +686,6 @@ export class ChatServer {
     } catch(e) { return 0; }
   }
 
-  // ============================================================
-  // ✅ SEND ALL STATE (DARI STORAGE + CACHE)
-  // ============================================================
-  
   async sendAllStateTo(ws, room, excludeSelf = false) {
     if (!ws || !ws.username) return;
     try {
@@ -807,10 +738,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // ✅ ALARM (15 MENIT) - CLEANUP STORAGE
-  // ============================================================
-  
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     
@@ -856,10 +783,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ CLEANUP STORAGE
-  // ============================================================
-  
   async _cleanupStorage() {
     try {
       await this._ensureCacheInitialized();
@@ -901,14 +824,10 @@ export class ChatServer {
       }
       
     } catch(e) {
-      console.error('[CLEANUP STORAGE] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ SAVE ALL STATE
-  // ============================================================
-  
   async _saveAllState() {
     try {
       await this._ensureCacheInitialized();
@@ -919,14 +838,10 @@ export class ChatServer {
         currentNumber: this.currentNumber
       });
     } catch(e) {
-      console.error('[SAVE ALL] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ CLEANUP DEAD CONNECTIONS & STALE LOCKS
-  // ============================================================
-  
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
@@ -956,10 +871,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // ✅ CLEANUP WEBSOCKET (MEMORY ONLY)
-  // ============================================================
-  
   cleanup(ws) {
     if (!ws || ws._cleaning) return;
     ws._cleaning = true;
@@ -999,10 +910,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ HANDLE SET ID - MULTI ID LANGSUNG RETURN
-  // ============================================================
-  
   async _handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
       try { if (ws?.readyState === 1) ws.close(1000, "Invalid username"); } catch(e) {}
@@ -1051,10 +958,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ HANDLE MESSAGE - LANGSUNG PROSES TANPA QUEUE
-  // ============================================================
-  
   async handleMessage(ws, raw) {
     if (!ws) return;
     try {
@@ -1081,20 +984,15 @@ export class ChatServer {
       await this._handleEventInternal(ws, [evt, ...args]);
       
     } catch(e) {
-      console.error('[HANDLE MESSAGE] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ HANDLE EVENT INTERNAL - DENGAN AUTO-RESTORE CACHE
-  // ============================================================
-  
   async _handleEventInternal(ws, data) {
     try {
       if (!ws || !data || !data[0]) return;
       const [evt, ...args] = data;
       
-      // ✅ PASTIKAN CACHE INITIALIZED UNTUK SEMUA EVENT
       await this._ensureCacheInitialized();
       
       switch(evt) {
@@ -1290,7 +1188,7 @@ export class ChatServer {
             this.safeSend(ws, ["exitMultiSuccess", targetUsername, roomName, seatNumber]);
             
           } catch(e) {
-            console.error('[exitMulti] Error:', e.message);
+            // Silent
             this.safeSend(ws, ["exitMultiError", e.message]);
           }
           break;
@@ -1442,7 +1340,7 @@ export class ChatServer {
             }
             
           } catch(e) {
-            console.error('[updateKursi] Error:', e.message);
+            // Silent
             this.safeSend(ws, ["updateKursiError", e.message || "Internal error"]);
           } finally {
             this._kursiLocks.delete(lockKey);
@@ -1590,7 +1488,7 @@ export class ChatServer {
               }
             }
           } catch(e) {
-            console.error('[notif] Error:', e.message);
+            // Silent
           }
           break;
         }
@@ -1601,7 +1499,7 @@ export class ChatServer {
           
           const userSeat = await this._getUserSeat(onlineTarget);
           if (userSeat) {
-            // ✅ Jika multi user → LANGSUNG ONLINE (tanpa cek apapun)
+            // ✅ MULTI ID → LANGSUNG ONLINE (tanpa cek apapun)
             if (userSeat.isMulti === true) {
               isOnline = true;
             } else {
@@ -1631,7 +1529,7 @@ export class ChatServer {
             if (seatInfo) {
               let isOnline = false;
               
-              // ✅ Jika multi user → LANGSUNG ONLINE (tanpa cek apapun)
+              // ✅ MULTI ID → LANGSUNG ONLINE (tanpa cek apapun)
               if (seatInfo.isMulti === true) {
                 isOnline = true;
               } else {
@@ -1697,18 +1595,12 @@ export class ChatServer {
           break;
       }
     } catch(e) {
-      console.error('[HANDLE EVENT] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ RESTORE ALL STATE (LOAD DARI STORAGE)
-  // ============================================================
-  
   async _restoreAllState() {
     try {
-      console.log('[RESTORE] Restoring state from storage...');
-      
       const roomsData = await this.ctx.storage.get("roomsData") || {};
       const userSeatData = await this.ctx.storage.get("userSeatData") || {};
       const currentNumber = await this.ctx.storage.get("currentNumber") || 1;
@@ -1716,8 +1608,6 @@ export class ChatServer {
       this._storageCache = { roomsData, userSeatData, currentNumber };
       this._cacheInitialized = true;
       this.currentNumber = currentNumber;
-      
-      console.log('[RESTORE] State restored successfully');
       
       const webSockets = this.ctx.getWebSockets();
       for (const ws of webSockets) {
@@ -1754,20 +1644,15 @@ export class ChatServer {
       }
       
     } catch(e) {
-      console.error('[RESTORE] Error:', e.message);
+      // Silent
     }
   }
 
-  // ============================================================
-  // ✅ FETCH
-  // ============================================================
-  
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
     }
     
-    // ✅ PASTIKAN CACHE INITIALIZED SEBELUM PROSES
     await this._ensureCacheInitialized();
     
     try {
@@ -1806,10 +1691,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ DESTROY
-  // ============================================================
-  
   async destroy() {
     if (this.isDestroyed) return;
     this.closing = true;
@@ -1838,5 +1719,4 @@ export class ChatServer {
   }
 }
 
-// ==================== EXPORT ====================
 export default ChatServer;
