@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1.js
-// VERSION: 11.0.0 - FULL PRODUCTION READY
+// VERSION: 11.0.0 - FINAL PRODUCTION READY
 // ============================================================
 
 // ============================================================
@@ -62,7 +62,7 @@ function parseTime(timeStr) {
 }
 
 // ============================================================
-// DATA MANAGER - D1 (PERMANENT DATA ONLY)
+// DATA MANAGER
 // ============================================================
 
 class DataManager {
@@ -1097,9 +1097,6 @@ export class GameServer {
       
       if (username) {
         this.userConnections.delete(username);
-        if (room) {
-          this._broadcastToRoom(room, ["userLeftRoom", username, room]);
-        }
       }
       
       if (room && wsId) {
@@ -1139,9 +1136,6 @@ export class GameServer {
       
       if (username) {
         this.userConnections.delete(username);
-        if (room) {
-          this._broadcastToRoom(room, ["userLeftRoom", username, room]);
-        }
       }
       
       if (room && wsId) {
@@ -1496,7 +1490,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - OPTIMIZED (NO FULL GAME STATE)
+  // SWITCH ROOM - HANYA switchRoomSuccess SAJA
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1522,13 +1516,6 @@ export class GameServer {
       
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
-        const game = this.activeGames.get(roomName);
-        const hasGame = game?._isActive && !game._gameEnded;
-        this._safeSend(ws, ["gameStatus", hasGame ? "true" : "false"]);
-        if (roomName === CONSTANTS.DICE_ROOM) {
-          this._sendDiceNotificationOnSwitch(ws, wsId);
-          this._checkAndStartDiceIfNeeded(ws);
-        }
         return;
       }
       
@@ -1595,21 +1582,8 @@ export class GameServer {
           }
         }
         
+        // ✅ HANYA INI YANG DIKIRIM
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
-        
-        const game = this.activeGames.get(roomName);
-        const hasGame = game?._isActive && !game._gameEnded;
-        this._safeSend(ws, ["gameStatus", hasGame ? "true" : "false"]);
-        
-        if (roomName === CONSTANTS.DICE_ROOM) {
-          this._sendDiceNotificationOnSwitch(ws, wsId);
-          this._checkAndStartDiceIfNeeded(ws);
-        }
-        
-        this._broadcastToRoom(roomName, ["userJoinedRoom", username, roomName]);
-        if (currentRoom && currentRoom !== roomName) {
-          this._broadcastToRoom(currentRoom, ["userLeftRoom", username, currentRoom]);
-        }
         
       } finally {
         setTimeout(() => {
@@ -1617,7 +1591,11 @@ export class GameServer {
           this._switchRetries.delete(lockKey);
         }, 2000);
       }
-    } catch(e) {}
+    } catch(e) {
+      this._safeSend(ws, ["switchRoomError", e.message || "Switch failed"]);
+      this._switchLocks.delete(`switch_${ws._wsId}`);
+      this._switchRetries.delete(`switch_${ws._wsId}`);
+    }
   }
 
   // ============================================================
