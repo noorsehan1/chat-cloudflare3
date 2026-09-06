@@ -905,6 +905,7 @@ export class GameServer {
         await this._handleWeeklyReset();
         await this.alarmScheduler._scheduleWeeklyReset();
         break;
+        
       case 'dice_session_start':
         if (this.alarmScheduler.isDiceTime()) {
           this.diceAutoEnabled = true;
@@ -919,14 +920,18 @@ export class GameServer {
           }
         }
         break;
+        
       case 'dice_session_end':
         this.diceAutoEnabled = false;
+        
         const timeUntilNext = this._getTimeLeftUntilNextDice();
+        
         if (timeUntilNext.totalMs > 0) {
-          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended. Next game in: " + timeUntilNext.text]);
+          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Session ended. Next dice game in: " + timeUntilNext.text]);
         } else {
           this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
         }
+        
         if (this.currentDiceRoll || this._isShowingDice) {
           this._endDiceRound();
         }
@@ -1088,8 +1093,8 @@ export class GameServer {
           if (room) {
             setTimeout(() => {
               if (ws && ws.readyState === 1) {
-                this._sendGameStateToClient(ws, room);
-                this._broadcastGameStateToRoom(room);
+                // HAPUS: this._sendGameStateToClient(ws, room);
+                // HAPUS: this._broadcastGameStateToRoom(room);
               }
             }, 100);
           }
@@ -1583,9 +1588,6 @@ export class GameServer {
         case "checkGameRunning": 
           await this.checkGameRunning(ws, data[1]); 
           break;
-        case "getGameState": 
-          this._sendGameStateToClient(ws, data[1] || room); 
-          break;
         default: 
           break;
       }
@@ -1593,7 +1595,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM
+  // SWITCH ROOM - DENGAN DELAY 5 DETIK
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1620,7 +1622,12 @@ export class GameServer {
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         if (roomName === CONSTANTS.DICE_ROOM) {
-          this._sendDiceNotificationOnly(ws);
+          // DELAY 5 DETIK SEBELUM KIRIM NOTIFIKASI
+          setTimeout(() => {
+            if (ws && ws.readyState === 1) {
+              this._sendDiceNotificationOnly(ws);
+            }
+          }, 5000);
         }
         return;
       }
@@ -1691,7 +1698,13 @@ export class GameServer {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         
         if (roomName === CONSTANTS.DICE_ROOM) {
-          this._sendDiceNotificationOnly(ws);
+          // DELAY 5 DETIK SEBELUM KIRIM NOTIFIKASI KE CLIENT
+          const delayTimer = setTimeout(() => {
+            if (ws && ws.readyState === 1) {
+              this._sendDiceNotificationOnly(ws);
+            }
+          }, 5000);
+          this._trackTimer(delayTimer);
         }
         
       } finally {
@@ -1726,8 +1739,7 @@ export class GameServer {
           round: this._diceRound || 1
         }]);
         
-        // CLIENT BARU JOIN - TANPA EMOJI
-        this._safeSend(ws, ["diceNotification", "CLICK DRAW NOW !!!!"]);
+        this._safeSend(ws, ["diceNotification", "click draw now !!!!"]);
         
         const elapsed = (Date.now() - this._diceStartTime) / 1000;
         const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
@@ -1833,8 +1845,8 @@ export class GameServer {
         round: this._diceRound
       }]);
       
-      // STEP 2: KIRIM "CLICK DRAW NOW !!!!" (TANPA EMOJI)
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "CLICK DRAW NOW !!!!"]);
+      // STEP 2: KIRIM "click draw now !!!!"
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "click draw now !!!!"]);
       
       // STEP 3: TIMER NOTIFIKASI
       for (const timeout of this._diceNotificationTimeouts) { 
@@ -2238,87 +2250,15 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST GAME STATE
+  // BROADCAST GAME STATE - SUDAH DIHAPUS
+  // ============================================================
+  // _broadcastGameStateToRoom() - TIDAK PERLU
+  // _sendGameStateToClient() - TIDAK PERLU
+
+  // ============================================================
+  // HELPERS
   // ============================================================
   
-  _broadcastGameStateToRoom(room) {
-    try {
-      if (!room) return;
-      const wsIds = this.wsClients.get(room);
-      if (!wsIds?.size) return;
-      
-      for (const wsId of wsIds) {
-        const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1) {
-          this._sendGameStateToClient(ws, room);
-        }
-      }
-    } catch(e) {}
-  }
-
-  _sendGameStateToClient(ws, room) {
-    try {
-      if (!ws || ws.readyState !== 1 || !room) return;
-      
-      const game = this.activeGames.get(room);
-      
-      if (!game || !game._isActive || game._gameEnded) {
-        this._safeSend(ws, ["gameState", { 
-          room, 
-          hasGame: false, 
-          gameType: 'lowcard',
-          isActive: false 
-        }]);
-        return;
-      }
-      
-      const activePlayers = this._getActivePlayers(game);
-      const allPlayers = Array.from(game.players?.values() || []).map(p => p.name);
-      const eliminated = Array.from(game.eliminated || []);
-      const submitted = Array.from(game.numbers?.keys() || []);
-      const submittedData = Array.from(game.numbers?.entries() || []).map(([id, num]) => ({
-        player: game.players?.get(id)?.name || id,
-        number: num,
-        tanda: game.tanda?.get(id) || ''
-      }));
-      
-      this._safeSend(ws, ["gameState", {
-        room, 
-        hasGame: true, 
-        gameType: 'lowcard',
-        isActive: game._isActive || false,
-        phase: game._phase || 'registration',
-        round: game.round || 1, 
-        bet: game.betAmount || 0,
-        host: game.hostName || 'Unknown',
-        registrationOpen: game.registrationOpen || false,
-        players: allPlayers, 
-        activePlayers: activePlayers.map(p => p.name),
-        eliminated, 
-        submitted,
-        submittedData,
-        playerCount: game.players?.size || 0,
-        activeCount: activePlayers.length,
-        isEvaluating: game._isEvaluating || false,
-        evaluationLocked: game.evaluationLocked || false,
-        drawTimeExpired: game.drawTimeExpired || false,
-        gameStatus: game._gameEnded ? 'ended' : (game._isActive ? 'active' : 'inactive'),
-        totalPlayers: game.players?.size || 0,
-        timestamp: Date.now()
-      }]);
-    } catch(e) {
-      try {
-        this._safeSend(ws, ["gameState", { 
-          room: room || 'unknown', 
-          hasGame: false, 
-          gameType: 'lowcard',
-          isActive: false,
-          error: true
-        }]);
-      } catch(err) {}
-    }
-  }
-
   _trackTimer(timer) {
     if (timer) this._allTimers.add(timer);
     return timer;
@@ -2532,8 +2472,6 @@ export class GameServer {
           message: "Game created! Waiting for players..."
         }]);
         
-        this._broadcastGameStateToRoom(room);
-        
         // Registration timer
         const regTimer = setTimeout(() => {
           if (this.activeGames.has(room)) {
@@ -2541,7 +2479,6 @@ export class GameServer {
             if (g && g._isActive && g.registrationOpen) {
               g.registrationOpen = false;
               g._phase = 'drawing';
-              this._broadcastGameStateToRoom(room);
               this._startDrawPhase(room);
             }
           }
@@ -2618,8 +2555,6 @@ export class GameServer {
           playerCount: game.players.size
         }]);
         
-        this._broadcastGameStateToRoom(room);
-        
       } finally {
         setTimeout(() => {
           this._joinLocks.delete(lockKey);
@@ -2688,8 +2623,6 @@ export class GameServer {
         message: "Number submitted!"
       }]);
       
-      this._broadcastGameStateToRoom(room);
-      
       // Check if all active players submitted
       const activePlayers = this._getActivePlayerIds(game);
       const allSubmitted = activePlayers.every(id => game.numbers.has(id));
@@ -2728,8 +2661,6 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardLeaveSuccess", {
           message: "Left game"
         }]);
-        
-        this._broadcastGameStateToRoom(room);
         
         // Check if host left
         if (game.hostName === username || game.players.size === 0) {
@@ -2789,8 +2720,6 @@ export class GameServer {
         round: game.round,
         message: "Submit your number (1-12)!"
       }]);
-      
-      this._broadcastGameStateToRoom(room);
       
       // Auto-submit bots
       this._autoSubmitBots(room);
@@ -2888,8 +2817,6 @@ export class GameServer {
         message: "Evaluating..."
       }]);
       
-      this._broadcastGameStateToRoom(room);
-      
       // Find lowest number
       let lowestNum = 13;
       let lowestPlayers = [];
@@ -2965,8 +2892,6 @@ export class GameServer {
         message: "Round " + game.round + " - Submit your number!"
       }]);
       
-      this._broadcastGameStateToRoom(room);
-      
       // Auto-submit bots for next round
       this._autoSubmitBots(room);
       
@@ -3014,15 +2939,12 @@ export class GameServer {
         room: room
       }]);
       
-      this._broadcastGameStateToRoom(room);
-      
       // Cleanup timers
       this._cleanupGameTimers(game);
       
       // Schedule cleanup
       const cleanupTimer = setTimeout(() => {
         this.activeGames.delete(room);
-        this._broadcastGameStateToRoom(room);
       }, CONSTANTS.GAME_CLEANUP_DELAY_MS);
       
       this._cleanupTimers.set(room, cleanupTimer);
