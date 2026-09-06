@@ -1,5 +1,5 @@
-// ==================== CHAT-SERVER-D1.JS ====================
-// VERSION: 9.0.0 - MIGRATED TO D1 DATABASE
+// ==================== CHAT-SERVER.JS ====================
+// VERSION: 9.0.0 - MIGRATED TO D1 (ONLY STORAGE CHANGED)
 
 const C = {
   MAX_SEATS: 45,
@@ -41,316 +41,102 @@ export class ChatServer {
     this.currentNumber = 1;
     this._isNumberUpdating = false;
     
-    // D1 Database - menggunakan binding dari env
+    // ============ D1 DATABASE ============
     this.db = env.DB;
     
-    // Cache untuk D1
-    this._cache = {
+    // Storage cache - tetap sama formatnya
+    this._storageCache = {
       roomsData: {},
       userSeatData: {},
       currentNumber: 1
     };
     this._cacheInitialized = false;
     this._cacheLoading = false;
-    this._alarmScheduled = false;
     
     for (const room of ROOMS) {
       this.roomClients.set(room, new Set());
     }
     
-    this._initialize().then(() => {
+    this._restoreAllState().then(() => {
       this._restored = true;
     }).catch(() => {
       this._restored = true;
     });
   }
 
-  // ==================== INISIALISASI ====================
-
-  async _initialize() {
+  // ============ GANTI: LOAD FROM D1 ============
+  async _loadFromStorage() {
     try {
-      await this._loadFromD1();
-      this._cacheInitialized = true;
+      // Load dari D1
+      const roomsData = await this.db
+        .prepare('SELECT value FROM system_config WHERE key = ?')
+        .bind('roomsData')
+        .first();
       
-      // Restore WebSocket connections
-      const webSockets = this.ctx.getWebSockets ? this.ctx.getWebSockets() : [];
-      for (const ws of webSockets) {
-        try {
-          const attachment = ws.deserializeAttachment();
-          if (attachment && attachment.username) {
-            const userSeat = this._cache.userSeatData[attachment.username];
-            if (userSeat) {
-              ws.username = attachment.username;
-              ws.room = userSeat.room;
-              ws.roomname = userSeat.room;
-              ws.idtarget = attachment.username;
-              ws._closing = false;
-              
-              const roomClients = this.roomClients.get(userSeat.room);
-              if (roomClients) roomClients.add(ws);
-              
-              let conns = this.userConnections.get(attachment.username);
-              if (!conns) conns = new Set();
-              conns.add(ws);
-              this.userConnections.set(attachment.username, conns);
-              
-              this.wsSet.add(ws);
-            }
-          }
-        } catch(e) {}
-      }
+      const userSeatData = await this.db
+        .prepare('SELECT value FROM system_config WHERE key = ?')
+        .bind('userSeatData')
+        .first();
       
-      if (!this.closing && !this.isDestroyed && !this._alarmScheduled) {
-        this._alarmScheduled = true;
-        setTimeout(() => this._alarm(), C.NUMBER_INTERVAL_MS);
-      }
-      
-    } catch(error) {
-      console.error('Initialization error:', error);
-    }
-  }
-
-  async _loadFromD1() {
-    try {
-      // Load current number
-      const numResult = await this.db
+      const currentNumber = await this.db
         .prepare('SELECT value FROM system_config WHERE key = ?')
         .bind('current_number')
         .first();
       
-      this.currentNumber = numResult ? parseInt(numResult.value) : 1;
-      this._cache.currentNumber = this.currentNumber;
-      
-      // Load rooms data
-      const roomsResult = await this.db.prepare('SELECT * FROM rooms').all();
-      const roomsData = {};
-      
-      for (const room of roomsResult.results) {
-        // Load seats for this room
-        const seatsResult = await this.db
-          .prepare('SELECT * FROM seats WHERE room_id = ?')
-          .bind(room.id)
-          .all();
-        
-        const pointsResult = await this.db
-          .prepare('SELECT * FROM points WHERE room_id = ?')
-          .bind(room.id)
-          .all();
-        
-        const seats = {};
-        for (const seat of seatsResult.results) {
-          seats[seat.seat_number] = {
-            noimageUrl: seat.noimage_url || "",
-            namauser: seat.username || "",
-            color: seat.color || "",
-            itembawah: seat.itembawah || 0,
-            itematas: seat.itematas || 0,
-            vip: seat.vip || 0,
-            viptanda: seat.viptanda || 0
-          };
-        }
-        
-        const points = {};
-        for (const point of pointsResult.results) {
-          points[point.seat_number] = {
-            x: point.x || 0,
-            y: point.y || 0,
-            fast: point.fast === 1
-          };
-        }
-        
-        roomsData[room.name] = {
-          seats: seats,
-          points: points,
-          muted: room.muted === 1,
-          number: room.number || 1
-        };
-      }
-      
-      this._cache.roomsData = roomsData;
-      
-      // Load user seats
-      const userSeatsResult = await this.db.prepare('SELECT * FROM user_seats').all();
-      const userSeatData = {};
-      
-      for (const us of userSeatsResult.results) {
-        const room = await this.db
-          .prepare('SELECT name FROM rooms WHERE id = ?')
-          .bind(us.room_id)
-          .first();
-        
-        if (room) {
-          userSeatData[us.username] = {
-            room: room.name,
-            seat: us.seat_number,
-            isMulti: us.is_multi === 1
-          };
-        }
-      }
-      
-      this._cache.userSeatData = userSeatData;
+      this._storageCache = { 
+        roomsData: roomsData ? JSON.parse(roomsData.value) : {},
+        userSeatData: userSeatData ? JSON.parse(userSeatData.value) : {},
+        currentNumber: currentNumber ? parseInt(currentNumber.value) : 1
+      };
       this._cacheInitialized = true;
+      this.currentNumber = this._storageCache.currentNumber;
       
-    } catch(error) {
-      console.error('Failed to load from D1:', error);
-      throw error;
+      return this._storageCache;
+    } catch(e) {
+      return { roomsData: {}, userSeatData: {}, currentNumber: 1 };
     }
   }
 
-  // ==================== D1 OPERATIONS ====================
-
-  async _saveRoomToD1(roomName, roomData) {
+  // ============ GANTI: SAVE TO D1 ============
+  async _updateCacheAndStorage(updates) {
     try {
-      // Get or create room
-      let room = await this.db
-        .prepare('SELECT id FROM rooms WHERE name = ?')
-        .bind(roomName)
-        .first();
-      
-      if (!room) {
-        const result = await this.db
-          .prepare('INSERT INTO rooms (name, muted, number) VALUES (?, ?, ?) RETURNING id')
-          .bind(roomName, roomData.muted ? 1 : 0, roomData.number || 1)
-          .first();
-        room = result;
-      } else {
+      if (updates.roomsData !== undefined) {
+        this._storageCache.roomsData = updates.roomsData;
         await this.db
-          .prepare('UPDATE rooms SET muted = ?, number = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-          .bind(roomData.muted ? 1 : 0, roomData.number || 1, room.id)
+          .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
+          .bind('roomsData', JSON.stringify(updates.roomsData))
+          .run();
+      }
+      if (updates.userSeatData !== undefined) {
+        this._storageCache.userSeatData = updates.userSeatData;
+        await this.db
+          .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
+          .bind('userSeatData', JSON.stringify(updates.userSeatData))
+          .run();
+      }
+      if (updates.currentNumber !== undefined) {
+        this._storageCache.currentNumber = updates.currentNumber;
+        this.currentNumber = updates.currentNumber;
+        await this.db
+          .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
+          .bind('current_number', String(updates.currentNumber))
           .run();
       }
       
-      // Delete existing seats and points for this room
-      await this.db
-        .prepare('DELETE FROM seats WHERE room_id = ?')
-        .bind(room.id)
-        .run();
+      this._cacheInitialized = true;
+      return this._storageCache;
       
-      await this.db
-        .prepare('DELETE FROM points WHERE room_id = ?')
-        .bind(room.id)
-        .run();
-      
-      // Insert new seats
-      for (const [seatNumber, seatData] of Object.entries(roomData.seats || {})) {
-        if (seatData && seatData.namauser) {
-          await this.db
-            .prepare(`
-              INSERT INTO seats (room_id, seat_number, username, noimage_url, color, itembawah, itematas, vip, viptanda)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `)
-            .bind(
-              room.id,
-              parseInt(seatNumber),
-              seatData.namauser,
-              seatData.noimageUrl || '',
-              seatData.color || '',
-              seatData.itembawah || 0,
-              seatData.itematas || 0,
-              seatData.vip || 0,
-              seatData.viptanda || 0
-            )
-            .run();
-        }
-      }
-      
-      // Insert new points
-      for (const [seatNumber, pointData] of Object.entries(roomData.points || {})) {
-        if (pointData) {
-          await this.db
-            .prepare(`
-              INSERT INTO points (room_id, seat_number, x, y, fast)
-              VALUES (?, ?, ?, ?, ?)
-            `)
-            .bind(
-              room.id,
-              parseInt(seatNumber),
-              pointData.x || 0,
-              pointData.y || 0,
-              pointData.fast ? 1 : 0
-            )
-            .run();
-        }
-      }
-      
-    } catch(error) {
-      console.error('Failed to save room to D1:', error);
-      throw error;
+    } catch(e) {
+      return this._storageCache;
     }
   }
 
-  async _saveUserSeatToD1(username, seatInfo) {
-    try {
-      if (!seatInfo || !seatInfo.room || !seatInfo.seat) {
-        // Delete user seat
-        await this.db
-          .prepare('DELETE FROM user_seats WHERE username = ?')
-          .bind(username)
-          .run();
-        return;
-      }
-      
-      // Get room
-      const room = await this.db
-        .prepare('SELECT id FROM rooms WHERE name = ?')
-        .bind(seatInfo.room)
-        .first();
-      
-      if (!room) return;
-      
-      const existing = await this.db
-        .prepare('SELECT id FROM user_seats WHERE username = ?')
-        .bind(username)
-        .first();
-      
-      if (existing) {
-        await this.db
-          .prepare(`
-            UPDATE user_seats 
-            SET room_id = ?, seat_number = ?, is_multi = ?, updated_at = CURRENT_TIMESTAMP 
-            WHERE username = ?
-          `)
-          .bind(room.id, seatInfo.seat, seatInfo.isMulti ? 1 : 0, username)
-          .run();
-      } else {
-        await this.db
-          .prepare(`
-            INSERT INTO user_seats (username, room_id, seat_number, is_multi)
-            VALUES (?, ?, ?, ?)
-          `)
-          .bind(username, room.id, seatInfo.seat, seatInfo.isMulti ? 1 : 0)
-          .run();
-      }
-      
-    } catch(error) {
-      console.error('Failed to save user seat to D1:', error);
-    }
-  }
-
-  async _deleteRoomFromD1(roomName) {
-    try {
-      const room = await this.db
-        .prepare('SELECT id FROM rooms WHERE name = ?')
-        .bind(roomName)
-        .first();
-      
-      if (room) {
-        await this.db
-          .prepare('DELETE FROM rooms WHERE id = ?')
-          .bind(room.id)
-          .run();
-      }
-    } catch(error) {
-      console.error('Failed to delete room from D1:', error);
-    }
-  }
-
-  // ==================== CACHE MANAGEMENT ====================
-
+  // ============ TETAP SAMA: CACHE METHODS ============
   async _ensureCacheInitialized() {
-    if (this._cacheInitialized && this._cache.roomsData && 
-        Object.keys(this._cache.roomsData).length > 0) {
-      return this._cache;
+    if (this._cacheInitialized && this._storageCache && 
+        this._storageCache.roomsData && 
+        Object.keys(this._storageCache.roomsData).length > 0) {
+      return this._storageCache;
     }
     
     if (this._cacheLoading) {
@@ -359,56 +145,57 @@ export class ChatServer {
         await new Promise(resolve => setTimeout(resolve, 100));
         waitCount++;
       }
-      return this._cache;
+      return this._storageCache;
     }
     
     this._cacheLoading = true;
     try {
-      await this._loadFromD1();
-      this._cacheInitialized = true;
+      await this._loadFromStorage();
     } catch(e) {
       // Silent
     } finally {
       this._cacheLoading = false;
     }
     
-    return this._cache;
+    return this._storageCache;
   }
 
-  async _updateCache(updates) {
-    try {
-      if (updates.roomsData !== undefined) {
-        this._cache.roomsData = updates.roomsData;
-      }
-      if (updates.userSeatData !== undefined) {
-        this._cache.userSeatData = updates.userSeatData;
-      }
-      if (updates.currentNumber !== undefined) {
-        this._cache.currentNumber = updates.currentNumber;
-        this.currentNumber = updates.currentNumber;
-      }
-      
-      this._cacheInitialized = true;
-      return this._cache;
-    } catch(e) {
-      return this._cache;
-    }
+  _getCache() {
+    return this._storageCache;
   }
 
+  async _saveToStorage(roomsData, userSeatData, currentNumber) {
+    const updates = {};
+    if (roomsData !== undefined) updates.roomsData = roomsData;
+    if (userSeatData !== undefined) updates.userSeatData = userSeatData;
+    if (currentNumber !== undefined) updates.currentNumber = currentNumber;
+    
+    return await this._updateCacheAndStorage(updates);
+  }
+
+  // ============ TETAP SAMA: SEMUA METHOD LAIN ============
   async _getRoomData(roomName) {
     await this._ensureCacheInitialized();
-    return this._cache.roomsData[roomName] || null;
+    const cache = this._storageCache;
+    if (cache && cache.roomsData) {
+      return cache.roomsData[roomName] || null;
+    }
+    return null;
   }
 
   async _getUserSeat(username) {
     await this._ensureCacheInitialized();
-    return this._cache.userSeatData[username] || null;
+    const cache = this._storageCache;
+    if (cache && cache.userSeatData) {
+      return cache.userSeatData[username] || null;
+    }
+    return null;
   }
 
   async _updateRoomData(roomName, updater) {
     await this._ensureCacheInitialized();
     
-    const roomsData = this._cache.roomsData || {};
+    const roomsData = this._storageCache.roomsData || {};
     
     if (!roomsData[roomName]) {
       roomsData[roomName] = { seats: {}, points: {}, muted: false, number: 1 };
@@ -416,10 +203,7 @@ export class ChatServer {
     
     updater(roomsData[roomName]);
     
-    // Save to D1
-    await this._saveRoomToD1(roomName, roomsData[roomName]);
-    
-    await this._updateCache({ roomsData: roomsData });
+    await this._updateCacheAndStorage({ roomsData: roomsData });
     
     return roomsData[roomName];
   }
@@ -427,7 +211,7 @@ export class ChatServer {
   async _updateUserSeat(username, updater) {
     await this._ensureCacheInitialized();
     
-    const userSeatData = this._cache.userSeatData || {};
+    const userSeatData = this._storageCache.userSeatData || {};
     
     if (!userSeatData[username]) {
       userSeatData[username] = {};
@@ -437,12 +221,9 @@ export class ChatServer {
     
     if (Object.keys(userSeatData[username]).length === 0) {
       delete userSeatData[username];
-      await this._saveUserSeatToD1(username, null);
-    } else {
-      await this._saveUserSeatToD1(username, userSeatData[username]);
     }
     
-    await this._updateCache({ userSeatData: userSeatData });
+    await this._updateCacheAndStorage({ userSeatData: userSeatData });
     
     return userSeatData[username];
   }
@@ -450,40 +231,36 @@ export class ChatServer {
   async _deleteUserSeat(username) {
     await this._ensureCacheInitialized();
     
-    const userSeatData = this._cache.userSeatData || {};
+    const userSeatData = this._storageCache.userSeatData || {};
     delete userSeatData[username];
     
-    await this._saveUserSeatToD1(username, null);
-    await this._updateCache({ userSeatData: userSeatData });
+    await this._updateCacheAndStorage({ userSeatData: userSeatData });
   }
 
   async _deleteRoomIfEmpty(roomName) {
     await this._ensureCacheInitialized();
     
-    const roomData = this._cache.roomsData[roomName];
+    const roomData = this._storageCache.roomsData[roomName];
     if (!roomData) return;
     
     const hasSeats = roomData.seats && Object.values(roomData.seats).some(s => s && s.namauser);
     const hasPoints = roomData.points && Object.keys(roomData.points).length > 0;
     
     if (!hasSeats && !hasPoints) {
-      const roomsData = this._cache.roomsData || {};
+      const roomsData = this._storageCache.roomsData || {};
       delete roomsData[roomName];
       
-      await this._deleteRoomFromD1(roomName);
-      await this._updateCache({ roomsData: roomsData });
+      await this._updateCacheAndStorage({ roomsData: roomsData });
     }
   }
-
-  // ==================== USER VALIDATION ====================
 
   async _isUserInAnyRoom(username) {
     if (!username) return null;
     
     await this._ensureCacheInitialized();
     
-    const userSeatData = this._cache.userSeatData || {};
-    const roomsData = this._cache.roomsData || {};
+    const userSeatData = this._storageCache.userSeatData || {};
+    const roomsData = this._storageCache.roomsData || {};
     
     const seatInfo = userSeatData[username];
     if (seatInfo && seatInfo.room) {
@@ -496,8 +273,7 @@ export class ChatServer {
         }
       }
       delete userSeatData[username];
-      await this._saveUserSeatToD1(username, null);
-      await this._updateCache({ userSeatData: userSeatData });
+      await this._updateCacheAndStorage({ userSeatData: userSeatData });
     }
     
     for (const [roomName, roomData] of Object.entries(roomsData)) {
@@ -505,8 +281,7 @@ export class ChatServer {
       for (const [seat, data] of Object.entries(roomData.seats)) {
         if (data && data.namauser === username) {
           userSeatData[username] = { room: roomName, seat: parseInt(seat) };
-          await this._saveUserSeatToD1(username, userSeatData[username]);
-          await this._updateCache({ userSeatData: userSeatData });
+          await this._updateCacheAndStorage({ userSeatData: userSeatData });
           return { room: roomName, seat: parseInt(seat) };
         }
       }
@@ -515,12 +290,40 @@ export class ChatServer {
     return null;
   }
 
+  async _validateUserInRoom(username, roomName) {
+    if (!username || !roomName) return false;
+    
+    const userSeat = await this._getUserSeat(username);
+    if (!userSeat) return false;
+    
+    return userSeat.room === roomName;
+  }
+
+  async _validateWsInRoom(ws, roomName) {
+    if (!ws || !roomName) return false;
+    
+    const wsRoom = ws.room || ws.roomname;
+    return wsRoom === roomName;
+  }
+
+  async _validateUserAndWsInRoom(ws, username, roomName) {
+    if (!ws || !username || !roomName) return false;
+    
+    const userSeat = await this._getUserSeat(username);
+    if (!userSeat || userSeat.room !== roomName) return false;
+    
+    const wsRoom = ws.room || ws.roomname;
+    if (wsRoom !== roomName) return false;
+    
+    return true;
+  }
+
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
     
     await this._ensureCacheInitialized();
     
-    const roomData = this._cache.roomsData[roomName];
+    const roomData = this._storageCache.roomsData[roomName];
     if (!roomData || !roomData.seats) return false;
     
     let seat = null;
@@ -538,7 +341,6 @@ export class ChatServer {
       delete roomData.points[seat];
     }
     
-    await this._saveRoomToD1(roomName, roomData);
     await this._updateRoomData(roomName, (data) => {
       data.seats = roomData.seats;
       data.points = roomData.points || {};
@@ -570,7 +372,7 @@ export class ChatServer {
     
     await this._ensureCacheInitialized();
     
-    const roomData = this._cache.roomsData[roomName];
+    const roomData = this._storageCache.roomsData[roomName];
     if (!roomData || !roomData.seats || !roomData.seats[seat]) {
       return { success: false, error: 'Seat not found' };
     }
@@ -590,7 +392,6 @@ export class ChatServer {
       viptanda: typeof data.viptanda === 'number' ? data.viptanda : (parseInt(data.viptanda) || 0)
     };
     
-    await this._saveRoomToD1(roomName, roomData);
     await this._updateRoomData(roomName, (d) => {
       d.seats = roomData.seats;
     });
@@ -601,22 +402,19 @@ export class ChatServer {
   async _updatePoint(roomName, seat, x, y, fast) {
     await this._ensureCacheInitialized();
     
-    const roomData = this._cache.roomsData[roomName];
+    const roomData = this._storageCache.roomsData[roomName];
     if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
     
     if (!roomData.points) roomData.points = {};
     
     roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
     
-    await this._saveRoomToD1(roomName, roomData);
     await this._updateRoomData(roomName, (d) => {
       d.points = roomData.points;
     });
     
     return true;
   }
-
-  // ==================== JOIN HANDLING ====================
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -652,7 +450,7 @@ export class ChatServer {
     
     await this._ensureCacheInitialized();
     
-    let roomData = this._cache.roomsData[roomName];
+    let roomData = this._storageCache.roomsData[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
     }
@@ -694,7 +492,6 @@ export class ChatServer {
         viptanda: 0
       };
       
-      await this._saveRoomToD1(roomName, roomData);
       await this._updateRoomData(roomName, (data) => {
         data.seats = roomData.seats;
         data.points = roomData.points || {};
@@ -744,8 +541,6 @@ export class ChatServer {
     return true;
   }
 
-  // ==================== WEBSOCKET HANDLING ====================
-
   async _cleanupUserOnDisconnect(ws) {
     try {
       if (!ws) return;
@@ -787,7 +582,7 @@ export class ChatServer {
           await this._removeUserFromRoom(username, userSeat.room);
         } else {
           await this._ensureCacheInitialized();
-          const roomsData = this._cache.roomsData || {};
+          const roomsData = this._storageCache.roomsData || {};
           let found = false;
           for (const [room, roomData] of Object.entries(roomsData)) {
             if (!roomData || !roomData.seats) continue;
@@ -863,8 +658,6 @@ export class ChatServer {
     }
   }
 
-  // ==================== BROADCAST ====================
-
   broadcast(room, msg) {
     if (this.closing || this.isDestroyed || !room || !msg) return;
     
@@ -925,7 +718,7 @@ export class ChatServer {
     try {
       await this._ensureCacheInitialized();
       
-      const roomData = this._cache.roomsData[room];
+      const roomData = this._storageCache.roomsData[room];
       if (!roomData || !roomData.seats) {
         this.broadcast(room, ["roomUserCount", room, 0]);
         return 0;
@@ -953,7 +746,7 @@ export class ChatServer {
     
     await this._ensureCacheInitialized();
     
-    const roomData = this._cache.roomsData[room];
+    const roomData = this._storageCache.roomsData[room];
     if (!roomData) return;
     
     try {
@@ -997,18 +790,19 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ==================== ALARM / NUMBER UPDATE ====================
-
-  async _alarm() {
+  // ============ GANTI: ALARM PAKAI D1 ============
+  async alarm() {
     if (this.closing || this.isDestroyed) return;
     
     await this._updateNumber();
     this._cleanupDeadConnections();
     this._cleanupStaleLocks();
     await this._cleanupStorage();
+    await this._saveAllState();
     
+    // Schedule next alarm
     if (!this.closing && !this.isDestroyed) {
-      setTimeout(() => this._alarm(), C.NUMBER_INTERVAL_MS);
+      this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
     }
   }
 
@@ -1018,15 +812,9 @@ export class ChatServer {
     try {
       this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
       
-      // Update D1
-      await this.db
-        .prepare('UPDATE system_config SET value = ? WHERE key = ?')
-        .bind(String(this.currentNumber), 'current_number')
-        .run();
+      await this._updateCacheAndStorage({ currentNumber: this.currentNumber });
       
-      await this._updateCache({ currentNumber: this.currentNumber });
-      
-      const roomsData = this._cache.roomsData || {};
+      const roomsData = this._storageCache.roomsData || {};
       let changed = false;
       
       for (const [roomName, roomData] of Object.entries(roomsData)) {
@@ -1037,10 +825,7 @@ export class ChatServer {
       }
       
       if (changed) {
-        for (const [roomName, roomData] of Object.entries(roomsData)) {
-          await this._saveRoomToD1(roomName, roomData);
-        }
-        await this._updateCache({ roomsData: roomsData });
+        await this._updateCacheAndStorage({ roomsData: roomsData });
       }
       
       for (const [room, clients] of this.roomClients) {
@@ -1058,8 +843,8 @@ export class ChatServer {
     try {
       await this._ensureCacheInitialized();
       
-      const roomsData = this._cache.roomsData || {};
-      const userSeatData = this._cache.userSeatData || {};
+      const roomsData = this._storageCache.roomsData || {};
+      const userSeatData = this._storageCache.userSeatData || {};
       
       let changed = false;
       
@@ -1070,7 +855,6 @@ export class ChatServer {
         
         if (!seatInfo || !seatInfo.room) {
           delete userSeatData[username];
-          await this._saveUserSeatToD1(username, null);
           changed = true;
           continue;
         }
@@ -1078,7 +862,6 @@ export class ChatServer {
         const roomData = roomsData[seatInfo.room];
         if (!roomData || !roomData.seats || !roomData.seats[seatInfo.seat]) {
           delete userSeatData[username];
-          await this._saveUserSeatToD1(username, null);
           changed = true;
         }
       }
@@ -1089,13 +872,12 @@ export class ChatServer {
         
         if (!hasSeats && !hasPoints) {
           delete roomsData[roomName];
-          await this._deleteRoomFromD1(roomName);
           changed = true;
         }
       }
       
       if (changed) {
-        await this._updateCache({ 
+        await this._updateCacheAndStorage({ 
           roomsData: roomsData, 
           userSeatData: userSeatData 
         });
@@ -1110,7 +892,19 @@ export class ChatServer {
     }
   }
 
-  // ==================== CLEANUP ====================
+  async _saveAllState() {
+    try {
+      await this._ensureCacheInitialized();
+      
+      await this._updateCacheAndStorage({
+        roomsData: this._storageCache.roomsData,
+        userSeatData: this._storageCache.userSeatData,
+        currentNumber: this.currentNumber
+      });
+    } catch(e) {
+      // Silent
+    }
+  }
 
   _cleanupDeadConnections() {
     try {
@@ -1179,8 +973,6 @@ export class ChatServer {
       try { if (ws && ws.readyState === 1) ws.close(1000, "Cleanup"); } catch(e) {}
     }
   }
-
-  // ==================== MESSAGE HANDLING ====================
 
   async _handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
@@ -1292,7 +1084,7 @@ export class ChatServer {
           
           await this._ensureCacheInitialized();
           
-          let roomData = this._cache.roomsData[multiRoomname];
+          let roomData = this._storageCache.roomsData[multiRoomname];
           if (!roomData) {
             roomData = { seats: {}, points: {}, muted: false, number: 1 };
           }
@@ -1320,7 +1112,6 @@ export class ChatServer {
             viptanda: 0
           };
           
-          await this._saveRoomToD1(multiRoomname, roomData);
           await this._updateRoomData(multiRoomname, (data) => {
             data.seats = roomData.seats;
             data.points = roomData.points || {};
@@ -1367,7 +1158,7 @@ export class ChatServer {
             
             if (!userSeat) {
               await this._ensureCacheInitialized();
-              const roomsData = this._cache.roomsData;
+              const roomsData = this._storageCache.roomsData;
               for (const [roomName, roomData] of Object.entries(roomsData)) {
                 if (!roomData || !roomData.seats) continue;
                 for (const [seat, data] of Object.entries(roomData.seats)) {
@@ -1794,7 +1585,7 @@ export class ChatServer {
         case "getOnlineUsers": {
           const users = [];
           await this._ensureCacheInitialized();
-          const userSeatData = this._cache.userSeatData || {};
+          const userSeatData = this._storageCache.userSeatData || {};
           
           for (const [username, seatInfo] of Object.entries(userSeatData)) {
             if (seatInfo) {
@@ -1827,7 +1618,7 @@ export class ChatServer {
           await this._ensureCacheInitialized();
           const counts = {};
           for (const room of ROOMS) {
-            const roomData = this._cache.roomsData[room];
+            const roomData = this._storageCache.roomsData[room];
             counts[room] = roomData?.seats ? Object.values(roomData.seats).filter(s => s && s.namauser).length : 0;
           }
           this.safeSend(ws, ["allRoomsUserCount", Object.entries(counts)]);
@@ -1838,7 +1629,7 @@ export class ChatServer {
           const roomName = args[0];
           if (roomName && ROOMS_SET.has(roomName)) {
             await this._ensureCacheInitialized();
-            const roomData = this._cache.roomsData[roomName];
+            const roomData = this._storageCache.roomsData[roomName];
             const count = roomData?.seats ? Object.values(roomData.seats).filter(s => s && s.namauser).length : 0;
             this.safeSend(ws, ["roomUserCount", roomName, count]);
           }
@@ -1849,7 +1640,7 @@ export class ChatServer {
           const getMuteRoom = args[0];
           if (getMuteRoom && ROOMS_SET.has(getMuteRoom)) {
             await this._ensureCacheInitialized();
-            const roomData = this._cache.roomsData[getMuteRoom];
+            const roomData = this._storageCache.roomsData[getMuteRoom];
             this.safeSend(ws, ["muteTypeResponse", roomData?.muted || false, getMuteRoom]);
           }
           break;
@@ -1868,7 +1659,48 @@ export class ChatServer {
     }
   }
 
-  // ==================== FETCH / WEB SOCKET ====================
+  async _restoreAllState() {
+    try {
+      await this._ensureCacheInitialized();
+      
+      const webSockets = this.ctx.getWebSockets();
+      for (const ws of webSockets) {
+        try {
+          const attachment = ws.deserializeAttachment();
+          if (attachment && attachment.username) {
+            const userSeat = this._storageCache.userSeatData[attachment.username];
+            if (userSeat) {
+              attachment.seatInfo = userSeat;
+              ws.serializeAttachment(attachment);
+              
+              ws.username = attachment.username;
+              ws.room = userSeat.room;
+              ws.roomname = userSeat.room;
+              ws.idtarget = attachment.username;
+              ws._closing = false;
+              
+              const roomClients = this.roomClients.get(userSeat.room);
+              if (roomClients) roomClients.add(ws);
+              
+              let conns = this.userConnections.get(attachment.username);
+              if (!conns) conns = new Set();
+              conns.add(ws);
+              this.userConnections.set(attachment.username, conns);
+              
+              this.wsSet.add(ws);
+            }
+          }
+        } catch(e) {}
+      }
+      
+      if (!this.closing && !this.isDestroyed) {
+        this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+      }
+      
+    } catch(e) {
+      // Silent
+    }
+  }
 
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
@@ -1880,7 +1712,7 @@ export class ChatServer {
     try {
       const upgrade = req.headers.get("Upgrade");
       if (upgrade !== "websocket") {
-        return new Response("Chat Server Running", { 
+        return new Response("Chat Server", { 
           status: 200,
           headers: { "Cache-Control": "no-cache" }
         });
