@@ -1,6 +1,6 @@
 // ============================================================
-// GAME-SERVER-STORAGE-ONLY.js
-// VERSION: 9.0.3 - PERSISTENCE FIXED
+// GAME-SERVER-D1.js
+// VERSION: 10.1.0 - 1-QUERY RESTORE LIKE CHAT SERVER
 // ============================================================
 
 // ============================================================
@@ -51,10 +51,12 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-  
+    // Tambahkan jadwal sesi disini
   ],
   TIMEZONE_OFFSET: 8,
 };
+
+const TABLE_NAME = 'game_data';
 
 function parseTime(timeStr) {
   const [hours, minutes] = timeStr.split(':').map(Number);
@@ -62,12 +64,135 @@ function parseTime(timeStr) {
 }
 
 // ============================================================
-// DATA MANAGER - STORAGE ONLY
+// DATA MANAGER - D1 VERSION (1 QUERY RESTORE)
 // ============================================================
 
 class DataManager {
-  constructor(state) {
-    this.state = state;
+  constructor(db) {
+    this.db = db;
+    this._cache = null;
+    this._cacheInitialized = false;
+    this._cacheLoading = false;
+    this._restored = false;
+  }
+
+  async init() {
+    try {
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  // ✅ 1 QUERY: Ambil SEMUA data sekaligus (seperti ChatServer)
+  async loadAllData() {
+    if (this._cacheLoading) {
+      let waitCount = 0;
+      while (this._cacheLoading && waitCount < 50) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        waitCount++;
+      }
+      return this._cache;
+    }
+    
+    this._cacheLoading = true;
+    try {
+      const result = await this.db
+        .prepare(`SELECT key, value FROM ${TABLE_NAME}`)
+        .all();
+
+      const cache = {
+        recordingStatusMap: {},
+        winnersMap: {},
+        dicePoints: {},
+        lastWeekWinner: null,
+        lastResetWeek: null,
+        scheduled_alarms: {},
+        activeGames: {}
+      };
+
+      for (const row of result.results) {
+        const key = row.key;
+        const value = JSON.parse(row.value);
+
+        switch(key) {
+          case 'recordingStatusMap':
+            cache.recordingStatusMap = value;
+            break;
+          case 'winnersMap':
+            cache.winnersMap = value;
+            break;
+          case 'dicePoints':
+            cache.dicePoints = value;
+            break;
+          case 'lastWeekWinner':
+            cache.lastWeekWinner = value;
+            break;
+          case 'lastResetWeek':
+            cache.lastResetWeek = value;
+            break;
+          case 'scheduled_alarms':
+            cache.scheduled_alarms = value;
+            break;
+          case 'activeGames':
+            cache.activeGames = value;
+            break;
+        }
+      }
+
+      this._cache = cache;
+      this._cacheInitialized = true;
+      this._restored = true;
+      return this._cache;
+
+    } catch(e) {
+      this._cache = {
+        recordingStatusMap: {},
+        winnersMap: {},
+        dicePoints: {},
+        lastWeekWinner: null,
+        lastResetWeek: null,
+        scheduled_alarms: {},
+        activeGames: {}
+      };
+      this._cacheInitialized = true;
+      this._restored = true;
+      return this._cache;
+    } finally {
+      this._cacheLoading = false;
+    }
+  }
+
+  async _ensureCacheInitialized() {
+    if (this._cacheInitialized && this._cache) {
+      return this._cache;
+    }
+    return await this.loadAllData();
+  }
+
+  // ✅ DELETE jika kosong (seperti ChatServer)
+  async _save(key, value) {
+    if (value === null || value === undefined || 
+        (typeof value === 'object' && Object.keys(value).length === 0) ||
+        (Array.isArray(value) && value.length === 0)) {
+      await this.db
+        .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
+        .bind(key)
+        .run();
+      return;
+    }
+    
+    await this.db
+      .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
+      .bind(key, JSON.stringify(value))
+      .run();
   }
 
   // ============================================================
@@ -75,35 +200,24 @@ class DataManager {
   // ============================================================
   
   async getRecordingStatus(room) {
-    try {
-      const map = await this.state.storage.get('recordingStatusMap');
-      return map && map[room] === true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.recordingStatusMap[room] === true;
   }
 
   async setRecordingStatus(room, enabled) {
-    try {
-      const map = await this.state.storage.get('recordingStatusMap') || {};
-      if (enabled) {
-        map[room] = true;
-      } else {
-        delete map[room];
-      }
-      await this.state.storage.put('recordingStatusMap', map);
-      return true;
-    } catch(e) {
-      return false;
+    await this._ensureCacheInitialized();
+    if (enabled) {
+      this._cache.recordingStatusMap[room] = true;
+    } else {
+      delete this._cache.recordingStatusMap[room];
     }
+    await this._save('recordingStatusMap', this._cache.recordingStatusMap);
+    return true;
   }
 
   async getAllRecordingStatus() {
-    try {
-      return await this.state.storage.get('recordingStatusMap') || {};
-    } catch(e) {
-      return {};
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.recordingStatusMap;
   }
 
   // ============================================================
@@ -111,51 +225,40 @@ class DataManager {
   // ============================================================
   
   async getWinners(room) {
-    try {
-      const map = await this.state.storage.get('winnersMap');
-      return map && map[room] ? map[room] : {};
-    } catch(e) {
-      return {};
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.winnersMap[room] || {};
   }
 
   async setWinners(room, winners) {
-    try {
-      const map = await this.state.storage.get('winnersMap') || {};
-      if (winners && Object.keys(winners).length > 0) {
-        map[room] = winners;
-      } else {
-        delete map[room];
-      }
-      await this.state.storage.put('winnersMap', map);
-      return true;
-    } catch(e) {
-      return false;
+    await this._ensureCacheInitialized();
+    if (winners && Object.keys(winners).length > 0) {
+      this._cache.winnersMap[room] = winners;
+    } else {
+      delete this._cache.winnersMap[room];
     }
+    await this._save('winnersMap', this._cache.winnersMap);
+    return true;
   }
 
   async addWinner(room, username) {
-    try {
-      const winners = await this.getWinners(room);
-      let count = parseInt(String(winners[username] || "0").replace("x", "")) || 0;
-      winners[username] = (count + 1) + "x";
-      await this.setWinners(room, winners);
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    const winners = await this.getWinners(room);
+    let count = parseInt(String(winners[username] || "0").replace("x", "")) || 0;
+    winners[username] = (count + 1) + "x";
+    await this.setWinners(room, winners);
+    return true;
   }
 
   async deleteAllWinners(room) {
-    return await this.setWinners(room, {});
+    await this._ensureCacheInitialized();
+    delete this._cache.winnersMap[room];
+    await this._save('winnersMap', this._cache.winnersMap);
+    return true;
   }
 
   async getAllWinners() {
-    try {
-      return await this.state.storage.get('winnersMap') || {};
-    } catch(e) {
-      return {};
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.winnersMap;
   }
 
   // ============================================================
@@ -163,78 +266,57 @@ class DataManager {
   // ============================================================
   
   async getDicePoints() {
-    try {
-      const points = await this.state.storage.get('dicePoints');
-      return points || {};
-    } catch(e) {
-      return {};
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.dicePoints;
   }
 
   async setDicePoints(points) {
-    try {
-      const cleanPoints = {};
-      for (const [username, score] of Object.entries(points || {})) {
-        if (username && typeof username === 'string') {
-          const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
-          if (numericScore > 0) {
-            cleanPoints[username] = numericScore;
-          }
+    await this._ensureCacheInitialized();
+    const cleanPoints = {};
+    for (const [username, score] of Object.entries(points || {})) {
+      if (username && typeof username === 'string') {
+        const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
+        if (numericScore > 0) {
+          cleanPoints[username] = numericScore;
         }
       }
-      
-      if (Object.keys(cleanPoints).length > 0) {
-        await this.state.storage.put('dicePoints', cleanPoints);
-      } else {
-        await this.state.storage.delete('dicePoints');
-      }
-      return true;
-    } catch(e) {
-      return false;
     }
+    this._cache.dicePoints = cleanPoints;
+    await this._save('dicePoints', this._cache.dicePoints);
+    return true;
   }
 
   async addDicePoint(username) {
-    try {
-      const points = await this.getDicePoints();
-      points[username] = (points[username] || 0) + 1;
-      await this.setDicePoints(points);
-      return points;
-    } catch(e) {
-      return null;
-    }
+    await this._ensureCacheInitialized();
+    const points = await this.getDicePoints();
+    points[username] = (points[username] || 0) + 1;
+    await this.setDicePoints(points);
+    return points;
   }
 
   async resetDicePoints() {
-    try {
-      await this.state.storage.delete('dicePoints');
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    this._cache.dicePoints = {};
+    await this._save('dicePoints', this._cache.dicePoints);
+    return true;
   }
 
   async getLeaderboard(limit = 10) {
-    try {
-      const points = await this.getDicePoints();
-      if (!points || Object.keys(points).length === 0) {
-        return [];
-      }
-      
-      const safeLimit = Math.min(
-        Math.max(limit, CONSTANTS.MIN_LEADERBOARD_LIMIT),
-        CONSTANTS.MAX_LEADERBOARD_LIMIT
-      );
-      
-      const sorted = Object.entries(points)
-        .filter(([username, score]) => username && score > 0)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, safeLimit);
-      
-      return sorted.map(([u, s]) => `${u}|${s}`);
-    } catch(e) {
-      return [];
-    }
+    await this._ensureCacheInitialized();
+    const points = this._cache.dicePoints;
+    if (!points || Object.keys(points).length === 0) return [];
+    
+    const safeLimit = Math.min(
+      Math.max(limit, CONSTANTS.MIN_LEADERBOARD_LIMIT),
+      CONSTANTS.MAX_LEADERBOARD_LIMIT
+    );
+    
+    const sorted = Object.entries(points)
+      .filter(([username, score]) => username && score > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, safeLimit);
+    
+    return sorted.map(([u, s]) => `${u}|${s}`);
   }
 
   // ============================================================
@@ -242,33 +324,22 @@ class DataManager {
   // ============================================================
   
   async getLastWeekWinner() {
-    try {
-      return await this.state.storage.get('lastWeekWinner') || null;
-    } catch(e) {
-      return null;
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.lastWeekWinner;
   }
 
   async setLastWeekWinner(winnerData) {
-    try {
-      if (winnerData && winnerData.username) {
-        await this.state.storage.put('lastWeekWinner', winnerData);
-      } else {
-        await this.state.storage.delete('lastWeekWinner');
-      }
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    this._cache.lastWeekWinner = winnerData;
+    await this._save('lastWeekWinner', this._cache.lastWeekWinner);
+    return true;
   }
 
   async deleteLastWeekWinner() {
-    try {
-      await this.state.storage.delete('lastWeekWinner');
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    this._cache.lastWeekWinner = null;
+    await this._save('lastWeekWinner', this._cache.lastWeekWinner);
+    return true;
   }
 
   // ============================================================
@@ -276,20 +347,15 @@ class DataManager {
   // ============================================================
   
   async getLastResetWeek() {
-    try {
-      return await this.state.storage.get('lastResetWeek') || null;
-    } catch(e) {
-      return null;
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.lastResetWeek;
   }
 
   async setLastResetWeek(week) {
-    try {
-      await this.state.storage.put('lastResetWeek', week);
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    this._cache.lastResetWeek = week;
+    await this._save('lastResetWeek', this._cache.lastResetWeek);
+    return true;
   }
 
   // ============================================================
@@ -297,143 +363,117 @@ class DataManager {
   // ============================================================
   
   async getAlarms() {
-    try {
-      return await this.state.storage.get('scheduled_alarms') || {};
-    } catch(e) {
-      return {};
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.scheduled_alarms;
   }
 
   async setAlarms(alarms) {
-    try {
-      await this.state.storage.put('scheduled_alarms', alarms);
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    this._cache.scheduled_alarms = alarms;
+    await this._save('scheduled_alarms', this._cache.scheduled_alarms);
+    return true;
   }
 
   async deleteAlarms() {
-    try {
-      await this.state.storage.delete('scheduled_alarms');
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    this._cache.scheduled_alarms = {};
+    await this._save('scheduled_alarms', this._cache.scheduled_alarms);
+    return true;
   }
 
   // ============================================================
-  // ACTIVE GAMES - PERSISTENCE
+  // ACTIVE GAMES
   // ============================================================
   
   async saveGameState(room, game) {
-    try {
-      if (!room || !game) return;
-      
-      const allGames = await this.state.storage.get('activeGames') || {};
-      
-      allGames[room] = {
-        room: game.room,
-        round: game.round || 1,
-        betAmount: game.betAmount || 0,
-        hostName: game.hostName,
-        hostId: game.hostId,
-        registrationOpen: game.registrationOpen || false,
-        _isActive: game._isActive || false,
-        _gameEnded: game._gameEnded || false,
-        _phase: game._phase || 'registration',
-        _createdAt: game._createdAt || Date.now(),
-        _startedByRecording: game._startedByRecording || false,
-        _startedBy: game._startedBy || 'user',
-        players: Array.from(game.players?.entries() || []),
-        botPlayers: Array.from(game.botPlayers?.entries() || []),
-        eliminated: Array.from(game.eliminated || []),
-        numbers: Array.from(game.numbers || []),
-        tanda: Array.from(game.tanda || []),
-        _botsAdded: game._botsAdded || false,
-        useBots: game.useBots || false,
-        evaluationLocked: game.evaluationLocked || false,
-        drawTimeExpired: game.drawTimeExpired || false,
-        _isEvaluating: game._isEvaluating || false,
-        playerWsId: Array.from(game.playerWsId?.entries() || []),
-        _drawPhaseStart: game._drawPhaseStart,
-        _endTime: game._endTime || Date.now()
-      };
-      
-      await this.state.storage.put('activeGames', allGames);
-      return true;
-    } catch(e) {
+    await this._ensureCacheInitialized();
+    if (!room || !game || !game._isActive || game._gameEnded) {
+      delete this._cache.activeGames[room];
+      await this._save('activeGames', this._cache.activeGames);
       return false;
     }
+    
+    this._cache.activeGames[room] = {
+      room: game.room,
+      round: game.round || 1,
+      betAmount: game.betAmount || 0,
+      hostName: game.hostName,
+      hostId: game.hostId,
+      registrationOpen: game.registrationOpen || false,
+      _isActive: game._isActive || false,
+      _gameEnded: game._gameEnded || false,
+      _phase: game._phase || 'registration',
+      _createdAt: game._createdAt || Date.now(),
+      _startedByRecording: game._startedByRecording || false,
+      _startedBy: game._startedBy || 'user',
+      players: Array.from(game.players?.entries() || []),
+      botPlayers: Array.from(game.botPlayers?.entries() || []),
+      eliminated: Array.from(game.eliminated || []),
+      numbers: Array.from(game.numbers || []),
+      tanda: Array.from(game.tanda || []),
+      _botsAdded: game._botsAdded || false,
+      useBots: game.useBots || false,
+      evaluationLocked: game.evaluationLocked || false,
+      drawTimeExpired: game.drawTimeExpired || false,
+      _isEvaluating: game._isEvaluating || false,
+      playerWsId: Array.from(game.playerWsId?.entries() || []),
+      _drawPhaseStart: game._drawPhaseStart,
+      _endTime: game._endTime || Date.now()
+    };
+    
+    await this._save('activeGames', this._cache.activeGames);
+    return true;
   }
 
   async loadAllGames() {
-    try {
-      return await this.state.storage.get('activeGames') || {};
-    } catch(e) {
-      return {};
-    }
+    await this._ensureCacheInitialized();
+    return this._cache.activeGames;
   }
 
   async removeGameFromStorage(room) {
-    try {
-      const allGames = await this.state.storage.get('activeGames') || {};
-      delete allGames[room];
-      if (Object.keys(allGames).length > 0) {
-        await this.state.storage.put('activeGames', allGames);
-      } else {
-        await this.state.storage.delete('activeGames');
-      }
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    delete this._cache.activeGames[room];
+    await this._save('activeGames', this._cache.activeGames);
+    return true;
   }
 
   async saveAllGames(gamesMap) {
-    try {
-      const allGames = {};
-      for (const [room, game] of gamesMap) {
-        if (game._isActive && !game._gameEnded) {
-          allGames[room] = {
-            room: game.room,
-            round: game.round || 1,
-            betAmount: game.betAmount || 0,
-            hostName: game.hostName,
-            hostId: game.hostId,
-            registrationOpen: game.registrationOpen || false,
-            _isActive: game._isActive || false,
-            _gameEnded: game._gameEnded || false,
-            _phase: game._phase || 'registration',
-            _createdAt: game._createdAt || Date.now(),
-            _startedByRecording: game._startedByRecording || false,
-            _startedBy: game._startedBy || 'user',
-            players: Array.from(game.players?.entries() || []),
-            botPlayers: Array.from(game.botPlayers?.entries() || []),
-            eliminated: Array.from(game.eliminated || []),
-            numbers: Array.from(game.numbers || []),
-            tanda: Array.from(game.tanda || []),
-            _botsAdded: game._botsAdded || false,
-            useBots: game.useBots || false,
-            evaluationLocked: game.evaluationLocked || false,
-            drawTimeExpired: game.drawTimeExpired || false,
-            _isEvaluating: game._isEvaluating || false,
-            playerWsId: Array.from(game.playerWsId?.entries() || []),
-            _drawPhaseStart: game._drawPhaseStart,
-            _endTime: game._endTime || Date.now()
-          };
-        }
+    await this._ensureCacheInitialized();
+    const allGames = {};
+    for (const [room, game] of gamesMap) {
+      if (game._isActive && !game._gameEnded) {
+        allGames[room] = {
+          room: game.room,
+          round: game.round || 1,
+          betAmount: game.betAmount || 0,
+          hostName: game.hostName,
+          hostId: game.hostId,
+          registrationOpen: game.registrationOpen || false,
+          _isActive: game._isActive || false,
+          _gameEnded: game._gameEnded || false,
+          _phase: game._phase || 'registration',
+          _createdAt: game._createdAt || Date.now(),
+          _startedByRecording: game._startedByRecording || false,
+          _startedBy: game._startedBy || 'user',
+          players: Array.from(game.players?.entries() || []),
+          botPlayers: Array.from(game.botPlayers?.entries() || []),
+          eliminated: Array.from(game.eliminated || []),
+          numbers: Array.from(game.numbers || []),
+          tanda: Array.from(game.tanda || []),
+          _botsAdded: game._botsAdded || false,
+          useBots: game.useBots || false,
+          evaluationLocked: game.evaluationLocked || false,
+          drawTimeExpired: game.drawTimeExpired || false,
+          _isEvaluating: game._isEvaluating || false,
+          playerWsId: Array.from(game.playerWsId?.entries() || []),
+          _drawPhaseStart: game._drawPhaseStart,
+          _endTime: game._endTime || Date.now()
+        };
       }
-      
-      if (Object.keys(allGames).length > 0) {
-        await this.state.storage.put('activeGames', allGames);
-      } else {
-        await this.state.storage.delete('activeGames');
-      }
-      return true;
-    } catch(e) {
-      return false;
     }
+    this._cache.activeGames = allGames;
+    await this._save('activeGames', this._cache.activeGames);
+    return true;
   }
 
   // ============================================================
@@ -450,49 +490,51 @@ class DataManager {
   }
 
   async clearAllData() {
-    try {
-      await this.state.storage.delete('recordingStatusMap');
-      await this.state.storage.delete('winnersMap');
-      await this.state.storage.delete('dicePoints');
-      await this.state.storage.delete('lastWeekWinner');
-      await this.state.storage.delete('lastResetWeek');
-      await this.state.storage.delete('scheduled_alarms');
-      await this.state.storage.delete('activeGames');
-      return true;
-    } catch(e) {
-      return false;
-    }
+    await this._ensureCacheInitialized();
+    this._cache = {
+      recordingStatusMap: {},
+      winnersMap: {},
+      dicePoints: {},
+      lastWeekWinner: null,
+      lastResetWeek: null,
+      scheduled_alarms: {},
+      activeGames: {}
+    };
+    await this.db.prepare(`DELETE FROM ${TABLE_NAME}`).run();
+    this._cacheInitialized = true;
+    return true;
   }
 
   async getStorageSize() {
     try {
-      const keys = await this.state.storage.list();
-      let totalSize = 0;
-      for (const key of keys.keys) {
-        const value = await this.state.storage.get(key.name);
-        totalSize += JSON.stringify(value).length;
-      }
+      const result = await this.db
+        .prepare(`SELECT COUNT(*) as count, SUM(LENGTH(value)) as size FROM ${TABLE_NAME}`)
+        .first();
       return {
-        keyCount: keys.keys.length,
-        totalSizeBytes: totalSize,
-        totalSizeKB: (totalSize / 1024).toFixed(2),
-        keys: keys.keys.map(k => k.name)
+        keyCount: result?.count || 0,
+        totalSizeBytes: result?.size || 0,
+        totalSizeKB: ((result?.size || 0) / 1024).toFixed(2)
       };
     } catch(e) {
       return { error: e.message };
     }
   }
+
+  isRestored() {
+    return this._restored;
+  }
 }
 
 // ============================================================
-// ALARM SCHEDULER - STORAGE ONLY
+// ALARM SCHEDULER
 // ============================================================
 
 class AlarmScheduler {
-  constructor(state) {
-    this.state = state;
+  constructor(db, ctx) {
+    this.db = db;
+    this.ctx = ctx;
+    this.dataManager = new DataManager(db);
     this._alarms = new Map();
-    this._alarmsKey = 'scheduled_alarms';
   }
 
   async scheduleAlarms() {
@@ -598,23 +640,13 @@ class AlarmScheduler {
       };
       
       this._alarms.set(name, alarm);
-      await this._saveAlarms();
+      await this.dataManager.setAlarms(Object.fromEntries(this._alarms));
       await this._scheduleNearestAlarm();
       
       return true;
     } catch(e) { 
       return false; 
     }
-  }
-
-  async _saveAlarms() {
-    try {
-      const data = {};
-      for (const [name, alarm] of this._alarms) {
-        data[name] = alarm;
-      }
-      await this.state.storage.put(this._alarmsKey, data);
-    } catch(e) {}
   }
 
   async _scheduleNearestAlarm() {
@@ -630,7 +662,7 @@ class AlarmScheduler {
       if (nearestTime < Infinity) {
         const delay = nearestTime - Date.now();
         if (delay > 0) {
-          await this.state.storage.setAlarm(Date.now() + delay);
+          await this.ctx.storage.setAlarm(Date.now() + delay);
         }
       }
     } catch(e) {}
@@ -639,8 +671,8 @@ class AlarmScheduler {
   async _clearAllAlarms() {
     try {
       this._alarms.clear();
-      await this.state.storage.delete(this._alarmsKey);
-      await this.state.storage.deleteAlarm();
+      await this.dataManager.deleteAlarms();
+      await this.ctx.storage.deleteAlarm();
     } catch(e) {}
   }
 
@@ -665,7 +697,7 @@ class AlarmScheduler {
       }
       
       if (expired.length > 0) {
-        await this._saveAlarms();
+        await this.dataManager.setAlarms(Object.fromEntries(this._alarms));
       }
       
       return pending;
@@ -684,7 +716,7 @@ class AlarmScheduler {
       }
       
       this._alarms.delete(name);
-      await this._saveAlarms();
+      await this.dataManager.setAlarms(Object.fromEntries(this._alarms));
       await this._scheduleNearestAlarm();
       
       return alarm || this._alarms.get(name);
@@ -695,7 +727,7 @@ class AlarmScheduler {
 
   async restoreAlarms() {
     try {
-      const stored = await this.state.storage.get(this._alarmsKey);
+      const stored = await this.dataManager.getAlarms();
       if (stored && typeof stored === 'object') {
         this._alarms.clear();
         for (const [name, data] of Object.entries(stored)) {
@@ -734,7 +766,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - STORAGE WITH PERSISTENCE
+// GAME SERVER - D1 VERSION (1 QUERY RESTORE)
 // ============================================================
 
 export class GameServer {
@@ -748,11 +780,15 @@ export class GameServer {
       this._initialized = false;
       this._startTime = Date.now();
       this._wsIdCounter = 0;
+      this._restored = false;
       
-      // Data Manager
-      this.dataManager = new DataManager(state);
+      // D1 Database
+      this.db = env.DB;
       
-      this.alarmScheduler = new AlarmScheduler(state);
+      // Data Manager with D1
+      this.dataManager = new DataManager(this.db);
+      
+      this.alarmScheduler = new AlarmScheduler(this.db, this.ctx);
       
       // Game state
       this.activeGames = new Map();
@@ -835,56 +871,125 @@ export class GameServer {
       }, 30000);
       this._trackTimer(this._saveInterval);
       
-      // Init
-      this._init();
+      // ✅ RESTORE DATA DARI D1 (SEPERTI CHAT-SERVER)
+      this._restoreAllState().then(() => {
+        this._restored = true;
+        console.log('✅ Game restore selesai!');
+      }).catch(() => {
+        this._restored = true;
+        console.log('⚠️ Game restore gagal, pakai state kosong');
+      });
       
     } catch(e) {
       console.error('Constructor error:', e);
+      this._restored = true;
     }
   }
 
   // ============================================================
-  // INIT - WITH PERSISTENCE LOAD
+  // RESTORE ALL STATE - 1 QUERY
   // ============================================================
-  async _init() {
+  
+  async _restoreAllState() {
     try {
+      // 1. INIT TABLE
+      await this.dataManager.init();
+      
+      // 2. LOAD SEMUA DATA DARI D1 (1 QUERY)
+      await this.dataManager.loadAllData();
+      
+      // 3. RESTORE ALARMS
       await this.alarmScheduler.restoreAlarms();
       await this.alarmScheduler.scheduleAlarms();
+      
+      // 4. CHECK WEEKLY RESET
       await this._checkAndForceResetIfMonday();
       
-      // 🔥 LOAD GAME STATE DARI STORAGE
+      // 5. LOAD GAME STATE DARI CACHE
       await this._loadAllGamesFromStorage();
       
+      // 6. RESTORE WEBSOCKET CONNECTIONS
+      await this._restoreWebSockets();
+      
+      // 7. SET INITIALIZED
       this._initialized = true;
       
+      // 8. START DICE IF NEEDED
       if (this.alarmScheduler.isDiceTime()) {
         const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
         if (clients && clients.size > 0) {
           this._startDiceFast();
         }
       }
+      
+      // 9. BROADCAST STATE KE SEMUA ROOM
+      for (const room of this.activeGames.keys()) {
+        this._broadcastGameStateToRoom(room);
+      }
+      
+      // 10. SET ALARM
+      if (!this.closing && !this.isDestroyed) {
+        this.ctx.storage.setAlarm(Date.now() + 60000);
+      }
+      
     } catch(e) {
-      console.error('Init error:', e);
-      this._initialized = true;
+      console.error('Restore error:', e);
+      throw e;
     }
   }
 
   // ============================================================
-  // GAME STATE PERSISTENCE - LOAD
+  // RESTORE WEBSOCKETS
   // ============================================================
+  
+  async _restoreWebSockets() {
+    try {
+      const webSockets = this.ctx.getWebSockets();
+      for (const ws of webSockets) {
+        try {
+          const attachment = ws.deserializeAttachment();
+          if (attachment && attachment.username && attachment.room) {
+            ws.username = attachment.username;
+            ws.room = attachment.room;
+            ws.roomname = attachment.room;
+            ws._wsId = attachment.wsId || ++this._wsIdCounter;
+            ws._closing = false;
+            
+            const roomClients = this.wsClients.get(attachment.room);
+            if (roomClients) {
+              roomClients.add(ws._wsId);
+            } else {
+              this.wsClients.set(attachment.room, new Set([ws._wsId]));
+            }
+            
+            this.wsMap.set(ws._wsId, ws);
+            
+            let conn = this.userConnections.get(attachment.username);
+            if (!conn) {
+              conn = { wsId: ws._wsId, ws: ws, room: attachment.room, timestamp: Date.now() };
+              this.userConnections.set(attachment.username, conn);
+            }
+          }
+        } catch(e) {}
+      }
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // LOAD GAMES FROM STORAGE (DARI CACHE)
+  // ============================================================
+  
   async _loadAllGamesFromStorage() {
     try {
       const allGames = await this.dataManager.loadAllGames();
       
       for (const [room, gameData] of Object.entries(allGames)) {
-        // Cek apakah game masih valid (tidak terlalu lama)
         const elapsed = Date.now() - (gameData._createdAt || 0);
-        if (elapsed > 300000) { // 5 menit
+        if (elapsed > 300000) {
           await this.dataManager.removeGameFromStorage(room);
           continue;
         }
         
-        // Rekonstruksi game
         const game = {
           room: gameData.room,
           players: new Map(gameData.players || []),
@@ -920,28 +1025,23 @@ export class GameServer {
           registrationOpen: gameData.registrationOpen || false
         };
         
-        // Jika game masih aktif tapi tidak ada timer, restart timernya
         if (game._isActive && !game._gameEnded) {
           this.activeGames.set(room, game);
           
-          // Restart phase berdasarkan state
           if (game._phase === 'registration' && game.registrationOpen) {
             this._startRegistration(room, game);
           } else if (game._phase === 'draw' && !game.drawTimeExpired && !game.evaluationLocked) {
             this._startDrawPhase(room, game);
           } else if (game.evaluationLocked && !game._gameEnded) {
-            // Jika sedang evaluasi, evaluasi ulang
             setTimeout(() => {
               this._evaluateRound(room, game);
             }, 1000);
           }
           
-          // Broadcast state ke semua client di room
           setTimeout(() => {
             this._broadcastGameStateToRoom(room);
           }, 500);
         } else {
-          // Game sudah selesai, hapus dari storage
           await this.dataManager.removeGameFromStorage(room);
         }
       }
@@ -1050,9 +1150,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // PROCESS ALARM
-  // ============================================================
   async _processAlarm(name) {
     switch(name) {
       case CONSTANTS.WEEKLY_RESET_ALARM:
@@ -1188,6 +1285,19 @@ export class GameServer {
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
+    // ⏳ TUNGGU RESTORE SELESAI (SEPERTI CHAT-SERVER)
+    if (!this._restored) {
+      let wait = 0;
+      while (!this._restored && wait < 30) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        wait++;
+      }
+      if (!this._restored) {
+        try { ws.send(JSON.stringify(["restoreError", "Server is still restoring"])); } catch(e) {}
+        return;
+      }
+    }
+    
     try {
       let attachment = null;
       try {
@@ -1202,12 +1312,16 @@ export class GameServer {
         ws._createdAt = attachment.createdAt || Date.now();
         
         if (attachment.username && attachment.room) {
-          this.userConnections.set(attachment.username, {
-            wsId: attachment.wsId,
-            ws: ws,
-            room: attachment.room,
-            timestamp: Date.now()
-          });
+          let conn = this.userConnections.get(attachment.username);
+          if (!conn) {
+            conn = { wsId: attachment.wsId, ws: ws, room: attachment.room, timestamp: Date.now() };
+            this.userConnections.set(attachment.username, conn);
+          } else {
+            conn.wsId = attachment.wsId;
+            conn.ws = ws;
+            conn.room = attachment.room;
+            conn.timestamp = Date.now();
+          }
         }
       }
       
@@ -1383,7 +1497,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // HANDLE EVENT INTERNAL - ALL EVENTS
+  // HANDLE EVENT INTERNAL
   // ============================================================
   async _handleEventInternal(ws, data) {
     try {
@@ -1670,7 +1784,6 @@ export class GameServer {
       
       const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
       
-      // Jika sudah di room yang sama, kirim state
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
@@ -1694,7 +1807,6 @@ export class GameServer {
         }
         this._switchRetries.set(lockKey, retryCount + 1);
         
-        // Kirim state untuk room yang diminta
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
         this._broadcastGameStateToRoom(roomName);
@@ -1927,10 +2039,8 @@ export class GameServer {
       if (this._isGameActuallyRunning(game) && game.players.size >= 2) {
         this._startDrawPhase(room, game);
         
-        // Save game state
         this.dataManager.saveGameState(room, game);
         
-        // Kirim state ke semua client di room
         setTimeout(() => {
           this._broadcastGameStateToRoom(room);
         }, 500);
@@ -2034,7 +2144,6 @@ export class GameServer {
         this._startBotDraws(room, game);
       }
       
-      // Save game state
       await this.dataManager.saveGameState(room, game);
       
     } catch(e) {
@@ -2217,7 +2326,6 @@ export class GameServer {
       }, CONSTANTS.EVALUATION_DELAY_MS));
       game._evalTimer = evalTimer;
       
-      // Save game state
       await this.dataManager.saveGameState(room, game);
       
     } catch(e) {
@@ -2371,7 +2479,6 @@ export class GameServer {
         this._startDrawPhase(room, game);
       }
       
-      // Save game state
       await this.dataManager.saveGameState(room, game);
       
     } catch(e) {
@@ -2437,10 +2544,8 @@ export class GameServer {
         game.playerWsId.set(usernameClean, wsId);
         this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
         
-        // Save game state
         await this.dataManager.saveGameState(room, game);
         
-        // Broadcast state ke semua client
         setTimeout(() => {
           this._broadcastGameStateToRoom(room);
         }, 100);
@@ -2519,7 +2624,6 @@ export class GameServer {
         game._evalTimer = evalTimer;
       }
       
-      // Save game state
       await this.dataManager.saveGameState(room, game);
       
     } catch(e) {}
@@ -2555,10 +2659,8 @@ export class GameServer {
       }
       this._removePlayerFromGame(usernameClean, room);
       
-      // Save game state
       await this.dataManager.saveGameState(room, game);
       
-      // Broadcast state ke semua client
       setTimeout(() => {
         this._broadcastGameStateToRoom(room);
       }, 100);
@@ -2719,10 +2821,8 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardStartSuccess", username, betAmount]);
       this._startRegistration(room, game);
       
-      // Save game state
       await this.dataManager.saveGameState(room, game);
       
-      // Broadcast state ke semua client
       setTimeout(() => {
         this._broadcastGameStateToRoom(room);
       }, 100);
@@ -3560,10 +3660,8 @@ export class GameServer {
         this._cleanupTimers.delete(room);
       }
       
-      // Remove from storage
       await this.dataManager.removeGameFromStorage(room);
       
-      // Broadcast state kosong
       this._broadcastToRoom(room, ["gameLowCardEnd", []]);
       this._broadcastGameStateToRoom(room);
       
@@ -3599,7 +3697,6 @@ export class GameServer {
       this.isDestroyed = true;
       this.closing = true;
       
-      // Save all games before destroy
       await this._saveAllGamesState();
       
       if (this._notificationTimers) {
