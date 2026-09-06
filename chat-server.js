@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 10.0.0 - PER KURSI (1 KEY PER KURSI)
+// VERSION: 10.0.0 - PER KURSI (1 KEY PER KURSI) + DELETE KOSONG
 
 const C = {
   MAX_SEATS: 45,
@@ -43,9 +43,8 @@ export class ChatServer {
     
     this.db = env.DB;
     
-    // Cache storage - per kursi
     this._storageCache = {
-      roomsData: {},    // { "Quiz": { seat: {1: {...}}, point: {1: {...}}, mute: false } }
+      roomsData: {},
       currentNumber: 1
     };
     this._cacheInitialized = false;
@@ -75,11 +74,9 @@ export class ChatServer {
 
       const roomsData = {};
       
-      // Load semua seat, point, mute per room
       for (const room of ROOMS) {
         roomsData[room] = { seat: {}, point: {}, mute: false };
         
-        // Load seats untuk room ini
         const seatsResult = await this.db
           .prepare('SELECT key, value FROM system_config WHERE key LIKE ?')
           .bind(`seat_${room}_%`)
@@ -90,7 +87,6 @@ export class ChatServer {
           roomsData[room].seat[seatNumber] = JSON.parse(row.value);
         }
         
-        // Load points untuk room ini
         const pointsResult = await this.db
           .prepare('SELECT key, value FROM system_config WHERE key LIKE ?')
           .bind(`point_${room}_%`)
@@ -101,7 +97,6 @@ export class ChatServer {
           roomsData[room].point[seatNumber] = JSON.parse(row.value);
         }
         
-        // Load mute untuk room ini
         const muteResult = await this.db
           .prepare('SELECT value FROM system_config WHERE key = ?')
           .bind(`mute_${room}`)
@@ -130,54 +125,59 @@ export class ChatServer {
     }
   }
 
-  // ============ SAVE KE D1 - PER KURSI ============
+  // ============ SAVE KE D1 - DELETE KALAU KOSONG ============
   
-  // SAVE 1 SEAT (HANYA 1 KURSI)
   async _saveSeat(roomName, seatNumber, seatData) {
     const key = `seat_${roomName}_${seatNumber}`;
+    
+    if (!seatData || !seatData.namauser || seatData.namauser.trim() === '') {
+      await this.db
+        .prepare('DELETE FROM system_config WHERE key = ?')
+        .bind(key)
+        .run();
+      return;
+    }
+    
     await this.db
       .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
       .bind(key, JSON.stringify(seatData))
       .run();
   }
 
-  // DELETE 1 SEAT
-  async _deleteSeat(roomName, seatNumber) {
-    const key = `seat_${roomName}_${seatNumber}`;
-    await this.db
-      .prepare('DELETE FROM system_config WHERE key = ?')
-      .bind(key)
-      .run();
-  }
-
-  // SAVE 1 POINT (HANYA 1 POINT)
   async _savePoint(roomName, seatNumber, pointData) {
     const key = `point_${roomName}_${seatNumber}`;
+    
+    if (!pointData || (pointData.x === 0 && pointData.y === 0 && !pointData.fast)) {
+      await this.db
+        .prepare('DELETE FROM system_config WHERE key = ?')
+        .bind(key)
+        .run();
+      return;
+    }
+    
     await this.db
       .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
       .bind(key, JSON.stringify(pointData))
       .run();
   }
 
-  // DELETE 1 POINT
-  async _deletePoint(roomName, seatNumber) {
-    const key = `point_${roomName}_${seatNumber}`;
-    await this.db
-      .prepare('DELETE FROM system_config WHERE key = ?')
-      .bind(key)
-      .run();
-  }
-
-  // SAVE MUTE (1 ROOM)
   async _saveMute(roomName, muted) {
     const key = `mute_${roomName}`;
+    
+    if (muted === false) {
+      await this.db
+        .prepare('DELETE FROM system_config WHERE key = ?')
+        .bind(key)
+        .run();
+      return;
+    }
+    
     await this.db
       .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
       .bind(key, JSON.stringify(muted))
       .run();
   }
 
-  // SAVE CURRENT NUMBER
   async _saveCurrentNumber() {
     await this.db
       .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
@@ -185,7 +185,33 @@ export class ChatServer {
       .run();
   }
 
+  // ============ DELETE SEAT + POINT ============
+  
+  async _deleteSeatInRoom(roomName, seatNumber) {
+    const roomBucket = await this._getRoomBucket(roomName);
+    delete roomBucket.seat[seatNumber];
+    delete roomBucket.point[seatNumber];
+    
+    const seatKey = `seat_${roomName}_${seatNumber}`;
+    await this.db
+      .prepare('DELETE FROM system_config WHERE key = ?')
+      .bind(seatKey)
+      .run();
+    
+    const pointKey = `point_${roomName}_${seatNumber}`;
+    await this.db
+      .prepare('DELETE FROM system_config WHERE key = ?')
+      .bind(pointKey)
+      .run();
+    
+    this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
+    await this.updateRoomCount(roomName);
+    
+    return true;
+  }
+
   // ============ BUCKET ROOM ============
+  
   async _getRoomBucket(roomName) {
     await this._ensureCacheInitialized();
     if (!this._storageCache.roomsData[roomName]) {
@@ -198,57 +224,49 @@ export class ChatServer {
     return this._storageCache.roomsData[roomName];
   }
 
-  // ============ UPDATE SEAT (HANYA 1 KURSI) ============
+  // ============ UPDATE SEAT ============
+  
   async _updateSeatInRoom(roomName, seatNumber, seatData) {
-    // 1. Update cache
     const roomBucket = await this._getRoomBucket(roomName);
+    
+    if (!seatData || !seatData.namauser || seatData.namauser.trim() === '') {
+      delete roomBucket.seat[seatNumber];
+      await this._saveSeat(roomName, seatNumber, null);
+      return true;
+    }
+    
     roomBucket.seat[seatNumber] = seatData;
-    
-    // 2. Save ke D1 - HANYA 1 KURSI
     await this._saveSeat(roomName, seatNumber, seatData);
-    
     return true;
   }
 
-  // ============ DELETE SEAT (HANYA 1 KURSI) ============
-  async _deleteSeatInRoom(roomName, seatNumber) {
-    // 1. Delete dari cache
-    const roomBucket = await this._getRoomBucket(roomName);
-    delete roomBucket.seat[seatNumber];
-    delete roomBucket.point[seatNumber];
-    
-    // 2. Delete dari D1 - HANYA 1 KURSI
-    await this._deleteSeat(roomName, seatNumber);
-    await this._deletePoint(roomName, seatNumber);
-    
-    return true;
-  }
-
-  // ============ UPDATE POINT (HANYA 1 POINT) ============
+  // ============ UPDATE POINT ============
+  
   async _updatePointInRoom(roomName, seatNumber, pointData) {
-    // 1. Update cache
     const roomBucket = await this._getRoomBucket(roomName);
+    
+    if (!pointData || (pointData.x === 0 && pointData.y === 0 && !pointData.fast)) {
+      delete roomBucket.point[seatNumber];
+      await this._savePoint(roomName, seatNumber, null);
+      return true;
+    }
+    
     roomBucket.point[seatNumber] = pointData;
-    
-    // 2. Save ke D1 - HANYA 1 POINT
     await this._savePoint(roomName, seatNumber, pointData);
-    
     return true;
   }
 
   // ============ UPDATE MUTE ============
+  
   async _updateMuteInRoom(roomName, muted) {
-    // 1. Update cache
     const roomBucket = await this._getRoomBucket(roomName);
     roomBucket.mute = muted;
-    
-    // 2. Save ke D1
     await this._saveMute(roomName, muted);
-    
     return true;
   }
 
   // ============ GET DATA ============
+  
   async _getRoomData(roomName) {
     await this._ensureCacheInitialized();
     return this._storageCache.roomsData[roomName] || null;
@@ -259,13 +277,6 @@ export class ChatServer {
     const roomBucket = this._storageCache.roomsData[roomName];
     if (!roomBucket || !roomBucket.seat) return null;
     return roomBucket.seat[seatNumber] || null;
-  }
-
-  async _getPointData(roomName, seatNumber) {
-    await this._ensureCacheInitialized();
-    const roomBucket = this._storageCache.roomsData[roomName];
-    if (!roomBucket || !roomBucket.point) return null;
-    return roomBucket.point[seatNumber] || null;
   }
 
   async _getRoomCount(roomName) {
@@ -282,6 +293,7 @@ export class ChatServer {
   }
 
   // ============ FIND USER ============
+  
   async _findUserInAnyRoom(username) {
     if (!username) return null;
     await this._ensureCacheInitialized();
@@ -298,6 +310,7 @@ export class ChatServer {
   }
 
   // ============ CACHE ============
+  
   async _ensureCacheInitialized() {
     if (this._cacheInitialized && this._storageCache && 
         this._storageCache.roomsData && 
@@ -327,6 +340,7 @@ export class ChatServer {
   }
 
   // ============ UPDATE KURSI ============
+  
   async _updateKursi(roomName, seat, data) {
     if (!roomName || !ROOMS_SET.has(roomName)) {
       return { success: false, error: 'Invalid room' };
@@ -363,7 +377,6 @@ export class ChatServer {
       isMulti: data.isMulti !== undefined ? data.isMulti : (currentSeatData.isMulti || false)
     };
     
-    // UPDATE HANYA 1 KURSI
     await this._updateSeatInRoom(roomName, seat, updatedSeat);
     
     return { success: true, data: updatedSeat };
@@ -379,6 +392,7 @@ export class ChatServer {
   }
 
   // ============ REMOVE USER ============
+  
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
     await this._ensureCacheInitialized();
@@ -393,12 +407,11 @@ export class ChatServer {
     }
     if (!seat) return false;
     await this._deleteSeatInRoom(roomName, seat);
-    this.broadcast(roomName, ["removeKursi", roomName, seat]);
-    await this.updateRoomCount(roomName);
     return true;
   }
 
   // ============ JOIN ROOM ============
+  
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -479,7 +492,6 @@ export class ChatServer {
         isMulti: false
       };
       
-      // UPDATE HANYA 1 KURSI
       await this._updateSeatInRoom(roomName, seat, newSeat);
     }
     
@@ -522,6 +534,7 @@ export class ChatServer {
   }
 
   // ============ MULTI JOIN ============
+  
   async _handleMultiJoin(ws, multiUsername, multiRoomname) {
     if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
     await this._ensureCacheInitialized();
@@ -568,6 +581,7 @@ export class ChatServer {
   }
 
   // ============ WEBSOCKET ============
+  
   async _cleanupUserOnDisconnect(ws) {
     try {
       if (!ws) return;
@@ -656,6 +670,7 @@ export class ChatServer {
   }
 
   // ============ BROADCAST ============
+  
   broadcast(room, msg) {
     if (this.closing || this.isDestroyed || !room || !msg) return;
     try {
@@ -780,6 +795,7 @@ export class ChatServer {
   }
 
   // ============ ALARM ============
+  
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     await this._updateNumber();
@@ -807,26 +823,17 @@ export class ChatServer {
   }
 
   // ============ CLEANUP STORAGE ============
+  
   async _cleanupStorage() {
     try {
       await this._ensureCacheInitialized();
       const roomsData = this._storageCache.roomsData || {};
-      let changed = false;
       
       for (const [roomName, roomBucket] of Object.entries(roomsData)) {
         const hasSeats = roomBucket.seat && Object.values(roomBucket.seat).some(s => s && s.namauser);
         const hasPoints = roomBucket.point && Object.keys(roomBucket.point).length > 0;
         if (!hasSeats && !hasPoints) {
-          // Hapus room dari cache
           delete roomsData[roomName];
-          
-          // Hapus mute dari D1
-          await this.db
-            .prepare('DELETE FROM system_config WHERE key = ?')
-            .bind(`mute_${roomName}`)
-            .run();
-          
-          // Hapus semua seat dan point room ini dari D1
           await this.db
             .prepare('DELETE FROM system_config WHERE key LIKE ?')
             .bind(`seat_${roomName}_%`)
@@ -835,18 +842,19 @@ export class ChatServer {
             .prepare('DELETE FROM system_config WHERE key LIKE ?')
             .bind(`point_${roomName}_%`)
             .run();
-          
-          changed = true;
+          await this.db
+            .prepare('DELETE FROM system_config WHERE key = ?')
+            .bind(`mute_${roomName}`)
+            .run();
         }
       }
       
-      if (changed) {
-        this._storageCache.roomsData = roomsData;
-      }
+      this._storageCache.roomsData = roomsData;
     } catch(e) {}
   }
 
   // ============ CLEANUP ============
+  
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
@@ -911,6 +919,7 @@ export class ChatServer {
   }
 
   // ============ RESTORE ============
+  
   async _restoreAllState() {
     try {
       await this._loadFromStorage();
@@ -951,6 +960,7 @@ export class ChatServer {
   }
 
   // ============ HANDLE MESSAGE ============
+  
   async _handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
       try { if (ws?.readyState === 1) ws.close(1000, "Invalid username"); } catch(e) {}
@@ -1488,6 +1498,7 @@ export class ChatServer {
   }
 
   // ============ FETCH ============
+  
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1523,6 +1534,7 @@ export class ChatServer {
   }
 
   // ============ DESTROY ============
+  
   async destroy() {
     if (this.isDestroyed) return;
     this.closing = true;
