@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 9.0.0 - MIGRATED TO D1 (ONLY STORAGE CHANGED)
+// VERSION: 9.0.0 - D1 DATABASE (NO MIGRATION NEEDED)
 
 const C = {
   MAX_SEATS: 45,
@@ -64,9 +64,18 @@ export class ChatServer {
     });
   }
 
-  // ============ GANTI: LOAD FROM D1 ============
+  // ============ LOAD FROM D1 ============
   async _loadFromStorage() {
     try {
+      // Auto create table if not exists
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS system_config (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+
       // Load dari D1
       const roomsData = await this.db
         .prepare('SELECT value FROM system_config WHERE key = ?')
@@ -97,7 +106,7 @@ export class ChatServer {
     }
   }
 
-  // ============ GANTI: SAVE TO D1 ============
+  // ============ SAVE TO D1 ============
   async _updateCacheAndStorage(updates) {
     try {
       if (updates.roomsData !== undefined) {
@@ -131,7 +140,7 @@ export class ChatServer {
     }
   }
 
-  // ============ TETAP SAMA: CACHE METHODS ============
+  // ============ CACHE METHODS ============
   async _ensureCacheInitialized() {
     if (this._cacheInitialized && this._storageCache && 
         this._storageCache.roomsData && 
@@ -173,7 +182,6 @@ export class ChatServer {
     return await this._updateCacheAndStorage(updates);
   }
 
-  // ============ TETAP SAMA: SEMUA METHOD LAIN ============
   async _getRoomData(roomName) {
     await this._ensureCacheInitialized();
     const cache = this._storageCache;
@@ -790,7 +798,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ GANTI: ALARM PAKAI D1 ============
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     
@@ -800,10 +807,7 @@ export class ChatServer {
     await this._cleanupStorage();
     await this._saveAllState();
     
-    // Schedule next alarm
-    if (!this.closing && !this.isDestroyed) {
-      this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
-    }
+    this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
   }
 
   async _updateNumber() {
