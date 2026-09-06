@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 11.0.0 - OPTIMASI 1 QUERY RESTORE + FIX POINT 1X UPDATE
+// VERSION: 11.0.0 - TABEL chat_data + OPTIMASI 1 QUERY RESTORE + FIX POINT 1X UPDATE
 
 const C = {
   MAX_SEATS: 45,
@@ -18,6 +18,8 @@ const ROOMS = [
 ];
 
 const ROOMS_SET = new Set(ROOMS);
+
+const TABLE_NAME = 'chat_data'; // ✅ NAMA TABEL BARU
 
 export class ChatServer {
   constructor(state, env) {
@@ -67,7 +69,7 @@ export class ChatServer {
   async _loadFromStorage() {
     try {
       await this.db.prepare(`
-        CREATE TABLE IF NOT EXISTS system_config (
+        CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL,
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -77,7 +79,7 @@ export class ChatServer {
       // ✅ 1 QUERY: Ambil SEMUA data sekaligus!
       const result = await this.db
         .prepare(`
-          SELECT key, value FROM system_config
+          SELECT key, value FROM ${TABLE_NAME}
         `)
         .all();
 
@@ -149,14 +151,14 @@ export class ChatServer {
     
     if (!seatData || !seatData.namauser || seatData.namauser.trim() === '') {
       await this.db
-        .prepare('DELETE FROM system_config WHERE key = ?')
+        .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
         .bind(key)
         .run();
       return;
     }
     
     await this.db
-      .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
+      .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
       .bind(key, JSON.stringify(seatData))
       .run();
   }
@@ -166,14 +168,14 @@ export class ChatServer {
     
     if (!pointData || (pointData.x === 0 && pointData.y === 0 && !pointData.fast)) {
       await this.db
-        .prepare('DELETE FROM system_config WHERE key = ?')
+        .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
         .bind(key)
         .run();
       return;
     }
     
     await this.db
-      .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
+      .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
       .bind(key, JSON.stringify(pointData))
       .run();
   }
@@ -183,21 +185,21 @@ export class ChatServer {
     
     if (muted === false) {
       await this.db
-        .prepare('DELETE FROM system_config WHERE key = ?')
+        .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
         .bind(key)
         .run();
       return;
     }
     
     await this.db
-      .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
+      .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
       .bind(key, JSON.stringify(muted))
       .run();
   }
 
   async _saveCurrentNumber() {
     await this.db
-      .prepare('INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)')
+      .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
       .bind('current_number', String(this._storageCache.currentNumber))
       .run();
   }
@@ -211,13 +213,13 @@ export class ChatServer {
     
     const seatKey = `seat_${roomName}_${seatNumber}`;
     await this.db
-      .prepare('DELETE FROM system_config WHERE key = ?')
+      .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
       .bind(seatKey)
       .run();
     
     const pointKey = `point_${roomName}_${seatNumber}`;
     await this.db
-      .prepare('DELETE FROM system_config WHERE key = ?')
+      .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
       .bind(pointKey)
       .run();
     
@@ -404,18 +406,12 @@ export class ChatServer {
   async _updatePointDirect(roomName, seat, x, y, fast) {
     await this._ensureCacheInitialized();
     
-    // Inisialisasi room jika belum ada
     if (!this._storageCache.roomsData[roomName]) {
       this._storageCache.roomsData[roomName] = { seat: {}, point: {}, mute: false };
     }
     
-    // Inisialisasi point
     const pointData = { x: x || 0, y: y || 0, fast: !!fast };
-    
-    // Simpan ke cache
     this._storageCache.roomsData[roomName].point[seat] = pointData;
-    
-    // Simpan ke D1
     await this._savePoint(roomName, seat, pointData);
     
     return true;
@@ -874,15 +870,15 @@ export class ChatServer {
         if (!hasSeats && !hasPoints) {
           delete roomsData[roomName];
           await this.db
-            .prepare('DELETE FROM system_config WHERE key LIKE ?')
+            .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE ?`)
             .bind(`seat_${roomName}_%`)
             .run();
           await this.db
-            .prepare('DELETE FROM system_config WHERE key LIKE ?')
+            .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE ?`)
             .bind(`point_${roomName}_%`)
             .run();
           await this.db
-            .prepare('DELETE FROM system_config WHERE key = ?')
+            .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
             .bind(`mute_${roomName}`)
             .run();
         }
@@ -961,7 +957,6 @@ export class ChatServer {
   
   async _restoreAllState() {
     try {
-      // ✅ Load data dengan 1 query
       await this._loadFromStorage();
       await this._ensureCacheInitialized();
       
@@ -1340,8 +1335,6 @@ export class ChatServer {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
           if (!pointRoom || typeof pointSeat !== 'number') break;
           
-          // ✅ FIX: UPDATE LANGSUNG tanpa validasi ketat!
-          // Ini memastikan point bergerak di update PERTAMA
           const updated = await this._updatePointDirect(
             pointRoom, 
             pointSeat, 
@@ -1351,9 +1344,7 @@ export class ChatServer {
           );
           
           if (updated) {
-            // Broadcast ke semua di room
             this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
-            // Kirim ack ke pengirim
             this.safeSend(ws, ["pointUpdateAck", pointRoom, pointSeat, pointX, pointY, pointFast]);
           }
           break;
