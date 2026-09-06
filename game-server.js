@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-STORAGE-ONLY.js
-// VERSION: 9.0.2 - FIXED (NO NEW EVENTS)
+// VERSION: 9.0.3 - PERSISTENCE FIXED
 // ============================================================
 
 // ============================================================
@@ -51,9 +51,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: "05:00", end: "06:00" },
-    { start: "13:00", end: "14:00" },
-    { start: "22:00", end: "23:00" }
+  
   ],
   TIMEZONE_OFFSET: 8,
 };
@@ -64,7 +62,7 @@ function parseTime(timeStr) {
 }
 
 // ============================================================
-// DATA MANAGER - STORAGE ONLY (NO CACHE, NO KV)
+// DATA MANAGER - STORAGE ONLY
 // ============================================================
 
 class DataManager {
@@ -325,6 +323,120 @@ class DataManager {
   }
 
   // ============================================================
+  // ACTIVE GAMES - PERSISTENCE
+  // ============================================================
+  
+  async saveGameState(room, game) {
+    try {
+      if (!room || !game) return;
+      
+      const allGames = await this.state.storage.get('activeGames') || {};
+      
+      allGames[room] = {
+        room: game.room,
+        round: game.round || 1,
+        betAmount: game.betAmount || 0,
+        hostName: game.hostName,
+        hostId: game.hostId,
+        registrationOpen: game.registrationOpen || false,
+        _isActive: game._isActive || false,
+        _gameEnded: game._gameEnded || false,
+        _phase: game._phase || 'registration',
+        _createdAt: game._createdAt || Date.now(),
+        _startedByRecording: game._startedByRecording || false,
+        _startedBy: game._startedBy || 'user',
+        players: Array.from(game.players?.entries() || []),
+        botPlayers: Array.from(game.botPlayers?.entries() || []),
+        eliminated: Array.from(game.eliminated || []),
+        numbers: Array.from(game.numbers || []),
+        tanda: Array.from(game.tanda || []),
+        _botsAdded: game._botsAdded || false,
+        useBots: game.useBots || false,
+        evaluationLocked: game.evaluationLocked || false,
+        drawTimeExpired: game.drawTimeExpired || false,
+        _isEvaluating: game._isEvaluating || false,
+        playerWsId: Array.from(game.playerWsId?.entries() || []),
+        _drawPhaseStart: game._drawPhaseStart,
+        _endTime: game._endTime || Date.now()
+      };
+      
+      await this.state.storage.put('activeGames', allGames);
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async loadAllGames() {
+    try {
+      return await this.state.storage.get('activeGames') || {};
+    } catch(e) {
+      return {};
+    }
+  }
+
+  async removeGameFromStorage(room) {
+    try {
+      const allGames = await this.state.storage.get('activeGames') || {};
+      delete allGames[room];
+      if (Object.keys(allGames).length > 0) {
+        await this.state.storage.put('activeGames', allGames);
+      } else {
+        await this.state.storage.delete('activeGames');
+      }
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async saveAllGames(gamesMap) {
+    try {
+      const allGames = {};
+      for (const [room, game] of gamesMap) {
+        if (game._isActive && !game._gameEnded) {
+          allGames[room] = {
+            room: game.room,
+            round: game.round || 1,
+            betAmount: game.betAmount || 0,
+            hostName: game.hostName,
+            hostId: game.hostId,
+            registrationOpen: game.registrationOpen || false,
+            _isActive: game._isActive || false,
+            _gameEnded: game._gameEnded || false,
+            _phase: game._phase || 'registration',
+            _createdAt: game._createdAt || Date.now(),
+            _startedByRecording: game._startedByRecording || false,
+            _startedBy: game._startedBy || 'user',
+            players: Array.from(game.players?.entries() || []),
+            botPlayers: Array.from(game.botPlayers?.entries() || []),
+            eliminated: Array.from(game.eliminated || []),
+            numbers: Array.from(game.numbers || []),
+            tanda: Array.from(game.tanda || []),
+            _botsAdded: game._botsAdded || false,
+            useBots: game.useBots || false,
+            evaluationLocked: game.evaluationLocked || false,
+            drawTimeExpired: game.drawTimeExpired || false,
+            _isEvaluating: game._isEvaluating || false,
+            playerWsId: Array.from(game.playerWsId?.entries() || []),
+            _drawPhaseStart: game._drawPhaseStart,
+            _endTime: game._endTime || Date.now()
+          };
+        }
+      }
+      
+      if (Object.keys(allGames).length > 0) {
+        await this.state.storage.put('activeGames', allGames);
+      } else {
+        await this.state.storage.delete('activeGames');
+      }
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  // ============================================================
   // UTILITY
   // ============================================================
   
@@ -345,6 +457,7 @@ class DataManager {
       await this.state.storage.delete('lastWeekWinner');
       await this.state.storage.delete('lastResetWeek');
       await this.state.storage.delete('scheduled_alarms');
+      await this.state.storage.delete('activeGames');
       return true;
     } catch(e) {
       return false;
@@ -621,7 +734,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - STORAGE ONLY (FIXED)
+// GAME SERVER - STORAGE WITH PERSISTENCE
 // ============================================================
 
 export class GameServer {
@@ -636,7 +749,7 @@ export class GameServer {
       this._startTime = Date.now();
       this._wsIdCounter = 0;
       
-      // ✅ ONLY DATA MANAGER - NO CACHE
+      // Data Manager
       this.dataManager = new DataManager(state);
       
       this.alarmScheduler = new AlarmScheduler(state);
@@ -652,7 +765,7 @@ export class GameServer {
       this._lastNotifTime = {};
       this._lastWinnerRequestTime = new Map();
       
-      // 🆕 NOTIFICATION TIMERS (POINT 1)
+      // Notification timers
       this._notificationTimers = new Set();
       
       // Dice state
@@ -714,7 +827,15 @@ export class GameServer {
       
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
       
-      // ✅ Inisialisasi
+      // Save interval
+      this._saveInterval = setInterval(() => {
+        if (!this.closing && !this.isDestroyed) {
+          this._saveAllGamesState().catch(() => {});
+        }
+      }, 30000);
+      this._trackTimer(this._saveInterval);
+      
+      // Init
       this._init();
       
     } catch(e) {
@@ -723,13 +844,17 @@ export class GameServer {
   }
 
   // ============================================================
-  // INIT - STORAGE ONLY
+  // INIT - WITH PERSISTENCE LOAD
   // ============================================================
   async _init() {
     try {
       await this.alarmScheduler.restoreAlarms();
       await this.alarmScheduler.scheduleAlarms();
       await this._checkAndForceResetIfMonday();
+      
+      // 🔥 LOAD GAME STATE DARI STORAGE
+      await this._loadAllGamesFromStorage();
+      
       this._initialized = true;
       
       if (this.alarmScheduler.isDiceTime()) {
@@ -745,7 +870,97 @@ export class GameServer {
   }
 
   // ============================================================
-  // WEEKLY RESET - STORAGE ONLY
+  // GAME STATE PERSISTENCE - LOAD
+  // ============================================================
+  async _loadAllGamesFromStorage() {
+    try {
+      const allGames = await this.dataManager.loadAllGames();
+      
+      for (const [room, gameData] of Object.entries(allGames)) {
+        // Cek apakah game masih valid (tidak terlalu lama)
+        const elapsed = Date.now() - (gameData._createdAt || 0);
+        if (elapsed > 300000) { // 5 menit
+          await this.dataManager.removeGameFromStorage(room);
+          continue;
+        }
+        
+        // Rekonstruksi game
+        const game = {
+          room: gameData.room,
+          players: new Map(gameData.players || []),
+          botPlayers: new Map(gameData.botPlayers || []),
+          round: gameData.round || 1,
+          numbers: new Map(gameData.numbers || []),
+          tanda: new Map(gameData.tanda || []),
+          eliminated: new Set(gameData.eliminated || []),
+          betAmount: gameData.betAmount || 0,
+          hostId: gameData.hostId,
+          hostName: gameData.hostName,
+          useBots: gameData.useBots || false,
+          evaluationLocked: gameData.evaluationLocked || false,
+          drawTimeExpired: gameData.drawTimeExpired || false,
+          _isActive: gameData._isActive || false,
+          _gameEnded: gameData._gameEnded || false,
+          _phase: gameData._phase || 'registration',
+          _botTimeouts: new Set(),
+          _botsAdded: gameData._botsAdded || false,
+          _registrationTimer: null,
+          _drawTimer: null,
+          _evalTimer: null,
+          _safetyTimer: null,
+          _isEvaluating: gameData._isEvaluating || false,
+          _createdAt: gameData._createdAt || Date.now(),
+          _drawPhaseStart: gameData._drawPhaseStart,
+          _endTime: gameData._endTime,
+          playerWsId: new Map(gameData.playerWsId || []),
+          _startedByRecording: gameData._startedByRecording || false,
+          _startedBy: gameData._startedBy || 'user',
+          _notificationTimers: [],
+          _drawNotificationTimers: [],
+          registrationOpen: gameData.registrationOpen || false
+        };
+        
+        // Jika game masih aktif tapi tidak ada timer, restart timernya
+        if (game._isActive && !game._gameEnded) {
+          this.activeGames.set(room, game);
+          
+          // Restart phase berdasarkan state
+          if (game._phase === 'registration' && game.registrationOpen) {
+            this._startRegistration(room, game);
+          } else if (game._phase === 'draw' && !game.drawTimeExpired && !game.evaluationLocked) {
+            this._startDrawPhase(room, game);
+          } else if (game.evaluationLocked && !game._gameEnded) {
+            // Jika sedang evaluasi, evaluasi ulang
+            setTimeout(() => {
+              this._evaluateRound(room, game);
+            }, 1000);
+          }
+          
+          // Broadcast state ke semua client di room
+          setTimeout(() => {
+            this._broadcastGameStateToRoom(room);
+          }, 500);
+        } else {
+          // Game sudah selesai, hapus dari storage
+          await this.dataManager.removeGameFromStorage(room);
+        }
+      }
+    } catch(e) {
+      console.error('Load games error:', e);
+    }
+  }
+
+  // ============================================================
+  // SAVE ALL GAMES STATE
+  // ============================================================
+  async _saveAllGamesState() {
+    try {
+      await this.dataManager.saveAllGames(this.activeGames);
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // WEEKLY RESET
   // ============================================================
   async _checkAndForceResetIfMonday() {
     try {
@@ -968,7 +1183,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // WEBSOCKET HANDLERS (FIXED)
+  // WEBSOCKET HANDLERS
   // ============================================================
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
@@ -1000,7 +1215,6 @@ export class GameServer {
       if (Array.isArray(data) && data.length > 0) {
         await this._processWithTimeout(ws, data);
         
-        // 🔥 FIX: Re-sync state setelah event tertentu
         const evt = data[0];
         const syncEvents = ['switchRoom', 'gameLowCardJoin', 'gameLowCardStart', 'gameLowCardNumber', 'checkGameRunning', 'gameLowCardLeave'];
         if (syncEvents.includes(evt)) {
@@ -1009,6 +1223,7 @@ export class GameServer {
             setTimeout(() => {
               if (ws && ws.readyState === 1) {
                 this._sendGameStateToClient(ws, room);
+                this._broadcastGameStateToRoom(room);
               }
             }, 100);
           }
@@ -1175,7 +1390,7 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
-      // SWITCH ROOM (FIXED)
+      // SWITCH ROOM
       if (evt === "switchRoom") {
         await this.switchRoom(ws, data[1], data[2]);
         return;
@@ -1289,7 +1504,7 @@ export class GameServer {
         return;
       }
 
-      // GET DICE LAST WEEK WINNER - STORAGE ONLY
+      // GET DICE LAST WEEK WINNER
       if (evt === "getDiceLastWeekWinner") {
         try {
           const wsId = ws._wsId;
@@ -1327,7 +1542,7 @@ export class GameServer {
         return;
       }
 
-      // GET DICE LEADERBOARD - STORAGE ONLY
+      // GET DICE LEADERBOARD
       if (evt === "getDiceLeaderboard") {
         try {
           let limit = CONSTANTS.DEFAULT_LEADERBOARD_LIMIT;
@@ -1343,7 +1558,7 @@ export class GameServer {
         return;
       }
 
-      // GET DICE POINTS - STORAGE ONLY
+      // GET DICE POINTS
       if (evt === "getDicePoints") {
         try {
           const points = await this.dataManager.getDicePoints();
@@ -1432,7 +1647,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // ROOM SWITCHING (FIXED)
+  // ROOM SWITCHING
   // ============================================================
   async switchRoom(ws, room, username = null) {
     try {
@@ -1455,10 +1670,11 @@ export class GameServer {
       
       const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
       
-      // 🔥 FIX 1: Jika sudah di room yang sama, kirim state
+      // Jika sudah di room yang sama, kirim state
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
+        this._broadcastGameStateToRoom(roomName);
         
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceNotificationOnSwitch(ws, wsId);
@@ -1478,9 +1694,10 @@ export class GameServer {
         }
         this._switchRetries.set(lockKey, retryCount + 1);
         
-        // 🔥 FIX 2: Kirim state untuk room yang diminta
+        // Kirim state untuk room yang diminta
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
+        this._broadcastGameStateToRoom(roomName);
         
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceNotificationOnSwitch(ws, wsId);
@@ -1540,6 +1757,7 @@ export class GameServer {
         
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
+        this._broadcastGameStateToRoom(roomName);
         
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceNotificationOnSwitch(ws, wsId);
@@ -1561,7 +1779,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: START (FIXED)
+  // GAME: START
   // ============================================================
   async startGame(ws, bet, username) {
     try {
@@ -1635,7 +1853,10 @@ export class GameServer {
         this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._startRegistration(room, game);
         
-        // 🔥 FIX: Broadcast state ke semua client
+        // Save game state
+        await this.dataManager.saveGameState(room, game);
+        
+        // Broadcast state ke semua client
         setTimeout(() => {
           this._broadcastGameStateToRoom(room);
         }, 100);
@@ -1685,7 +1906,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CLOSE REGISTRATION (FIXED)
+  // GAME: CLOSE REGISTRATION
   // ============================================================
   _closeRegistration(room, game) {
     try {
@@ -1706,7 +1927,10 @@ export class GameServer {
       if (this._isGameActuallyRunning(game) && game.players.size >= 2) {
         this._startDrawPhase(room, game);
         
-        // 🔥 FIX: Kirim state ke semua client di room
+        // Save game state
+        this.dataManager.saveGameState(room, game);
+        
+        // Kirim state ke semua client di room
         setTimeout(() => {
           this._broadcastGameStateToRoom(room);
         }, 500);
@@ -1809,6 +2033,10 @@ export class GameServer {
       if (game.botPlayers?.size > 0 && this._isGameActuallyRunning(game)) {
         this._startBotDraws(room, game);
       }
+      
+      // Save game state
+      await this.dataManager.saveGameState(room, game);
+      
     } catch(e) {
       this._releaseLock(this._gameOperationLocks, lockKey);
     }
@@ -1988,6 +2216,10 @@ export class GameServer {
         } catch(e) {}
       }, CONSTANTS.EVALUATION_DELAY_MS));
       game._evalTimer = evalTimer;
+      
+      // Save game state
+      await this.dataManager.saveGameState(room, game);
+      
     } catch(e) {
       this._releaseLock(this._drawLocks, drawLockKey);
     }
@@ -2138,6 +2370,10 @@ export class GameServer {
       if (this._isGameActuallyRunning(game) && !game._gameEnded) {
         this._startDrawPhase(room, game);
       }
+      
+      // Save game state
+      await this.dataManager.saveGameState(room, game);
+      
     } catch(e) {
       if (game) { game._isEvaluating = false; }
       this._releaseLock(this._evaluationLocks, `eval_${room}`);
@@ -2145,7 +2381,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: JOIN (FIXED)
+  // GAME: JOIN
   // ============================================================
   async joinGame(ws, username) {
     try {
@@ -2201,7 +2437,10 @@ export class GameServer {
         game.playerWsId.set(usernameClean, wsId);
         this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
         
-        // 🔥 FIX: Broadcast state ke semua client
+        // Save game state
+        await this.dataManager.saveGameState(room, game);
+        
+        // Broadcast state ke semua client
         setTimeout(() => {
           this._broadcastGameStateToRoom(room);
         }, 100);
@@ -2213,7 +2452,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: SUBMIT NUMBER (FIXED)
+  // GAME: SUBMIT NUMBER
   // ============================================================
   async submitNumber(ws, number, tanda, username) {
     try {
@@ -2279,11 +2518,15 @@ export class GameServer {
         }, CONSTANTS.EVALUATION_DELAY_MS));
         game._evalTimer = evalTimer;
       }
+      
+      // Save game state
+      await this.dataManager.saveGameState(room, game);
+      
     } catch(e) {}
   }
 
   // ============================================================
-  // GAME: LEAVE (FIXED)
+  // GAME: LEAVE
   // ============================================================
   async leaveGame(ws, username) {
     try {
@@ -2312,7 +2555,10 @@ export class GameServer {
       }
       this._removePlayerFromGame(usernameClean, room);
       
-      // 🔥 FIX: Broadcast state ke semua client
+      // Save game state
+      await this.dataManager.saveGameState(room, game);
+      
+      // Broadcast state ke semua client
       setTimeout(() => {
         this._broadcastGameStateToRoom(room);
       }, 100);
@@ -2378,13 +2624,12 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CHECK GAME RUNNING (FIXED)
+  // GAME: CHECK GAME RUNNING
   // ============================================================
   async checkGameRunning(ws, roomname) {
     try {
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameStatus", "false"]);
-        // 🔥 FIX: Kirim state kosong
         this._safeSend(ws, ["gameState", { 
           room: roomname || 'unknown', 
           hasGame: false, 
@@ -2412,7 +2657,6 @@ export class GameServer {
       if (isRunning) {
         this._sendGameStateToClient(ws, room);
       } else {
-        // 🔥 FIX: Kirim state kosong agar client tahu tidak ada game
         this._safeSend(ws, ["gameState", { 
           room: room, 
           hasGame: false, 
@@ -2475,7 +2719,10 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardStartSuccess", username, betAmount]);
       this._startRegistration(room, game);
       
-      // 🔥 FIX: Broadcast state ke semua client
+      // Save game state
+      await this.dataManager.saveGameState(room, game);
+      
+      // Broadcast state ke semua client
       setTimeout(() => {
         this._broadcastGameStateToRoom(room);
       }, 100);
@@ -2946,7 +3193,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST GAME STATE TO ROOM (NEW HELPER - NO NEW EVENT)
+  // BROADCAST GAME STATE TO ROOM
   // ============================================================
   _broadcastGameStateToRoom(room) {
     try {
@@ -2964,7 +3211,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SEND GAME STATE TO CLIENT (FIXED)
+  // SEND GAME STATE TO CLIENT
   // ============================================================
   _sendGameStateToClient(ws, room) {
     try {
@@ -2972,7 +3219,6 @@ export class GameServer {
       
       const game = this.activeGames.get(room);
       
-      // 🔥 FIX: Selalu kirim state, baik ada game atau tidak
       if (!game || !game._isActive || game._gameEnded) {
         this._safeSend(ws, ["gameState", { 
           room, 
@@ -2983,11 +3229,15 @@ export class GameServer {
         return;
       }
       
-      // 🔥 FIX: Pastikan data yang dikirim lengkap
       const activePlayers = this._getActivePlayers(game);
       const allPlayers = Array.from(game.players?.values() || []).map(p => p.name);
       const eliminated = Array.from(game.eliminated || []);
       const submitted = Array.from(game.numbers?.keys() || []);
+      const submittedData = Array.from(game.numbers?.entries() || []).map(([id, num]) => ({
+        player: game.players?.get(id)?.name || id,
+        number: num,
+        tanda: game.tanda?.get(id) || ''
+      }));
       
       this._safeSend(ws, ["gameState", {
         room, 
@@ -3002,17 +3252,18 @@ export class GameServer {
         players: allPlayers, 
         activePlayers: activePlayers.map(p => p.name),
         eliminated, 
-        submitted, 
+        submitted,
+        submittedData,
         playerCount: game.players?.size || 0,
         activeCount: activePlayers.length,
         isEvaluating: game._isEvaluating || false,
         evaluationLocked: game.evaluationLocked || false,
         drawTimeExpired: game.drawTimeExpired || false,
         gameStatus: game._gameEnded ? 'ended' : (game._isActive ? 'active' : 'inactive'),
-        totalPlayers: game.players?.size || 0
+        totalPlayers: game.players?.size || 0,
+        timestamp: Date.now()
       }]);
     } catch(e) {
-      // 🔥 FIX: Jika error, kirim state kosong
       try {
         this._safeSend(ws, ["gameState", { 
           room: room || 'unknown', 
@@ -3210,7 +3461,7 @@ export class GameServer {
   _getWsId(ws) { return ws?._wsId || null; }
 
   // ============================================================
-  // GAME: CLEANUP (FIXED)
+  // GAME: CLEANUP
   // ============================================================
   _scheduleGameCleanup(room, game) {
     try {
@@ -3309,7 +3560,10 @@ export class GameServer {
         this._cleanupTimers.delete(room);
       }
       
-      // 🔥 FIX: Broadcast state kosong
+      // Remove from storage
+      await this.dataManager.removeGameFromStorage(room);
+      
+      // Broadcast state kosong
       this._broadcastToRoom(room, ["gameLowCardEnd", []]);
       this._broadcastGameStateToRoom(room);
       
@@ -3345,6 +3599,9 @@ export class GameServer {
       this.isDestroyed = true;
       this.closing = true;
       
+      // Save all games before destroy
+      await this._saveAllGamesState();
+      
       if (this._notificationTimers) {
         for (const timer of this._notificationTimers) {
           clearTimeout(timer);
@@ -3356,6 +3613,11 @@ export class GameServer {
         try { clearTimeout(timer); } catch(e) {}
       }
       this._allTimers.clear();
+      
+      if (this._saveInterval) {
+        clearInterval(this._saveInterval);
+        this._saveInterval = null;
+      }
       
       if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
       if (this._diceCooldownTimer) { clearTimeout(this._diceCooldownTimer); this._diceCooldownTimer = null; }
