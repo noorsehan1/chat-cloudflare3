@@ -51,7 +51,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: "05:00", end: "06:00" },
+    { start: "02:00", end: "02:50" },
     { start: "13:00", end: "14:00" },
     { start: "22:00", end: "23:00" }
   ],
