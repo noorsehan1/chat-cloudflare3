@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 11.0.0 - OPTIMASI 1 QUERY RESTORE
+// VERSION: 11.0.0 - OPTIMASI 1 QUERY RESTORE + FIX POINT 1X UPDATE
 
 const C = {
   MAX_SEATS: 45,
@@ -56,15 +56,16 @@ export class ChatServer {
     
     this._restoreAllState().then(() => {
       this._restored = true;
+      console.log('✅ Restore selesai!');
     }).catch(() => {
       this._restored = true;
+      console.log('⚠️ Restore gagal, pakai state kosong');
     });
   }
 
   // ============ LOAD FROM D1 - 1 QUERY OPTIMASI ============
   async _loadFromStorage() {
     try {
-      // Buat tabel jika belum ada
       await this.db.prepare(`
         CREATE TABLE IF NOT EXISTS system_config (
           key TEXT PRIMARY KEY,
@@ -80,7 +81,6 @@ export class ChatServer {
         `)
         .all();
 
-      // Inisialisasi roomsData
       const roomsData = {};
       for (const room of ROOMS) {
         roomsData[room] = { seat: {}, point: {}, mute: false };
@@ -99,10 +99,9 @@ export class ChatServer {
         }
 
         const parts = key.split('_');
-        const type = parts[0]; // 'seat', 'point', 'mute'
+        const type = parts[0];
         const roomName = parts[1];
 
-        // Handle mute (tidak ada seat number)
         if (type === 'mute') {
           if (roomsData[roomName]) {
             roomsData[roomName].mute = value;
@@ -110,7 +109,6 @@ export class ChatServer {
           continue;
         }
 
-        // Handle seat dan point (ada seat number)
         const seatNumber = parseInt(parts[2]);
         
         if (!roomsData[roomName]) {
@@ -134,7 +132,6 @@ export class ChatServer {
       return this._storageCache;
 
     } catch(e) {
-      // Error: buat state kosong
       this._storageCache = {
         roomsData: {},
         currentNumber: 1
@@ -400,6 +397,28 @@ export class ChatServer {
     await this._updateSeatInRoom(roomName, seat, updatedSeat);
     
     return { success: true, data: updatedSeat };
+  }
+
+  // ============ UPDATE POINT DIRECT (FIX 1X UPDATE) ============
+  
+  async _updatePointDirect(roomName, seat, x, y, fast) {
+    await this._ensureCacheInitialized();
+    
+    // Inisialisasi room jika belum ada
+    if (!this._storageCache.roomsData[roomName]) {
+      this._storageCache.roomsData[roomName] = { seat: {}, point: {}, mute: false };
+    }
+    
+    // Inisialisasi point
+    const pointData = { x: x || 0, y: y || 0, fast: !!fast };
+    
+    // Simpan ke cache
+    this._storageCache.roomsData[roomName].point[seat] = pointData;
+    
+    // Simpan ke D1
+    await this._savePoint(roomName, seat, pointData);
+    
+    return true;
   }
 
   async _updatePoint(roomName, seat, x, y, fast) {
@@ -1022,11 +1041,26 @@ export class ChatServer {
 
   async handleMessage(ws, raw) {
     if (!ws) return;
+    
+    // ⏳ TUNGGU RESTORE SELESAI
+    if (!this._restored) {
+      let wait = 0;
+      while (!this._restored && wait < 30) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        wait++;
+      }
+      if (!this._restored) {
+        this.safeSend(ws, ["restoreError", "Server is still restoring"]);
+        return;
+      }
+    }
+    
     try {
       if (ws.readyState !== 1 || ws._closing || this.closing || this.isDestroyed) {
         return;
       }
     } catch(e) { return; }
+    
     try {
       let str = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
       if (str.length > C.MAX_MESSAGE_SIZE) return;
@@ -1305,11 +1339,22 @@ export class ChatServer {
         case "updatePoint": {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
           if (!pointRoom || typeof pointSeat !== 'number') break;
-          const found = await this._findUserInAnyRoom(ws.username);
-          if (!found || found.room !== pointRoom || found.seat !== pointSeat) break;
-          const updated = await this._updatePoint(pointRoom, pointSeat, pointX, pointY, pointFast === 1);
+          
+          // ✅ FIX: UPDATE LANGSUNG tanpa validasi ketat!
+          // Ini memastikan point bergerak di update PERTAMA
+          const updated = await this._updatePointDirect(
+            pointRoom, 
+            pointSeat, 
+            pointX, 
+            pointY, 
+            pointFast === 1
+          );
+          
           if (updated) {
+            // Broadcast ke semua di room
             this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
+            // Kirim ack ke pengirim
+            this.safeSend(ws, ["pointUpdateAck", pointRoom, pointSeat, pointX, pointY, pointFast]);
           }
           break;
         }
