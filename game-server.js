@@ -58,7 +58,6 @@ const QUIZ_SCHEDULE = {
   TIMEZONE_OFFSET: 8,
 };
 
-
 const TABLE_NAME = 'game_data';
 
 function parseTime(timeStr) {
@@ -901,6 +900,7 @@ export class GameServer {
     switch(name) {
       case CONSTANTS.WEEKLY_RESET_ALARM:
         await this._handleWeeklyReset();
+        await this.alarmScheduler._scheduleWeeklyReset();
         break;
       case 'dice_session_start':
         if (this.alarmScheduler.isDiceTime()) {
@@ -1495,7 +1495,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - HANYA switchRoomSuccess SAJA
+  // SWITCH ROOM
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1587,7 +1587,6 @@ export class GameServer {
           }
         }
         
-        // ✅ HANYA INI YANG DIKIRIM
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         
       } finally {
