@@ -50,9 +50,14 @@ const CONSTANTS = {
 };
 
 const QUIZ_SCHEDULE = {
-  SESSIONS: [],
+  SESSIONS: [
+    { start: "05:00", end: "06:00" },
+    { start: "13:00", end: "14:00" },
+    { start: "22:00", end: "23:00" }
+  ],
   TIMEZONE_OFFSET: 8,
 };
+
 
 const TABLE_NAME = 'game_data';
 
