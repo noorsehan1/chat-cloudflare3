@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 10.0.0 - PER KURSI (1 KEY PER KURSI) + DELETE KOSONG
+// VERSION: 11.0.0 - OPTIMASI 1 QUERY RESTORE
 
 const C = {
   MAX_SEATS: 45,
@@ -61,9 +61,10 @@ export class ChatServer {
     });
   }
 
-  // ============ LOAD FROM D1 ============
+  // ============ LOAD FROM D1 - 1 QUERY OPTIMASI ============
   async _loadFromStorage() {
     try {
+      // Buat tabel jika belum ada
       await this.db.prepare(`
         CREATE TABLE IF NOT EXISTS system_config (
           key TEXT PRIMARY KEY,
@@ -72,56 +73,75 @@ export class ChatServer {
         )
       `).run();
 
+      // ✅ 1 QUERY: Ambil SEMUA data sekaligus!
+      const result = await this.db
+        .prepare(`
+          SELECT key, value FROM system_config
+        `)
+        .all();
+
+      // Inisialisasi roomsData
       const roomsData = {};
-      
       for (const room of ROOMS) {
         roomsData[room] = { seat: {}, point: {}, mute: false };
-        
-        const seatsResult = await this.db
-          .prepare('SELECT key, value FROM system_config WHERE key LIKE ?')
-          .bind(`seat_${room}_%`)
-          .all();
-        
-        for (const row of seatsResult.results) {
-          const seatNumber = parseInt(row.key.split('_')[2]);
-          roomsData[room].seat[seatNumber] = JSON.parse(row.value);
+      }
+
+      let currentNumber = 1;
+
+      // 🔄 Proses semua data di Worker
+      for (const row of result.results) {
+        const key = row.key;
+        const value = JSON.parse(row.value);
+
+        if (key === 'current_number') {
+          currentNumber = parseInt(value);
+          continue;
         }
-        
-        const pointsResult = await this.db
-          .prepare('SELECT key, value FROM system_config WHERE key LIKE ?')
-          .bind(`point_${room}_%`)
-          .all();
-        
-        for (const row of pointsResult.results) {
-          const seatNumber = parseInt(row.key.split('_')[2]);
-          roomsData[room].point[seatNumber] = JSON.parse(row.value);
+
+        const parts = key.split('_');
+        const type = parts[0]; // 'seat', 'point', 'mute'
+        const roomName = parts[1];
+
+        // Handle mute (tidak ada seat number)
+        if (type === 'mute') {
+          if (roomsData[roomName]) {
+            roomsData[roomName].mute = value;
+          }
+          continue;
         }
+
+        // Handle seat dan point (ada seat number)
+        const seatNumber = parseInt(parts[2]);
         
-        const muteResult = await this.db
-          .prepare('SELECT value FROM system_config WHERE key = ?')
-          .bind(`mute_${room}`)
-          .first();
-        
-        if (muteResult) {
-          roomsData[room].mute = JSON.parse(muteResult.value);
+        if (!roomsData[roomName]) {
+          roomsData[roomName] = { seat: {}, point: {}, mute: false };
+        }
+
+        if (type === 'seat') {
+          roomsData[roomName].seat[seatNumber] = value;
+        } else if (type === 'point') {
+          roomsData[roomName].point[seatNumber] = value;
         }
       }
-      
-      const currentNumber = await this.db
-        .prepare('SELECT value FROM system_config WHERE key = ?')
-        .bind('current_number')
-        .first();
-      
+
       this._storageCache = { 
-        roomsData: roomsData,
-        currentNumber: currentNumber ? parseInt(currentNumber.value) : 1
+        roomsData: roomsData, 
+        currentNumber: currentNumber 
       };
       this._cacheInitialized = true;
       this.currentNumber = this._storageCache.currentNumber;
-      
+
       return this._storageCache;
+
     } catch(e) {
-      return { roomsData: {}, currentNumber: 1 };
+      // Error: buat state kosong
+      this._storageCache = {
+        roomsData: {},
+        currentNumber: 1
+      };
+      this._cacheInitialized = true;
+      this.currentNumber = 1;
+      return this._storageCache;
     }
   }
 
@@ -922,8 +942,10 @@ export class ChatServer {
   
   async _restoreAllState() {
     try {
+      // ✅ Load data dengan 1 query
       await this._loadFromStorage();
       await this._ensureCacheInitialized();
+      
       const webSockets = this.ctx.getWebSockets();
       for (const ws of webSockets) {
         try {
