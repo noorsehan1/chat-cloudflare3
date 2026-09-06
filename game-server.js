@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1.js
-// VERSION: 12.0.1 - STABILITY FIX
+// VERSION: 12.0.3 - FIXED GAME CLEANUP + STABILITY
 // ============================================================
 
 // ============================================================
@@ -51,7 +51,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: "01:00", end: "02:00" },
+    { start: "05:00", end: "06:00" },
     { start: "13:00", end: "14:00" },
     { start: "22:00", end: "23:00" }
   ],
@@ -835,6 +835,24 @@ export class GameServer {
     }
   }
 
+  async _forceResetIfNeeded() {
+    try {
+      const now = new Date();
+      const currentDay = now.getUTCDay();
+      const currentWeek = this.dataManager.getCurrentWeek();
+      const lastResetWeek = await this.dataManager.getLastResetWeek();
+      
+      if (currentDay === CONSTANTS.WEEKLY_RESET_DAY && lastResetWeek !== currentWeek) {
+        await this._handleWeeklyReset();
+        await this.dataManager.setLastResetWeek(currentWeek);
+        return true;
+      }
+      return false;
+    } catch(e) {
+      return false;
+    }
+  }
+
   async _handleWeeklyReset() {
     try {
       const points = await this.dataManager.getDicePoints();
@@ -882,6 +900,8 @@ export class GameServer {
     if (this.closing || this.isDestroyed) return;
     
     try {
+      await this._forceResetIfNeeded();
+      
       await this.alarmScheduler.restoreAlarms();
       const pendingAlarms = await this.alarmScheduler.getPendingAlarms();
       
@@ -1729,6 +1749,10 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // GAME: CLOSE REGISTRATION - FIXED
+  // ============================================================
+  
   _closeRegistration(room, game) {
     try {
       if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
@@ -1751,7 +1775,8 @@ export class GameServer {
         game._gameEnded = true;
         game._isActive = false;
         this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
-        this._scheduleGameCleanup(room, game);
+        // FIX: Langsung cleanup
+        this._forceCleanupGame(room, game);
       }
     } catch(e) {}
   }
@@ -1793,7 +1818,6 @@ export class GameServer {
         return;
       }
       
-      // FIX: Reset evaluation flags
       game._isEvaluating = false;
       game._evalStartTime = null;
       game.evaluationLocked = false;
@@ -1956,7 +1980,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CLOSE DRAW PHASE
+  // GAME: CLOSE DRAW PHASE - FIXED
   // ============================================================
   
   async _closeDrawPhase(room, game) {
@@ -1964,7 +1988,6 @@ export class GameServer {
     if (this._drawLocks.has(drawLockKey)) return;
     if (!this._acquireLock(this._drawLocks, drawLockKey, 10000)) return;
     try {
-      // FIX: Check if already evaluating
       if (!this._isGameActuallyRunning(game) || game.drawTimeExpired || game.evaluationLocked || game._isEvaluating) {
         this._releaseLock(this._drawLocks, drawLockKey);
         return;
@@ -2040,7 +2063,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: EVALUATE ROUND - FIXED
+  // GAME: EVALUATE ROUND - FULLY FIXED
   // ============================================================
   
   async _evaluateRound(room, game) {
@@ -2048,7 +2071,6 @@ export class GameServer {
     if (this._evaluationLocks.has(evalLockKey)) return;
     if (!this._acquireLock(this._evaluationLocks, evalLockKey, 15000)) return;
     try {
-      // FIX: Check if game is already evaluating or ended
       if (this.isDestroyed || !game || game._isEvaluating || !game._isActive || game._gameEnded) {
         this._releaseLock(this._evaluationLocks, evalLockKey);
         return;
@@ -2064,7 +2086,7 @@ export class GameServer {
       game._isEvaluating = true;
       game._evalStartTime = Date.now();
       
-      // FIX: Safety timer - RECOVER not CLEANUP
+      // Safety timer - RECOVER
       const safetyTimer = this._trackTimer(setTimeout(() => {
         if (game?._isEvaluating) {
           game._isEvaluating = false;
@@ -2075,9 +2097,11 @@ export class GameServer {
           
           if (this._isGameActuallyRunning(game) && !game._gameEnded) {
             this._startDrawPhase(room, game);
+          } else if (game && !game._isActive) {
+            this._forceCleanupGame(room, game);
           }
         }
-      }, CONSTANTS.EVALUATION_TIMEOUT_MS));
+      }, 30000));
       game._safetyTimer = safetyTimer;
       
       const numbers = game.numbers || new Map();
@@ -2088,11 +2112,11 @@ export class GameServer {
       const submittedIds = new Set(numbers.keys());
       const activeIds = this._getActivePlayerIds(game);
       
-      // FIX: Check game status during evaluation
       if (!game._isActive || game._gameEnded) {
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
         this._releaseLock(this._evaluationLocks, evalLockKey);
+        this._forceCleanupGame(room, game);
         return;
       }
       
@@ -2168,6 +2192,8 @@ export class GameServer {
         
         if (this._isGameActuallyRunning(game) && !game._gameEnded) {
           this._startDrawPhase(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
         }
         return;
       }
@@ -2226,11 +2252,14 @@ export class GameServer {
         setTimeout(() => {
           if (this._isGameActuallyRunning(game) && !game._gameEnded) {
             this._startDrawPhase(room, game);
+          } else {
+            this._forceCleanupGame(room, game);
           }
         }, 500);
+      } else {
+        this._forceCleanupGame(room, game);
       }
     } catch(e) {
-      // FIX: Error handling - recover not cleanup
       if (game) {
         game._isEvaluating = false;
         game._evalStartTime = null;
@@ -2241,8 +2270,12 @@ export class GameServer {
           setTimeout(() => {
             if (this._isGameActuallyRunning(game) && !game._gameEnded) {
               this._startDrawPhase(room, game);
+            } else {
+              this._forceCleanupGame(room, game);
             }
           }, 1000);
+        } else {
+          this._forceCleanupGame(room, game);
         }
       } else {
         this._releaseLock(this._evaluationLocks, `eval_${room}`);
@@ -2342,7 +2375,6 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "You have been eliminated"]);
         return;
       }
-      // FIX: Check if game is evaluating
       if (game.registrationOpen || game.evaluationLocked || game.drawTimeExpired || game._phase !== 'draw' || game._isEvaluating) {
         this._safeSend(ws, ["gameLowCardError", "Cannot submit now"]);
         return;
@@ -3094,7 +3126,7 @@ export class GameServer {
   _getWsId(ws) { return ws?._wsId || null; }
 
   // ============================================================
-  // GAME: CLEANUP - FIXED DOUBLE CLEANUP
+  // GAME: CLEANUP - FIXED
   // ============================================================
   
   _scheduleGameCleanup(room, game) {
@@ -3163,7 +3195,6 @@ export class GameServer {
         return; 
       }
       
-      // FIX: Prevent double cleanup
       if (game._cleanupStarted) {
         this._releaseLock(this._cleanupLocks, lockKey);
         return;
