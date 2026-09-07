@@ -58,10 +58,8 @@ export class ChatServer {
     
     this._restoreAllState().then(() => {
       this._restored = true;
-      console.log('✅ Restore selesai!');
     }).catch(() => {
       this._restored = true;
-      console.log('⚠️ Restore gagal, pakai state kosong');
     });
   }
 
@@ -384,14 +382,14 @@ export class ChatServer {
     }
     
     const updatedSeat = {
-      noimageUrl: data.noimageUrl || currentSeatData.noimageUrl || "",
-      namauser: data.namauser || currentSeatData.namauser || "",
-      color: data.color || currentSeatData.color || "",
-      itembawah: typeof data.itembawah === 'number' ? data.itembawah : (parseInt(data.itembawah) || 0),
-      itematas: typeof data.itematas === 'number' ? data.itematas : (parseInt(data.itematas) || 0),
-      vip: typeof data.vip === 'number' ? data.vip : (parseInt(data.vip) || 0),
-      viptanda: typeof data.viptanda === 'number' ? data.viptanda : (parseInt(data.viptanda) || 0),
-      isMulti: data.isMulti !== undefined ? data.isMulti : (currentSeatData.isMulti || false)
+      noimageUrl: data.noimageUrl || "",
+      namauser: data.namauser || "",
+      color: data.color || "",
+      itembawah: data.itembawah || 0,
+      itematas: data.itematas || 0,
+      vip: data.vip || 0,
+      viptanda: data.viptanda || 0,
+      isMulti: data.isMulti || false
     };
     
     await this._updateSeatInRoom(roomName, seat, updatedSeat);
@@ -618,7 +616,8 @@ export class ChatServer {
   async _cleanupUserOnDisconnect(ws) {
     try {
       if (!ws) return;
-      if (ws._closing) return; // CEK: Jangan proses jika sudah closing
+      if (ws._closing) return;
+      ws._closing = true;
       
       const username = ws.username;
       const roomName = ws.room || ws.roomname;
@@ -677,10 +676,6 @@ export class ChatServer {
       this.wsSet.delete(ws);
       this.wsActiveMulti.delete(ws);
       
-      if (targetRoom && username) {
-        this.broadcast(targetRoom, ["userOffline", username]);
-      }
-      
     } catch(e) {}
   }
 
@@ -694,21 +689,13 @@ export class ChatServer {
   async webSocketClose(ws) { 
     if (!ws) return;
     if (ws._closing) return;
-    ws._closing = true;
-    
-    try {
-      await this._cleanupUserOnDisconnect(ws);
-    } catch(e) {}
+    await this._cleanupUserOnDisconnect(ws);
   }
 
   async webSocketError(ws) { 
     if (!ws) return;
     if (ws._closing) return;
-    ws._closing = true;
-    
-    try {
-      await this._cleanupUserOnDisconnect(ws);
-    } catch(e) {}
+    await this._cleanupUserOnDisconnect(ws);
   }
 
   // ============ BROADCAST ============
@@ -722,7 +709,7 @@ export class ChatServer {
       const toRemove = new Set();
       for (const ws of clients) {
         if (!ws) { toRemove.add(ws); continue; }
-        if (ws._closing) { toRemove.add(ws); continue; } // CEK: Skip jika closing
+        if (ws._closing) { toRemove.add(ws); continue; }
         const wsRoom = ws.room || ws.roomname;
         if (wsRoom !== room) {
           toRemove.add(ws);
@@ -740,7 +727,6 @@ export class ChatServer {
         for (const ws of toRemove) {
           try {
             clients.delete(ws);
-            if (ws) this.cleanup(ws);
           } catch(e) {}
         }
       }
@@ -749,7 +735,7 @@ export class ChatServer {
 
   safeSend(ws, msg) {
     if (!ws) return false;
-    if (ws._closing) return false; // CEK: Skip jika closing
+    if (ws._closing) return false;
     try {
       if (ws.readyState !== 1 || ws._closing || this.closing || this.isDestroyed) {
         return false;
@@ -757,7 +743,6 @@ export class ChatServer {
       ws.send(JSON.stringify(msg));
       return true;
     } catch(e) {
-      this.cleanup(ws);
       return false;
     }
   }
@@ -786,7 +771,7 @@ export class ChatServer {
 
   async sendAllStateTo(ws, room, excludeSelf = false) {
     if (!ws || !ws.username) return;
-    if (ws._closing) return; // CEK: Skip jika closing
+    if (ws._closing) return;
     try {
       if (ws.readyState !== 1 || ws._closing) return;
     } catch(e) { return; }
@@ -931,7 +916,7 @@ export class ChatServer {
 
   cleanup(ws) {
     if (!ws || ws._cleaning) return;
-    if (ws._closing) return; // CEK: Jangan proses jika sudah closing
+    if (ws._closing) return;
     ws._closing = true;
     ws._cleaning = true;
     
@@ -962,7 +947,6 @@ export class ChatServer {
       try { this.wsSet.delete(ws); } catch(e) {}
     } catch(e) {} finally {
       ws._cleaning = false;
-      // HAPUS ws.close() - TIDAK MENUTUP WS DI SINI
     }
   }
 
@@ -978,12 +962,10 @@ export class ChatServer {
       
       for (const ws of webSockets) {
         try {
-          // CEK: Hanya restore jika WebSocket valid
           if (!ws || ws.readyState !== 1) {
             continue;
           }
           
-          // CEK: Jangan restore jika sudah closing
           if (ws._closing) {
             continue;
           }
@@ -996,8 +978,6 @@ export class ChatServer {
               ws.room = found.room;
               ws.roomname = found.room;
               ws.idtarget = attachment.username;
-              // JANGAN RESET _closing!
-              // ws._closing = false;
               
               const roomClients = this.roomClients.get(found.room);
               if (roomClients) roomClients.add(ws);
@@ -1018,7 +998,6 @@ export class ChatServer {
         this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
       }
       
-      // Hanya update untuk room yang ada WebSocket valid
       const roomsWithClients = new Set();
       for (const ws of validWss) {
         if (ws.room) {
@@ -1030,7 +1009,6 @@ export class ChatServer {
         await this.updateRoomCount(room);
       }
       
-      // Broadcast ke semua room yang ada clients
       for (const [room, clients] of this.roomClients) {
         if (clients && clients.size > 0) {
           this.broadcast(room, ["currentNumber", this.currentNumber]);
@@ -1340,13 +1318,13 @@ export class ChatServer {
           this._kursiLocks.set(lockKey, Date.now());
           try {
             const updateData = {
-              noimageUrl: String(kursiNoimg || ""),
-              namauser: String(kursiName || ""),
-              color: String(kursiColor || ""),
-              itembawah: typeof kursiBawah === 'number' ? kursiBawah : (parseInt(kursiBawah) || 0),
-              itematas: typeof kursiAtas === 'number' ? kursiAtas : (parseInt(kursiAtas) || 0),
-              vip: typeof kursiVip === 'number' ? kursiVip : (parseInt(kursiVip) || 0),
-              viptanda: typeof kursiVt === 'number' ? kursiVt : (parseInt(kursiVt) || 0),
+              noimageUrl: kursiNoimg || "",
+              namauser: kursiName || "",
+              color: kursiColor || "",
+              itembawah: kursiBawah || 0,
+              itematas: kursiAtas || 0,
+              vip: kursiVip || 0,
+              viptanda: kursiVt || 0,
               isMulti: seatData.isMulti || false
             };
             const result = await this._updateKursi(kursiRoom, kursiSeat, updateData);
@@ -1657,7 +1635,6 @@ export class ChatServer {
       } catch(e) {}
     }
     
-    // Bersihkan sisa map
     this.userConnections.clear();
     this.roomClients.clear();
     this.wsSet.clear();
