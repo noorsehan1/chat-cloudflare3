@@ -617,90 +617,135 @@ export class ChatServer {
 
   // ============ WEBSOCKET ============
   
-  async _cleanupUserOnDisconnect(ws) {
+  async _cleanupUserCompletely(ws) {
+    if (!ws || ws._cleaning) return;
+    ws._cleaning = true;
+    
     try {
-      if (!ws) return;
       const username = ws.username;
       const roomName = ws.room || ws.roomname;
       const isMulti = this.wsActiveMulti.has(ws);
       
       if (isMulti) {
-        const connections = this.userConnections.get(username);
-        if (connections) {
-          connections.delete(ws);
+        // ============ MULTI USER: HANYA HAPUS WS NYA ============
+        
+        // 1. Hapus dari userConnections
+        if (username) {
+          const connections = this.userConnections.get(username);
+          if (connections) {
+            connections.delete(ws);
+            if (connections.size === 0) {
+              this.userConnections.delete(username);
+            }
+          }
         }
+        
+        // 2. Hapus dari roomClients
         if (roomName) {
           const roomClients = this.roomClients.get(roomName);
           if (roomClients) roomClients.delete(ws);
-        } else {
-          try {
-            const attachment = ws.deserializeAttachment();
-            if (attachment && attachment.seatInfo && attachment.seatInfo.room) {
-              const roomClients = this.roomClients.get(attachment.seatInfo.room);
-              if (roomClients) roomClients.delete(ws);
-            }
-          } catch(e) {}
         }
-        this.wsActiveMulti.delete(ws);
+        
+        // 3. Hapus dari map lainnya
         this.wsSet.delete(ws);
-        return;
-      }
-      
-      if (roomName) {
-        await this._removeUserFromRoom(username, roomName);
+        this.wsActiveMulti.delete(ws);
+        
+        // 4. Hapus data attachment
+        try {
+          ws.serializeAttachment({});
+          ws.username = null;
+          ws.room = null;
+          ws.roomname = null;
+          ws.idtarget = null;
+          ws._closing = true;
+        } catch(e) {}
+        
+        // 5. Tutup WebSocket
+        try {
+          if (ws && ws.readyState === 1) {
+            ws.close(1000, "Multi user cleanup");
+          }
+        } catch(e) {}
+        
       } else {
-        const found = await this._findUserInAnyRoom(username);
-        if (found) {
-          await this._removeUserFromRoom(username, found.room);
+        // ============ USER MURNI: HAPUS SEMUA (MAP + STORAGE/D1) ============
+        
+        // 1. Hapus dari D1/Storage
+        if (roomName && username) {
+          await this._removeUserFromRoom(username, roomName);
+        } else if (username) {
+          const found = await this._findUserInAnyRoom(username);
+          if (found) {
+            await this._removeUserFromRoom(username, found.room);
+          }
         }
-      }
-      
-      const connections = this.userConnections.get(username);
-      if (connections) {
-        connections.delete(ws);
-        if (connections.size === 0) {
-          this.userConnections.delete(username);
+        
+        // 2. Hapus dari userConnections
+        if (username) {
+          const connections = this.userConnections.get(username);
+          if (connections) {
+            connections.delete(ws);
+            if (connections.size === 0) {
+              this.userConnections.delete(username);
+            }
+          }
         }
-      }
-      
-      const targetRoom = roomName || (await this._findUserInAnyRoom(username))?.room;
-      if (targetRoom) {
-        const roomClients = this.roomClients.get(targetRoom);
-        if (roomClients) {
-          roomClients.delete(ws);
+        
+        // 3. Hapus dari roomClients
+        if (roomName) {
+          const roomClients = this.roomClients.get(roomName);
+          if (roomClients) roomClients.delete(ws);
+        } else if (username) {
+          const found = await this._findUserInAnyRoom(username);
+          if (found) {
+            const roomClients = this.roomClients.get(found.room);
+            if (roomClients) roomClients.delete(ws);
+          }
         }
+        
+        // 4. Hapus dari map lainnya
+        this.wsSet.delete(ws);
+        this.wsActiveMulti.delete(ws);
+        
+        // 5. Hapus data attachment
+        try {
+          ws.serializeAttachment({});
+          ws.username = null;
+          ws.room = null;
+          ws.roomname = null;
+          ws.idtarget = null;
+          ws._closing = true;
+        } catch(e) {}
+        
+        // 6. Tutup WebSocket
+        try {
+          if (ws && ws.readyState === 1) {
+            ws.close(1000, "User cleanup complete");
+          }
+        } catch(e) {}
       }
       
-      this.wsSet.delete(ws);
-      this.wsActiveMulti.delete(ws);
-      
-      if (targetRoom && username) {
-        this.broadcast(targetRoom, ["userOffline", username]);
-      }
-      
-    } catch(e) {}
+    } catch(e) {
+      // Silent error
+    } finally {
+      ws._cleaning = false;
+    }
+  }
+
+  async webSocketClose(ws) { 
+    if (!ws) return;
+    await this._cleanupUserCompletely(ws);
+  }
+
+  async webSocketError(ws) { 
+    if (!ws) return;
+    await this._cleanupUserCompletely(ws);
   }
 
   async webSocketMessage(ws, msg) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     try { 
       await this.handleMessage(ws, msg); 
-    } catch(e) {}
-  }
-
-  async webSocketClose(ws) { 
-    if (!ws) return;
-    try {
-      await this._cleanupUserOnDisconnect(ws);
-      this.cleanup(ws);
-    } catch(e) {}
-  }
-
-  async webSocketError(ws) { 
-    if (!ws) return;
-    try {
-      await this._cleanupUserOnDisconnect(ws);
-      this.cleanup(ws);
     } catch(e) {}
   }
 
@@ -1544,9 +1589,11 @@ export class ChatServer {
           break;
         }
         
-        case "onDestroy":
-          this.cleanup(ws);
+        case "onDestroy": {
+          if (!ws) break;
+          await this._cleanupUserCompletely(ws);
           break;
+        }
         
         default:
           this.safeSend(ws, ["error", `Unknown event: ${evt}`]);
