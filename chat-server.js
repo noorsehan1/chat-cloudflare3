@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 11.0.4 - FULL COMPATIBLE WITH ANDROID CLIENT
+// VERSION: 11.0.5 - FULL COMPATIBLE WITH ANDROID CLIENT
 
 const C = {
   MAX_SEATS: 45,
@@ -407,6 +407,10 @@ export class ChatServer {
     
     if (typeof seat !== 'number' || seat < 1 || seat > C.MAX_SEATS) {
       return { success: false, error: 'Invalid seat number' };
+    }
+    
+    if (!data || !data.namauser) {
+      return { success: false, error: 'Username is required' };
     }
     
     await this._ensureCacheInitialized();
