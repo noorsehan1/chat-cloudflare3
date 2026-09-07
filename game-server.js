@@ -1,3 +1,15 @@
+Perbaikan Tie Breaker
+GameStopNoWinner
+Cloudflare Durable Objects fix
+ChatServer Code Analysis
+Dice room no time left
+ChatServer Analysis
+Chat Server Code Analysis
+Jumlah user tidak sesuai
+Upgrade Billing v9.0.0
+Perbaikan Tie Breaker
+javascript
+
 // ============================================================
 // GAME-SERVER-D1.js
 // VERSION: 12.0.8 - FINAL
@@ -51,7 +63,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: "03:00", end: "03:30" },
+    { start: "01:00", end: "02:00" },
     { start: "13:00", end: "14:00" },
     { start: "22:00", end: "23:00" }
   ],
@@ -702,9 +714,9 @@ export class GameServer {
       this._canSubmitDiceAnswer = false;
       this._diceRound = 0;
       
-      // NEW: Dice session flags
       this._diceSessionActive = false;
       this._diceStartedByUser = false;
+      this._diceSessionEnded = false;
       
       this._tieBreakers = new Map();
       this._tieRound = 0;
@@ -761,6 +773,7 @@ export class GameServer {
       
       if (this.alarmScheduler.isDiceTime()) {
         this._diceSessionActive = true;
+        this._diceSessionEnded = false;
         const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
         if (clients && clients.size > 0) {
           this._startDiceFast();
@@ -898,7 +911,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // ALARM - FIXED
+  // ALARM
   // ============================================================
   
   async alarm() {
@@ -931,6 +944,7 @@ export class GameServer {
         if (this.alarmScheduler.isDiceTime()) {
           this.diceAutoEnabled = true;
           this._diceSessionActive = true;
+          this._diceSessionEnded = false;
           
           const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
           if (clients && clients.size > 0) {
@@ -947,11 +961,36 @@ export class GameServer {
       case 'dice_session_end':
         this.diceAutoEnabled = false;
         this._diceSessionActive = false;
+        this._diceSessionEnded = true;
         this._diceStartedByUser = false;
+        
         this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
+        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceSessionEnded", true]);
+        
         if (this.currentDiceRoll || this._isShowingDice) {
           this._endDiceRound();
         }
+        
+        this.currentDiceRoll = null;
+        this._diceLock = false;
+        this._isShowingDice = false;
+        this._canSubmitDiceAnswer = false;
+        this.diceAnswered = new Set();
+        this._playerAnswers = new Map();
+        this.diceHasWinner = false;
+        this.diceWinner = null;
+        this._diceRound = 0;
+        
+        if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
+        if (this._diceCooldownTimer) { clearTimeout(this._diceCooldownTimer); this._diceCooldownTimer = null; }
+        if (this._diceTimeUpCooldownTimer) { clearTimeout(this._diceTimeUpCooldownTimer); this._diceTimeUpCooldownTimer = null; }
+        for (const timeout of this._diceNotificationTimeouts) { clearTimeout(timeout); }
+        this._diceNotificationTimeouts = [];
+        
+        if (this._tieActive) {
+          this._resetTieBreakerState(null);
+        }
+        
         break;
     }
   }
@@ -1505,7 +1544,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - DICE NOTIFICATION + START IF SESSION ACTIVE
+  // SWITCH ROOM
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1597,7 +1636,6 @@ export class GameServer {
           }
         }
         
-        // SKENARIO 1: NOTIFIKASI SAAT MASUK ROOM QUIZ
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceNotificationOnSwitch(ws, wsId);
         }
@@ -1617,20 +1655,23 @@ export class GameServer {
     }
   }
 
-  // ============================================================
-  // DICE NOTIFICATION - SKENARIO 1: MASUK ROOM QUIZ
-  // ============================================================
-  
   _sendDiceNotificationOnSwitch(ws, wsId) {
     try {
       if (!ws || ws.readyState !== 1) return;
+      
+      if (this._diceSessionEnded) {
+        setTimeout(() => {
+          if (ws && ws.readyState === 1) {
+            this._safeSend(ws, ["diceNotification", "Dice session ended. Next session soon..."]);
+          }
+        }, 5000);
+        return;
+      }
       
       const isGameActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
       const isDiceTime = this.alarmScheduler.isDiceTime();
       const timeLeft = this._getTimeLeftUntilNextDice();
       
-      // HANYA SKENARIO: Diluar sesi dice - kirim waktu ke sesi berikutnya
-      // DELAY 5 DETIK
       if (!isDiceTime && !isGameActive && timeLeft && timeLeft.totalMs > 0) {
         const hours = timeLeft.hours;
         const minutes = timeLeft.minutes;
@@ -1653,8 +1694,7 @@ export class GameServer {
         return;
       }
       
-      // JIKA SESI AKTIF DAN BELUM ADA GAME, START GAME
-      if (this._diceSessionActive && !isGameActive) {
+      if (this._diceSessionActive && !this._diceSessionEnded && !isGameActive) {
         if (!this._diceLock && !this._isShowingDice && !this._diceTimeUpCooldown) {
           setTimeout(() => {
             if (ws && ws.readyState === 1) {
@@ -1662,7 +1702,7 @@ export class GameServer {
             }
           }, 5000);
           
-          if (!this.currentDiceRoll && this._diceSessionActive) {
+          if (!this.currentDiceRoll && this._diceSessionActive && !this._diceSessionEnded) {
             this._diceStartedByUser = true;
             this._startDiceFast();
           }
@@ -2544,17 +2584,15 @@ export class GameServer {
   }
 
   // ============================================================
-  // DICE GAME - START DICE FAST (CEK SESI AKTIF)
+  // DICE GAME - START DICE FAST
   // ============================================================
   
   _startDiceFast() {
     try {
-      // CEK: JIKA SESI TIDAK AKTIF, JANGAN START
-      if (!this._diceSessionActive && !this.diceAutoEnabled) {
+      if (!this._diceSessionActive || this._diceSessionEnded) {
         return;
       }
       
-      // CEK: JIKA SUDAH ADA GAME, JANGAN START LAGI
       if (this._diceLock || this.currentDiceRoll || this._isShowingDice) {
         return;
       }
@@ -2603,7 +2641,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // END DICE ROUND - SKENARIO 2 + CEK SESI AKTIF
+  // END DICE ROUND
   // ============================================================
   
   async _endDiceRound() {
@@ -2652,11 +2690,11 @@ export class GameServer {
       this._diceLock = false;
       this._diceTimeUpCooldown = true;
       
-      // NOTIFIKASI NEXT GAME - HANYA JIKA SESI MASIH AKTIF
       const timeLeft = this._getTimeLeftUntilNextDice();
-      if (this._diceSessionActive) {
+      
+      if (this._diceSessionActive && !this._diceSessionEnded) {
         setTimeout(() => {
-          if (this._diceSessionActive) {
+          if (this._diceSessionActive && !this._diceSessionEnded) {
             if (!this.alarmScheduler.isDiceTime() && timeLeft && timeLeft.totalMs > 0) {
               const hours = timeLeft.hours;
               const minutes = timeLeft.minutes;
@@ -2682,8 +2720,7 @@ export class GameServer {
         this._diceNotifiedFlags = { 20: false, 10: false, 5: false, timeup: false };
         this._lastSentRemaining = -1;
         
-        // CEK: START GAME BERIKUTNYA HANYA JIKA SESI AKTIF DAN ADA USER
-        if (this._diceSessionActive) {
+        if (this._diceSessionActive && !this._diceSessionEnded) {
           const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
           if (clients && clients.size > 0) {
             if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
@@ -2702,7 +2739,7 @@ export class GameServer {
   // ============================================================
   // TIE BREAKER
   // ============================================================
-  
+
   async _startTieBreaker(room, players) {
     if (this._tieLock) return;
     this._tieLock = true;
@@ -2713,7 +2750,12 @@ export class GameServer {
       this._tiePlayers = [...players];
       this._tieAnswers = new Map();
       const id = `tie_${Date.now()}`;
-      this._tieBreakers.set(id, { players, round: 0, winner: null, status: 'waiting' });
+      this._tieBreakers.set(id, { 
+        players, 
+        round: 0, 
+        winner: null, 
+        status: 'waiting'
+      });
       await this._runTieRound(room, id, players);
     } finally {
       setTimeout(() => { this._tieLock = false; }, 2000);
@@ -2723,16 +2765,21 @@ export class GameServer {
   async _runTieRound(room, id, players) {
     const data = this._tieBreakers.get(id);
     if (!data) return;
+    
     this._clearTimer(this._tieTimer);
     this._clearTimer(this._tieInterval);
-    for (const timeout of this._tieNotificationTimeouts) { clearTimeout(timeout); }
+    for (const timeout of this._tieNotificationTimeouts) { 
+      clearTimeout(timeout); 
+    }
     this._tieNotificationTimeouts = [];
+    
     this._tieRound++;
-    this._tiePlayers = [...players];
-    this._tieAnswers = new Map();
     data.round = this._tieRound;
     data.status = 'running';
     data.players = players;
+    
+    this._tiePlayers = [...players];
+    this._tieAnswers = new Map();
     this._diceQuestionStartTime = Date.now();
     this._canSubmitDiceAnswer = true;
     this.diceAnswered = new Set();
@@ -2740,29 +2787,54 @@ export class GameServer {
     this._isShowingDice = true;
     this.diceHasWinner = false;
     this.diceWinner = null;
-    this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Tie Round " + this._tieRound + ": " + players.join(', ')]);
+    
+    this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+      `Tie Round ${this._tieRound}: ${players.join(', ')}`
+    ]);
+    
+    this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceTieBreaker", {
+      round: this._tieRound,
+      players: players
+    }]);
+    
     const timeLimit = CONSTANTS.TIE_BREAKER_TIME_LIMIT || 20;
     let isProcessed = false;
+    
+    this._tieNotificationTimeouts.push(setTimeout(() => {
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "15s remaining"]);
+    }, 5000));
+    
     this._tieNotificationTimeouts.push(setTimeout(() => {
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "10s remaining"]);
-    }, (timeLimit - 10) * 1000));
+    }, 10000));
+    
     this._tieNotificationTimeouts.push(setTimeout(() => {
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "5s remaining"]);
-    }, (timeLimit - 5) * 1000));
+    }, 15000));
+    
     this._tieNotificationTimeouts.push(setTimeout(() => {
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "3s remaining"]);
-    }, (timeLimit - 3) * 1000));
+    }, 17000));
+    
     this._tieTimer = this._trackTimer(setTimeout(() => {
       if (!isProcessed) {
         isProcessed = true;
         this._canSubmitDiceAnswer = false;
         this._isShowingDice = false;
         this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "TIME UP"]);
-        for (const timeout of this._tieNotificationTimeouts) { clearTimeout(timeout); }
+        
+        for (const timeout of this._tieNotificationTimeouts) { 
+          clearTimeout(timeout); 
+        }
         this._tieNotificationTimeouts = [];
+        
         const tieId = this._getActiveTieBreakerId();
-        if (tieId) this._processTieResults(room, tieId, players);
-        else { this._resetTieBreakerState(null); this._startCooldownAfterTieBreaker(); }
+        if (tieId) {
+          this._processTieResults(room, tieId, players);
+        } else {
+          this._resetTieBreakerState(null);
+          this._startCooldownAfterTieBreaker();
+        }
       }
     }, (timeLimit * 1000) + 2000));
   }
@@ -2770,69 +2842,250 @@ export class GameServer {
   async _processTieResults(room, id, players) {
     const data = this._tieBreakers.get(id);
     if (!data) return;
-    let highest = 0, highestPlayers = [];
+    
+    const entries = [];
+    let answeredCount = 0;
+    let highest = 0;
+    let highestPlayers = [];
+    
     for (const player of players) {
       const answer = this._tieAnswers.get(player);
       if (answer !== undefined && answer >= 1 && answer <= 6) {
-        if (answer > highest) { highest = answer; highestPlayers = [player]; }
-        else if (answer === highest) { highestPlayers.push(player); }
+        answeredCount++;
+        entries.push({ player, answer });
+        if (answer > highest) {
+          highest = answer;
+          highestPlayers = [player];
+        } else if (answer === highest) {
+          highestPlayers.push(player);
+        }
       }
     }
-    if (highestPlayers.length === 0) {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "No one answered tie breaker"]);
+    
+    if (answeredCount === 0) {
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+        `No one answered in Round ${this._tieRound} - Tie breaker ended`
+      ]);
+      
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceTieAnswer", {
+        round: this._tieRound,
+        results: [],
+        winners: [],
+        eliminated: players,
+        status: 'no_answers'
+      }]);
+      
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
     }
-    if (highestPlayers.length === 1) {
-      const winner = highestPlayers[0];
+    
+    if (answeredCount === 1) {
+      const winner = entries[0].player;
+      const answer = entries[0].answer;
+      
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+        `${winner} answered with ${answer} - Auto win!`
+      ]);
+      
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceTieAnswer", {
+        round: this._tieRound,
+        results: entries.map(e => `${e.player}:${e.answer}`),
+        winners: [winner],
+        eliminated: players.filter(p => p !== winner),
+        status: 'single_winner'
+      }]);
+      
       try {
         const points = await this.dataManager.addDicePoint(winner);
         this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-          username: winner, totalPoints: points[winner] || 0, diceValue: highest,
-          round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true
+          username: winner,
+          totalPoints: points[winner] || 0,
+          diceValue: answer,
+          round: this._diceRound || 1,
+          isTieBreaker: true,
+          tieBreakerRound: this._tieRound,
+          finalWinner: true,
+          totalTieRounds: this._tieRound
         }]);
       } catch(e) {
         this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-          username: winner, totalPoints: 0, diceValue: highest,
-          round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true
+          username: winner,
+          totalPoints: 0,
+          diceValue: answer,
+          round: this._diceRound || 1,
+          isTieBreaker: true,
+          tieBreakerRound: this._tieRound,
+          finalWinner: true,
+          totalTieRounds: this._tieRound
         }]);
       }
+      
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
     }
-    if (highestPlayers.length > 1) {
-      this._tiePlayers = highestPlayers;
+    
+    const allSame = entries.every(e => e.answer === entries[0].answer);
+    
+    if (allSame) {
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+        `All answered same value: ${entries[0].answer} - Tie again!`
+      ]);
+      
+      const allPlayers = entries.map(e => e.player);
+      
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceTieAnswer", {
+        round: this._tieRound,
+        results: entries.map(e => `${e.player}:${e.answer}`),
+        winners: [],
+        eliminated: [],
+        status: 'all_same',
+        allPlayers: allPlayers,
+        value: entries[0].answer
+      }]);
+      
+      this._tiePlayers = allPlayers;
       this._tieAnswers = new Map();
-      data.players = highestPlayers;
-      data.round = this._tieRound;
+      data.players = allPlayers;
       data.status = 'waiting';
-      const nextTimer = setTimeout(() => {
+      
+      const nextTimer = setTimeout(async () => {
         if (this._tieActive && this._tiePlayers.length > 1) {
-          this._runTieRound(room, id, this._tiePlayers);
+          await this._runTieRound(room, id, this._tiePlayers);
         } else if (this._tiePlayers.length === 1) {
-          this._processSingleWinner(room, id, this._tiePlayers[0]);
+          await this._processSingleWinner(room, id, this._tiePlayers[0]);
+        } else {
+          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+            "No players remaining in tie breaker"
+          ]);
+          this._resetTieBreakerState(id);
+          this._startCooldownAfterTieBreaker();
         }
-      }, 2000);
+      }, 3000);
+      
       this._trackTimer(nextTimer);
       return;
     }
+    
+    if (highestPlayers.length === 1) {
+      const winner = highestPlayers[0];
+      
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+        `${winner} wins with highest value: ${highest}`
+      ]);
+      
+      const losers = players.filter(p => p !== winner);
+      
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceTieAnswer", {
+        round: this._tieRound,
+        results: entries.map(e => `${e.player}:${e.answer}`),
+        winners: [winner],
+        eliminated: losers,
+        status: 'winner_found'
+      }]);
+      
+      try {
+        const points = await this.dataManager.addDicePoint(winner);
+        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
+          username: winner,
+          totalPoints: points[winner] || 0,
+          diceValue: highest,
+          round: this._diceRound || 1,
+          isTieBreaker: true,
+          tieBreakerRound: this._tieRound,
+          finalWinner: true,
+          totalTieRounds: this._tieRound
+        }]);
+      } catch(e) {
+        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
+          username: winner,
+          totalPoints: 0,
+          diceValue: highest,
+          round: this._diceRound || 1,
+          isTieBreaker: true,
+          tieBreakerRound: this._tieRound,
+          finalWinner: true,
+          totalTieRounds: this._tieRound
+        }]);
+      }
+      
+      this._resetTieBreakerState(id);
+      this._startCooldownAfterTieBreaker();
+      return;
+    }
+    
+    if (highestPlayers.length > 1) {
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+        `Tie again! Round ${this._tieRound + 1} between: ${highestPlayers.join(', ')}`
+      ]);
+      
+      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceTieAnswer", {
+        round: this._tieRound,
+        results: entries.map(e => `${e.player}:${e.answer}`),
+        winners: [],
+        eliminated: players.filter(p => !highestPlayers.includes(p)),
+        status: 'tie_continue',
+        remainingPlayers: highestPlayers,
+        nextRound: this._tieRound + 1
+      }]);
+      
+      this._tiePlayers = highestPlayers;
+      this._tieAnswers = new Map();
+      data.players = highestPlayers;
+      data.status = 'waiting';
+      
+      const nextTimer = setTimeout(async () => {
+        if (this._tieActive && this._tiePlayers.length > 1) {
+          await this._runTieRound(room, id, this._tiePlayers);
+        } else if (this._tiePlayers.length === 1) {
+          await this._processSingleWinner(room, id, this._tiePlayers[0]);
+        } else {
+          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
+            "No players remaining in tie breaker"
+          ]);
+          this._resetTieBreakerState(id);
+          this._startCooldownAfterTieBreaker();
+        }
+      }, 3000);
+      
+      this._trackTimer(nextTimer);
+      return;
+    }
+    
     this._resetTieBreakerState(id);
     this._startCooldownAfterTieBreaker();
   }
 
   async _processSingleWinner(room, id, winner) {
+    if (!winner) {
+      this._resetTieBreakerState(id);
+      this._startCooldownAfterTieBreaker();
+      return;
+    }
+    
     try {
       const points = await this.dataManager.addDicePoint(winner);
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-        username: winner, totalPoints: points[winner] || 0, diceValue: 'auto',
-        round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true
+        username: winner,
+        totalPoints: points[winner] || 0,
+        diceValue: 'auto',
+        round: this._diceRound || 1,
+        isTieBreaker: true,
+        tieBreakerRound: this._tieRound,
+        finalWinner: true,
+        totalTieRounds: this._tieRound
       }]);
     } catch(e) {
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-        username: winner, totalPoints: 0, diceValue: 'auto',
-        round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true
+        username: winner,
+        totalPoints: 0,
+        diceValue: 'auto',
+        round: this._diceRound || 1,
+        isTieBreaker: true,
+        tieBreakerRound: this._tieRound,
+        finalWinner: true,
+        totalTieRounds: this._tieRound
       }]);
     }
     this._resetTieBreakerState(id);
@@ -2851,8 +3104,12 @@ export class GameServer {
       this._lastNotificationKey = "";
       this._lastNotificationTime = 0;
       
-      // CEK: START GAME BERIKUTNYA HANYA JIKA SESI AKTIF DAN ADA USER
-      if (this._diceSessionActive) {
+      this._tieActive = false;
+      this._tiePlayers = [];
+      this._tieAnswers = new Map();
+      this._tieRound = 0;
+      
+      if (this._diceSessionActive && !this._diceSessionEnded) {
         const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
         if (clients && clients.size > 0) {
           if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
@@ -2864,7 +3121,10 @@ export class GameServer {
   }
 
   _resetTieBreakerState(id) {
-    if (id) this._tieBreakers.delete(id);
+    if (id) {
+      this._tieBreakers.delete(id);
+    }
+    
     this._tieActive = false;
     this._tiePlayers = [];
     this._tieAnswers = new Map();
@@ -2876,15 +3136,26 @@ export class GameServer {
     this._playerAnswers = new Map();
     this.diceHasWinner = false;
     this.diceWinner = null;
-    if (this._tieTimer) { this._clearTimer(this._tieTimer); this._tieTimer = null; }
-    if (this._tieInterval) { this._clearTimer(this._tieInterval); this._tieInterval = null; }
-    for (const timeout of this._tieNotificationTimeouts) { clearTimeout(timeout); }
+    
+    if (this._tieTimer) { 
+      this._clearTimer(this._tieTimer); 
+      this._tieTimer = null; 
+    }
+    if (this._tieInterval) { 
+      this._clearTimer(this._tieInterval); 
+      this._tieInterval = null; 
+    }
+    for (const timeout of this._tieNotificationTimeouts) { 
+      clearTimeout(timeout); 
+    }
     this._tieNotificationTimeouts = [];
   }
 
   _getActiveTieBreakerId() {
     for (const [id, data] of this._tieBreakers) {
-      if (data.status === 'waiting' || data.status === 'running') return id;
+      if (data.status === 'waiting' || data.status === 'running') {
+        return id;
+      }
     }
     return null;
   }
@@ -3384,3 +3655,203 @@ export class GameServer {
 }
 
 export default GameServer;
+
+perbiakan apa saaj dikode ini
+Perbaikan yang Dilakukan pada Kode:
+1. Penambahan Variable _diceSessionEnded
+javascript
+
+this._diceSessionEnded = false; // Di constructor
+
+Untuk menandai apakah sesi dice sudah berakhir atau belum.
+2. Perbaikan _processAlarm untuk dice_session_start
+javascript
+
+case 'dice_session_start':
+  if (this.alarmScheduler.isDiceTime()) {
+    this.diceAutoEnabled = true;
+    this._diceSessionActive = true;
+    this._diceSessionEnded = false; // Reset flag sesi berakhir
+    // ... 
+  }
+
+Perubahan: Reset _diceSessionEnded = false saat sesi baru dimulai.
+3. Perbaikan _processAlarm untuk dice_session_end
+javascript
+
+case 'dice_session_end':
+  this.diceAutoEnabled = false;
+  this._diceSessionActive = false;
+  this._diceSessionEnded = true; // Tandai sesi sudah berakhir
+  this._diceStartedByUser = false;
+  
+  this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
+  this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceSessionEnded", true]);
+  
+  // Hentikan game yang sedang berjalan
+  if (this.currentDiceRoll || this._isShowingDice) {
+    this._endDiceRound();
+  }
+  
+  // Reset semua state dice
+  this.currentDiceRoll = null;
+  this._diceLock = false;
+  this._isShowingDice = false;
+  this._canSubmitDiceAnswer = false;
+  this.diceAnswered = new Set();
+  this._playerAnswers = new Map();
+  this.diceHasWinner = false;
+  this.diceWinner = null;
+  this._diceRound = 0;
+  
+  // Hentikan semua timer dice
+  if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
+  if (this._diceCooldownTimer) { clearTimeout(this._diceCooldownTimer); this._diceCooldownTimer = null; }
+  if (this._diceTimeUpCooldownTimer) { clearTimeout(this._diceTimeUpCooldownTimer); this._diceTimeUpCooldownTimer = null; }
+  for (const timeout of this._diceNotificationTimeouts) { clearTimeout(timeout); }
+  this._diceNotificationTimeouts = [];
+  
+  // Reset tie breaker jika masih aktif
+  if (this._tieActive) {
+    this._resetTieBreakerState(null);
+  }
+
+Perubahan:
+
+    Set _diceSessionEnded = true
+
+    Kirim event diceSessionEnded ke client
+
+    Hentikan semua game yang sedang berjalan
+
+    Reset semua state dice dan tie breaker
+
+4. Perbaikan _startDiceFast
+javascript
+
+_startDiceFast() {
+  try {
+    // CEK: Jika sesi tidak aktif ATAU sesi sudah berakhir, JANGAN start
+    if (!this._diceSessionActive || this._diceSessionEnded) {
+      return;
+    }
+    // ...
+  }
+}
+
+Perubahan: Tambahan cek this._diceSessionEnded
+5. Perbaikan _endDiceRound
+javascript
+
+// NOTIFIKASI NEXT GAME - HANYA JIKA SESI MASIH AKTIF DAN BELUM BERAKHIR
+if (this._diceSessionActive && !this._diceSessionEnded) {
+  setTimeout(() => {
+    if (this._diceSessionActive && !this._diceSessionEnded) {
+      // ... notifikasi
+    }
+  }, 5000);
+}
+
+// Start game berikutnya HANYA jika sesi aktif DAN sesi belum berakhir
+if (this._diceSessionActive && !this._diceSessionEnded) {
+  const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
+  if (clients && clients.size > 0) {
+    if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
+      this._startDiceFast();
+    }
+  }
+}
+
+Perubahan: Tambahan cek !this._diceSessionEnded
+6. Perbaikan _startCooldownAfterTieBreaker
+javascript
+
+// CEK: Start game berikutnya HANYA jika sesi aktif DAN sesi belum berakhir
+if (this._diceSessionActive && !this._diceSessionEnded) {
+  const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
+  if (clients && clients.size > 0) {
+    if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
+      this._startDiceFast();
+    }
+  }
+}
+
+Perubahan: Tambahan cek !this._diceSessionEnded
+7. Perbaikan _sendDiceNotificationOnSwitch
+javascript
+
+// CEK: Jika sesi sudah berakhir, kirim notifikasi "Session ended"
+if (this._diceSessionEnded) {
+  setTimeout(() => {
+    if (ws && ws.readyState === 1) {
+      this._safeSend(ws, ["diceNotification", "Dice session ended. Next session soon..."]);
+    }
+  }, 5000);
+  return;
+}
+
+// CEK: JIKA SESI AKTIF DAN BELUM BERAKHIR
+if (this._diceSessionActive && !this._diceSessionEnded && !isGameActive) {
+  // ... start game
+}
+
+Perubahan:
+
+    Jika sesi berakhir, kirim notifikasi khusus
+
+    Tambahan cek !this._diceSessionEnded
+
+8. Perbaikan _restoreAllState
+javascript
+
+if (this.alarmScheduler.isDiceTime()) {
+  this._diceSessionActive = true;
+  this._diceSessionEnded = false; // Reset flag
+  // ...
+}
+
+Perubahan: Reset _diceSessionEnded = false saat restore
+Ringkasan Perubahan:
+No	Fungsi	Perubahan
+1	Constructor	Tambah _diceSessionEnded = false
+2	_processAlarm - session_start	Reset _diceSessionEnded = false
+3	_processAlarm - session_end	Set _diceSessionEnded = true, reset semua state
+4	_startDiceFast	Cek _diceSessionEnded
+5	_endDiceRound	Cek _diceSessionEnded untuk notifikasi dan start berikutnya
+6	_startCooldownAfterTieBreaker	Cek _diceSessionEnded
+7	_sendDiceNotificationOnSwitch	Cek _diceSessionEnded
+8	_restoreAllState	Reset _diceSessionEnded = false
+Efek Perubahan:
+
+    Setelah sesi berakhir (jam 02:00, 14:00, 23:00):
+
+        Tidak ada game baru yang bisa dimulai
+
+        Game yang sedang berjalan dihentikan
+
+        Semua state di-reset
+
+        Client mendapat notifikasi "Dice session ended"
+
+    Saat sesi baru dimulai:
+
+        Flag _diceSessionEnded di-reset ke false
+
+        Game bisa dimulai lagi
+
+    Tidak ada event baru - Semua menggunakan event yang sudah ada di client Java
+
+paakh tie breker sperti lowcrad skrng
+Perbandingan Tie Breaker dengan LowCard:
+Persamaan dengan LowCard:
+Fitur	LowCard	Tie Breaker
+Round system	✅ Ada round	✅ Ada round (Tie Round)
+Eliminasi	✅ Nilai terendah keluar	✅ Nilai rendah keluar
+Lanjut sampai 1 pemenang	✅ Ya	✅ Ya
+Notifikasi waktu	✅ 15s, 10s, 5s	✅ 15s, 10s, 5s
+Broadcast hasil round	✅ gameLowCardRoundResult	✅ diceTieAnswer
+Broadcast pemenang	✅ gameLowCardWinner	✅ diceWinner
+Event yang sudah ada	✅	✅
+Perbedaan dengan LowCard:
+Fitur	LowCard	Tie Breaker
+Tujuan	Nilai TERENDAH kalah	Nilai TERTINGGI menang
