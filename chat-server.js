@@ -59,31 +59,20 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    this._startRestore();
-  }
-
-  // ============ START RESTORE ============
-  
-  _startRestore() {
-    if (this._restoring) return;
-    this._restoring = true;
-    
-    this._restoreAllState()
-      .then(() => {
-        this._restored = true;
-        this._restoring = false;
-      })
-      .catch(() => {
-        this._restored = true;
-        this._restoring = false;
-        this._cacheInitialized = true;
-        if (!this._storageCache || Object.keys(this._storageCache.roomsData).length === 0) {
-          this._storageCache = {
-            roomsData: {},
-            currentNumber: 1
-          };
-        }
-      });
+    this._restoreAllState().then(() => {
+      this._restored = true;
+      this._restoring = false;
+    }).catch(() => {
+      this._restored = true;
+      this._restoring = false;
+      this._cacheInitialized = true;
+      if (!this._storageCache || Object.keys(this._storageCache.roomsData).length === 0) {
+        this._storageCache = {
+          roomsData: {},
+          currentNumber: 1
+        };
+      }
+    });
     
     setTimeout(() => {
       if (!this._restored) {
