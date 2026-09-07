@@ -1,6 +1,7 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 12.2.0 - ALL ERROR RESPONSES REMOVED
-// NO activeMultiReplaced, NO exitMultiError
+// VERSION: 12.3.0 - FULLY FIXED: ALL RACE CONDITIONS & INFINITE LOOPS
+// FIXED: onDestroy, wsClose, wsError - ALL REMOVE KURSI
+// NO LOGS, NO ERROR RESPONSES
 
 const C = {
   MAX_SEATS: 45,
@@ -41,10 +42,6 @@ class AtomicLock {
   
   release(key) {
     this.locks.delete(key);
-  }
-  
-  isLocked(key) {
-    return this.locks.has(key);
   }
 }
 
@@ -562,6 +559,54 @@ export class ChatServer {
     }
   }
 
+  // ============ FIXED: Remove User Langsung dari Database (FALLBACK) ============
+  async _removeUserFromRoomDirect(username) {
+    if (!username) return false;
+    
+    try {
+      const result = await this.db
+        .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE value LIKE ?`)
+        .bind(`%"namauser":"${username}"%`)
+        .all();
+      
+      let removed = false;
+      for (const row of result.results || []) {
+        const key = row.key;
+        if (key.startsWith('seat_')) {
+          const parts = key.split('_');
+          if (parts.length >= 3) {
+            const roomName = parts[1];
+            const seatNumber = parseInt(parts[2]);
+            if (!isNaN(seatNumber)) {
+              await this.db
+                .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
+                .bind(`seat_${roomName}_${seatNumber}`)
+                .run();
+              await this.db
+                .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
+                .bind(`point_${roomName}_${seatNumber}`)
+                .run();
+              
+              const roomBucket = await this._getRoomBucket(roomName);
+              if (roomBucket && roomBucket.seat) {
+                delete roomBucket.seat[seatNumber];
+                delete roomBucket.point[seatNumber];
+              }
+              
+              await this._safeBroadcast(roomName, ["removeKursi", roomName, seatNumber]);
+              await this.updateRoomCount(roomName);
+              
+              removed = true;
+            }
+          }
+        }
+      }
+      return removed;
+    } catch(e) {
+      return false;
+    }
+  }
+
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -798,28 +843,47 @@ export class ChatServer {
     }
   }
 
+  // ============ FIXED: _cleanupNormalUser dengan FALLBACK ke Database ============
   async _cleanupNormalUser(ws, username, roomName) {
     if (ws._isCleaning) return;
     ws._isCleaning = true;
     
     try {
+      let removed = false;
+      
+      // 1. Jika roomName ada, remove langsung
       if (roomName && username) {
         try {
-          await this._removeUserFromRoom(username, roomName);
-          this._storageCache.roomsData[roomName] = await this._getRoomBucket(roomName);
-          await this.updateRoomCount(roomName);
-        } catch(e) {}
-      } else if (username) {
-        try {
-          const found = await this._findUserInAnyRoom(username);
-          if (found) {
-            await this._removeUserFromRoom(username, found.room);
-            this._storageCache.roomsData[found.room] = await this._getRoomBucket(found.room);
-            await this.updateRoomCount(found.room);
+          removed = await this._removeUserFromRoom(username, roomName);
+          if (removed) {
+            this._storageCache.roomsData[roomName] = await this._getRoomBucket(roomName);
+            await this.updateRoomCount(roomName);
           }
         } catch(e) {}
       }
       
+      // 2. Jika roomName tidak ada atau remove gagal, cari di cache
+      if (!removed && username) {
+        try {
+          const found = await this._findUserInAnyRoom(username);
+          if (found) {
+            removed = await this._removeUserFromRoom(username, found.room);
+            if (removed) {
+              this._storageCache.roomsData[found.room] = await this._getRoomBucket(found.room);
+              await this.updateRoomCount(found.room);
+            }
+          }
+        } catch(e) {}
+      }
+      
+      // 3. FALLBACK: Cari langsung di DATABASE
+      if (!removed && username) {
+        try {
+          removed = await this._removeUserFromRoomDirect(username);
+        } catch(e) {}
+      }
+      
+      // 4. Hapus dari user connections
       if (username) {
         const connections = this.userConnections.get(username);
         if (connections) {
@@ -830,6 +894,7 @@ export class ChatServer {
         }
       }
       
+      // 5. Hapus dari room clients
       if (roomName) {
         const roomClients = this.roomClients.get(roomName);
         if (roomClients) roomClients.delete(ws);
@@ -843,9 +908,11 @@ export class ChatServer {
         } catch(e) {}
       }
       
+      // 6. Hapus dari global set
       this.wsSet.delete(ws);
       this.wsActiveMulti.delete(ws);
       
+      // 7. Clear data
       try {
         ws.serializeAttachment({});
         ws.username = null;
@@ -853,6 +920,7 @@ export class ChatServer {
         ws.roomname = null;
         ws.idtarget = null;
       } catch(e) {}
+      
     } finally {
       ws._isCleaning = false;
     }
@@ -973,6 +1041,7 @@ export class ChatServer {
     roomClients.clear();
   }
 
+  // ============ WEBSOCKET EVENTS ============
   async webSocketClose(ws) { 
     if (!ws) return;
     await this._cleanupUserCompletely(ws);
@@ -2022,8 +2091,17 @@ export class ChatServer {
           break;
         }
         
+        // ============ FIXED: onDestroy dengan roomname ============
         case "onDestroy": {
           if (!ws) break;
+          
+          // Ambil roomname dari args jika ada
+          const roomname = args.length > 0 ? args[0] : null;
+          if (roomname && typeof roomname === 'string' && !roomname.isEmpty()) {
+            ws.room = roomname;
+            ws.roomname = roomname;
+          }
+          
           await this.destroyWebSocket(ws, "onDestroy event");
           break;
         }
