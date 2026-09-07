@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 11.0.3 - FULL COMPATIBLE WITH ANDROID CLIENT
+// VERSION: 11.0.4 - FULL COMPATIBLE WITH ANDROID CLIENT
 
 const C = {
   MAX_SEATS: 45,
