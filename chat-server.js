@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 12.6.0 - COMPLETE FIXED ALL ISSUES
+// VERSION: 13.1.0 - FINAL CLEAN VERSION
 
 const C = {
   MAX_SEATS: 45,
@@ -10,7 +10,6 @@ const C = {
   LOCK_TIMEOUT: 5000,
   USER_JOIN_LOCK_TIMEOUT: 10000,
   CACHE_LOAD_TIMEOUT: 5000,
-  CLEANUP_BATCH_SIZE: 50,
 };
 
 const ROOMS = [
@@ -60,11 +59,8 @@ export class ChatServer {
     };
     this._cacheInitialized = false;
     this._cacheLoading = false;
+    this._cacheLoadingPromise = null;
     this._cacheLoadAttempts = 0;
-    
-    this._cleaningSet = new Set();
-    this._cleanupQueue = [];
-    this._isProcessingCleanup = false;
     
     // Inisialisasi room clients
     for (const room of ROOMS) {
@@ -120,7 +116,6 @@ export class ChatServer {
         )
       `).run();
 
-      // 1 QUERY UNTUK SEMUA DATA
       const result = await this.db
         .prepare(`SELECT key, value FROM ${TABLE_NAME}`)
         .all();
@@ -132,7 +127,6 @@ export class ChatServer {
 
       let currentNumber = 1;
 
-      // LOOP DI MEMORY - BUKAN DATABASE
       for (const row of result.results) {
         try {
           const key = row.key;
@@ -342,10 +336,10 @@ export class ChatServer {
     }
     
     if (this._cacheLoading) {
-      let waited = 0;
-      while (this._cacheLoading && waited < C.CACHE_LOAD_TIMEOUT) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-        waited += 100;
+      if (this._cacheLoadingPromise) {
+        try {
+          await this._cacheLoadingPromise;
+        } catch(e) {}
       }
       return this._storageCache || { roomsData: {}, currentNumber: 1 };
     }
@@ -369,17 +363,52 @@ export class ChatServer {
     }
     
     this._cacheLoading = true;
-    try {
-      await this._loadFromStorage();
-    } catch(e) {
-      if (!this._cacheInitialized) {
-        this._storageCache = { roomsData: {}, currentNumber: 1 };
+    this._cacheLoadingPromise = this._loadFromStorage()
+      .then(result => {
+        this._storageCache = result;
         this._cacheInitialized = true;
-      }
-    } finally {
-      this._cacheLoading = false;
+        return result;
+      })
+      .catch(e => {
+        if (!this._cacheInitialized) {
+          this._storageCache = { roomsData: {}, currentNumber: 1 };
+          this._cacheInitialized = true;
+        }
+        return this._storageCache;
+      })
+      .finally(() => {
+        this._cacheLoading = false;
+        this._cacheLoadingPromise = null;
+      });
+    
+    try {
+      await this._cacheLoadingPromise;
+    } catch(e) {}
+    
+    return this._storageCache || { roomsData: {}, currentNumber: 1 };
+  }
+
+  // ============ LOCK SYSTEM ============
+  async _withLock(lockMap, key, fn, timeout = C.LOCK_TIMEOUT) {
+    const start = Date.now();
+    let waited = 0;
+    
+    while (lockMap.has(key) && waited < timeout) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      waited += 50;
     }
-    return this._storageCache;
+    
+    if (lockMap.has(key)) {
+      lockMap.delete(key);
+    }
+    
+    lockMap.set(key, Date.now());
+    try {
+      const result = await fn();
+      return result;
+    } finally {
+      lockMap.delete(key);
+    }
   }
 
   // ============ UPDATE KURSI ============
@@ -461,16 +490,15 @@ export class ChatServer {
     const username = ws.username;
     const lockKey = `join_user_${username}`;
     
-    const existingLock = this._userJoinLock.get(lockKey);
-    if (existingLock && Date.now() - existingLock < C.USER_JOIN_LOCK_TIMEOUT) {
-      return false;
-    }
-    this._userJoinLock.set(lockKey, Date.now());
-    
     try {
-      return await this._joinInternal(ws, roomName, username);
-    } finally {
-      this._userJoinLock.delete(lockKey);
+      return await this._withLock(
+        this._userJoinLock, 
+        lockKey, 
+        () => this._joinInternal(ws, roomName, username),
+        C.USER_JOIN_LOCK_TIMEOUT
+      );
+    } catch(e) {
+      return false;
     }
   }
 
@@ -623,7 +651,7 @@ export class ChatServer {
     return { room: multiRoomname, seat: seat };
   }
 
-  // ============ WEBSOCKET CLEANUP - PER USER ============
+  // ============ WEBSOCKET CLEANUP ============
   async _cleanupUserCompletely(ws) {
     if (!ws) return;
     
@@ -631,39 +659,25 @@ export class ChatServer {
     if (!state) {
       state = {
         cleaning: false,
-        cleanupPromise: null,
-        cleanupDone: false
+        cleanupDone: false,
+        cleanupStart: null
       };
       _wsCleanupState.set(ws, state);
     }
     
     if (state.cleanupDone) return;
-    if (state.cleaning && state.cleanupPromise) {
-      return state.cleanupPromise;
+    
+    if (state.cleanupStart && Date.now() - state.cleanupStart > 10000) {
+      state.cleaning = false;
     }
     
     if (state.cleaning) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-      if (state.cleanupDone) return;
-      if (state.cleanupPromise) return state.cleanupPromise;
-      state.cleaning = false;
+      return;
     }
     
     state.cleaning = true;
-    state.cleanupPromise = this._performCleanup(ws, state);
+    state.cleanupStart = Date.now();
     
-    try {
-      await state.cleanupPromise;
-    } catch(e) {
-      // Silent
-    } finally {
-      state.cleaning = false;
-      state.cleanupDone = true;
-      state.cleanupPromise = null;
-    }
-  }
-
-  async _performCleanup(ws, state) {
     try {
       const username = ws.username || ws._username;
       const roomName = ws.room || ws.roomname || ws._room;
@@ -788,17 +802,6 @@ export class ChatServer {
       this.wsSet.delete(ws);
       this.wsActiveMulti.delete(ws);
       
-      if (this._cleaningSet) {
-        this._cleaningSet.delete(ws);
-      }
-      
-      if (this._cleanupQueue) {
-        const index = this._cleanupQueue.indexOf(ws);
-        if (index !== -1) {
-          this._cleanupQueue.splice(index, 1);
-        }
-      }
-      
       try {
         ws.serializeAttachment({});
         ws.username = null;
@@ -811,8 +814,10 @@ export class ChatServer {
         ws._room = null;
       } catch(e) {}
       
-    } catch(e) {
-      // Silent
+    } catch(e) {} finally {
+      state.cleaning = false;
+      state.cleanupDone = true;
+      state.cleanupStart = null;
     }
   }
 
@@ -828,7 +833,7 @@ export class ChatServer {
     }
     
     const state = _wsCleanupState.get(ws);
-    if (state && (state.cleaning || state.cleanupDone)) return;
+    if (state && state.cleanupDone) return;
     
     await this._cleanupUserCompletely(ws);
   }
@@ -844,7 +849,7 @@ export class ChatServer {
     }
     
     const state = _wsCleanupState.get(ws);
-    if (state && (state.cleaning || state.cleanupDone)) return;
+    if (state && state.cleanupDone) return;
     
     await this._cleanupUserCompletely(ws);
   }
@@ -856,68 +861,17 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ CLEANUP QUEUE ============
-  _queueCleanup(ws) {
-    if (!ws || this.isDestroyed) return;
-    
-    const state = _wsCleanupState.get(ws);
-    if (state && (state.cleaning || state.cleanupDone)) return;
-    
-    if (this._cleaningSet && this._cleaningSet.has(ws)) return;
-    
-    if (!this._cleaningSet) {
-      this._cleaningSet = new Set();
-    }
-    this._cleaningSet.add(ws);
-    
-    if (!this._cleanupQueue) {
-      this._cleanupQueue = [];
-    }
-    this._cleanupQueue.push(ws);
-    
-    if (!this._isProcessingCleanup) {
-      this._processCleanupQueue();
-    }
-  }
-
-  async _processCleanupQueue() {
-    if (this._isProcessingCleanup || this.isDestroyed) return;
-    this._isProcessingCleanup = true;
-    
-    try {
-      while (this._cleanupQueue && this._cleanupQueue.length > 0) {
-        const batchSize = Math.min(C.CLEANUP_BATCH_SIZE || 50, this._cleanupQueue.length);
-        const batch = this._cleanupQueue.splice(0, batchSize);
-        
-        for (const ws of batch) {
-          if (this._cleaningSet) {
-            this._cleaningSet.delete(ws);
-          }
-        }
-        
-        await Promise.allSettled(
-          batch.map(ws => this._cleanupUserCompletely(ws))
-        );
-      }
-    } catch(e) {
-      // Silent
-    } finally {
-      this._isProcessingCleanup = false;
-      if (this._cleanupQueue && this._cleanupQueue.length > 0 && !this.isDestroyed) {
-        this._processCleanupQueue();
-      }
-    }
-  }
-
   // ============ BROADCAST ============
   broadcast(room, msg) {
-    if (this.closing || this.isDestroyed || !room || !msg) return;
+    if (this.closing || this.isDestroyed || !room || !msg) return 0;
     try {
       const msgStr = JSON.stringify(msg);
       const clients = this.roomClients.get(room);
-      if (!clients || clients.size === 0) return;
+      if (!clients || clients.size === 0) return 0;
       
       const toRemove = new Set();
+      let sentCount = 0;
+      
       for (const ws of clients) {
         if (!ws) { 
           toRemove.add(ws); 
@@ -925,7 +879,7 @@ export class ChatServer {
         }
         
         const state = _wsCleanupState.get(ws);
-        if (state && (state.cleaning || state.cleanupDone)) {
+        if (state && state.cleanupDone) {
           toRemove.add(ws);
           continue;
         }
@@ -939,6 +893,7 @@ export class ChatServer {
         try {
           if (ws.readyState === 1 && !ws._closing && !ws._cleaning) {
             ws.send(msgStr);
+            sentCount++;
           } else {
             toRemove.add(ws);
           }
@@ -951,13 +906,14 @@ export class ChatServer {
         for (const ws of toRemove) {
           try {
             clients.delete(ws);
-            if (ws) {
-              this._queueCleanup(ws);
-            }
           } catch(e) {}
         }
       }
-    } catch(e) {}
+      
+      return sentCount;
+    } catch(e) {
+      return 0;
+    }
   }
 
   safeSend(ws, msg) {
@@ -969,7 +925,6 @@ export class ChatServer {
       ws.send(JSON.stringify(msg));
       return true;
     } catch(e) {
-      this._queueCleanup(ws);
       return false;
     }
   }
@@ -1049,9 +1004,17 @@ export class ChatServer {
   // ============ ALARM ============
   async alarm() {
     if (this.closing || this.isDestroyed) return;
+    
+    if (!this._restored && this._restorePromise) {
+      try {
+        await Promise.race([
+          this._restorePromise,
+          new Promise(resolve => setTimeout(resolve, C.CACHE_LOAD_TIMEOUT))
+        ]);
+      } catch(e) {}
+    }
+    
     await this._updateNumber();
-    this._cleanupStaleLocks();
-    await this._cleanupStorage();
     this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
   }
 
@@ -1072,44 +1035,6 @@ export class ChatServer {
     }
   }
 
-  // ============ CLEANUP STORAGE ============
-  async _cleanupStorage() {
-    try {
-      await this._ensureCacheInitialized();
-      const roomsData = this._storageCache.roomsData || {};
-      
-      for (const [roomName, roomBucket] of Object.entries(roomsData)) {
-        const hasSeats = roomBucket.seat && Object.values(roomBucket.seat).some(s => s?.namauser);
-        const hasPoints = roomBucket.point && Object.keys(roomBucket.point).length > 0;
-        if (!hasSeats && !hasPoints) {
-          delete roomsData[roomName];
-          await this.db
-            .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE ? OR key LIKE ? OR key = ?`)
-            .bind(`seat_${roomName}_%`, `point_${roomName}_%`, `mute_${roomName}`)
-            .run();
-        }
-      }
-      
-      this._storageCache.roomsData = roomsData;
-    } catch(e) {}
-  }
-
-  // ============ CLEANUP STALE LOCKS ============
-  _cleanupStaleLocks() {
-    try {
-      const now = Date.now();
-      for (const [key, time] of this._joinLocks) {
-        if (now - time > C.LOCK_TIMEOUT) this._joinLocks.delete(key);
-      }
-      for (const [key, time] of this._kursiLocks) {
-        if (now - time > C.LOCK_TIMEOUT) this._kursiLocks.delete(key);
-      }
-      for (const [key, time] of this._userJoinLock) {
-        if (now - time > C.USER_JOIN_LOCK_TIMEOUT) this._userJoinLock.delete(key);
-      }
-    } catch(e) {}
-  }
-
   // ============ RESTORE ============
   async _restoreAllState() {
     try {
@@ -1117,10 +1042,33 @@ export class ChatServer {
       await this._ensureCacheInitialized();
       
       const webSockets = this.ctx.getWebSockets();
-      let restoredCount = 0;
+      
+      const batchSize = 10;
+      for (let i = 0; i < webSockets.length; i += batchSize) {
+        const batch = webSockets.slice(i, i + batchSize);
+        await Promise.allSettled(
+          batch.map(ws => this._restoreSingleWebSocket(ws))
+        );
+      }
       
       for (const ws of webSockets) {
         try {
+          const state = _wsCleanupState.get(ws);
+          if (state) {
+            state.cleaning = false;
+            state.cleanupDone = false;
+            state.cleanupStart = null;
+          } else {
+            _wsCleanupState.set(ws, {
+              cleaning: false,
+              cleanupDone: false,
+              cleanupStart: null
+            });
+          }
+          
+          ws._closing = false;
+          ws._cleaning = false;
+          
           const attachment = ws.deserializeAttachment();
           if (attachment?.username) {
             const found = await this._findUserInAnyRoom(attachment.username);
@@ -1128,50 +1076,11 @@ export class ChatServer {
               ws.username = attachment.username;
               ws.room = found.room;
               ws.roomname = found.room;
-              ws.idtarget = attachment.username;
-              ws._closing = false;
-              ws._cleaning = false;
               ws._username = attachment.username;
               ws._room = found.room;
-              ws._wsId = Date.now() + Math.random();
-              
-              const state = _wsCleanupState.get(ws);
-              if (state) {
-                state.cleaning = false;
-                state.cleanupPromise = null;
-                state.cleanupDone = false;
-              } else {
-                _wsCleanupState.set(ws, {
-                  cleaning: false,
-                  cleanupPromise: null,
-                  cleanupDone: false
-                });
-              }
-              
-              const roomClients = this.roomClients.get(found.room);
-              if (roomClients && !roomClients.has(ws)) {
-                roomClients.add(ws);
-              }
-              
-              let conns = this.userConnections.get(attachment.username);
-              if (!conns) {
-                conns = new Set();
-                this.userConnections.set(attachment.username, conns);
-              }
-              if (!conns.has(ws)) {
-                conns.add(ws);
-              }
-              
-              if (!this.wsSet.has(ws)) {
-                this.wsSet.add(ws);
-              }
-              
-              restoredCount++;
             }
           }
-        } catch(e) {
-          continue;
-        }
+        } catch(e) {}
       }
       
       if (!this.closing && !this.isDestroyed) {
@@ -1197,8 +1106,27 @@ export class ChatServer {
         this.broadcast(room, ["currentNumber", this.currentNumber]);
       }
       
+      for (const ws of webSockets) {
+        try {
+          if (ws.readyState === 1 && ws.username && ws.room) {
+            await this.sendAllStateTo(ws, ws.room, false);
+            
+            const roomBucket = this._storageCache.roomsData[ws.room];
+            if (roomBucket) {
+              this.safeSend(ws, ["muteTypeResponse", roomBucket.mute || false, ws.room]);
+            }
+            
+            const found = await this._findUserInAnyRoom(ws.username);
+            if (found) {
+              this.safeSend(ws, ["numberKursiSaya", found.seat]);
+            }
+          }
+        } catch(e) {}
+      }
+      
       this._restored = true;
       this._restoreDone = true;
+      this._restoreFailed = false;
       
       return true;
       
@@ -1218,6 +1146,76 @@ export class ChatServer {
       
       throw e;
     }
+  }
+
+  async _restoreSingleWebSocket(ws) {
+    try {
+      const attachment = ws.deserializeAttachment();
+      if (!attachment?.username) return;
+      
+      const found = await this._findUserInAnyRoom(attachment.username);
+      if (!found) {
+        try {
+          ws.serializeAttachment({});
+          ws.username = null;
+          ws.room = null;
+          ws.roomname = null;
+          ws.idtarget = null;
+          ws._username = null;
+          ws._room = null;
+          _wsCleanupState.delete(ws);
+          this.wsSet.delete(ws);
+        } catch(e) {}
+        return;
+      }
+      
+      ws.username = attachment.username;
+      ws.room = found.room;
+      ws.roomname = found.room;
+      ws.idtarget = attachment.username;
+      ws._closing = false;
+      ws._cleaning = false;
+      ws._username = attachment.username;
+      ws._room = found.room;
+      ws._wsId = Date.now() + Math.random();
+      
+      const state = _wsCleanupState.get(ws);
+      if (state) {
+        state.cleaning = false;
+        state.cleanupDone = false;
+        state.cleanupStart = null;
+      } else {
+        _wsCleanupState.set(ws, {
+          cleaning: false,
+          cleanupDone: false,
+          cleanupStart: null
+        });
+      }
+      
+      const roomClients = this.roomClients.get(found.room);
+      if (roomClients && !roomClients.has(ws)) {
+        roomClients.add(ws);
+      }
+      
+      let conns = this.userConnections.get(attachment.username);
+      if (!conns) {
+        conns = new Set();
+        this.userConnections.set(attachment.username, conns);
+      }
+      if (!conns.has(ws)) {
+        conns.add(ws);
+      }
+      
+      if (!this.wsSet.has(ws)) {
+        this.wsSet.add(ws);
+      }
+      
+      ws.serializeAttachment({
+        username: attachment.username,
+        seatInfo: found
+      });
+      
+    } catch(e) {}
   }
 
   // ============ HANDLE MESSAGE ============
@@ -1263,11 +1261,24 @@ export class ChatServer {
   async handleMessage(ws, raw) {
     if (!ws) return;
     
+    const state = _wsCleanupState.get(ws);
+    if (state && state.cleanupDone) {
+      return;
+    }
+    
+    if (ws._cleaning || ws._closing) {
+      return;
+    }
+    
     if (!this._restored && this._restorePromise) {
-      await Promise.race([
-        this._restorePromise,
-        new Promise(resolve => setTimeout(resolve, C.CACHE_LOAD_TIMEOUT))
-      ]);
+      try {
+        await Promise.race([
+          this._restorePromise,
+          new Promise(resolve => setTimeout(resolve, C.CACHE_LOAD_TIMEOUT))
+        ]);
+      } catch(e) {
+        return;
+      }
       if (!this._restored) {
         return;
       }
@@ -1295,8 +1306,7 @@ export class ChatServer {
           ws._room = ws.room || ws.roomname;
         }
         
-        const state = _wsCleanupState.get(ws);
-        if (state && (state.cleaning || state.cleanupDone)) {
+        if (state && state.cleanupDone) {
           return;
         }
         
@@ -1530,32 +1540,30 @@ export class ChatServer {
             break;
           }
           
-          const lockKey = `kursi_${kursiRoom}_${kursiSeat}`;
-          const now = Date.now();
-          const existingLock = this._kursiLocks.get(lockKey);
-          if (existingLock && now - existingLock < C.LOCK_TIMEOUT) {
-            break;
-          }
-          this._kursiLocks.set(lockKey, now);
-          
           try {
-            const updateData = {
-              noimageUrl: String(kursiNoimg || ""),
-              namauser: String(kursiName || ""),
-              color: String(kursiColor || ""),
-              itembawah: typeof kursiBawah === 'number' ? kursiBawah : (parseInt(kursiBawah) || 0),
-              itematas: typeof kursiAtas === 'number' ? kursiAtas : (parseInt(kursiAtas) || 0),
-              vip: typeof kursiVip === 'number' ? kursiVip : (parseInt(kursiVip) || 0),
-              viptanda: typeof kursiVt === 'number' ? kursiVt : (parseInt(kursiVt) || 0),
-              isMulti: seatData.isMulti || false
-            };
-            const result = await this._updateKursi(kursiRoom, kursiSeat, updateData);
-            if (result.success) {
-              this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, result.data]]]);
-            }
-          } catch(e) {} finally {
-            this._kursiLocks.delete(lockKey);
-          }
+            await this._withLock(
+              this._kursiLocks,
+              `kursi_${kursiRoom}_${kursiSeat}`,
+              async () => {
+                const updateData = {
+                  noimageUrl: String(kursiNoimg || ""),
+                  namauser: String(kursiName || ""),
+                  color: String(kursiColor || ""),
+                  itembawah: typeof kursiBawah === 'number' ? kursiBawah : (parseInt(kursiBawah) || 0),
+                  itematas: typeof kursiAtas === 'number' ? kursiAtas : (parseInt(kursiAtas) || 0),
+                  vip: typeof kursiVip === 'number' ? kursiVip : (parseInt(kursiVip) || 0),
+                  viptanda: typeof kursiVt === 'number' ? kursiVt : (parseInt(kursiVt) || 0),
+                  isMulti: seatData.isMulti || false
+                };
+                const result = await this._updateKursi(kursiRoom, kursiSeat, updateData);
+                if (result.success) {
+                  this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, result.data]]]);
+                }
+                return result;
+              },
+              C.LOCK_TIMEOUT
+            );
+          } catch(e) {}
           break;
         }
         
@@ -1823,11 +1831,25 @@ export class ChatServer {
     }
     
     if (!this._restored && this._restorePromise) {
-      await Promise.race([
-        this._restorePromise,
-        new Promise(resolve => setTimeout(resolve, C.CACHE_LOAD_TIMEOUT))
-      ]);
+      try {
+        await Promise.race([
+          this._restorePromise,
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Restore timeout')), C.CACHE_LOAD_TIMEOUT)
+          )
+        ]);
+      } catch(e) {
+        if (!this._cacheInitialized) {
+          this._storageCache = { roomsData: {}, currentNumber: 1 };
+          this._cacheInitialized = true;
+          this.currentNumber = 1;
+          this._restored = true;
+          this._restoreDone = true;
+          this._restoreFailed = true;
+        }
+      }
     }
+    
     await this._ensureCacheInitialized();
     
     try {
@@ -1859,6 +1881,12 @@ export class ChatServer {
       server._wsId = Date.now() + Math.random();
       server.serializeAttachment({});
       
+      _wsCleanupState.set(server, {
+        cleaning: false,
+        cleanupDone: false,
+        cleanupStart: null
+      });
+      
       if (!this.wsSet.has(server)) this.wsSet.add(server);
       
       return new Response(null, { status: 101, webSocket: client });
@@ -1876,13 +1904,6 @@ export class ChatServer {
     this._joinLocks.clear();
     this._kursiLocks.clear();
     this._userJoinLock.clear();
-    
-    if (this._cleanupQueue) {
-      this._cleanupQueue = [];
-    }
-    if (this._cleaningSet) {
-      this._cleaningSet.clear();
-    }
     
     const wsCopy = Array.from(this.wsSet);
     const cleanupPromises = [];
@@ -1926,7 +1947,10 @@ export class ChatServer {
     }
     
     if (cleanupPromises.length > 0) {
-      await Promise.allSettled(cleanupPromises);
+      await Promise.race([
+        Promise.allSettled(cleanupPromises),
+        new Promise(resolve => setTimeout(resolve, 3000))
+      ]);
     }
     
     for (const [username, conns] of this.userConnections) {
