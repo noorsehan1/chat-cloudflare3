@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1.js
-// VERSION: 12.0.8 - FINAL
+// VERSION: 12.1.0 - FULL WITH LOWCARD QUIZ
 // ============================================================
 
 // ============================================================
@@ -52,10 +52,32 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: "01:00", end: "02:00" },
-    { start: "16:00", end: "16:15" },
+    { start: "13:00", end: "14:00" },
     { start: "22:00", end: "23:00" }
   ],
   TIMEZONE_OFFSET: 8,
+};
+
+// LOWCARD QUIZ CONFIGURATION
+const LOWCARD_QUIZ_CONFIG = {
+  SCHEDULE: {
+    SESSIONS: [
+      { start: "14:00", end: "15:00" }
+    ],
+    TIMEZONE_OFFSET: 8,
+  },
+  BET_AMOUNT: 100,
+  MAX_GAMES_PER_SESSION: 20,
+  COOLDOWN_BETWEEN_GAMES_MS: 5000,
+  WIN_POINTS: 1,
+  ROOM_NAME: 'Lowcard',
+  ALARM_START: 'lowcard_quiz_session_start',
+  ALARM_END: 'lowcard_quiz_session_end',
+  ALARM_WEEKLY_RESET: 'lowcard_quiz_weekly_reset',
+  GAME_REGISTRATION_TIME_MS: 20000,
+  GAME_DRAW_TIME_MS: 20000,
+  GAME_EVALUATION_DELAY_MS: 2000,
+  MIN_PLAYERS_FOR_NO_BOT: 5,
 };
 
 const TABLE_NAME = 'game_data';
@@ -78,7 +100,14 @@ class DataManager {
       dicePoints: {},
       lastWeekWinner: null,
       lastResetWeek: null,
-      scheduled_alarms: {}
+      scheduled_alarms: {},
+      lowcardQuizPoints: {},
+      lowcardQuizLastWeekWinner: null,
+      lowcardQuizLastResetWeek: null,
+      lowcardQuizSessionActive: false,
+      lowcardQuizGameRunning: false,
+      lowcardQuizAutoStart: false,
+      lowcardQuizGameCount: 0,
     };
     this._cacheInitialized = false;
     this._cacheLoading = false;
@@ -122,7 +151,14 @@ class DataManager {
         dicePoints: {},
         lastWeekWinner: null,
         lastResetWeek: null,
-        scheduled_alarms: {}
+        scheduled_alarms: {},
+        lowcardQuizPoints: {},
+        lowcardQuizLastWeekWinner: null,
+        lowcardQuizLastResetWeek: null,
+        lowcardQuizSessionActive: false,
+        lowcardQuizGameRunning: false,
+        lowcardQuizAutoStart: false,
+        lowcardQuizGameCount: 0,
       };
 
       for (const row of result.results) {
@@ -148,6 +184,27 @@ class DataManager {
           case 'scheduled_alarms':
             cache.scheduled_alarms = value;
             break;
+          case 'lowcardQuizPoints':
+            cache.lowcardQuizPoints = value;
+            break;
+          case 'lowcardQuizLastWeekWinner':
+            cache.lowcardQuizLastWeekWinner = value;
+            break;
+          case 'lowcardQuizLastResetWeek':
+            cache.lowcardQuizLastResetWeek = value;
+            break;
+          case 'lowcardQuizSessionActive':
+            cache.lowcardQuizSessionActive = value;
+            break;
+          case 'lowcardQuizGameRunning':
+            cache.lowcardQuizGameRunning = value;
+            break;
+          case 'lowcardQuizAutoStart':
+            cache.lowcardQuizAutoStart = value;
+            break;
+          case 'lowcardQuizGameCount':
+            cache.lowcardQuizGameCount = value;
+            break;
         }
       }
 
@@ -163,7 +220,14 @@ class DataManager {
         dicePoints: {},
         lastWeekWinner: null,
         lastResetWeek: null,
-        scheduled_alarms: {}
+        scheduled_alarms: {},
+        lowcardQuizPoints: {},
+        lowcardQuizLastWeekWinner: null,
+        lowcardQuizLastResetWeek: null,
+        lowcardQuizSessionActive: false,
+        lowcardQuizGameRunning: false,
+        lowcardQuizAutoStart: false,
+        lowcardQuizGameCount: 0,
       };
       this._cacheInitialized = true;
       this._restored = true;
@@ -197,6 +261,10 @@ class DataManager {
       .run();
   }
 
+  // ============================================================
+  // Recording Status
+  // ============================================================
+  
   async getRecordingStatus(room) {
     await this._ensureCacheInitialized();
     return this._cache.recordingStatusMap[room] === true;
@@ -218,6 +286,10 @@ class DataManager {
     return this._cache.recordingStatusMap;
   }
 
+  // ============================================================
+  // Winners
+  // ============================================================
+  
   async getWinners(room) {
     await this._ensureCacheInitialized();
     return this._cache.winnersMap[room] || {};
@@ -255,6 +327,10 @@ class DataManager {
     return this._cache.winnersMap;
   }
 
+  // ============================================================
+  // Dice Points
+  // ============================================================
+  
   async getDicePoints() {
     await this._ensureCacheInitialized();
     return this._cache.dicePoints;
@@ -368,6 +444,139 @@ class DataManager {
     return `${year}-W${String(week).padStart(2, '0')}`;
   }
 
+  // ============================================================
+  // LOWCARD QUIZ POINTS
+  // ============================================================
+  
+  async getLowcardQuizPoints() {
+    await this._ensureCacheInitialized();
+    if (!this._cache.lowcardQuizPoints) {
+      this._cache.lowcardQuizPoints = {};
+    }
+    return this._cache.lowcardQuizPoints;
+  }
+
+  async setLowcardQuizPoints(points) {
+    await this._ensureCacheInitialized();
+    const cleanPoints = {};
+    for (const [username, score] of Object.entries(points || {})) {
+      if (username && typeof username === 'string') {
+        const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
+        if (numericScore > 0) {
+          cleanPoints[username] = numericScore;
+        }
+      }
+    }
+    this._cache.lowcardQuizPoints = cleanPoints;
+    await this._save('lowcardQuizPoints', this._cache.lowcardQuizPoints);
+    return true;
+  }
+
+  async addLowcardQuizPoint(username, points = 1) {
+    await this._ensureCacheInitialized();
+    const allPoints = await this.getLowcardQuizPoints();
+    allPoints[username] = (allPoints[username] || 0) + points;
+    await this.setLowcardQuizPoints(allPoints);
+    return allPoints;
+  }
+
+  async resetLowcardQuizPoints() {
+    await this._ensureCacheInitialized();
+    this._cache.lowcardQuizPoints = {};
+    await this._save('lowcardQuizPoints', this._cache.lowcardQuizPoints);
+    return true;
+  }
+
+  async getLowcardQuizLeaderboard(limit = 10) {
+    await this._ensureCacheInitialized();
+    const points = this._cache.lowcardQuizPoints || {};
+    if (!points || Object.keys(points).length === 0) return [];
+    
+    const safeLimit = Math.min(
+      Math.max(limit, CONSTANTS.MIN_LEADERBOARD_LIMIT || 1),
+      CONSTANTS.MAX_LEADERBOARD_LIMIT || 30
+    );
+    
+    const sorted = Object.entries(points)
+      .filter(([username, score]) => username && score > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, safeLimit);
+    
+    return sorted.map(([u, s]) => `${u}|${s}`);
+  }
+
+  async getLowcardQuizLastWeekWinner() {
+    await this._ensureCacheInitialized();
+    return this._cache.lowcardQuizLastWeekWinner || null;
+  }
+
+  async setLowcardQuizLastWeekWinner(winnerData) {
+    await this._ensureCacheInitialized();
+    this._cache.lowcardQuizLastWeekWinner = winnerData;
+    await this._save('lowcardQuizLastWeekWinner', this._cache.lowcardQuizLastWeekWinner);
+    return true;
+  }
+
+  async getLowcardQuizLastResetWeek() {
+    await this._ensureCacheInitialized();
+    return this._cache.lowcardQuizLastResetWeek || null;
+  }
+
+  async setLowcardQuizLastResetWeek(week) {
+    await this._ensureCacheInitialized();
+    this._cache.lowcardQuizLastResetWeek = week;
+    await this._save('lowcardQuizLastResetWeek', this._cache.lowcardQuizLastResetWeek);
+    return true;
+  }
+
+  async getLowcardQuizSessionActive() {
+    await this._ensureCacheInitialized();
+    return this._cache.lowcardQuizSessionActive || false;
+  }
+
+  async setLowcardQuizSessionActive(active) {
+    await this._ensureCacheInitialized();
+    this._cache.lowcardQuizSessionActive = active;
+    await this._save('lowcardQuizSessionActive', this._cache.lowcardQuizSessionActive);
+    return true;
+  }
+
+  async getLowcardQuizGameRunning() {
+    await this._ensureCacheInitialized();
+    return this._cache.lowcardQuizGameRunning || false;
+  }
+
+  async setLowcardQuizGameRunning(running) {
+    await this._ensureCacheInitialized();
+    this._cache.lowcardQuizGameRunning = running;
+    await this._save('lowcardQuizGameRunning', this._cache.lowcardQuizGameRunning);
+    return true;
+  }
+
+  async getLowcardQuizAutoStart() {
+    await this._ensureCacheInitialized();
+    return this._cache.lowcardQuizAutoStart || false;
+  }
+
+  async setLowcardQuizAutoStart(enabled) {
+    await this._ensureCacheInitialized();
+    this._cache.lowcardQuizAutoStart = enabled;
+    await this._save('lowcardQuizAutoStart', this._cache.lowcardQuizAutoStart);
+    return true;
+  }
+
+  async getLowcardQuizGameCount() {
+    await this._ensureCacheInitialized();
+    return this._cache.lowcardQuizGameCount || 0;
+  }
+
+  async setLowcardQuizGameCount(count) {
+    await this._ensureCacheInitialized();
+    this._cache.lowcardQuizGameCount = count;
+    await this._save('lowcardQuizGameCount', this._cache.lowcardQuizGameCount);
+    return true;
+  }
+
   async clearAllData() {
     await this._ensureCacheInitialized();
     this._cache = {
@@ -376,7 +585,14 @@ class DataManager {
       dicePoints: {},
       lastWeekWinner: null,
       lastResetWeek: null,
-      scheduled_alarms: {}
+      scheduled_alarms: {},
+      lowcardQuizPoints: {},
+      lowcardQuizLastWeekWinner: null,
+      lowcardQuizLastResetWeek: null,
+      lowcardQuizSessionActive: false,
+      lowcardQuizGameRunning: false,
+      lowcardQuizAutoStart: false,
+      lowcardQuizGameCount: 0,
     };
     await this.db.prepare(`DELETE FROM ${TABLE_NAME}`).run();
     this._cacheInitialized = true;
@@ -424,6 +640,7 @@ class AlarmScheduler {
       await this._clearAllAlarms();
       await this._scheduleWeeklyResetUTC();
       
+      // Dice Quiz Schedule
       let currentSession = null;
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
@@ -439,32 +656,34 @@ class AlarmScheduler {
         if (endDelay > 0) {
           await this._scheduleAlarm('dice_session_end', endDelay);
         }
-        return true;
-      }
-      
-      let nextSession = null;
-      let minDiff = Infinity;
-      for (const session of QUIZ_SCHEDULE.SESSIONS) {
-        const startTotal = parseTime(session.start);
-        let diff = startTotal - currentTotal;
-        if (diff < 0) diff += 24 * 60;
-        if (diff < minDiff) {
-          minDiff = diff;
-          nextSession = { ...session, startTotal, status: 'upcoming' };
+      } else {
+        let nextSession = null;
+        let minDiff = Infinity;
+        for (const session of QUIZ_SCHEDULE.SESSIONS) {
+          const startTotal = parseTime(session.start);
+          let diff = startTotal - currentTotal;
+          if (diff < 0) diff += 24 * 60;
+          if (diff < minDiff) {
+            minDiff = diff;
+            nextSession = { ...session, startTotal, status: 'upcoming' };
+          }
         }
-      }
-      
-      if (nextSession) {
-        let startDelay = minDiff * 60 * 1000;
-        if (startDelay < 0) startDelay = 0;
-        await this._scheduleAlarm('dice_session_start', startDelay);
         
-        const endTotal = parseTime(nextSession.end);
-        const endDelay = (endTotal - currentTotal) * 60 * 1000;
-        if (endDelay > 0) {
-          await this._scheduleAlarm('dice_session_end', endDelay);
+        if (nextSession) {
+          let startDelay = minDiff * 60 * 1000;
+          if (startDelay < 0) startDelay = 0;
+          await this._scheduleAlarm('dice_session_start', startDelay);
+          
+          const endTotal = parseTime(nextSession.end);
+          const endDelay = (endTotal - currentTotal) * 60 * 1000;
+          if (endDelay > 0) {
+            await this._scheduleAlarm('dice_session_end', endDelay);
+          }
         }
       }
+      
+      // Lowcard Quiz Schedule (12:00 - 12:30 WITA)
+      await this._scheduleLowcardQuizAlarms();
       
       return true;
     } catch(e) { 
@@ -497,6 +716,61 @@ class AlarmScheduler {
       
       if (delayMs > 0) {
         await this._scheduleAlarm(CONSTANTS.WEEKLY_RESET_ALARM, delayMs);
+        await this._scheduleAlarm(LOWCARD_QUIZ_CONFIG.ALARM_WEEKLY_RESET, delayMs);
+      }
+      
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _scheduleLowcardQuizAlarms() {
+    try {
+      const now = new Date();
+      const witaNow = this._toWITA(now);
+      const currentTotal = witaNow.getHours() * 60 + witaNow.getMinutes();
+      
+      let currentSession = null;
+      for (const session of LOWCARD_QUIZ_CONFIG.SCHEDULE.SESSIONS) {
+        const startTotal = parseTime(session.start);
+        const endTotal = parseTime(session.end);
+        if (currentTotal >= startTotal && currentTotal < endTotal) {
+          currentSession = { ...session, startTotal, endTotal, status: 'active' };
+          break;
+        }
+      }
+      
+      if (currentSession) {
+        const endDelay = (currentSession.endTotal - currentTotal) * 60 * 1000;
+        if (endDelay > 0) {
+          await this._scheduleAlarm(LOWCARD_QUIZ_CONFIG.ALARM_END, endDelay);
+        }
+        return true;
+      }
+      
+      let nextSession = null;
+      let minDiff = Infinity;
+      for (const session of LOWCARD_QUIZ_CONFIG.SCHEDULE.SESSIONS) {
+        const startTotal = parseTime(session.start);
+        let diff = startTotal - currentTotal;
+        if (diff < 0) diff += 24 * 60;
+        if (diff < minDiff) {
+          minDiff = diff;
+          nextSession = { ...session, startTotal, status: 'upcoming' };
+        }
+      }
+      
+      if (nextSession) {
+        let startDelay = minDiff * 60 * 1000;
+        if (startDelay < 0) startDelay = 0;
+        await this._scheduleAlarm(LOWCARD_QUIZ_CONFIG.ALARM_START, startDelay);
+        
+        const endTotal = parseTime(nextSession.end);
+        const endDelay = (endTotal - currentTotal) * 60 * 1000;
+        if (endDelay > 0) {
+          await this._scheduleAlarm(LOWCARD_QUIZ_CONFIG.ALARM_END, endDelay);
+        }
       }
       
       return true;
@@ -644,7 +918,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER
+// GAME SERVER - FULL CLASS
 // ============================================================
 
 export class GameServer {
@@ -675,6 +949,7 @@ export class GameServer {
       this._lastWinnerRequestTime = new Map();
       this._notificationTimers = new Set();
       
+      // Dice state
       this.currentDiceRoll = null;
       this._diceLock = false;
       this._tieActive = false;
@@ -701,11 +976,11 @@ export class GameServer {
       this._diceTaskRunning = false;
       this._canSubmitDiceAnswer = false;
       this._diceRound = 0;
-      
       this._diceSessionActive = false;
       this._diceStartedByUser = false;
       this._diceSessionEnded = false;
       
+      // Tie breaker state
       this._tieBreakers = new Map();
       this._tieRound = 0;
       this._tiePlayers = [];
@@ -715,6 +990,7 @@ export class GameServer {
       this._tieLock = false;
       this._tieNotificationTimeouts = [];
       
+      // Locks
       this._gameLocks = new Map();
       this._joinLocks = new Map();
       this._cleanupTimers = new Map();
@@ -725,12 +1001,18 @@ export class GameServer {
       this._drawLocks = new Map();
       this._cleanupLocks = new Map();
       
+      // Rate limiting
       this._requestCount = 0;
       this._lastResetTime = Date.now();
       this._circuitOpen = false;
       this._errorCount = 0;
       this._lastErrorReset = Date.now();
       this._reconnectAttempts = new Map();
+      
+      // Lowcard Quiz state
+      this._lowcardQuizCooldownTimer = null;
+      this._quizActive = false;
+      this._quizEnded = false;
       
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
       
@@ -759,6 +1041,7 @@ export class GameServer {
       await this._restoreWebSockets();
       this._initialized = true;
       
+      // Dice restore
       if (this.alarmScheduler.isDiceTime()) {
         this._diceSessionActive = true;
         this._diceSessionEnded = false;
@@ -766,6 +1049,15 @@ export class GameServer {
         if (clients && clients.size > 0) {
           this._startDiceFast();
         }
+      }
+      
+      // Lowcard Quiz restore
+      const lqSessionActive = await this.dataManager.getLowcardQuizSessionActive();
+      const lqAutoStart = await this.dataManager.getLowcardQuizAutoStart();
+      const lqGameRunning = await this.dataManager.getLowcardQuizGameRunning();
+      
+      if (lqSessionActive && lqAutoStart && !lqGameRunning) {
+        this._startLowcardQuizGame();
       }
       
       if (!this.closing && !this.isDestroyed) {
@@ -978,7 +1270,19 @@ export class GameServer {
         if (this._tieActive) {
           this._resetTieBreakerState(null);
         }
+        break;
         
+      // ============================================================
+      // LOWCARD QUIZ ALARMS
+      // ============================================================
+      case LOWCARD_QUIZ_CONFIG.ALARM_START:
+        await this._handleLowcardQuizSessionStart();
+        break;
+      case LOWCARD_QUIZ_CONFIG.ALARM_END:
+        await this._handleLowcardQuizSessionEnd();
+        break;
+      case LOWCARD_QUIZ_CONFIG.ALARM_WEEKLY_RESET:
+        await this._handleLowcardQuizWeeklyReset();
         break;
     }
   }
@@ -1287,6 +1591,236 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
+      // ============================================================
+      // LOWCARD QUIZ EVENTS
+      // ============================================================
+      
+      if (evt === "getLowcardQuizPoints") {
+        try {
+          const points = await this.dataManager.getLowcardQuizPoints();
+          this._safeSend(ws, ["lowcardQuizPoints", points]);
+        } catch(e) { 
+          this._safeSend(ws, ["lowcardQuizPoints", {}]);
+        }
+        return;
+      }
+
+      if (evt === "getLowcardQuizLeaderboard") {
+        try {
+          let limit = CONSTANTS.DEFAULT_LEADERBOARD_LIMIT || 10;
+          if (data.length > 1 && typeof data[1] === 'number') {
+            limit = Math.min(Math.max(data[1], 1), CONSTANTS.MAX_LEADERBOARD_LIMIT || 30);
+          }
+          const leaderboard = await this.dataManager.getLowcardQuizLeaderboard(limit);
+          this._safeSend(ws, ["lowcardQuizLeaderboard", leaderboard]);
+        } catch(e) { 
+          this._safeSend(ws, ["lowcardQuizLeaderboard", []]);
+        }
+        return;
+      }
+
+      if (evt === "getLowcardQuizLastWeekWinner") {
+        try {
+          const now = Date.now();
+          if (!this._lastWinnerRequestTime) this._lastWinnerRequestTime = new Map();
+          const lastReq = this._lastWinnerRequestTime.get(ws._wsId) || 0;
+          if (now - lastReq < 5000) return;
+          this._lastWinnerRequestTime.set(ws._wsId, now);
+          
+          const winner = await this.dataManager.getLowcardQuizLastWeekWinner();
+          if (winner && typeof winner === 'object' && winner.username) {
+            this._safeSend(ws, [
+              "lowcardQuizLastWeekWinner", 
+              String(winner.username), 
+              parseInt(winner.score, 10) || 0, 
+              String(winner.week || '')
+            ]);
+          } else {
+            this._safeSend(ws, ["lowcardQuizLastWeekWinner", "", 0, ""]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["lowcardQuizLastWeekWinner", "", 0, ""]);
+        }
+        return;
+      }
+
+      if (evt === "getLowcardQuizStatus") {
+        const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+        const gameRunning = await this.dataManager.getLowcardQuizGameRunning();
+        const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+        const gameCount = await this.dataManager.getLowcardQuizGameCount();
+        const maxGames = LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION;
+        const timeLeft = this._getLowcardQuizTimeLeft();
+        const isQuizTime = this._isLowcardQuizTime();
+        const isQuizEnded = this._isLowcardQuizEnded();
+        
+        const game = this.activeGames.get(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+        let playerCount = 0;
+        let humanCount = 0;
+        let botCount = 0;
+        let isGameActive = false;
+        
+        if (game && game._isActive) {
+          isGameActive = true;
+          playerCount = game.players.size;
+          humanCount = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_')).length;
+          botCount = playerCount - humanCount;
+        }
+        
+        const isActive = sessionActive || autoStart || isQuizTime;
+        const canStart = !isActive && !sessionActive && !autoStart && !isQuizTime;
+        
+        this._safeSend(ws, ["lowcardQuizStatus", {
+          sessionActive: sessionActive,
+          gameRunning: gameRunning,
+          autoStart: autoStart,
+          gameCount: gameCount,
+          maxGames: maxGames,
+          nextGameIn: timeLeft.text,
+          isQuizTime: isQuizTime,
+          isQuizEnded: isQuizEnded,
+          betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+          players: playerCount,
+          humans: humanCount,
+          bots: botCount,
+          isGameActive: isGameActive,
+          canStartGame: canStart,
+          mode: isActive ? "quiz" : "normal",
+          botRule: "Bot only if less than 5 human players",
+          message: isActive ? "Quiz is running! Auto-game only." : "Normal mode - Start games manually"
+        }]);
+        return;
+      }
+
+      if (evt === "getLowcardQuizMode") {
+        const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+        const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+        const isQuizTime = this._isLowcardQuizTime();
+        const isQuizEnded = this._isLowcardQuizEnded();
+        
+        if (isQuizEnded && !isQuizTime) {
+          await this._forceResetLowcardQuizMode();
+        }
+        
+        const isActive = sessionActive || autoStart || isQuizTime;
+        const canStart = !isActive && !sessionActive && !autoStart && !isQuizTime;
+        
+        this._safeSend(ws, ["lowcardQuizMode", {
+          mode: isActive ? "quiz" : "normal",
+          canStartGame: canStart,
+          isQuizTime: isQuizTime,
+          isQuizEnded: isQuizEnded,
+          message: isActive ? "Quiz is running! Auto-game only." : "Normal mode - Start games manually"
+        }]);
+        return;
+      }
+
+      // ============================================================
+      // DICE EVENTS
+      // ============================================================
+      
+      if (evt === "submitDiceAnswer") {
+        await this.submitDiceAnswer(ws, data[1], data[2]);
+        return;
+      }
+
+      if (evt === "getDiceLastWeekWinner") {
+        try {
+          const wsId = ws._wsId;
+          const now = Date.now();
+          if (!this._lastWinnerRequestTime) this._lastWinnerRequestTime = new Map();
+          const lastReq = this._lastWinnerRequestTime.get(wsId) || 0;
+          if (now - lastReq < 5000) return;
+          this._lastWinnerRequestTime.set(wsId, now);
+          
+          const winner = await this.dataManager.getLastWeekWinner();
+          
+          if (winner && typeof winner === 'object' && winner.username) {
+            this._safeSend(ws, [
+              "diceLastWeekWinner", 
+              String(winner.username), 
+              parseInt(winner.score, 10) || 0, 
+              String(winner.week || '')
+            ]);
+          } else {
+            this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
+        }
+        return;
+      }
+
+      if (evt === "deleteDiceLastWeekWinner") {
+        try {
+          await this.dataManager.deleteLastWeekWinner();
+          this._safeSend(ws, ["diceLastWeekWinnerDeleted", true, "Deleted"]);
+        } catch(e) { 
+          this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, e.message]); 
+        }
+        return;
+      }
+
+      if (evt === "getDiceLeaderboard") {
+        try {
+          let limit = CONSTANTS.DEFAULT_LEADERBOARD_LIMIT;
+          if (data.length > 1 && typeof data[1] === 'number') {
+            limit = Math.min(Math.max(data[1], CONSTANTS.MIN_LEADERBOARD_LIMIT), CONSTANTS.MAX_LEADERBOARD_LIMIT);
+          }
+          
+          const leaderboard = await this.dataManager.getLeaderboard(limit);
+          this._safeSend(ws, ["diceLeaderboard", leaderboard]);
+        } catch(e) { 
+          this._safeSend(ws, ["diceLeaderboard", []]);
+        }
+        return;
+      }
+
+      if (evt === "getDicePoints") {
+        try {
+          const points = await this.dataManager.getDicePoints();
+          this._safeSend(ws, ["dicePoints", points]);
+        } catch(e) { 
+          this._safeSend(ws, ["dicePoints", {}]);
+        }
+        return;
+      }
+
+      if (evt === "getDiceStatus") {
+        const isActive = !!this.currentDiceRoll && this._canSubmitDiceAnswer;
+        this._safeSend(ws, ["diceStatus", isActive, this._diceRound || 1]);
+        return;
+      }
+
+      if (evt === "getDiceNotification") {
+        try {
+          const isDiceTime = this.alarmScheduler.isDiceTime();
+          const isActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
+          const timeLeft = this._getTimeLeftUntilNextDice();
+          let notification = "";
+          if (isActive) {
+            const elapsed = (Date.now() - this._diceStartTime) / 1000;
+            const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
+            const remaining = Math.max(0, totalTime - elapsed);
+            notification = Math.floor(remaining) + "s remaining";
+          } else if (isDiceTime) {
+            notification = "Dice game starting soon...";
+          } else if (timeLeft && timeLeft.text) {
+            notification = "Next dice game in: " + timeLeft.text;
+          } else {
+            notification = "Waiting...";
+          }
+          this._safeSend(ws, ["diceNotification", notification]);
+        } catch(e) {
+          this._safeSend(ws, ["diceNotification", "Waiting..."]);
+        }
+        return;
+      }
+
+      // ============================================================
+      // RECORDING EVENTS
+      // ============================================================
+      
       if (evt === "switchRoom") {
         await this.switchRoom(ws, data[1], data[2]);
         return;
@@ -1392,104 +1926,6 @@ export class GameServer {
         return;
       }
 
-      if (evt === "submitDiceAnswer") {
-        await this.submitDiceAnswer(ws, data[1], data[2]);
-        return;
-      }
-
-      if (evt === "getDiceLastWeekWinner") {
-        try {
-          const wsId = ws._wsId;
-          const now = Date.now();
-          if (!this._lastWinnerRequestTime) this._lastWinnerRequestTime = new Map();
-          const lastReq = this._lastWinnerRequestTime.get(wsId) || 0;
-          if (now - lastReq < 5000) return;
-          this._lastWinnerRequestTime.set(wsId, now);
-          
-          const winner = await this.dataManager.getLastWeekWinner();
-          
-          if (winner && typeof winner === 'object' && winner.username) {
-            this._safeSend(ws, [
-              "diceLastWeekWinner", 
-              String(winner.username), 
-              parseInt(winner.score, 10) || 0, 
-              String(winner.week || '')
-            ]);
-          } else {
-            this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
-          }
-        } catch(e) {
-          this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
-        }
-        return;
-      }
-
-      if (evt === "deleteDiceLastWeekWinner") {
-        try {
-          await this.dataManager.deleteLastWeekWinner();
-          this._safeSend(ws, ["diceLastWeekWinnerDeleted", true, "Deleted"]);
-        } catch(e) { 
-          this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, e.message]); 
-        }
-        return;
-      }
-
-      if (evt === "getDiceLeaderboard") {
-        try {
-          let limit = CONSTANTS.DEFAULT_LEADERBOARD_LIMIT;
-          if (data.length > 1 && typeof data[1] === 'number') {
-            limit = Math.min(Math.max(data[1], CONSTANTS.MIN_LEADERBOARD_LIMIT), CONSTANTS.MAX_LEADERBOARD_LIMIT);
-          }
-          
-          const leaderboard = await this.dataManager.getLeaderboard(limit);
-          this._safeSend(ws, ["diceLeaderboard", leaderboard]);
-        } catch(e) { 
-          this._safeSend(ws, ["diceLeaderboard", []]);
-        }
-        return;
-      }
-
-      if (evt === "getDicePoints") {
-        try {
-          const points = await this.dataManager.getDicePoints();
-          this._safeSend(ws, ["dicePoints", points]);
-        } catch(e) { 
-          this._safeSend(ws, ["dicePoints", {}]);
-        }
-        return;
-      }
-
-      if (evt === "getDiceStatus") {
-        const isActive = !!this.currentDiceRoll && this._canSubmitDiceAnswer;
-        this._safeSend(ws, ["diceStatus", isActive, this._diceRound || 1]);
-        return;
-      }
-
-      if (evt === "getDiceNotification") {
-        try {
-          const isDiceTime = this.alarmScheduler.isDiceTime();
-          const isActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
-          const timeLeft = this._getTimeLeftUntilNextDice();
-          let notification = "";
-          if (isActive) {
-            const elapsed = (Date.now() - this._diceStartTime) / 1000;
-            const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
-            const remaining = Math.max(0, totalTime - elapsed);
-            notification = Math.floor(remaining) + "s remaining";
-          } else if (isDiceTime) {
-            notification = "Dice game starting soon...";
-          } else if (timeLeft && timeLeft.text) {
-            notification = "Next dice game in: " + timeLeft.text;
-          } else {
-            notification = "Waiting...";
-          }
-          this._safeSend(ws, ["diceNotification", notification]);
-        } catch(e) {
-          this._safeSend(ws, ["diceNotification", "Waiting..."]);
-        }
-        return;
-      }
-
       if (evt === "startGameWithRecording") {
         const [_, room, bet, username] = data;
         if (!room || !username || typeof room !== 'string' || typeof username !== 'string') {
@@ -1505,6 +1941,10 @@ export class GameServer {
         return;
       }
 
+      // ============================================================
+      // GAME EVENTS
+      // ============================================================
+      
       const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room || typeof room !== 'string' || room.trim() === '') {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
@@ -1558,6 +1998,11 @@ export class GameServer {
       
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
+        
+        // If switching to Lowcard room, send quiz status
+        if (roomName === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
+          await this._sendLowcardQuizStatus(ws);
+        }
         return;
       }
       
@@ -1628,6 +2073,18 @@ export class GameServer {
           this._sendDiceNotificationOnSwitch(ws, wsId);
         }
         
+        if (roomName === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
+          await this._sendLowcardQuizStatus(ws);
+          
+          const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+          const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+          const gameRunning = await this.dataManager.getLowcardQuizGameRunning();
+          
+          if (sessionActive && autoStart && !gameRunning) {
+            this._startLowcardQuizGame();
+          }
+        }
+        
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         
       } finally {
@@ -1641,6 +2098,49 @@ export class GameServer {
       this._switchLocks.delete(`switch_${ws._wsId}`);
       this._switchRetries.delete(`switch_${ws._wsId}`);
     }
+  }
+
+  async _sendLowcardQuizStatus(ws) {
+    try {
+      const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+      const gameRunning = await this.dataManager.getLowcardQuizGameRunning();
+      const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+      const gameCount = await this.dataManager.getLowcardQuizGameCount();
+      const timeLeft = this._getLowcardQuizTimeLeft();
+      const isQuizTime = this._isLowcardQuizTime();
+      const isQuizEnded = this._isLowcardQuizEnded();
+      
+      if (isQuizEnded && !isQuizTime) {
+        await this._forceResetLowcardQuizMode();
+      }
+      
+      const isActive = sessionActive || autoStart || isQuizTime;
+      const canStart = !isActive && !sessionActive && !autoStart && !isQuizTime;
+      
+      this._safeSend(ws, ["lowcardQuizStatus", {
+        sessionActive: sessionActive,
+        gameRunning: gameRunning,
+        autoStart: autoStart,
+        gameCount: gameCount,
+        maxGames: LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION,
+        betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+        nextGameIn: timeLeft.text,
+        isQuizTime: isQuizTime,
+        isQuizEnded: isQuizEnded,
+        canStartGame: canStart,
+        mode: isActive ? "quiz" : "normal",
+        message: isActive ? "Quiz is running! Auto-game only." : "Normal mode - Start games manually"
+      }]);
+      
+      const winners = await this.dataManager.getWinners(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      const points = await this.dataManager.getLowcardQuizPoints();
+      this._safeSend(ws, ["lowcardQuizWinners", { 
+        winners: winners || {}, 
+        points: points || {},
+        room: LOWCARD_QUIZ_CONFIG.ROOM_NAME, 
+        recording: sessionActive || false
+      }]);
+    } catch(e) {}
   }
 
   _sendDiceNotificationOnSwitch(ws, wsId) {
@@ -1750,6 +2250,37 @@ export class GameServer {
         return;
       }
       
+      // ============================================================
+      // CEK LOWCARD QUIZ
+      // ============================================================
+      if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
+        const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+        const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+        const isQuizTime = this._isLowcardQuizTime();
+        const isQuizEnded = this._isLowcardQuizEnded();
+        
+        // Jika quiz sudah berakhir, reset ke mode normal
+        if (isQuizEnded && !isQuizTime) {
+          await this._forceResetLowcardQuizMode();
+          // Lanjutkan ke start game normal
+        } else if (sessionActive || autoStart || isQuizTime) {
+          // Quiz masih aktif, tolak start game
+          this._safeSend(ws, ["gameLowCardError", 
+            "❌ Lowcard Quiz is active! Auto-game running. You can only join, not start."
+          ]);
+          return;
+        }
+        
+        // Cek apakah dalam 5 menit sebelum quiz dimulai
+        const timeLeft = this._getLowcardQuizTimeLeft();
+        if (timeLeft && timeLeft.totalMs > 0 && timeLeft.totalMs < 300000) {
+          this._safeSend(ws, ["gameLowCardError", 
+            `⚠️ Lowcard Quiz will start in ${timeLeft.text}. Please wait for auto-game.`
+          ]);
+          return;
+        }
+      }
+      
       const lockKey = `game_start_${room}`;
       if (this._gameLocks.has(lockKey)) {
         this._safeSend(ws, ["gameLowCardError", "Game is starting, please wait"]);
@@ -1842,7 +2373,7 @@ export class GameServer {
           this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
           this._closeRegistration(room, game);
         }
-      }, 20000));
+      }, CONSTANTS.REGISTRATION_TIME_MS));
       game._registrationTimer = timer;
     } catch(e) {}
   }
@@ -1858,7 +2389,17 @@ export class GameServer {
       game.registrationOpen = false;
       const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
       const humanCount = humanPlayers.length;
-      if (!game._botsAdded) {
+      
+      // CEK LOWCARD QUIZ: Bot hanya jika player < 5
+      if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
+        if (!game._botsAdded && humanCount < LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
+          const needed = Math.min(4, LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT - 1 - humanCount);
+          if (needed > 0 && humanCount > 0) {
+            this._addLowcardQuizBots(room, needed, game);
+            game._botsAdded = true;
+          }
+        }
+      } else if (!game._botsAdded) {
         if (humanCount === 1 || humanCount === 0) {
           this._addBots(room, 4);
           game._botsAdded = true;
@@ -1867,13 +2408,19 @@ export class GameServer {
           if (needed > 0) { this._addBots(room, needed); game._botsAdded = true; }
         }
       }
+      
       if (this._isGameActuallyRunning(game) && game.players.size >= 2) {
         this._startDrawPhase(room, game);
       } else {
         game._gameEnded = true;
         game._isActive = false;
         this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
-        this._forceCleanupGame(room, game);
+        
+        if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
+          this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
       }
     } catch(e) {}
   }
@@ -1898,6 +2445,35 @@ export class GameServer {
       }
       game._botsAdded = true;
       game.useBots = true;
+    } catch(e) {}
+  }
+
+  _addLowcardQuizBots(room, count, game) {
+    try {
+      if (!this._isGameActuallyRunning(game)) return;
+      
+      const botNames = ["Bot1", "Bot2", "Bot3", "Bot4"];
+      const existingBots = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
+      const existingBotCount = existingBots.length;
+      const maxBotsToAdd = Math.min(count, 4 - existingBotCount);
+      
+      if (maxBotsToAdd <= 0) return;
+      
+      for (let i = 0; i < maxBotsToAdd; i++) {
+        const botId = `BOT_LCQ_${i}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const botName = botNames[(existingBotCount + i) % botNames.length];
+        if (!game.players.has(botId)) {
+          game.players.set(botId, { id: botId, name: botName });
+          if (!game.botPlayers) game.botPlayers = new Map();
+          game.botPlayers.set(botId, botName);
+        }
+      }
+      game._botsAdded = true;
+      game.useBots = true;
+      
+      this._broadcastToRoom(room, ["lowcardQuizNotification", 
+        `${maxBotsToAdd} bot(s) added (${humanCount} humans + ${maxBotsToAdd} bots)`
+      ]);
     } catch(e) {}
   }
 
@@ -1930,32 +2506,67 @@ export class GameServer {
       }
       
       const activePlayers = this._getActivePlayers(game);
-      if (activePlayers.length < 2) {
-        if (!game._botsAdded) {
-          const needed = Math.min(4 - activePlayers.length, CONSTANTS.MAX_BOTS_PER_GAME);
-          if (needed > 0) { this._addBots(room, needed); game._botsAdded = true; }
+      
+      // LOWCARD QUIZ: Bot hanya jika player < 5
+      if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
+        const humanCount = activePlayers.filter(p => !p.id.startsWith('BOT_')).length;
+        if (humanCount >= LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
+          game._botsAdded = true;
+          game.useBots = false;
         }
+      }
+      
+      if (activePlayers.length < 2) {
+        if (!game._botsAdded && room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
+          const humanCount = activePlayers.filter(p => !p.id.startsWith('BOT_')).length;
+          if (humanCount < LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT && humanCount > 0) {
+            const needed = Math.min(4 - humanCount, 4);
+            if (needed > 0) { 
+              this._addLowcardQuizBots(room, needed, game); 
+              game._botsAdded = true; 
+            }
+          }
+        } else if (!game._botsAdded) {
+          const needed = Math.min(4 - activePlayers.length, CONSTANTS.MAX_BOTS_PER_GAME);
+          if (needed > 0 && activePlayers.length > 0) { 
+            this._addBots(room, needed); 
+            game._botsAdded = true; 
+          }
+        }
+        
         const newActive = this._getActivePlayers(game);
         if (newActive.length < 2) {
           if (newActive.length === 1 && !game._gameEnded) {
             const winner = newActive[0]?.name || "Unknown";
             const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
-            if (game._startedByRecording) {
-              await this._addLowCardWinner(room, winner);
-              await this._broadcastLowCardWinners(room);
+            
+            if (game._startedByRecording || game._startedBy === 'lowcard_quiz') {
+              await this._addLowcardQuizWinner(room, winner);
+              await this._broadcastLowcardQuizWinners(room);
             }
+            
             game._gameEnded = true;
             game._isActive = false;
             this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
             this._releaseLock(this._gameOperationLocks, lockKey);
-            this._forceCleanupGame(room, game);
+            
+            if (game._startedBy === 'lowcard_quiz') {
+              await this._handleLowcardQuizGameEnd(room, game);
+            } else {
+              this._forceCleanupGame(room, game);
+            }
             return;
           } else {
             game._gameEnded = true;
             game._isActive = false;
             this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
             this._releaseLock(this._gameOperationLocks, lockKey);
-            this._forceCleanupGame(room, game);
+            
+            if (game._startedBy === 'lowcard_quiz') {
+              await this._handleLowcardQuizGameEnd(room, game);
+            } else {
+              this._forceCleanupGame(room, game);
+            }
             return;
           }
         }
@@ -2012,7 +2623,7 @@ export class GameServer {
           this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
           this._closeDrawPhase(room, game);
         }
-      }, 20000));
+      }, CONSTANTS.DRAW_TIME_MS));
       game._drawTimer = timer;
     } catch(e) {}
   }
@@ -2108,7 +2719,12 @@ export class GameServer {
         game._isActive = false;
         game._endTime = Date.now();
         this._releaseLock(this._drawLocks, drawLockKey);
-        this._forceCleanupGame(room, game);
+        
+        if (game._startedBy === 'lowcard_quiz') {
+          await this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
         return;
       }
       for (const id of notSubmitted) {
@@ -2122,16 +2738,23 @@ export class GameServer {
         const winnerId = remaining[0];
         const winnerName = game.players.get(winnerId)?.name || winnerId;
         const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
-        if (game._startedByRecording) {
-          await this._addLowCardWinner(room, winnerName);
-          await this._broadcastLowCardWinners(room);
+        
+        if (game._startedByRecording || game._startedBy === 'lowcard_quiz') {
+          await this._addLowcardQuizWinner(room, winnerName);
+          await this._broadcastLowcardQuizWinners(room);
         }
+        
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
         game._gameEnded = true;
         game._isActive = false;
         game._endTime = Date.now();
         this._releaseLock(this._drawLocks, drawLockKey);
-        this._forceCleanupGame(room, game);
+        
+        if (game._startedBy === 'lowcard_quiz') {
+          await this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
         return;
       }
       if (remaining.length === 0) {
@@ -2140,7 +2763,12 @@ export class GameServer {
         game._isActive = false;
         game._endTime = Date.now();
         this._releaseLock(this._drawLocks, drawLockKey);
-        this._forceCleanupGame(room, game);
+        
+        if (game._startedBy === 'lowcard_quiz') {
+          await this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
         return;
       }
       this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
@@ -2194,7 +2822,11 @@ export class GameServer {
           if (this._isGameActuallyRunning(game) && !game._gameEnded) {
             this._startDrawPhase(room, game);
           } else if (game && !game._isActive) {
-            this._forceCleanupGame(room, game);
+            if (game._startedBy === 'lowcard_quiz') {
+              this._handleLowcardQuizGameEnd(room, game);
+            } else {
+              this._forceCleanupGame(room, game);
+            }
           }
         }
       }, 30000));
@@ -2212,7 +2844,12 @@ export class GameServer {
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
         this._releaseLock(this._evaluationLocks, evalLockKey);
-        this._forceCleanupGame(room, game);
+        
+        if (game._startedBy === 'lowcard_quiz') {
+          this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
         return;
       }
       
@@ -2232,16 +2869,23 @@ export class GameServer {
           const winnerId = remaining[0];
           const winnerName = players.get(winnerId)?.name || winnerId;
           const totalCoin = (game.betAmount || 0) * players.size;
-          if (game._startedByRecording) {
-            await this._addLowCardWinner(room, winnerName);
-            await this._broadcastLowCardWinners(room);
+          
+          if (game._startedByRecording || game._startedBy === 'lowcard_quiz') {
+            await this._addLowcardQuizWinner(room, winnerName);
+            await this._broadcastLowcardQuizWinners(room);
           }
+          
           this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
           game._gameEnded = true;
           game._isActive = false;
           game._isEvaluating = false;
           if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-          this._forceCleanupGame(room, game);
+          
+          if (game._startedBy === 'lowcard_quiz') {
+            this._handleLowcardQuizGameEnd(room, game);
+          } else {
+            this._forceCleanupGame(room, game);
+          }
           return;
         }
         this._broadcastToRoom(room, ["gameLowCardError", "No numbers drawn this round"]);
@@ -2249,7 +2893,12 @@ export class GameServer {
         game._isActive = false;
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-        this._forceCleanupGame(room, game);
+        
+        if (game._startedBy === 'lowcard_quiz') {
+          this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
         return;
       }
       
@@ -2289,7 +2938,11 @@ export class GameServer {
         if (this._isGameActuallyRunning(game) && !game._gameEnded) {
           this._startDrawPhase(room, game);
         } else {
-          this._forceCleanupGame(room, game);
+          if (game._startedBy === 'lowcard_quiz') {
+            this._handleLowcardQuizGameEnd(room, game);
+          } else {
+            this._forceCleanupGame(room, game);
+          }
         }
         return;
       }
@@ -2298,17 +2951,24 @@ export class GameServer {
         const winnerId = remaining[0];
         const winnerName = players.get(winnerId)?.name || winnerId;
         const totalCoin = (game.betAmount || 0) * players.size;
-        if (game._startedByRecording) {
-          await this._addLowCardWinner(room, winnerName);
-          await this._broadcastLowCardWinners(room);
+        
+        if (game._startedByRecording || game._startedBy === 'lowcard_quiz') {
+          await this._addLowcardQuizWinner(room, winnerName);
+          await this._broadcastLowcardQuizWinners(room);
         }
+        
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
         game._gameEnded = true;
         game._isActive = false;
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
         this._releaseLock(this._evaluationLocks, evalLockKey);
-        this._forceCleanupGame(room, game);
+        
+        if (game._startedBy === 'lowcard_quiz') {
+          this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
         return;
       }
       
@@ -2319,7 +2979,12 @@ export class GameServer {
         game._gameEnded = true;
         game._isActive = false;
         this._broadcastToRoom(room, ["gameLowCardError", "All players eliminated"]);
-        this._forceCleanupGame(room, game);
+        
+        if (game._startedBy === 'lowcard_quiz') {
+          this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
         return;
       }
       
@@ -2349,11 +3014,19 @@ export class GameServer {
           if (this._isGameActuallyRunning(game) && !game._gameEnded) {
             this._startDrawPhase(room, game);
           } else {
-            this._forceCleanupGame(room, game);
+            if (game._startedBy === 'lowcard_quiz') {
+              this._handleLowcardQuizGameEnd(room, game);
+            } else {
+              this._forceCleanupGame(room, game);
+            }
           }
         }, 500);
       } else {
-        this._forceCleanupGame(room, game);
+        if (game._startedBy === 'lowcard_quiz') {
+          this._handleLowcardQuizGameEnd(room, game);
+        } else {
+          this._forceCleanupGame(room, game);
+        }
       }
     } catch(e) {
       if (game) {
@@ -2367,11 +3040,19 @@ export class GameServer {
             if (this._isGameActuallyRunning(game) && !game._gameEnded) {
               this._startDrawPhase(room, game);
             } else {
-              this._forceCleanupGame(room, game);
+              if (game._startedBy === 'lowcard_quiz') {
+                this._handleLowcardQuizGameEnd(room, game);
+              } else {
+                this._forceCleanupGame(room, game);
+              }
             }
           }, 1000);
         } else {
-          this._forceCleanupGame(room, game);
+          if (game._startedBy === 'lowcard_quiz') {
+            this._handleLowcardQuizGameEnd(room, game);
+          } else {
+            this._forceCleanupGame(room, game);
+          }
         }
       } else {
         this._releaseLock(this._evaluationLocks, `eval_${room}`);
@@ -2400,18 +3081,30 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
         return;
       }
+      
       const lockKey = `join_${room}_${usernameClean}`;
       if (this._joinLocks.has(lockKey)) {
         this._safeSend(ws, ["gameLowCardError", "Please wait"]);
         return;
       }
       this._joinLocks.set(lockKey, Date.now());
+      
       try {
         const game = this.activeGames.get(room);
         if (!game?._isActive || game._gameEnded || !game.players) {
+          // Cek apakah ini room Lowcard dan quiz sedang aktif
+          if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
+            const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+            const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+            if (sessionActive && autoStart) {
+              this._safeSend(ws, ["gameLowCardError", "Quiz game is starting, please wait..."]);
+              return;
+            }
+          }
           this._safeSend(ws, ["gameLowCardError", "No active game in this room"]);
           return;
         }
+        
         if (game.players.has(usernameClean)) {
           if (game.eliminated?.has(usernameClean)) {
             this._safeSend(ws, ["gameLowCardError", "You have been eliminated"]);
@@ -2422,19 +3115,32 @@ export class GameServer {
           }
           return;
         }
+        
         if (!game.registrationOpen) {
           this._safeSend(ws, ["gameLowCardNoJoin", usernameClean, game.betAmount]);
           this._safeSend(ws, ["gameLowCardError", "Registration is closed"]);
           return;
         }
+        
         if (game.players.size >= CONSTANTS.MAX_PLAYERS_PER_GAME) {
           this._safeSend(ws, ["gameLowCardError", "Game is full"]);
           return;
         }
+        
+        // Cek untuk Lowcard Quiz: jika sudah ada 5 pemain, tidak perlu bot lagi
+        if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
+          const humanCount = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_')).length;
+          if (humanCount >= LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
+            game._botsAdded = true;
+            game.useBots = false;
+          }
+        }
+        
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
         this._addClient(room, ws, usernameClean);
         game.playerWsId.set(usernameClean, wsId);
         this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
+        
       } finally {
         setTimeout(() => { this._joinLocks.delete(lockKey); }, 2000);
       }
@@ -2522,6 +3228,21 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Room and username required"]);
         return;
       }
+      
+      // CEK LOWCARD QUIZ
+      if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
+        const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+        const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+        const isQuizTime = this._isLowcardQuizTime();
+        
+        if (sessionActive || autoStart || isQuizTime) {
+          this._safeSend(ws, ["gameLowCardError", 
+            "❌ Lowcard Quiz is active! Recording is managed by quiz system."
+          ]);
+          return;
+        }
+      }
+      
       const isRecordingEnabled = await this.dataManager.getRecordingStatus(room);
       if (!isRecordingEnabled) {
         this._safeSend(ws, ["gameLowCardError", "Recording is not enabled in this room"]);
@@ -3208,6 +3929,485 @@ export class GameServer {
   }
 
   // ============================================================
+  // LOWCARD QUIZ - CORE METHODS
+  // ============================================================
+
+  _isLowcardQuizTime(date) {
+    const wita = this._toWITA(date || new Date());
+    const currentTotal = wita.getHours() * 60 + wita.getMinutes();
+    
+    for (const session of LOWCARD_QUIZ_CONFIG.SCHEDULE.SESSIONS) {
+      const startTotal = parseTime(session.start);
+      const endTotal = parseTime(session.end);
+      if (currentTotal >= startTotal && currentTotal < endTotal) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _isLowcardQuizEnded() {
+    try {
+      const wita = this._toWITA(new Date());
+      const currentTotal = wita.getHours() * 60 + wita.getMinutes();
+      
+      for (const session of LOWCARD_QUIZ_CONFIG.SCHEDULE.SESSIONS) {
+        const endTotal = parseTime(session.end);
+        if (currentTotal >= endTotal) {
+          return true;
+        }
+      }
+      return false;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  _getLowcardQuizTimeLeft() {
+    try {
+      const wita = this._toWITA(new Date());
+      const currentTotal = wita.getHours() * 60 + wita.getMinutes();
+      let minDiff = Infinity;
+      
+      for (const session of LOWCARD_QUIZ_CONFIG.SCHEDULE.SESSIONS) {
+        const startTotal = parseTime(session.start);
+        let diff = startTotal - currentTotal;
+        if (diff < 0) diff += 24 * 60;
+        if (diff < minDiff) {
+          minDiff = diff;
+        }
+      }
+      
+      const hours = Math.floor(minDiff / 60);
+      const minutes = Math.floor(minDiff % 60);
+      const isRunning = this._isLowcardQuizTime();
+      
+      let text = "";
+      if (isRunning) {
+        text = "Quiz is running now!";
+      } else if (hours > 0) {
+        text = hours + "h " + minutes + "m";
+      } else {
+        text = minutes + "m";
+      }
+      
+      return { 
+        hours, 
+        minutes, 
+        totalMs: minDiff * 60 * 1000,
+        text: text,
+        isRunning
+      };
+    } catch(e) {
+      return { hours: 0, minutes: 0, totalMs: 0, text: 'unknown', isRunning: false };
+    }
+  }
+
+  async _forceResetLowcardQuizMode() {
+    try {
+      await this.dataManager.setLowcardQuizSessionActive(false);
+      await this.dataManager.setLowcardQuizAutoStart(false);
+      await this.dataManager.setLowcardQuizGameRunning(false);
+      await this.dataManager.setRecordingStatus(LOWCARD_QUIZ_CONFIG.ROOM_NAME, false);
+      await this.dataManager.deleteAllWinners(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      
+      const game = this.activeGames.get(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      if (game) {
+        await this._forceCleanupGame(LOWCARD_QUIZ_CONFIG.ROOM_NAME, game);
+      }
+      
+      if (this._lowcardQuizCooldownTimer) {
+        this._clearTimer(this._lowcardQuizCooldownTimer);
+        this._lowcardQuizCooldownTimer = null;
+      }
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["gameLowCardMode", {
+        mode: "normal",
+        canStartGame: true,
+        message: "Normal mode - You can start games manually"
+      }]);
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizNotification", 
+        `🔄 Lowcard Quiz mode reset. Back to normal mode.`
+      ]);
+      
+      this._quizActive = false;
+      this._quizEnded = true;
+      
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _handleLowcardQuizSessionStart() {
+    try {
+      await this.dataManager.setRecordingStatus(LOWCARD_QUIZ_CONFIG.ROOM_NAME, true);
+      await this.dataManager.setLowcardQuizSessionActive(true);
+      await this.dataManager.setLowcardQuizAutoStart(true);
+      await this.dataManager.setLowcardQuizGameCount(0);
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizNotification", 
+        `🎯 Lowcard Quiz session started! Auto-game with bet ${LOWCARD_QUIZ_CONFIG.BET_AMOUNT} starting...`
+      ]);
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizSessionStart", {
+        message: "Lowcard Quiz session started!",
+        betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+        maxGames: LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION,
+        canStartGame: false
+      }]);
+      
+      await this._startLowcardQuizGame();
+      
+    } catch(e) {}
+  }
+
+  async _handleLowcardQuizSessionEnd() {
+    try {
+      await this.dataManager.setLowcardQuizSessionActive(false);
+      await this.dataManager.setLowcardQuizAutoStart(false);
+      await this.dataManager.setLowcardQuizGameRunning(false);
+      await this.dataManager.setRecordingStatus(LOWCARD_QUIZ_CONFIG.ROOM_NAME, false);
+      
+      const winners = await this.dataManager.getWinners(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      const points = await this.dataManager.getLowcardQuizPoints();
+      const gameCount = await this.dataManager.getLowcardQuizGameCount();
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizSessionEnd", {
+        message: "🏁 Lowcard Quiz session ended! Back to normal mode.",
+        winners: winners || {},
+        points: points || {},
+        totalGames: gameCount || 0,
+        canStartGame: true,
+        mode: "normal"
+      }]);
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizNotification", 
+        `✅ Lowcard Quiz session ended! ${gameCount || 0} games played. You can now start manual games normally.`
+      ]);
+      
+      await this.dataManager.deleteAllWinners(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      
+      const game = this.activeGames.get(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      if (game) {
+        await this._forceCleanupGame(LOWCARD_QUIZ_CONFIG.ROOM_NAME, game);
+      }
+      
+      if (this._lowcardQuizCooldownTimer) {
+        this._clearTimer(this._lowcardQuizCooldownTimer);
+        this._lowcardQuizCooldownTimer = null;
+      }
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["gameLowCardMode", {
+        mode: "normal",
+        canStartGame: true,
+        message: "Normal mode - You can start games manually"
+      }]);
+      
+      this._quizEnded = true;
+      this._quizActive = false;
+      
+    } catch(e) {}
+  }
+
+  async _handleLowcardQuizWeeklyReset() {
+    try {
+      const points = await this.dataManager.getLowcardQuizPoints();
+      
+      let winner = null;
+      let highestScore = 0;
+      for (const [username, score] of Object.entries(points)) {
+        if (username && typeof username === 'string') {
+          const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
+          if (numericScore > highestScore) {
+            highestScore = numericScore;
+            winner = username;
+          }
+        }
+      }
+      
+      const currentWeek = this.dataManager.getCurrentWeek();
+      
+      if (winner && highestScore > 0) {
+        const winnerData = { 
+          username: winner, 
+          score: highestScore, 
+          week: currentWeek,
+          timestamp: Date.now() 
+        };
+        await this.dataManager.setLowcardQuizLastWeekWinner(winnerData);
+      } else {
+        await this.dataManager.setLowcardQuizLastWeekWinner(null);
+      }
+      
+      await this.dataManager.resetLowcardQuizPoints();
+      await this.dataManager.setLowcardQuizLastResetWeek(currentWeek);
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizWeeklyReset", {
+        winner: winner,
+        score: highestScore,
+        week: currentWeek,
+        message: winner ? `🏆 Weekly winner: ${winner} with ${highestScore} points!` : "No winner this week"
+      }]);
+      
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _startLowcardQuizGame() {
+    try {
+      const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+      const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+      const gameCount = await this.dataManager.getLowcardQuizGameCount();
+      const maxGames = LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION;
+      
+      if (!sessionActive || !autoStart) {
+        return;
+      }
+      
+      if (gameCount >= maxGames) {
+        this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizNotification", 
+          `✅ All ${maxGames} games completed for this session!`
+        ]);
+        return;
+      }
+      
+      const existingGame = this.activeGames.get(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      if (existingGame && existingGame._isActive && !existingGame._gameEnded) {
+        return;
+      }
+      
+      if (existingGame) {
+        await this._forceCleanupGame(LOWCARD_QUIZ_CONFIG.ROOM_NAME, existingGame);
+      }
+      
+      await this.dataManager.setLowcardQuizGameRunning(true);
+      const newCount = gameCount + 1;
+      await this.dataManager.setLowcardQuizGameCount(newCount);
+      
+      const game = this._createLowcardQuizGame(newCount);
+      this.activeGames.set(LOWCARD_QUIZ_CONFIG.ROOM_NAME, game);
+      
+      this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizGameStart", {
+        gameNumber: newCount,
+        totalGames: maxGames,
+        bet: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+        message: `🎮 Game ${newCount}/${maxGames} starting... Register now! (Min 2 players, Bot only if <5 players)`
+      }]);
+      
+      this._startLowcardQuizRegistration(LOWCARD_QUIZ_CONFIG.ROOM_NAME, game);
+      
+    } catch(e) {
+      await this.dataManager.setLowcardQuizGameRunning(false);
+    }
+  }
+
+  _createLowcardQuizGame(gameNumber) {
+    return {
+      room: LOWCARD_QUIZ_CONFIG.ROOM_NAME,
+      players: new Map(),
+      botPlayers: new Map(),
+      registrationOpen: true,
+      round: 1,
+      numbers: new Map(),
+      tanda: new Map(),
+      eliminated: new Set(),
+      betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+      hostId: 'QuizMaster',
+      hostName: '🎯 Quiz Master',
+      useBots: false,
+      evaluationLocked: false,
+      drawTimeExpired: false,
+      _isActive: true,
+      _gameEnded: false,
+      _phase: 'registration',
+      _botTimeouts: new Set(),
+      _botsAdded: false,
+      _registrationTimer: null,
+      _drawTimer: null,
+      _evalTimer: null,
+      _safetyTimer: null,
+      _isEvaluating: false,
+      _evalStartTime: null,
+      _createdAt: Date.now(),
+      _drawPhaseStart: null,
+      _endTime: null,
+      playerWsId: new Map(),
+      _startedByRecording: true,
+      _startedBy: 'lowcard_quiz',
+      _notificationTimers: [],
+      _drawNotificationTimers: [],
+      _cleanupStarted: false,
+      _quizGameNumber: gameNumber,
+    };
+  }
+
+  _startLowcardQuizRegistration(room, game) {
+    try {
+      if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
+      
+      if (game._registrationTimer) {
+        this._clearTimer(game._registrationTimer);
+        game._registrationTimer = null;
+      }
+      
+      if (game._notificationTimers) {
+        for (const timer of game._notificationTimers) {
+          this._clearTimer(timer);
+        }
+        game._notificationTimers = [];
+      } else {
+        game._notificationTimers = [];
+      }
+      
+      const notifications = [
+        { delay: 5000, message: "15s" },
+        { delay: 10000, message: "10s" },
+        { delay: 15000, message: "5s" }
+      ];
+      for (const notif of notifications) {
+        const timer = this._trackTimer(setTimeout(() => {
+          if (this._isGameActuallyRunning(game) && game.registrationOpen) {
+            this._broadcastToRoom(room, ["gameLowCardTimeLeft", notif.message]);
+          }
+        }, notif.delay));
+        game._notificationTimers.push(timer);
+      }
+      
+      const timer = this._trackTimer(setTimeout(() => {
+        if (this._isGameActuallyRunning(game) && game.registrationOpen) {
+          this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
+          this._closeLowcardQuizRegistration(room, game);
+        }
+      }, LOWCARD_QUIZ_CONFIG.GAME_REGISTRATION_TIME_MS || 20000));
+      game._registrationTimer = timer;
+    } catch(e) {}
+  }
+
+  async _closeLowcardQuizRegistration(room, game) {
+    try {
+      if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
+      this._cleanupGameTimers(game);
+      game.registrationOpen = false;
+      
+      const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
+      const humanCount = humanPlayers.length;
+      
+      // Bot hanya jika player < 5
+      if (!game._botsAdded && humanCount < LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
+        const needed = Math.min(4, LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT - 1 - humanCount);
+        if (needed > 0 && humanCount > 0) {
+          this._addLowcardQuizBots(room, needed, game);
+          game._botsAdded = true;
+        }
+      }
+      
+      const totalPlayers = game.players.size;
+      
+      if (totalPlayers >= 2) {
+        this._startDrawPhase(room, game);
+      } else {
+        game._gameEnded = true;
+        game._isActive = false;
+        this._broadcastToRoom(room, ["gameLowCardError", "Not enough players for Quiz! Need at least 2 players."]);
+        await this._handleLowcardQuizGameEnd(room, game);
+      }
+    } catch(e) {}
+  }
+
+  async _handleLowcardQuizGameEnd(room, game) {
+    try {
+      await this.dataManager.setLowcardQuizGameRunning(false);
+      
+      const gameCount = await this.dataManager.getLowcardQuizGameCount();
+      const maxGames = LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION;
+      
+      this._broadcastToRoom(room, ["lowcardQuizGameEnd", {
+        gameNumber: game?._quizGameNumber || gameCount,
+        totalGames: maxGames,
+        message: `🏁 Game ${game?._quizGameNumber || gameCount} finished!`
+      }]);
+      
+      if (game) {
+        this._forceCleanupGame(room, game);
+      }
+      
+      const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+      const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+      const currentCount = await this.dataManager.getLowcardQuizGameCount();
+      
+      if (sessionActive && autoStart && currentCount < maxGames) {
+        this._broadcastToRoom(room, ["lowcardQuizNotification", 
+          `⏳ Next game starting in 5 seconds...`
+        ]);
+        
+        if (this._lowcardQuizCooldownTimer) {
+          this._clearTimer(this._lowcardQuizCooldownTimer);
+          this._lowcardQuizCooldownTimer = null;
+        }
+        
+        this._lowcardQuizCooldownTimer = this._trackTimer(setTimeout(async () => {
+          this._lowcardQuizCooldownTimer = null;
+          if (sessionActive && autoStart) {
+            await this._startLowcardQuizGame();
+          }
+        }, LOWCARD_QUIZ_CONFIG.COOLDOWN_BETWEEN_GAMES_MS || 5000));
+      } else {
+        this._broadcastToRoom(room, ["lowcardQuizNotification", 
+          sessionActive ? "All games completed!" : "Session ended"
+        ]);
+      }
+      
+    } catch(e) {}
+  }
+
+  async _addLowcardQuizWinner(room, username) {
+    try {
+      if (!room || !username) return false;
+      
+      const isRecording = await this.dataManager.getRecordingStatus(room);
+      if (!isRecording) return false;
+      
+      await this.dataManager.addWinner(room, username);
+      
+      const points = await this.dataManager.addLowcardQuizPoint(username, LOWCARD_QUIZ_CONFIG.WIN_POINTS);
+      
+      this._broadcastToRoom(room, ["lowcardQuizPointsUpdate", {
+        username: username,
+        points: points[username] || 0
+      }]);
+      
+      await this._broadcastLowcardQuizWinners(room);
+      
+      return true;
+    } catch(e) { 
+      return false; 
+    }
+  }
+
+  async _broadcastLowcardQuizWinners(room) {
+    try {
+      if (!room || typeof room !== 'string' || room.trim() === '') return;
+      const roomKey = room.trim();
+      const isRecording = await this.dataManager.getRecordingStatus(roomKey);
+      if (!isRecording) return;
+      
+      const winners = await this.dataManager.getWinners(roomKey);
+      const points = await this.dataManager.getLowcardQuizPoints();
+      
+      this._broadcastToRoom(roomKey, ["lowcardQuizWinners", {
+        winners: winners || {}, 
+        points: points || {},
+        room: roomKey, 
+        recording: true
+      }]);
+    } catch(e) {}
+  }
+
+  // ============================================================
   // BROADCAST HELPERS
   // ============================================================
   
@@ -3272,7 +4472,10 @@ export class GameServer {
       
       const isNotification = message[0] === 'diceNotification' || 
                              message[0] === 'gameLowCardTimeLeft' ||
-                             message[0] === 'gameLowCardWait';
+                             message[0] === 'gameLowCardWait' ||
+                             message[0] === 'lowcardQuizNotification' ||
+                             message[0] === 'lowcardQuizStatus' ||
+                             message[0] === 'lowcardQuizMode';
       
       if (isNotification) {
         const now = Date.now();
@@ -3343,6 +4546,12 @@ export class GameServer {
     } catch(e) { 
       return { hours: 0, minutes: 0, totalMinutes: 0 }; 
     }
+  }
+
+  _toWITA(date) {
+    const wita = new Date(date);
+    wita.setHours(wita.getHours() + LOWCARD_QUIZ_CONFIG.SCHEDULE.TIMEZONE_OFFSET);
+    return wita;
   }
 
   _isGameActuallyRunning(game) { 
@@ -3601,6 +4810,11 @@ export class GameServer {
       if (this._tieInterval) { clearInterval(this._tieInterval); this._tieInterval = null; }
       for (const timeout of this._tieNotificationTimeouts) { clearTimeout(timeout); }
       this._tieNotificationTimeouts = [];
+      
+      if (this._lowcardQuizCooldownTimer) {
+        this._clearTimer(this._lowcardQuizCooldownTimer);
+        this._lowcardQuizCooldownTimer = null;
+      }
       
       for (const [room, game] of this.activeGames) {
         this._cleanupGameTimers(game);
