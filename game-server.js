@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1.js
-// VERSION: 12.0.9 - LOWCARD QUIZ
+// VERSION: 12.0.9 - LOWCARD QUIZ ROOM
 // ============================================================
 
 // ============================================================
@@ -59,7 +59,7 @@ const QUIZ_SCHEDULE = {
 };
 
 // ============================================================
-// LOWCARD QUIZ SCHEDULE - TAMBAHAN
+// LOWCARD QUIZ SCHEDULE - KHUSUS ROOM "LowCard"
 // ============================================================
 
 const LOWCARD_QUIZ_SCHEDULE = {
@@ -68,7 +68,13 @@ const LOWCARD_QUIZ_SCHEDULE = {
   ],
   TIMEZONE_OFFSET: 8,
   DEFAULT_BET: 100,
-  ROOM_NAME: "LowCard"
+  ROOM_NAME: "LowCard",  // HANYA ROOM INI
+  QUIZ_MODE: true,
+  REGISTRATION_TIME: 15000,  // 15 detik
+  DRAW_TIME: 15000,          // 15 detik
+  MAX_PLAYERS: 20,
+  MIN_PLAYERS: 2,
+  MAX_BOTS: 4
 };
 
 const TABLE_NAME = 'game_data';
@@ -92,7 +98,6 @@ class DataManager {
       lastWeekWinner: null,
       lastResetWeek: null,
       scheduled_alarms: {},
-      // TAMBAHKAN
       lowcardQuizActive: {},
       lowcardQuizRunning: {}
     };
@@ -485,7 +490,7 @@ class AlarmScheduler {
       
       await this._clearAllAlarms();
       await this._scheduleWeeklyResetUTC();
-      await this._scheduleLowcardQuiz(); // TAMBAHKAN
+      await this._scheduleLowcardQuiz();
       
       let currentSession = null;
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
@@ -569,7 +574,7 @@ class AlarmScheduler {
   }
 
   // ============================================================
-  // LOWCARD QUIZ SCHEDULE - TAMBAHAN
+  // LOWCARD QUIZ SCHEDULE - KHUSUS ROOM "LowCard"
   // ============================================================
 
   async _scheduleLowcardQuiz() {
@@ -578,7 +583,7 @@ class AlarmScheduler {
       const witaNow = this._toWITA(now);
       const currentTotal = witaNow.getHours() * 60 + witaNow.getMinutes();
       
-      // Cek apakah dalam sesi LowCard Quiz
+      // Cek apakah dalam sesi LowCard Quiz (17:00-18:00)
       let isInSession = false;
       let sessionEnd = null;
       
@@ -593,7 +598,7 @@ class AlarmScheduler {
       }
       
       if (isInSession) {
-        // Dalam sesi - aktifkan
+        // Dalam sesi - aktifkan quiz
         await this._scheduleAlarm('lowcard_quiz_start', 1000);
         
         // Jadwalkan end jika belum
@@ -871,7 +876,10 @@ export class GameServer {
       
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
       
-      // TAMBAHKAN
+      // ============================================================
+      // KHUSUS ROOM "LowCard" - QUIZ MODE
+      // ============================================================
+      this._quizRoomName = "LowCard";
       this._lowcardQuizActive = false;
       this._lowcardQuizRunning = false;
       this._lowcardQuizTimer = null;
@@ -887,6 +895,18 @@ export class GameServer {
     } catch(e) {
       this._restored = true;
     }
+  }
+
+  // ============================================================
+  // CEK APAKAH ROOM ADALAH QUIZ ROOM
+  // ============================================================
+
+  _isQuizRoom(room) {
+    return room === this._quizRoomName;
+  }
+
+  _isQuizTime() {
+    return this.alarmScheduler.isLowcardQuizTime();
   }
 
   // ============================================================
@@ -1139,7 +1159,9 @@ export class GameServer {
         
         break;
 
-      // TAMBAHKAN
+      // ============================================================
+      // LOWCARD QUIZ - KHUSUS ROOM "LowCard"
+      // ============================================================
       case 'lowcard_quiz_start':
         await this._handleLowcardQuizStart();
         break;
@@ -1150,12 +1172,12 @@ export class GameServer {
   }
 
   // ============================================================
-  // LOWCARD QUIZ - HANDLERS
+  // LOWCARD QUIZ - HANDLERS KHUSUS ROOM "LowCard"
   // ============================================================
 
   async _handleLowcardQuizStart() {
     try {
-      const room = LOWCARD_QUIZ_SCHEDULE.ROOM_NAME;
+      const room = LOWCARD_QUIZ_SCHEDULE.ROOM_NAME; // "LowCard"
       
       // Cek apakah sudah ada game berjalan
       const existingGame = this.activeGames.get(room);
@@ -1176,7 +1198,7 @@ export class GameServer {
       await this.dataManager.setLowcardQuizActive(room, true);
       
       // Broadcast notifikasi
-      this._broadcastToRoom(room, ["gameLowCardNotification", "LowCard Quiz dimulai! Auto start dalam 3 detik..."]);
+      this._broadcastToRoom(room, ["gameLowCardNotification", "🎯 LowCard Quiz dimulai! Auto start dalam 3 detik..."]);
       
       // Start game setelah delay
       if (this._lowcardQuizTimer) {
@@ -1195,12 +1217,11 @@ export class GameServer {
       if (this._lowcardQuizLock) return;
       this._lowcardQuizLock = true;
       
-      const bet = LOWCARD_QUIZ_SCHEDULE.DEFAULT_BET;
+      const bet = LOWCARD_QUIZ_SCHEDULE.DEFAULT_BET; // 100
       
       // Cek game existing
       const existingGame = this.activeGames.get(room);
       if (existingGame?._isActive && !existingGame._gameEnded) {
-        // Jika game sedang berjalan, tunggu sampai selesai
         this._lowcardQuizLock = false;
         return;
       }
@@ -1225,7 +1246,11 @@ export class GameServer {
         _startedByRecording: true, _startedBy: 'lowcard_quiz',
         _notificationTimers: [],
         _drawNotificationTimers: [],
-        _cleanupStarted: false
+        _cleanupStarted: false,
+        // Flag khusus quiz room
+        _isQuizRoom: true,
+        _quizRegistrationTime: 15000,
+        _quizDrawTime: 15000
       };
       
       // Tambahkan bot sebagai host
@@ -1240,7 +1265,7 @@ export class GameServer {
       
       // Broadcast start
       this._broadcastToRoom(room, ["gameLowCardStart", bet]);
-      this._broadcastToRoom(room, ["gameLowCardNotification", `LowCard Quiz dimulai! Bet ${bet}`]);
+      this._broadcastToRoom(room, ["gameLowCardNotification", `🎯 LowCard Quiz dimulai! Bet ${bet}`]);
       
       // Start registrasi
       this._startLowcardQuizRegistration(room, game);
@@ -1252,85 +1277,157 @@ export class GameServer {
     }
   }
 
+  // ============================================================
+  // REGISTRASI QUIZ - 15 DETIK (Lebih Cepat)
+  // ============================================================
+
   _startLowcardQuizRegistration(room, game) {
     try {
       if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
       
-      // Registrasi lebih pendek untuk quiz (15 detik)
+      // Bersihkan timer lama
       if (game._registrationTimer) {
         this._clearTimer(game._registrationTimer);
         game._registrationTimer = null;
       }
       
-      // Notifikasi countdown
-      const notifications = [
-        { delay: 3000, message: "12s" },
-        { delay: 8000, message: "7s" },
-        { delay: 12000, message: "3s" }
-      ];
-      
-      for (const notif of notifications) {
-        const timer = this._trackTimer(setTimeout(() => {
-          if (this._isGameActuallyRunning(game) && game.registrationOpen) {
-            this._broadcastToRoom(room, ["gameLowCardTimeLeft", notif.message]);
-          }
-        }, notif.delay));
-        game._notificationTimers.push(timer);
+      if (game._notificationTimers) {
+        for (const timer of game._notificationTimers) {
+          this._clearTimer(timer);
+        }
+        game._notificationTimers = [];
+      } else {
+        game._notificationTimers = [];
       }
       
-      const timer = this._trackTimer(setTimeout(() => {
-        if (this._isGameActuallyRunning(game) && game.registrationOpen) {
-          this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
-          this._closeLowcardQuizRegistration(room, game);
-        }
-      }, 15000)); // 15 detik registrasi
+      // ============================================================
+      // NOTIFIKASI COUNTDOWN - 15 DETIK
+      // Event: gameLowCardTimeLeft
+      // ============================================================
       
-      game._registrationTimer = timer;
+      // Notifikasi 12s
+      const timer12s = this._trackTimer(setTimeout(() => {
+        if (this._isGameActuallyRunning(game) && game.registrationOpen) {
+          this._broadcastToRoom(room, ["gameLowCardTimeLeft", "12s"]);
+        }
+      }, 3000));
+      game._notificationTimers.push(timer12s);
+      
+      // Notifikasi 7s
+      const timer7s = this._trackTimer(setTimeout(() => {
+        if (this._isGameActuallyRunning(game) && game.registrationOpen) {
+          this._broadcastToRoom(room, ["gameLowCardTimeLeft", "7s"]);
+        }
+      }, 8000));
+      game._notificationTimers.push(timer7s);
+      
+      // Notifikasi 3s
+      const timer3s = this._trackTimer(setTimeout(() => {
+        if (this._isGameActuallyRunning(game) && game.registrationOpen) {
+          this._broadcastToRoom(room, ["gameLowCardTimeLeft", "3s"]);
+        }
+      }, 12000));
+      game._notificationTimers.push(timer3s);
+      
+      // ============================================================
+      // TIMER UTAMA - 15 DETIK
+      // Event: gameLowCardTimeLeft "TIME UP"
+      // ============================================================
+      const mainTimer = this._trackTimer(setTimeout(() => {
+        if (!this._isGameActuallyRunning(game) || !game.registrationOpen) {
+          return;
+        }
+        
+        this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
+        this._closeLowcardQuizRegistration(room, game);
+        
+      }, 15000));
+      
+      game._registrationTimer = mainTimer;
+      
+      // Broadcast notifikasi awal
+      this._broadcastToRoom(room, ["gameLowCardNotification", 
+        `🎯 LowCard Quiz registrasi dibuka! ${game.players.size} pemain bergabung`]);
+      
+      this._broadcastToRoom(room, ["gameLowCardStart", game.betAmount]);
+      
     } catch(e) {}
   }
 
+  // ============================================================
+  // TUTUP REGISTRASI QUIZ
+  // ============================================================
+
   _closeLowcardQuizRegistration(room, game) {
     try {
-      if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
+      if (!this._isGameActuallyRunning(game) || !game.registrationOpen) {
+        return;
+      }
+      
       this._cleanupGameTimers(game);
       game.registrationOpen = false;
       
-      // Tambahkan bot jika kurang dari 2 pemain
-      const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_') && id !== 'QUIZ_BOT');
+      // Hitung pemain manusia
+      const humanPlayers = Array.from(game.players.keys())
+        .filter(id => !id.startsWith('BOT_') && id !== 'QUIZ_BOT');
       const humanCount = humanPlayers.length;
       
+      // Tambahkan bot jika kurang dari 2 pemain
       if (!game._botsAdded) {
         if (humanCount < 2) {
           const needed = Math.min(4 - game.players.size, CONSTANTS.MAX_BOTS_PER_GAME);
           if (needed > 0) {
             this._addLowcardQuizBots(room, needed);
             game._botsAdded = true;
+            
+            const botNames = Array.from(game.botPlayers.values());
+            this._broadcastToRoom(room, ["gameLowCardNotification", 
+              `🤖 ${botNames.join(', ')} bergabung sebagai bot`]);
           }
         }
       }
       
-      // Cek apakah game bisa dimulai
+      // Cek total pemain >= 2
       if (this._isGameActuallyRunning(game) && game.players.size >= 2) {
-        // Update players list
-        this._broadcastToRoom(room, ["gameLowCardClosed", 
-          Array.from(game.players.keys()).filter(id => !game.eliminated?.has(id)).map(id => game.players.get(id)?.name || id)
-        ]);
+        
+        // Broadcast registrasi ditutup
+        const activePlayerNames = Array.from(game.players.keys())
+          .filter(id => !game.eliminated?.has(id))
+          .map(id => game.players.get(id)?.name || id);
+        
+        this._broadcastToRoom(room, ["gameLowCardClosed", activePlayerNames]);
+        this._broadcastToRoom(room, ["gameLowCardNotification", 
+          `🎯 Game dimulai dengan ${activePlayerNames.length} pemain!`]);
+        
+        // Mulai draw phase
         this._startDrawPhase(room, game);
+        
       } else {
+        // Tidak cukup pemain
         game._gameEnded = true;
         game._isActive = false;
-        this._broadcastToRoom(room, ["gameLowCardError", "Not enough players for quiz"]);
+        
+        this._broadcastToRoom(room, ["gameLowCardError", 
+          `❌ Tidak cukup pemain (${game.players.size}/2). Quiz dibatalkan`]);
+        this._broadcastToRoom(room, ["gameLowCardNotification", 
+          "⏳ Menunggu pemain... Quiz akan restart dalam 5 detik"]);
+        
         this._forceCleanupGame(room, game);
         
-        // Coba ulang setelah 5 detik
+        // Retry setelah 5 detik
         setTimeout(() => {
           if (this._lowcardQuizActive && !this._lowcardQuizRunning) {
             this._startLowcardQuizGame(room);
           }
         }, 5000);
       }
+      
     } catch(e) {}
   }
+
+  // ============================================================
+  // TAMBAH BOT QUIZ
+  // ============================================================
 
   _addLowcardQuizBots(room, count) {
     try {
@@ -1338,25 +1435,44 @@ export class GameServer {
       if (!this._isGameActuallyRunning(game)) return;
       
       const botNames = ["QuizBot1", "QuizBot2", "QuizBot3", "QuizBot4"];
-      const existingBots = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
+      const existingBots = Array.from(game.players.keys())
+        .filter(id => id.startsWith('BOT_'));
       const existingBotCount = existingBots.length;
       const maxBotsToAdd = Math.min(count, CONSTANTS.MAX_BOTS_PER_GAME - existingBotCount);
       
       if (maxBotsToAdd <= 0) return;
       
+      const addedBots = [];
+      
       for (let i = 0; i < maxBotsToAdd; i++) {
         const botId = `BOT_${room}_${i}_${Date.now()}`;
         const botName = botNames[(existingBotCount + i) % botNames.length];
+        
         if (!game.players.has(botId)) {
           game.players.set(botId, { id: botId, name: botName });
           if (!game.botPlayers) game.botPlayers = new Map();
           game.botPlayers.set(botId, botName);
+          addedBots.push(botName);
+          
+          // Broadcast bot join
+          this._broadcastToRoom(room, ["gameLowCardJoin", botName, game.betAmount]);
         }
       }
+      
       game._botsAdded = true;
       game.useBots = true;
+      
+      if (addedBots.length > 0) {
+        this._broadcastToRoom(room, ["gameLowCardNotification", 
+          `🤖 ${addedBots.join(', ')} bergabung sebagai bot`]);
+      }
+      
     } catch(e) {}
   }
+
+  // ============================================================
+  // AKHIRI QUIZ (18:00)
+  // ============================================================
 
   async _handleLowcardQuizEnd() {
     try {
@@ -1369,28 +1485,30 @@ export class GameServer {
       await this.dataManager.setLowcardQuizRunning(room, false);
       
       // Broadcast notifikasi
-      this._broadcastToRoom(room, ["gameLowCardNotification", "LowCard Quiz telah berakhir!"]);
+      this._broadcastToRoom(room, ["gameLowCardNotification", 
+        "🏁 LowCard Quiz telah berakhir! Sampai jumpa besok!"]);
       
-      // Cleanup game jika ada
+      // Tampilkan winners
       const game = this.activeGames.get(room);
       if (game) {
-        // Tampilkan winners
         await this._broadcastLowCardWinners(room);
-        
-        // Jangan langsung hapus, biarkan pemain melihat hasil
-        setTimeout(() => {
-          if (this.activeGames.has(room)) {
-            const currentGame = this.activeGames.get(room);
-            if (currentGame && !currentGame._isActive) {
-              this._forceCleanupGame(room, currentGame);
-            }
-          }
-        }, 10000);
+        this._broadcastToRoom(room, ["gameLowCardNotification", 
+          "📊 Lihat pemenang di menu Winners"]);
       }
       
-      // Matikan recording
-      await this.dataManager.setRecordingStatus(room, false);
-      this._broadcastToRoom(room, ["recordingStatus", false]);
+      // Matikan recording setelah delay
+      setTimeout(async () => {
+        await this.dataManager.setRecordingStatus(room, false);
+        this._broadcastToRoom(room, ["recordingStatus", false]);
+        
+        // Cleanup game
+        if (this.activeGames.has(room)) {
+          const currentGame = this.activeGames.get(room);
+          if (currentGame && !currentGame._isActive) {
+            this._forceCleanupGame(room, currentGame);
+          }
+        }
+      }, 10000);
       
       if (this._lowcardQuizTimer) {
         this._clearTimer(this._lowcardQuizTimer);
@@ -1402,10 +1520,14 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // JOIN QUIZ - KHUSUS ROOM "LowCard"
+  // ============================================================
+
   async _joinLowcardQuiz(ws, username) {
     try {
       if (!this._lowcardQuizActive || !this._lowcardQuizRunning) {
-        this._safeSend(ws, ["gameLowCardError", "LowCard Quiz tidak aktif"]);
+        this._safeSend(ws, ["gameLowCardError", "❌ LowCard Quiz tidak aktif"]);
         return;
       }
       
@@ -1413,22 +1535,22 @@ export class GameServer {
       const game = this.activeGames.get(room);
       
       if (!game?._isActive || game._gameEnded) {
-        this._safeSend(ws, ["gameLowCardError", "Quiz belum dimulai"]);
+        this._safeSend(ws, ["gameLowCardError", "❌ Quiz belum dimulai"]);
         return;
       }
       
       if (!game.registrationOpen) {
-        this._safeSend(ws, ["gameLowCardError", "Quiz sudah dimulai, tidak bisa join"]);
+        this._safeSend(ws, ["gameLowCardError", "❌ Quiz sudah dimulai, tidak bisa join"]);
         return;
       }
       
       if (game.players.has(username)) {
-        this._safeSend(ws, ["gameLowCardError", "Anda sudah bergabung"]);
+        this._safeSend(ws, ["gameLowCardError", "✅ Anda sudah bergabung"]);
         return;
       }
       
-      if (game.players.size >= CONSTANTS.MAX_PLAYERS_PER_GAME) {
-        this._safeSend(ws, ["gameLowCardError", "Quiz penuh"]);
+      if (game.players.size >= 20) { // Max 20 pemain untuk quiz
+        this._safeSend(ws, ["gameLowCardError", "❌ Quiz penuh (max 20 pemain)"]);
         return;
       }
       
@@ -1439,9 +1561,10 @@ export class GameServer {
       
       this._broadcastToRoom(room, ["gameLowCardJoin", username, game.betAmount]);
       this._safeSend(ws, ["gameLowCardJoinSuccess", username, game.betAmount]);
+      this._safeSend(ws, ["gameLowCardNotification", `✅ ${username} berhasil bergabung!`]);
       
     } catch(e) {
-      this._safeSend(ws, ["gameLowCardError", "Gagal join quiz"]);
+      this._safeSend(ws, ["gameLowCardError", "❌ Gagal join quiz"]);
     }
   }
 
@@ -1741,7 +1864,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // HANDLE EVENT INTERNAL
+  // HANDLE EVENT INTERNAL - KHUSUS ROOM "LowCard"
   // ============================================================
   
   async _handleEventInternal(ws, data) {
@@ -1749,9 +1872,12 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
-      // TAMBAHKAN
-      if (evt === "joinLowcardQuiz") {
-        const username = data[1];
+      // ============================================================
+      // KHUSUS ROOM "LowCard" - JOIN QUIZ
+      // ============================================================
+      if (evt === "joinLowcardQuiz" || (evt === "gameLowCardJoin" && 
+          ws.room === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME)) {
+        const username = data[1] || data[2];
         if (!username) {
           this._safeSend(ws, ["gameLowCardError", "Username required"]);
           return;
@@ -1772,6 +1898,13 @@ export class GameServer {
           return;
         }
         const room = roomName.trim();
+        
+        // Cek jika room adalah "LowCard" - hanya bisa diaktifkan oleh quiz
+        if (room === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
+          this._safeSend(ws, ["recordingError", "Recording untuk LowCard diatur otomatis oleh Quiz"]);
+          return;
+        }
+        
         await this.dataManager.setRecordingStatus(room, true);
         this._broadcastToRoom(room, ["recordingStatus", true]);
         this._safeSend(ws, ["startRecordingResult", { success: true, message: "Recording enabled" }]);
@@ -1785,6 +1918,13 @@ export class GameServer {
           return;
         }
         const room = roomName.trim();
+        
+        // Cek jika room adalah "LowCard" - hanya bisa dimatikan oleh quiz end
+        if (room === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
+          this._safeSend(ws, ["recordingError", "Recording untuk LowCard diatur otomatis oleh Quiz"]);
+          return;
+        }
+        
         await this.dataManager.setRecordingStatus(room, false);
         await this.dataManager.deleteAllWinners(room);
         this._broadcastToRoom(room, ["recordingStatus", false]);
@@ -1813,6 +1953,15 @@ export class GameServer {
         const roomKey = room.trim();
         const userKey = username.trim();
         
+        // Cek jika room adalah "LowCard" - hanya bisa ditambah oleh quiz
+        if (roomKey === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
+          const isRecording = await this.dataManager.getRecordingStatus(roomKey);
+          if (!isRecording) {
+            this._safeSend(ws, ["error", "LowCard hanya bisa menambah winner saat Quiz aktif"]);
+            return;
+          }
+        }
+        
         const winners = await this.dataManager.getWinners(roomKey);
         let count = parseInt(String(winners[userKey] || "0").replace("x", "")) || 0;
         winners[userKey] = (count + 1) + "x";
@@ -1830,6 +1979,13 @@ export class GameServer {
           return;
         }
         const roomKey = room.trim();
+        
+        // Cek jika room adalah "LowCard" - tidak bisa dihapus manual
+        if (roomKey === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
+          this._safeSend(ws, ["error", "Tidak bisa menghapus winners LowCard secara manual"]);
+          return;
+        }
+        
         await this.dataManager.deleteAllWinners(roomKey);
         this._broadcastToRoom(roomKey, ["recordingStatus", false]);
         this._safeSend(ws, ["deleteWinnersResult", { success: true }]);
@@ -1969,7 +2125,15 @@ export class GameServer {
           this._safeSend(ws, ["gameLowCardError", "Room and username required"]);
           return;
         }
-        await this._startGameWithRecording(ws, room.trim(), bet, username.trim());
+        const roomKey = room.trim();
+        
+        // Cek jika room adalah "LowCard" - tidak bisa start manual
+        if (roomKey === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
+          this._safeSend(ws, ["gameLowCardError", "LowCard adalah Quiz Room, tidak bisa start manual"]);
+          return;
+        }
+        
+        await this._startGameWithRecording(ws, roomKey, bet, username.trim());
         return;
       }
 
@@ -1978,13 +2142,28 @@ export class GameServer {
         return;
       }
 
+      // ============================================================
+      // GAME LOWCARD - NORMAL ROOM
+      // ============================================================
+      
       const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room || typeof room !== 'string' || room.trim() === '') {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
         return;
       }
+      
       if (room === CONSTANTS.DICE_ROOM) {
         this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
+        return;
+      }
+
+      // ============================================================
+      // KHUSUS ROOM "LowCard" - TIDAK BISA START NORMAL
+      // ============================================================
+      if (room === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
+        this._safeSend(ws, ["gameLowCardError", "LowCard adalah Quiz Room, game diatur otomatis"]);
+        this._safeSend(ws, ["gameLowCardNotification", 
+          "🎯 LowCard Quiz aktif jam 17:00-18:00 WITA"]);
         return;
       }
 
@@ -2005,7 +2184,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM
+  // SWITCH ROOM - KHUSUS ROOM "LowCard"
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -2027,12 +2206,30 @@ export class GameServer {
         return;
       }
 
-      // TAMBAHKAN - Auto trigger LowCard Quiz jika masuk ke room LowCard
+      // ============================================================
+      // KHUSUS ROOM "LowCard" - QUIZ MODE
+      // ============================================================
       if (roomName === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
-        if (this._lowcardQuizActive && !this._lowcardQuizRunning) {
-          this._startLowcardQuizGame(roomName);
+        // Jika masuk ke room "LowCard", cek status quiz
+        if (this._lowcardQuizActive) {
+          // Quiz aktif
+          if (!this._lowcardQuizRunning) {
+            // Quiz belum jalan, start
+            this._startLowcardQuizGame(roomName);
+          }
+          
+          // Set flag bahwa ini room quiz
+          this._isQuizRoom = true;
+        } else {
+          // Tidak dalam jam quiz
+          this._safeSend(ws, ["gameLowCardNotification", 
+            "🎯 LowCard Quiz hanya aktif jam 17:00-18:00 WITA"]);
+          this._safeSend(ws, ["gameLowCardNotification", 
+            "⏳ Waktu tersisa: " + this._getTimeUntilQuiz()]);
         }
       }
+      
+      // ... existing switch room code ...
       
       const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
       
@@ -2108,19 +2305,42 @@ export class GameServer {
           this._sendDiceNotificationOnSwitch(ws, wsId);
         }
 
-        // TAMBAHKAN - Notifikasi untuk LowCard room
-        if (roomName === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME && this._lowcardQuizActive) {
+        // ============================================================
+        // NOTIFIKASI KHUSUS ROOM "LowCard"
+        // ============================================================
+        if (roomName === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
           setTimeout(() => {
             if (ws && ws.readyState === 1) {
               if (this._lowcardQuizRunning) {
                 const game = this.activeGames.get(roomName);
                 if (game?._isActive && game.registrationOpen) {
-                  this._safeSend(ws, ["gameLowCardNotification", "LowCard Quiz sedang berlangsung! Ketik 'join' untuk bergabung"]);
+                  this._safeSend(ws, ["gameLowCardNotification", 
+                    "🎯 LowCard Quiz sedang berlangsung! Kirim 'join' untuk bergabung"]);
+                  this._safeSend(ws, ["gameLowCardJoinPrompt", "join"]);
+                  
+                  // Kirim status pemain
+                  const playerCount = game.players.size;
+                  this._safeSend(ws, ["gameLowCardNotification", 
+                    `👥 ${playerCount} pemain bergabung`]);
+                  
                 } else if (game?._isActive && !game.registrationOpen) {
-                  this._safeSend(ws, ["gameLowCardNotification", "LowCard Quiz sedang berlangsung..."]);
+                  this._safeSend(ws, ["gameLowCardNotification", 
+                    "🎯 LowCard Quiz sedang berlangsung..."]);
+                  
+                  // Kirim status round
+                  this._safeSend(ws, ["gameLowCardNotification", 
+                    `📊 Round ${game.round} sedang berjalan`]);
                 }
               } else if (this._lowcardQuizActive) {
-                this._safeSend(ws, ["gameLowCardNotification", "LowCard Quiz akan dimulai sebentar lagi..."]);
+                this._safeSend(ws, ["gameLowCardNotification", 
+                  "🎯 LowCard Quiz akan dimulai sebentar lagi..."]);
+                this._safeSend(ws, ["gameLowCardNotification", 
+                  "⏳ Persiapan... Mohon tunggu"]);
+              } else {
+                // Tidak aktif
+                const timeUntil = this._getTimeUntilQuiz();
+                this._safeSend(ws, ["gameLowCardNotification", 
+                  `⏳ LowCard Quiz akan dimulai dalam ${timeUntil}`]);
               }
             }
           }, 2000);
@@ -2138,6 +2358,40 @@ export class GameServer {
       this._safeSend(ws, ["switchRoomError", e.message || "Switch failed"]);
       this._switchLocks.delete(`switch_${ws._wsId}`);
       this._switchRetries.delete(`switch_${ws._wsId}`);
+    }
+  }
+
+  // ============================================================
+  // HELPER - GET TIME UNTIL QUIZ
+  // ============================================================
+
+  _getTimeUntilQuiz() {
+    try {
+      const witaTime = this._getCurrentWITATime();
+      const currentTotal = witaTime.totalMinutes;
+      
+      let minDiff = Infinity;
+      for (const session of LOWCARD_QUIZ_SCHEDULE.SESSIONS) {
+        const startTotal = parseTime(session.start);
+        let diff = startTotal - currentTotal;
+        if (diff < 0) diff += 24 * 60;
+        if (diff < minDiff) minDiff = diff;
+      }
+      
+      const hours = Math.floor(minDiff / 60);
+      const minutes = Math.floor(minDiff % 60);
+      
+      if (hours > 0 && minutes > 0) {
+        return `${hours} jam ${minutes} menit`;
+      } else if (hours > 0) {
+        return `${hours} jam`;
+      } else if (minutes > 0) {
+        return `${minutes} menit`;
+      } else {
+        return "kurang dari 1 menit";
+      }
+    } catch(e) {
+      return "tidak diketahui";
     }
   }
 
@@ -2224,7 +2478,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: START
+  // GAME: START (NORMAL ROOM ONLY)
   // ============================================================
   
   async startGame(ws, bet, username) {
@@ -2248,7 +2502,9 @@ export class GameServer {
         return;
       }
       if (room === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
-        this._safeSend(ws, ["gameLowCardError", "LowCard Quiz is auto-managed"]);
+        this._safeSend(ws, ["gameLowCardError", "❌ LowCard adalah Quiz Room! Game diatur otomatis"]);
+        this._safeSend(ws, ["gameLowCardNotification", 
+          "🎯 LowCard Quiz aktif jam 17:00-18:00 WITA"]);
         return;
       }
       
@@ -2295,7 +2551,8 @@ export class GameServer {
           _startedByRecording: false, _startedBy: 'user',
           _notificationTimers: [],
           _drawNotificationTimers: [],
-          _cleanupStarted: false
+          _cleanupStarted: false,
+          _isQuizRoom: false
         };
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
         game.playerWsId.set(usernameClean, wsId);
@@ -2882,7 +3139,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: JOIN
+  // GAME: JOIN (NORMAL ROOM ONLY)
   // ============================================================
   
   async joinGame(ws, username) {
@@ -2902,6 +3159,13 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
         return;
       }
+      
+      // Cek jika room adalah "LowCard" - gunakan join quiz
+      if (room === LOWCARD_QUIZ_SCHEDULE.ROOM_NAME) {
+        await this._joinLowcardQuiz(ws, usernameClean);
+        return;
+      }
+      
       const lockKey = `join_${room}_${usernameClean}`;
       if (this._joinLocks.has(lockKey)) {
         this._safeSend(ws, ["gameLowCardError", "Please wait"]);
@@ -3059,7 +3323,8 @@ export class GameServer {
         _startedByRecording: true, _startedBy: 'recording',
         _notificationTimers: [],
         _drawNotificationTimers: [],
-        _cleanupStarted: false
+        _cleanupStarted: false,
+        _isQuizRoom: false
       };
       game.players.set(username, { id: username, name: username });
       game.playerWsId.set(username, wsId);
