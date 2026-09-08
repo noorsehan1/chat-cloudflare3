@@ -1089,40 +1089,8 @@ export class ChatServer {
         } catch(e) {}
       }
       
-      for (const room of ROOMS) {
-        const roomBucket = this._storageCache.roomsData[room];
-        let count = 0;
-        if (roomBucket?.seat) {
-          for (const seat in roomBucket.seat) {
-            if (roomBucket.seat[seat]?.namauser) {
-              count++;
-            }
-          }
-        }
-        this.broadcast(room, ["roomUserCount", room, count]);
-      }
-      
-      for (const room of ROOMS) {
-        this.broadcast(room, ["currentNumber", this.currentNumber]);
-      }
-      
-      for (const ws of webSockets) {
-        try {
-          if (ws.readyState === 1 && ws.username && ws.room) {
-            await this.sendAllStateTo(ws, ws.room, false);
-            
-            const roomBucket = this._storageCache.roomsData[ws.room];
-            if (roomBucket) {
-              this.safeSend(ws, ["muteTypeResponse", roomBucket.mute || false, ws.room]);
-            }
-            
-            const found = await this._findUserInAnyRoom(ws.username);
-            if (found) {
-              this.safeSend(ws, ["numberKursiSaya", found.seat]);
-            }
-          }
-        } catch(e) {}
-      }
+      // HANYA UPDATE CACHE - TIDAK ADA BROADCAST APAPUN
+      // Data akan diambil user saat melakukan event/action
       
       this._restored = true;
       this._restoreDone = true;
