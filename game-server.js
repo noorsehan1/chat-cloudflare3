@@ -70,7 +70,7 @@ const LOWCARD_QUIZ_CONFIG = {
   MAX_GAMES_PER_SESSION: 20,
   COOLDOWN_BETWEEN_GAMES_MS: 5000,
   WIN_POINTS: 1,
-  ROOM_NAME: 'Lowcard',
+  ROOM_NAME: 'LowCard',
   ALARM_START: 'lowcard_quiz_session_start',
   ALARM_END: 'lowcard_quiz_session_end',
   ALARM_WEEKLY_RESET: 'lowcard_quiz_weekly_reset',
