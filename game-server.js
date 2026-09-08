@@ -464,13 +464,14 @@ class DataManager {
   }
 
   async setLowcardQuizRunning(room, running) {
+    // ⭐ HANYA DI CACHE, TIDAK DISIMPAN KE DB
     await this._ensureCacheInitialized();
     if (running) {
       this._cache.lowcardQuizRunning[room] = true;
     } else {
       delete this._cache.lowcardQuizRunning[room];
     }
-    await this._save(DB_KEYS.LOWCARD_QUIZ_RUNNING, this._cache.lowcardQuizRunning);
+    // ⭐ TIDAK SAVE KE DB
     return true;
   }
 }
@@ -1005,25 +1006,37 @@ export class GameServer {
 
   async _handleWeeklyReset() {
     try {
-      const points = await this.dataManager.getDicePoints();
+      const now = new Date();
+      const currentDay = now.getUTCDay();
+      const currentHour = now.getUTCHours();
       
-      let winner = null;
+      // ⭐ HANYA SENIN JAM 00:00 UTC
+      if (currentDay !== 1 || currentHour !== 0) {
+        return false;
+      }
+      
+      const points = await this.dataManager.getDicePoints();
+      const winners = await this.dataManager.getAllWinners();
+      
+      // ⭐ CEK WINNER DICE
+      let diceWinner = null;
       let highestScore = 0;
       for (const [username, score] of Object.entries(points)) {
         if (username && typeof username === 'string') {
           const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
           if (numericScore > highestScore) {
             highestScore = numericScore;
-            winner = username;
+            diceWinner = username;
           }
         }
       }
       
       const currentWeek = this.dataManager.getCurrentWeek();
       
-      if (winner && highestScore > 0) {
+      // ⭐ SIMPAN WINNER DICE
+      if (diceWinner && highestScore > 0) {
         const winnerData = { 
-          username: winner, 
+          username: diceWinner, 
           score: highestScore, 
           week: currentWeek,
           timestamp: Date.now() 
@@ -1033,7 +1046,20 @@ export class GameServer {
         await this.dataManager.deleteLastWeekWinner();
       }
       
+      // ⭐ RESET POINTS DICE
       await this.dataManager.resetDicePoints();
+      
+      // ⭐ HAPUS WINNERS LOWCARD HANYA JIKA ADA WINNER
+      const hasLowcardWinners = Object.keys(winners).length > 0;
+      if (hasLowcardWinners) {
+        for (const room of Object.keys(winners)) {
+          await this.dataManager.deleteAllWinners(room);
+        }
+      }
+      
+      // ⭐ UPDATE LAST RESET WEEK
+      await this.dataManager.setLastResetWeek(currentWeek);
+      
       return true;
     } catch(e) {
       const currentWeek = this.dataManager.getCurrentWeek();
@@ -1850,7 +1876,6 @@ export class GameServer {
         return;
       }
 
-      // Auto-start LowCard if entering room during session
       if (roomName === this._quizRoomName) {
         if (this._lowcardQuizActive && !this._lowcardQuizRunning) {
           this._startLowcardQuizGame(roomName);
@@ -1927,12 +1952,10 @@ export class GameServer {
           }
         }
         
-        // Dice Room Notification
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceNotificationOnSwitch(ws, wsId);
         }
 
-        // LowCard Room Notification
         if (roomName === this._quizRoomName) {
           setTimeout(() => {
             if (ws && ws.readyState === 1) {
@@ -2222,7 +2245,6 @@ export class GameServer {
         this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
         this._forceCleanupGame(room, game);
         
-        // Restart jika quiz masih aktif
         if (this._lowcardQuizActive && !this._lowcardQuizRunning) {
           setTimeout(() => {
             if (this._lowcardQuizActive && !this._lowcardQuizRunning) {
@@ -3805,7 +3827,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // FORCE CLEANUP GAME (DENGAN AUTO RESTART)
+  // FORCE CLEANUP GAME (DENGAN AUTO RESTART 15 DETIK)
   // ============================================================
 
   async _forceCleanupGame(room, game) {
@@ -3866,9 +3888,12 @@ export class GameServer {
       
       this._broadcastToRoom(room, ["gameLowCardEnd", []]);
       
+      // ⭐ RESET STATUS QUIZ (TAPI JANGAN SAVE KE DB)
+      this._lowcardQuizRunning = false;
+      await this.dataManager.setLowcardQuizRunning(room, false);
+      
       // ⭐ AUTO RESTART: Cek apakah masih dalam sesi LowCard
-      if (game?._startedBy === 'lowcard_quiz' && this._lowcardQuizActive) {
-        const now = new Date();
+      if (this._lowcardQuizActive) {
         const witaNow = this._getCurrentWITATime();
         const currentTotal = witaNow.totalMinutes;
         
@@ -3882,13 +3907,17 @@ export class GameServer {
           }
         }
         
-        // ⭐ Jika masih dalam sesi, restart game setelah 15 detik
+        // ⭐ JIKA MASIH SESI → RESTART SETELAH 15 DETIK
         if (isInSession) {
+          // ⭐ RESET LOCK
+          this._lowcardQuizLock = false;
+          
+          // ⭐ WAIT 15 DETIK → START LAGI
           setTimeout(() => {
-            if (this._lowcardQuizActive && !this._lowcardQuizRunning) {
+            if (this._lowcardQuizActive) {
               const currentGame = this.activeGames.get(room);
               if (!currentGame?._isActive || currentGame?._gameEnded) {
-                this._startLowcardQuizGame(room); // 🔄 RESTART!
+                this._startLowcardQuizGame(room);
               }
             }
           }, 15000);
