@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1.js
-// VERSION: 12.2.0 - FIXED BROADCAST ONLY
+// VERSION: 12.3.0 - FINAL
 // ============================================================
 
 // ============================================================
@@ -651,7 +651,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - FULL CLASS FIXED
+// GAME SERVER - FULL CLASS
 // ============================================================
 
 export class GameServer {
@@ -741,20 +741,17 @@ export class GameServer {
       
       this._restoreAllState().then(() => {
         this._restored = true;
-        console.log('[GAME] Server restored');
-      }).catch((e) => {
-        console.error('[GAME] Restore failed:', e);
+      }).catch(() => {
         this._restored = true;
       });
       
     } catch(e) {
-      console.error('[GAME] Constructor error:', e);
       this._restored = true;
     }
   }
 
   // ============================================================
-  // RESTORE ALL STATE - 1 QUERY
+  // RESTORE ALL STATE
   // ============================================================
   
   async _restoreAllState() {
@@ -783,7 +780,6 @@ export class GameServer {
       }
       
     } catch(e) {
-      console.error('[GAME] Restore error:', e);
       throw e;
     }
   }
@@ -823,7 +819,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SYNC ALL ROOMS - FIX BROADCAST
+  // SYNC ALL ROOMS
   // ============================================================
   
   _syncAllRooms() {
@@ -832,7 +828,7 @@ export class GameServer {
       const clientRoomMap = new Map();
       
       for (const [wsId, ws] of this.wsMap) {
-        if (ws && ws.room && ws.readyState === 1) {
+        if (ws && ws.room && ws.readyState === 1 && !ws._closing) {
           const room = ws.room;
           if (!roomMap.has(room)) {
             roomMap.set(room, new Set());
@@ -859,7 +855,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GET ROOM USERS - INTERNAL USE ONLY
+  // GET ROOM USERS - INTERNAL
   // ============================================================
   
   _getRoomUsers(room) {
@@ -888,7 +884,8 @@ export class GameServer {
           if (ws && ws.readyState === 1 && !ws._closing) {
             users.push({
               wsId: wsId,
-              ws: ws
+              ws: ws,
+              username: ws.username || 'Anonymous'
             });
           } else {
             toRemove.push(wsId);
@@ -899,6 +896,13 @@ export class GameServer {
           for (const wsId of toRemove) {
             wsIds.delete(wsId);
             this.clientRooms.delete(wsId);
+            this.wsMap.delete(wsId);
+            for (const [username, conn] of this.userConnections) {
+              if (conn.wsId === wsId) {
+                this.userConnections.delete(username);
+                break;
+              }
+            }
           }
           if (wsIds.size === 0) {
             this.wsClients.delete(room);
@@ -915,7 +919,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST TO ROOM - FIXED
+  // BROADCAST TO ROOM
   // ============================================================
   
   _broadcastToRoom(room, message) {
@@ -927,6 +931,7 @@ export class GameServer {
       const users = this._getRoomUsers(room);
       
       if (!users || users.length === 0) {
+        this.wsClients.delete(room);
         return 0;
       }
       
@@ -955,6 +960,12 @@ export class GameServer {
             clients.delete(wsId);
             this.clientRooms.delete(wsId);
             this.wsMap.delete(wsId);
+            for (const [username, conn] of this.userConnections) {
+              if (conn.wsId === wsId) {
+                this.userConnections.delete(username);
+                break;
+              }
+            }
           }
           if (clients.size === 0) {
             this.wsClients.delete(room);
@@ -1318,6 +1329,15 @@ export class GameServer {
         this.clientRooms.delete(wsId);
       }
       
+      for (const [r, clients] of this.wsClients) {
+        if (clients.has(wsId)) {
+          clients.delete(wsId);
+          if (clients.size === 0) {
+            this.wsClients.delete(r);
+          }
+        }
+      }
+      
       try {
         ws.serializeAttachment({
           wsId: wsId,
@@ -1355,6 +1375,15 @@ export class GameServer {
       if (wsId) {
         this.wsMap.delete(wsId);
         this.clientRooms.delete(wsId);
+      }
+      
+      for (const [r, clients] of this.wsClients) {
+        if (clients.has(wsId)) {
+          clients.delete(wsId);
+          if (clients.size === 0) {
+            this.wsClients.delete(r);
+          }
+        }
       }
       
       try {
@@ -1690,7 +1719,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - FIXED
+  // SWITCH ROOM
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1709,6 +1738,11 @@ export class GameServer {
       
       if (!wsId) {
         this._safeSend(ws, ["gameLowCardError", "Connection error"]);
+        return;
+      }
+      
+      if (ws.readyState !== 1 || ws._closing) {
+        this._safeSend(ws, ["gameLowCardError", "Connection closed"]);
         return;
       }
       
@@ -1767,10 +1801,7 @@ export class GameServer {
       
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
       
-      if (currentRoom) {
-        this._broadcastToRoom(currentRoom, ["playerLeft", finalUsername || "Anonymous"]);
-      }
-      this._broadcastToRoom(roomName, ["playerJoined", finalUsername || "Anonymous"]);
+      this._sendRoomStateToUser(ws, roomName);
       
       if (roomName === CONSTANTS.DICE_ROOM) {
         this._sendDiceNotificationOnSwitch(ws, wsId);
@@ -1779,6 +1810,17 @@ export class GameServer {
     } catch(e) {
       this._safeSend(ws, ["switchRoomError", e.message || "Switch failed"]);
     }
+  }
+
+  _sendRoomStateToUser(ws, room) {
+    try {
+      if (!ws || ws.readyState !== 1) return;
+      
+      this.dataManager.getRecordingStatus(room).then(isRecording => {
+        this._safeSend(ws, ["recordingStatus", isRecording]);
+      });
+      
+    } catch(e) {}
   }
 
   _sendDiceNotificationOnSwitch(ws, wsId) {
