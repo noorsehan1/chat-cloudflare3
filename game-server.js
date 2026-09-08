@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1.js
-// VERSION: 12.0.9 - FINAL FIXED
+// VERSION: 12.1.0 - FINAL FIXED
 // ============================================================
 
 // ============================================================
@@ -17,7 +17,6 @@ const CONSTANTS = {
   MAX_BOT_DRAWS_PER_ROUND: 4,
   EVALUATION_TIMEOUT_MS: 30000,
   MAX_PLAYERS_PER_GAME: 45,
-  GAME_CLEANUP_DELAY_MS: 5000,
   MAX_WS_CLIENTS: 150,
   MAX_EVENT_QUEUE_SIZE: 50,
   ERROR_RESET_INTERVAL_MS: 60000,
@@ -66,7 +65,7 @@ function parseTime(timeStr) {
 }
 
 // ============================================================
-// DATA MANAGER
+// DATA MANAGER - 1 QUERY RESTORE
 // ============================================================
 
 class DataManager {
@@ -100,6 +99,7 @@ class DataManager {
     }
   }
 
+  // ⚡ 1 QUERY UNTUK SEMUA DATA
   async loadAllData() {
     if (this._cacheLoading) {
       let waitCount = 0;
@@ -112,6 +112,7 @@ class DataManager {
     
     this._cacheLoading = true;
     try {
+      // ⚡ 1 QUERY SAJA
       const result = await this.db
         .prepare(`SELECT key, value FROM ${TABLE_NAME}`)
         .all();
@@ -125,28 +126,34 @@ class DataManager {
         scheduled_alarms: {}
       };
 
-      for (const row of result.results) {
+      const results = result.results || [];
+      for (const row of results) {
         const key = row.key;
-        const value = JSON.parse(row.value);
+        let value;
+        try {
+          value = JSON.parse(row.value);
+        } catch(e) {
+          continue;
+        }
 
         switch(key) {
           case 'recordingStatusMap':
-            cache.recordingStatusMap = value;
+            cache.recordingStatusMap = value || {};
             break;
           case 'winnersMap':
-            cache.winnersMap = value;
+            cache.winnersMap = value || {};
             break;
           case 'dicePoints':
-            cache.dicePoints = value;
+            cache.dicePoints = value || {};
             break;
           case 'lastWeekWinner':
-            cache.lastWeekWinner = value;
+            cache.lastWeekWinner = value || null;
             break;
           case 'lastResetWeek':
-            cache.lastResetWeek = value;
+            cache.lastResetWeek = value || null;
             break;
           case 'scheduled_alarms':
-            cache.scheduled_alarms = value;
+            cache.scheduled_alarms = value || {};
             break;
         }
       }
@@ -181,20 +188,22 @@ class DataManager {
   }
 
   async _save(key, value) {
-    if (value === null || value === undefined || 
-        (typeof value === 'object' && Object.keys(value).length === 0) ||
-        (Array.isArray(value) && value.length === 0)) {
+    try {
+      if (value === null || value === undefined || 
+          (typeof value === 'object' && Object.keys(value).length === 0) ||
+          (Array.isArray(value) && value.length === 0)) {
+        await this.db
+          .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
+          .bind(key)
+          .run();
+        return;
+      }
+      
       await this.db
-        .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
-        .bind(key)
+        .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
+        .bind(key, JSON.stringify(value))
         .run();
-      return;
-    }
-    
-    await this.db
-      .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
-      .bind(key, JSON.stringify(value))
-      .run();
+    } catch(e) {}
   }
 
   async getRecordingStatus(room) {
@@ -644,7 +653,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - FULL CLASS
+// GAME SERVER - FULL CLASS FIXED
 // ============================================================
 
 export class GameServer {
@@ -732,6 +741,7 @@ export class GameServer {
       
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
       
+      // RESTORE - 1 QUERY SAJA
       this._restoreAllState().then(() => {
         this._restored = true;
       }).catch(() => {
@@ -744,13 +754,13 @@ export class GameServer {
   }
 
   // ============================================================
-  // RESTORE
+  // RESTORE ALL STATE - 1 QUERY
   // ============================================================
   
   async _restoreAllState() {
     try {
       await this.dataManager.init();
-      await this.dataManager.loadAllData();
+      await this.dataManager.loadAllData(); // ⚡ 1 QUERY
       await this.alarmScheduler.restoreAlarms();
       await this.alarmScheduler.scheduleAlarms();
       await this._checkAndForceResetIfMondayUTC();
@@ -1530,7 +1540,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - FIXED: TIDAK HAPUS WS
+  // SWITCH ROOM - TIDAK HAPUS WS
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1582,7 +1592,6 @@ export class GameServer {
       ws.roomname = roomName;
       if (username) ws.username = username;
       
-      // UPDATE ATTACHMENT
       ws.serializeAttachment({
         wsId: wsId,
         username: username || ws.username || null,
@@ -1591,7 +1600,6 @@ export class GameServer {
         createdAt: ws._createdAt || Date.now()
       });
       
-      // UPDATE USER CONNECTION
       const finalUsername = username || ws.username;
       if (finalUsername) {
         let conn = this.userConnections.get(finalUsername);
@@ -1826,7 +1834,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CLOSE REGISTRATION - FIXED
+  // GAME: CLOSE REGISTRATION - LANGSUNG CLEANUP
   // ============================================================
   
   _closeRegistration(room, game) {
@@ -2060,7 +2068,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CLOSE DRAW PHASE - FIXED
+  // GAME: CLOSE DRAW PHASE - LANGSUNG CLEANUP
   // ============================================================
   
   async _closeDrawPhase(room, game) {
@@ -2146,7 +2154,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: EVALUATE ROUND - FIXED
+  // GAME: EVALUATE ROUND - LANGSUNG CLEANUP
   // ============================================================
   
   async _evaluateRound(room, game) {
@@ -3421,24 +3429,20 @@ export class GameServer {
   _getWsId(ws) { return ws?._wsId || null; }
 
   // ============================================================
-  // GAME: FORCE CLEANUP - FIXED: HANYA SAAT GAME SELESAI
+  // GAME: FORCE CLEANUP - HANYA SAAT GAME SELESAI
   // ============================================================
   
   async _forceCleanupGame(room, game) {
     try {
       if (!game) return;
       
-      // TANDAI GAME SUDAH SELESAI
       game._gameEnded = true;
       game._isActive = false;
       
-      // CLEANUP TIMERS
       this._cleanupGameTimers(game);
       
-      // BROADCAST GAME END
       this._broadcastToRoom(room, ["gameLowCardEnd", []]);
       
-      // HAPUS SEMUA DATA GAME
       game.players = null;
       game.botPlayers = null;
       game.numbers = null;
@@ -3469,10 +3473,8 @@ export class GameServer {
       game._botTimeouts = null;
       game._cleanupStarted = false;
       
-      // HAPUS DARI ACTIVE GAMES
       this.activeGames.delete(room);
       
-      // HAPUS LOCKS
       this._gameLocks.delete(room);
       this._joinLocks.delete(room);
       this._evaluationLocks.delete(`eval_${room}`);
