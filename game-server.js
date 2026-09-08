@@ -68,7 +68,7 @@ const LOWCARD_QUIZ_CONFIG = {
   },
   BET_AMOUNT: 100,
   MAX_GAMES_PER_SESSION: 20,
-  COOLDOWN_BETWEEN_GAMES_MS: 5000,
+  COOLDOWN_BETWEEN_GAMES_MS: 15000,  // ⬅️ 15 detik
   WIN_POINTS: 1,
   ROOM_NAME: 'LowCard',
   ALARM_START: 'lowcard_quiz_session_start',
@@ -682,7 +682,7 @@ class AlarmScheduler {
         }
       }
       
-      // Lowcard Quiz Schedule (12:00 - 12:30 WITA)
+      // Lowcard Quiz Schedule
       await this._scheduleLowcardQuizAlarms();
       
       return true;
@@ -1999,9 +1999,9 @@ export class GameServer {
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         
-        // If switching to Lowcard room, send quiz status
         if (roomName === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
           await this._sendLowcardQuizStatus(ws);
+          await this._checkAndStartLowcardQuizIfNeeded();
         }
         return;
       }
@@ -2075,14 +2075,7 @@ export class GameServer {
         
         if (roomName === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
           await this._sendLowcardQuizStatus(ws);
-          
-          const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
-          const autoStart = await this.dataManager.getLowcardQuizAutoStart();
-          const gameRunning = await this.dataManager.getLowcardQuizGameRunning();
-          
-          if (sessionActive && autoStart && !gameRunning) {
-            this._startLowcardQuizGame();
-          }
+          await this._checkAndStartLowcardQuizIfNeeded();
         }
         
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
@@ -2100,6 +2093,64 @@ export class GameServer {
     }
   }
 
+  // ============================================================
+  // CHECK AND START LOWCARD QUIZ IF NEEDED
+  // ============================================================
+
+  async _checkAndStartLowcardQuizIfNeeded() {
+    try {
+      const isQuizTime = this._isLowcardQuizTime();
+      const isQuizEnded = this._isLowcardQuizEnded();
+      const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
+      const autoStart = await this.dataManager.getLowcardQuizAutoStart();
+      const gameRunning = await this.dataManager.getLowcardQuizGameRunning();
+      
+      if (isQuizEnded && !isQuizTime) {
+        await this._forceResetLowcardQuizMode();
+        return;
+      }
+      
+      if (!isQuizTime) {
+        if (sessionActive || autoStart) {
+          await this._forceResetLowcardQuizMode();
+        }
+        return;
+      }
+      
+      if (!sessionActive) {
+        await this.dataManager.setLowcardQuizSessionActive(true);
+        await this.dataManager.setLowcardQuizAutoStart(true);
+        await this.dataManager.setRecordingStatus(LOWCARD_QUIZ_CONFIG.ROOM_NAME, true);
+        
+        this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizNotification", 
+          `🎯 Lowcard Quiz is starting! Auto-game with bet ${LOWCARD_QUIZ_CONFIG.BET_AMOUNT}`
+        ]);
+        
+        this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizSessionStart", {
+          message: "Lowcard Quiz session started!",
+          betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+          maxGames: LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION,
+          canStartGame: false
+        }]);
+      }
+      
+      const gameCount = await this.dataManager.getLowcardQuizGameCount();
+      const maxGames = LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION;
+      
+      if (gameCount < maxGames && !gameRunning) {
+        const existingGame = this.activeGames.get(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+        if (!existingGame || !existingGame._isActive || existingGame._gameEnded) {
+          await this._startLowcardQuizGame();
+        }
+      } else if (gameCount >= maxGames) {
+        this._broadcastToRoom(LOWCARD_QUIZ_CONFIG.ROOM_NAME, ["lowcardQuizNotification", 
+          `✅ All ${maxGames} games completed for this session!`
+        ]);
+      }
+      
+    } catch(e) {}
+  }
+
   async _sendLowcardQuizStatus(ws) {
     try {
       const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
@@ -2112,10 +2163,44 @@ export class GameServer {
       
       if (isQuizEnded && !isQuizTime) {
         await this._forceResetLowcardQuizMode();
+        const newSessionActive = await this.dataManager.getLowcardQuizSessionActive();
+        const newAutoStart = await this.dataManager.getLowcardQuizAutoStart();
+        const isActive = newSessionActive || newAutoStart || false;
+        
+        this._safeSend(ws, ["lowcardQuizStatus", {
+          sessionActive: false,
+          gameRunning: false,
+          autoStart: false,
+          gameCount: 0,
+          maxGames: LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION,
+          betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+          nextGameIn: "Not scheduled",
+          isQuizTime: false,
+          isQuizEnded: true,
+          canStartGame: true,
+          mode: "normal",
+          message: "Normal mode - You can start games manually"
+        }]);
+        return;
       }
       
       const isActive = sessionActive || autoStart || isQuizTime;
       const canStart = !isActive && !sessionActive && !autoStart && !isQuizTime;
+      
+      const game = this.activeGames.get(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+      let playerCount = 0;
+      let humanCount = 0;
+      let botCount = 0;
+      let isGameActive = false;
+      
+      if (game && game._isActive && !game._gameEnded) {
+        isGameActive = true;
+        playerCount = game.players ? game.players.size : 0;
+        if (game.players) {
+          humanCount = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_')).length;
+          botCount = playerCount - humanCount;
+        }
+      }
       
       this._safeSend(ws, ["lowcardQuizStatus", {
         sessionActive: sessionActive,
@@ -2123,23 +2208,30 @@ export class GameServer {
         autoStart: autoStart,
         gameCount: gameCount,
         maxGames: LOWCARD_QUIZ_CONFIG.MAX_GAMES_PER_SESSION,
-        betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
         nextGameIn: timeLeft.text,
         isQuizTime: isQuizTime,
         isQuizEnded: isQuizEnded,
+        betAmount: LOWCARD_QUIZ_CONFIG.BET_AMOUNT,
+        players: playerCount,
+        humans: humanCount,
+        bots: botCount,
+        isGameActive: isGameActive,
         canStartGame: canStart,
         mode: isActive ? "quiz" : "normal",
+        botRule: "Bot only if less than 5 human players",
         message: isActive ? "Quiz is running! Auto-game only." : "Normal mode - Start games manually"
       }]);
       
-      const winners = await this.dataManager.getWinners(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
-      const points = await this.dataManager.getLowcardQuizPoints();
-      this._safeSend(ws, ["lowcardQuizWinners", { 
-        winners: winners || {}, 
-        points: points || {},
-        room: LOWCARD_QUIZ_CONFIG.ROOM_NAME, 
-        recording: sessionActive || false
-      }]);
+      if (sessionActive || autoStart || isQuizTime) {
+        const winners = await this.dataManager.getWinners(LOWCARD_QUIZ_CONFIG.ROOM_NAME);
+        const points = await this.dataManager.getLowcardQuizPoints();
+        this._safeSend(ws, ["lowcardQuizWinners", { 
+          winners: winners || {}, 
+          points: points || {},
+          room: LOWCARD_QUIZ_CONFIG.ROOM_NAME, 
+          recording: sessionActive || false
+        }]);
+      }
     } catch(e) {}
   }
 
@@ -2250,28 +2342,21 @@ export class GameServer {
         return;
       }
       
-      // ============================================================
-      // CEK LOWCARD QUIZ
-      // ============================================================
       if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
         const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
         const autoStart = await this.dataManager.getLowcardQuizAutoStart();
         const isQuizTime = this._isLowcardQuizTime();
         const isQuizEnded = this._isLowcardQuizEnded();
         
-        // Jika quiz sudah berakhir, reset ke mode normal
         if (isQuizEnded && !isQuizTime) {
           await this._forceResetLowcardQuizMode();
-          // Lanjutkan ke start game normal
         } else if (sessionActive || autoStart || isQuizTime) {
-          // Quiz masih aktif, tolak start game
           this._safeSend(ws, ["gameLowCardError", 
             "❌ Lowcard Quiz is active! Auto-game running. You can only join, not start."
           ]);
           return;
         }
         
-        // Cek apakah dalam 5 menit sebelum quiz dimulai
         const timeLeft = this._getLowcardQuizTimeLeft();
         if (timeLeft && timeLeft.totalMs > 0 && timeLeft.totalMs < 300000) {
           this._safeSend(ws, ["gameLowCardError", 
@@ -2390,7 +2475,6 @@ export class GameServer {
       const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
       const humanCount = humanPlayers.length;
       
-      // CEK LOWCARD QUIZ: Bot hanya jika player < 5
       if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
         if (!game._botsAdded && humanCount < LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
           const needed = Math.min(4, LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT - 1 - humanCount);
@@ -2471,6 +2555,7 @@ export class GameServer {
       game._botsAdded = true;
       game.useBots = true;
       
+      const humanCount = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_')).length;
       this._broadcastToRoom(room, ["lowcardQuizNotification", 
         `${maxBotsToAdd} bot(s) added (${humanCount} humans + ${maxBotsToAdd} bots)`
       ]);
@@ -2507,7 +2592,6 @@ export class GameServer {
       
       const activePlayers = this._getActivePlayers(game);
       
-      // LOWCARD QUIZ: Bot hanya jika player < 5
       if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
         const humanCount = activePlayers.filter(p => !p.id.startsWith('BOT_')).length;
         if (humanCount >= LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
@@ -3092,7 +3176,6 @@ export class GameServer {
       try {
         const game = this.activeGames.get(room);
         if (!game?._isActive || game._gameEnded || !game.players) {
-          // Cek apakah ini room Lowcard dan quiz sedang aktif
           if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
             const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
             const autoStart = await this.dataManager.getLowcardQuizAutoStart();
@@ -3127,7 +3210,6 @@ export class GameServer {
           return;
         }
         
-        // Cek untuk Lowcard Quiz: jika sudah ada 5 pemain, tidak perlu bot lagi
         if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME && game._startedBy === 'lowcard_quiz') {
           const humanCount = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_')).length;
           if (humanCount >= LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
@@ -3229,7 +3311,6 @@ export class GameServer {
         return;
       }
       
-      // CEK LOWCARD QUIZ
       if (room === LOWCARD_QUIZ_CONFIG.ROOM_NAME) {
         const sessionActive = await this.dataManager.getLowcardQuizSessionActive();
         const autoStart = await this.dataManager.getLowcardQuizAutoStart();
@@ -4296,7 +4377,6 @@ export class GameServer {
       const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
       const humanCount = humanPlayers.length;
       
-      // Bot hanya jika player < 5
       if (!game._botsAdded && humanCount < LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT) {
         const needed = Math.min(4, LOWCARD_QUIZ_CONFIG.MIN_PLAYERS_FOR_NO_BOT - 1 - humanCount);
         if (needed > 0 && humanCount > 0) {
@@ -4340,8 +4420,9 @@ export class GameServer {
       const currentCount = await this.dataManager.getLowcardQuizGameCount();
       
       if (sessionActive && autoStart && currentCount < maxGames) {
+        // ✅ Hanya 1 notifikasi awal (silent, tanpa countdown)
         this._broadcastToRoom(room, ["lowcardQuizNotification", 
-          `⏳ Next game starting in 5 seconds...`
+          `⏳ Next game starting in 15 seconds...`
         ]);
         
         if (this._lowcardQuizCooldownTimer) {
@@ -4349,12 +4430,21 @@ export class GameServer {
           this._lowcardQuizCooldownTimer = null;
         }
         
+        // ✅ Silent cooldown 15 detik (tanpa notifikasi tambahan)
         this._lowcardQuizCooldownTimer = this._trackTimer(setTimeout(async () => {
           this._lowcardQuizCooldownTimer = null;
-          if (sessionActive && autoStart) {
+          
+          const stillActive = await this.dataManager.getLowcardQuizSessionActive();
+          const stillAuto = await this.dataManager.getLowcardQuizAutoStart();
+          
+          if (stillActive && stillAuto) {
+            this._broadcastToRoom(room, ["lowcardQuizNotification", 
+              `🎮 Starting game ${currentCount + 1}/${maxGames}...`
+            ]);
+            
             await this._startLowcardQuizGame();
           }
-        }, LOWCARD_QUIZ_CONFIG.COOLDOWN_BETWEEN_GAMES_MS || 5000));
+        }, LOWCARD_QUIZ_CONFIG.COOLDOWN_BETWEEN_GAMES_MS || 15000));
       } else {
         this._broadcastToRoom(room, ["lowcardQuizNotification", 
           sessionActive ? "All games completed!" : "Session ended"
