@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 14.2.0 - FIXED BROADCAST & CLIENT SYNC
+// VERSION: 14.3.0 - FIXED SERVER SLEEP & BROADCAST
 // ============================================================
 
 // ============================================================
@@ -569,7 +569,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - FULL CLASS (JAVA COMPATIBLE)
+// GAME SERVER - FULL CLASS
 // ============================================================
 
 export class GameServer {
@@ -1172,6 +1172,31 @@ export class GameServer {
         }
       }
       
+      // FALLBACK: Ambil dari game.players jika wsIds kosong (server tidur)
+      if (wsIds.size === 0) {
+        const game = this.activeGames.get(room);
+        if (game && game.players) {
+          for (const [playerId, playerData] of game.players) {
+            const wsId = game.playerWsId?.get(playerId);
+            if (wsId) {
+              const ws = this.wsMap.get(wsId);
+              let foundWs = ws;
+              if (!foundWs) {
+                for (const [username, conn] of this.userConnections) {
+                  if (conn.wsId === wsId) {
+                    foundWs = conn.ws;
+                    break;
+                  }
+                }
+              }
+              if (foundWs && foundWs.readyState === 1 && !foundWs._closing) {
+                wsIds.add(wsId);
+              }
+            }
+          }
+        }
+      }
+      
       if (wsIds.size === 0) return 0;
       
       const msgStr = JSON.stringify(message);
@@ -1510,7 +1535,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // WEBSOCKET HANDLERS
+  // WEBSOCKET HANDLERS - DIPERBAIKI
   // ============================================================
   
   async webSocketMessage(ws, message) {
@@ -1546,6 +1571,7 @@ export class GameServer {
         ws.room = attachment.room || null;
         ws.roomname = attachment.roomname || null;
         ws._createdAt = attachment.createdAt || Date.now();
+        
         if (attachment.username && attachment.room) {
           let conn = this.userConnections.get(attachment.username);
           if (!conn) {
@@ -1557,8 +1583,39 @@ export class GameServer {
             conn.room = attachment.room;
             conn.timestamp = Date.now();
           }
+          
+          // SYNC ULANG KE wsClients SAAT RECONNECT
+          const room = attachment.room;
+          if (!this.wsClients.has(room)) {
+            this.wsClients.set(room, new Set());
+          }
+          this.wsClients.get(room).add(attachment.wsId);
+          this.clientRooms.set(attachment.wsId, room);
+          this.wsMap.set(attachment.wsId, ws);
+          
+          // KIRIM STATE GAME JIKA ADA
+          const game = this.activeGames.get(room);
+          if (game && game._isActive && !game._gameEnded) {
+            this._sendCurrentGameState(ws, room);
+            
+            this._broadcastToRoom(room, ["gameLowCardStart", game.betAmount]);
+            this._broadcastToRoom(room, ["gameLowCardStartSuccess", game.hostName || game.hostId, game.betAmount]);
+            
+            const players = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
+            for (const player of players) {
+              this._broadcastToRoom(room, ["gameLowCardJoin", player, game.betAmount]);
+            }
+            
+            const elapsed = Date.now() - game._createdAt;
+            const remaining = Math.max(0, CONSTANTS.REGISTRATION_TIME_MS - elapsed);
+            if (remaining > 0) {
+              const seconds = Math.ceil(remaining / 1000);
+              this._broadcastToRoom(room, ["gameLowCardTimeLeft", seconds + "s"]);
+            }
+          }
         }
       }
+      
       const data = JSON.parse(message);
       if (Array.isArray(data) && data.length > 0) {
         await this._processWithTimeout(ws, data);
@@ -2191,7 +2248,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - DIPERBAIKI
+  // SWITCH ROOM
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -2502,18 +2559,8 @@ export class GameServer {
         
         const wsId = ws._wsId;
         
-        const roomClients = this.wsClients.get(room);
-        if (!roomClients || roomClients.size === 0) {
-          const newClients = new Set();
-          for (const [id, clientRoom] of this.clientRooms) {
-            if (clientRoom === room) {
-              newClients.add(id);
-            }
-          }
-          if (newClients.size > 0) {
-            this.wsClients.set(room, newClients);
-          }
-        }
+        // SYNC SEBELUM START
+        this._syncAllRooms();
         
         const game = this._createGameObject(room, betAmount, usernameClean, false);
         
@@ -2522,9 +2569,11 @@ export class GameServer {
         this.activeGames.set(room, game);
         this._addClient(room, ws, usernameClean);
         
+        // BROADCAST PERTAMA
         this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
         this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         
+        // KIRIM MANUAL KE SEMUA USER
         const allUsers = this._getRoomUsers(room);
         for (const user of allUsers) {
           if (user.ws && user.ws !== ws && user.ws.readyState === 1) {
