@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 13.6.1 - FIX BOT TIDAK BERJALAN
+// VERSION: 13.7.0 - FIX BOT TIDAK BERJALAN & TIMEUP LANJUT
 // ============================================================
 
 // ============================================================
@@ -2062,182 +2062,297 @@ export class GameServer {
   }
 
   // ============================================================
-  // CLOSE REGISTRATION - FIXED: BOT TIDAK BERJALAN
+  // CLOSE REGISTRATION - FIX: BOT TIDAK BERJALAN & TIMEUP LANJUT
   // ============================================================
   
   _closeRegistration(room, game) {
     try {
-      if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
+      // Validasi
+      if (!game) {
+        console.log('[DEBUG] _closeRegistration: Game tidak ditemukan');
+        return;
+      }
+      
+      if (game._gameEnded || !game._isActive) {
+        console.log('[DEBUG] _closeRegistration: Game sudah berakhir');
+        return;
+      }
+      
+      if (!game.registrationOpen) {
+        console.log('[DEBUG] _closeRegistration: Registrasi sudah ditutup');
+        return;
+      }
+      
+      console.log(`[DEBUG] _closeRegistration: START - Room=${room}, Players=${game.players.size}, Round=${game.round}`);
+      
+      // Bersihkan timer
       this._cleanupGameTimers(game);
       game.registrationOpen = false;
       
-      // Hitung human players (bukan bot)
+      // ==== HITUNG HUMAN PLAYER ====
       const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
       const humanCount = humanPlayers.length;
-      const totalPlayers = game.players.size;
-      const botCount = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_')).length;
       
-      // 🔥 FIX: Tambah bot jika belum ada bot dan human kurang dari 2
-      if (!game._botsAdded && (totalPlayers < 2 || humanCount <= 1)) {
-        const neededBots = Math.min(
-          CONSTANTS.MAX_BOTS_PER_GAME,
-          Math.max(4 - totalPlayers, 4 - humanCount)
-        );
+      console.log(`[DEBUG] _closeRegistration: Human=${humanCount}, Total=${game.players.size}`);
+      
+      // ==== LOGIKA CERDAS TAMBAH BOT ====
+      
+      // SKENARIO 1: 1 orang → TAMBAH 4 BOT
+      if (humanCount === 1 && game.players.size === 1) {
+        console.log('[DEBUG] _closeRegistration: Hanya 1 player, tambah 4 bot');
+        this._addBots(room, 4);
         
-        if (neededBots > 0) {
-          this._addBots(room, neededBots);
-          game._botsAdded = true;
-          game.useBots = true;
-        } else {
-          game._botsAdded = true;
+        // Pastikan bot benar-benar bertambah
+        if (game.players.size < 2) {
+          console.log('[DEBUG] _closeRegistration: Tambah bot gagal, coba lagi');
+          this._addBots(room, 4);
         }
-      } else {
-        // Jika sudah ada bot tapi total player < 2, tambahkan bot lagi
-        if (totalPlayers < 2 && botCount < CONSTANTS.MAX_BOTS_PER_GAME) {
-          const neededBots = Math.min(CONSTANTS.MAX_BOTS_PER_GAME - botCount, 4 - totalPlayers);
-          if (neededBots > 0) {
-            this._addBots(room, neededBots);
-            game.useBots = true;
-          }
-        }
+      }
+      
+      // SKENARIO 2: 2 orang atau lebih → LANJUT TANPA BOT
+      if (humanCount >= 2) {
+        console.log(`[DEBUG] _closeRegistration: ${humanCount} players, LANJUT tanpa bot`);
+        game._botsAdded = true;
+        game.useBots = false;
+      }
+      
+      // SKENARIO 3: 0 orang → TAMBAH 4 BOT (tidak mungkin terjadi)
+      if (humanCount === 0) {
+        console.log('[DEBUG] _closeRegistration: Tidak ada player, tambah 4 bot');
+        this._addBots(room, 4);
+      }
+      
+      // SKENARIO 4: 1 orang + sudah ada bot → cukup
+      if (humanCount === 1 && game.players.size >= 2) {
+        console.log(`[DEBUG] _closeRegistration: 1 human + ${game.players.size - 1} bot, LANJUT`);
         game._botsAdded = true;
       }
       
-      // Cek apakah cukup player (human + bot) untuk memulai game
-      const finalTotalPlayers = game.players.size;
-      if (this._isGameActuallyRunning(game) && finalTotalPlayers >= 2) {
+      console.log(`[DEBUG] _closeRegistration: Setelah proses, total=${game.players.size}, bots=${game.botPlayers?.size || 0}`);
+      
+      // ==== MULAI GAME JIKA CUKUP PLAYER ====
+      if (game.players.size >= 2) {
+        console.log(`[DEBUG] _closeRegistration: ✅ CUKUP PLAYER (${game.players.size}), memulai draw phase`);
+        
+        // ✅ RESET STATE GAME
+        game.numbers = new Map();
+        game.tanda = new Map();
+        game.eliminated = new Set();
+        game.evaluationLocked = false;
+        game.drawTimeExpired = false;
+        game._isEvaluating = false;
+        game._evalStartTime = null;
+        game._phase = 'draw';
+        game._state = 'draw';
+        game._drawPhaseStart = Date.now();
+        
+        if (!game._botTimeouts) game._botTimeouts = new Set();
+        
+        // ✅ BROADCAST KE ROOM
+        const playersList = this._getActivePlayers(game).map(p => p.name);
+        this._broadcastToRoom(room, ["gameLowCardClosed", playersList]);
+        this._broadcastToRoom(room, ["gameLowCardNextRound", game.round]);
+        
+        // ✅ LANGSUNG MULAI DRAW PHASE
         this._startDrawPhase(room, game);
+        
       } else {
+        // ❌ Tidak cukup player
+        console.log(`[DEBUG] _closeRegistration: ❌ GAGAL - Total player ${game.players.size} < 2`);
         this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
         this._forceCleanupGame(room, game);
       }
-    } catch(e) {}
+      
+    } catch(e) {
+      console.error('[ERROR] _closeRegistration:', e);
+      this._forceCleanupGame(room, game);
+    }
   }
 
   // ============================================================
-  // ADD BOTS - FIXED: TIDAK TERLALU KETAT
+  // ADD BOTS - FIX: HAPUS CEK BERLEBIHAN
   // ============================================================
   
   _addBots(room, count) {
     try {
       const game = this.activeGames.get(room);
       
-      // ✅ HAPUS CEK _isGameActuallyRunning - terlalu ketat
-      if (!game || game._gameEnded) return;
+      // ✅ HAPUS CEK _isGameActuallyRunning - terlalu ketat!
+      if (!game) {
+        console.log('[DEBUG] _addBots: Game tidak ditemukan');
+        return;
+      }
+      
+      if (game._gameEnded) {
+        console.log('[DEBUG] _addBots: Game sudah berakhir');
+        return;
+      }
+      
+      if (game.players.size >= CONSTANTS.MAX_PLAYERS_PER_GAME) {
+        console.log('[DEBUG] _addBots: Game penuh');
+        return;
+      }
       
       const botNames = ["moz1", "moz2", "moz3", "moz4"];
       const existingBots = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
       const existingBotCount = existingBots.length;
-      const maxBotsToAdd = Math.min(count, CONSTANTS.MAX_BOTS_PER_GAME - existingBotCount);
       
-      if (maxBotsToAdd <= 0) return;
+      const maxBotsToAdd = Math.min(
+        count,
+        CONSTANTS.MAX_BOTS_PER_GAME - existingBotCount,
+        CONSTANTS.MAX_PLAYERS_PER_GAME - game.players.size
+      );
       
-      let addedCount = 0;
+      console.log(`[DEBUG] _addBots: Menambah ${maxBotsToAdd} bot (existing=${existingBotCount}, total=${game.players.size})`);
+      
+      if (maxBotsToAdd <= 0) {
+        game._botsAdded = true;
+        return;
+      }
+      
+      let added = 0;
       for (let i = 0; i < maxBotsToAdd; i++) {
-        const botId = `BOT_${room}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        const botName = botNames[(existingBotCount + addedCount) % botNames.length];
+        const botId = `BOT_${room}_${i}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const botName = botNames[(existingBotCount + added) % botNames.length];
+        
         if (!game.players.has(botId)) {
-          game.players.set(botId, { id: botId, name: botName });
+          game.players.set(botId, { 
+            id: botId, 
+            name: botName,
+            isBot: true 
+          });
+          
           if (!game.botPlayers) game.botPlayers = new Map();
           game.botPlayers.set(botId, botName);
-          addedCount++;
+          added++;
+          console.log(`[DEBUG] _addBots: Bot ${botName} (${botId}) ditambahkan`);
         }
       }
       
-      // 🔥 FIX: Pastikan game.useBots = true dan _botsAdded = true
-      if (addedCount > 0) {
-        game._botsAdded = true;
-        game.useBots = true;
-        // Broadcast bot bergabung
-        const botNamesList = Array.from(game.botPlayers.values());
-        this._broadcastToRoom(room, ["gameLowCardJoin", "Bots: " + botNamesList.join(", "), game.betAmount]);
-      }
-    } catch(e) {}
+      game._botsAdded = true;
+      game.useBots = added > 0;
+      
+      console.log(`[DEBUG] _addBots: Selesai. Total player=${game.players.size}, bots=${game.botPlayers?.size || 0}`);
+      
+    } catch(e) {
+      console.error('[ERROR] _addBots:', e);
+    }
   }
 
   // ============================================================
-  // GAME: DRAW PHASE
+  // GAME: DRAW PHASE - FIX: LEBIH ROBUST
   // ============================================================
   
   async _startDrawPhase(room, game) {
     const lockKey = `startDraw_${room}`;
-    if (this._gameOperationLocks.has(lockKey)) return;
-    if (!this._acquireLock(this._gameOperationLocks, lockKey, 10000)) return;
+    
+    if (this._gameOperationLocks.has(lockKey)) {
+      console.log(`[DEBUG] _startDrawPhase: Locked, skip`);
+      return;
+    }
+    
+    if (!this._acquireLock(this._gameOperationLocks, lockKey, 10000)) {
+      console.log(`[DEBUG] _startDrawPhase: Gagal acquire lock`);
+      return;
+    }
+    
     try {
-      if (!this._isGameActuallyRunning(game)) {
+      console.log(`[DEBUG] _startDrawPhase: START - Room=${room}`);
+      
+      // Validasi
+      if (!game) {
+        console.log('[DEBUG] _startDrawPhase: Game null');
         this._releaseLock(this._gameOperationLocks, lockKey);
         return;
       }
       
-      // 🔥 FIX: Pastikan ada cukup player (termasuk bot)
-      const activePlayers = this._getActivePlayers(game);
-      const humanPlayers = activePlayers.filter(p => !p.id.startsWith('BOT_'));
-      
-      // Jika hanya 1 human atau total player < 2, tambahkan bot
-      if (humanPlayers.length <= 1 || activePlayers.length < 2) {
-        const neededBots = Math.min(
-          CONSTANTS.MAX_BOTS_PER_GAME,
-          Math.max(4 - activePlayers.length, 4 - humanPlayers.length)
-        );
-        if (neededBots > 0) {
-          this._addBots(room, neededBots);
-          game._botsAdded = true;
-          game.useBots = true;
-        }
+      if (game._gameEnded || !game._isActive) {
+        console.log(`[DEBUG] _startDrawPhase: Game ended atau inactive`);
+        this._releaseLock(this._gameOperationLocks, lockKey);
+        return;
       }
       
-      // 🔥 FIX: Ulangi cek setelah menambah bot
-      const newActivePlayers = this._getActivePlayers(game);
-      if (newActivePlayers.length < 2) {
-        if (newActivePlayers.length === 1 && !game._gameEnded) {
-          const winner = newActivePlayers[0]?.name || "Unknown";
-          const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
-          if (game._startedByRecording) {
-            await this._addLowCardWinner(room, winner);
-            await this._broadcastLowCardWinners(room);
+      // ==== PASTIKAN ADA MINIMAL 2 PLAYER ====
+      if (game.players.size < 2) {
+        console.log(`[DEBUG] _startDrawPhase: Total player ${game.players.size} < 2`);
+        
+        if (!game._botsAdded) {
+          const needed = Math.min(4, 2 - game.players.size);
+          if (needed > 0) {
+            console.log(`[DEBUG] _startDrawPhase: Tambah ${needed} bot`);
+            this._addBots(room, needed);
           }
+        }
+        
+        // Jika masih < 2, hentikan
+        if (game.players.size < 2) {
+          console.log(`[DEBUG] _startDrawPhase: ❌ GAGAL - Total ${game.players.size} < 2`);
+          
+          if (game.players.size === 1) {
+            const winner = Array.from(game.players.values())[0]?.name || "Unknown";
+            const totalCoin = (game.betAmount || 0) * game.players.size;
+            
+            if (game._startedByRecording) {
+              await this._addLowCardWinner(room, winner);
+              await this._broadcastLowCardWinners(room);
+            }
+            
+            this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
+          } else {
+            this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
+          }
+          
           game._gameEnded = true;
           game._isActive = false;
-          this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
-          this._releaseLock(this._gameOperationLocks, lockKey);
-          this._forceCleanupGame(room, game);
-          return;
-        } else {
-          game._gameEnded = true;
-          game._isActive = false;
-          this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
           this._releaseLock(this._gameOperationLocks, lockKey);
           this._forceCleanupGame(room, game);
           return;
         }
       }
+      
+      // ==== RESET STATE ====
+      this._cleanupGameTimers(game);
       
       game._isEvaluating = false;
       game._evalStartTime = null;
       game.evaluationLocked = false;
-      if (game._drawTimer) { this._clearTimer(game._drawTimer); game._drawTimer = null; }
-      if (game._evalTimer) { this._clearTimer(game._evalTimer); game._evalTimer = null; }
-      if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-      if (game._botTimeouts) {
-        for (const id of game._botTimeouts) this._clearTimer(id);
-        game._botTimeouts.clear();
-      }
-      
+      game.drawTimeExpired = false;
       game._phase = 'draw';
       game._state = 'draw';
-      game.drawTimeExpired = false;
-      game.evaluationLocked = false;
       game._drawPhaseStart = Date.now();
+      game._isActive = true;
+      game._gameEnded = false;
+      
       if (!game._botTimeouts) game._botTimeouts = new Set();
+      game.numbers = new Map();
+      game.tanda = new Map();
+      
+      console.log(`[DEBUG] _startDrawPhase: ✅ Mulai draw - Players=${game.players.size}, Bots=${game.botPlayers?.size || 0}, Round=${game.round}`);
+      
+      // ==== BROADCAST ====
       const playersList = this._getActivePlayers(game).map(p => p.name);
       this._broadcastToRoom(room, ["gameLowCardClosed", playersList]);
       this._broadcastToRoom(room, ["gameLowCardNextRound", game.round]);
+      
       this._releaseLock(this._gameOperationLocks, lockKey);
+      
+      // ==== MULAI COUNTDOWN ====
       this._startDrawCountdown(room, game);
-      if (game.botPlayers?.size > 0 && this._isGameActuallyRunning(game)) {
-        this._startBotDraws(room, game);
+      
+      // ==== MULAI BOT DRAWS (HANYA JIKA ADA BOT) ====
+      if (game.botPlayers && game.botPlayers.size > 0) {
+        console.log(`[DEBUG] _startDrawPhase: Mulai bot draws (${game.botPlayers.size} bot)`);
+        setTimeout(() => {
+          if (this._isGameActuallyRunning(game) && game._state === 'draw') {
+            this._startBotDraws(room, game);
+          }
+        }, 500);
+      } else {
+        console.log('[DEBUG] _startDrawPhase: Tidak ada bot, hanya player vs player');
       }
+      
     } catch(e) {
+      console.error('[ERROR] _startDrawPhase:', e);
       this._releaseLock(this._gameOperationLocks, lockKey);
     }
   }
@@ -2270,20 +2385,47 @@ export class GameServer {
   }
 
   // ============================================================
-  // BOT DRAWS
+  // BOT DRAWS - HANYA JIKA ADA BOT
   // ============================================================
   
   _startBotDraws(room, game) {
     try {
-      if (!this._isGameActuallyRunning(game)) return;
-      if (game.botPlayers.size === 0) return;
-      if (game._state !== 'draw') return;
-      if (game.evaluationLocked || game._isEvaluating) return;
-      if (game.drawTimeExpired) return;
+      // Cek apakah ada bot
+      if (!game.botPlayers || game.botPlayers.size === 0) {
+        console.log('[DEBUG] _startBotDraws: Tidak ada bot, skip');
+        return;
+      }
       
+      if (!this._isGameActuallyRunning(game)) {
+        console.log('[DEBUG] _startBotDraws: Game tidak berjalan');
+        return;
+      }
+      
+      if (game._state !== 'draw') {
+        console.log(`[DEBUG] _startBotDraws: State=${game._state}, bukan draw`);
+        return;
+      }
+      
+      if (game.evaluationLocked || game._isEvaluating) {
+        console.log('[DEBUG] _startBotDraws: Evaluation sedang berjalan');
+        return;
+      }
+      
+      if (game.drawTimeExpired) {
+        console.log('[DEBUG] _startBotDraws: Draw time expired');
+        return;
+      }
+      
+      // Ambil bot yang belum draw
       const activeBotIds = Array.from(game.botPlayers.keys())
         .filter(id => !game.eliminated.has(id) && !game.numbers.has(id));
-      if (activeBotIds.length === 0) return;
+      
+      if (activeBotIds.length === 0) {
+        console.log('[DEBUG] _startBotDraws: Semua bot sudah draw');
+        return;
+      }
+      
+      console.log(`[DEBUG] _startBotDraws: ${activeBotIds.length} bot belum draw`);
       
       for (const botId of activeBotIds) {
         if (game.evaluationLocked || game._isEvaluating) break;
@@ -2297,13 +2439,21 @@ export class GameServer {
           if (game.evaluationLocked || game._isEvaluating) return;
           if (game.eliminated.has(botId) || game.numbers.has(botId)) return;
           if (game.drawTimeExpired) return;
+          
           this._handleBotDraw(room, botId, game);
-          game._botTimers.delete(timer);
+          if (game._botTimers) {
+            game._botTimers.delete(timer);
+          }
         }, delay);
+        
         this._trackTimer(timer);
+        if (!game._botTimers) game._botTimers = new Set();
         game._botTimers.add(timer);
       }
-    } catch(e) {}
+      
+    } catch(e) {
+      console.error('[ERROR] _startBotDraws:', e);
+    }
   }
 
   _handleBotDraw(room, botId, game) {
