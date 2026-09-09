@@ -1,6 +1,6 @@
 // ============================================================
-// GAME-SERVER-D1-FINAL-FIXED.js
-// VERSION: 12.5.0 - ALL ISSUES FIXED
+// GAME-SERVER-D1-FINAL-COMPLETE.js
+// VERSION: 12.6.0 - ALL FIXES INCLUDED
 // ============================================================
 
 // ============================================================
@@ -79,7 +79,7 @@ function parseTime(timeStr) {
 }
 
 // ============================================================
-// DATA MANAGER (FIXED)
+// DATA MANAGER
 // ============================================================
 
 class DataManager {
@@ -694,7 +694,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - FINAL FIXED VERSION
+// GAME SERVER - FINAL COMPLETE VERSION
 // ============================================================
 
 export class GameServer {
@@ -1012,6 +1012,110 @@ export class GameServer {
   }
 
   // ============================================================
+  // GET ROOM - HELPER FIXED
+  // ============================================================
+  
+  _getClientRoom(ws) {
+    try {
+      if (!ws) return null;
+      
+      // 1. Check ws properties
+      let room = ws.room || ws.roomname;
+      if (room) return room;
+      
+      // 2. Check clientRooms map
+      const wsId = ws._wsId;
+      if (wsId) {
+        room = this.clientRooms.get(wsId);
+        if (room) return room;
+      }
+      
+      // 3. Check WebSocket attachment
+      try {
+        const attachment = ws.deserializeAttachment();
+        if (attachment && attachment.room) {
+          return attachment.room;
+        }
+      } catch(e) {}
+      
+      // 4. Check userConnections
+      if (ws.username) {
+        const conn = this.userConnections.get(ws.username);
+        if (conn && conn.room) {
+          return conn.room;
+        }
+      }
+      
+      return null;
+    } catch(e) {
+      return null;
+    }
+  }
+  
+  _ensureClientInRoom(ws, room, username = null) {
+    try {
+      if (!ws || !room) return false;
+      
+      const wsId = ws._wsId;
+      if (!wsId) return false;
+      
+      // Create room if not exists
+      if (!this.wsClients.has(room)) {
+        this.wsClients.set(room, new Set());
+      }
+      
+      // Add client to room
+      const clients = this.wsClients.get(room);
+      if (!clients.has(wsId)) {
+        clients.add(wsId);
+        this.clientRooms.set(wsId, room);
+        this.wsMap.set(wsId, ws);
+      }
+      
+      // Update ws properties
+      ws.room = room;
+      ws.roomname = room;
+      if (username) {
+        ws.username = username;
+      }
+      
+      // Update attachment
+      try {
+        ws.serializeAttachment({
+          wsId: wsId,
+          username: ws.username || null,
+          room: room,
+          roomname: room,
+          createdAt: ws._createdAt || Date.now()
+        });
+      } catch(e) {}
+      
+      // Update user connections
+      if (ws.username) {
+        let conn = this.userConnections.get(ws.username);
+        if (conn) {
+          conn.wsId = wsId;
+          conn.ws = ws;
+          conn.room = room;
+          conn.timestamp = Date.now();
+        } else {
+          this.userConnections.set(ws.username, {
+            wsId: wsId,
+            ws: ws,
+            room: room,
+            timestamp: Date.now()
+          });
+        }
+      }
+      
+      return true;
+    } catch(e) {
+      console.error('Ensure client in room error:', e);
+      return false;
+    }
+  }
+
+  // ============================================================
   // BROADCAST
   // ============================================================
   
@@ -1106,6 +1210,12 @@ export class GameServer {
         return;
       }
       
+      // Create room if not exists
+      if (!this.wsClients.has(room)) {
+        this.wsClients.set(room, new Set());
+      }
+      
+      // Remove from old room
       const oldRoom = this.clientRooms.get(wsId);
       if (oldRoom && oldRoom !== room) {
         const oldClients = this.wsClients.get(oldRoom);
@@ -1117,11 +1227,14 @@ export class GameServer {
         }
       }
       
+      // Update ws data
       ws.room = room;
+      ws.roomname = room;
       if (username) {
         ws.username = username;
       }
       
+      // Serialize attachment
       ws.serializeAttachment({
         wsId: wsId,
         username: ws.username || null,
@@ -1130,6 +1243,7 @@ export class GameServer {
         createdAt: ws._createdAt || Date.now()
       });
       
+      // Update user connections
       if (ws.username) {
         let conn = this.userConnections.get(ws.username);
         if (conn) {
@@ -1147,11 +1261,8 @@ export class GameServer {
         }
       }
       
-      let clients = this.wsClients.get(room);
-      if (!clients) {
-        clients = new Set();
-        this.wsClients.set(room, clients);
-      }
+      // Add to room
+      const clients = this.wsClients.get(room);
       clients.add(wsId);
       this.clientRooms.set(wsId, room);
       this.wsMap.set(wsId, ws);
@@ -1223,7 +1334,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: START
+  // GAME: START - FIXED
   // ============================================================
   
   async startGame(ws, bet, username) {
@@ -1239,19 +1350,31 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       
-      if (!room || room === this.DICE_ROOM) {
-        this._safeSend(ws, ["gameLowCardError", "Invalid room"]);
+      // ✅ FIX: Get room using helper
+      let room = this._getClientRoom(ws);
+      
+      if (!room) {
+        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first. Use: switchRoom 'RoomName' 'Username'"]);
         return;
       }
       
+      if (room === this.DICE_ROOM) {
+        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
+        return;
+      }
+      
+      // ✅ Ensure client is properly registered in room
+      this._ensureClientInRoom(ws, room, usernameClean);
+      
+      // Check if recording is enabled
       const isRecordingEnabled = await this.dataManager.getRecordingStatus(room);
       if (isRecordingEnabled) {
         this._safeSend(ws, ["gameLowCardError", "Recording is ACTIVE. Users cannot start games."]);
         return;
       }
       
+      // Acquire lock
       const lockKey = `start_${room}`;
       if (!this._acquireLock(this._gameLocks, lockKey, 10000)) {
         this._safeSend(ws, ["gameLowCardError", "Game is starting..."]);
@@ -1259,28 +1382,34 @@ export class GameServer {
       }
       
       try {
+        // Check existing game
         const existing = this.activeGames.get(room);
         if (existing && existing._isActive && !existing._gameEnded) {
           this._safeSend(ws, ["gameLowCardError", "Game already running"]);
           return;
         }
         
+        // Cleanup existing if any
         if (existing) {
           this._forceCleanupGame(room, existing);
         }
         
+        // Validate bet
         const betAmount = parseInt(bet, 10) || 0;
         if (betAmount < 0 || (betAmount > 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
           this._safeSend(ws, ["gameLowCardError", "Invalid bet (0 or 100-" + CONSTANTS.MAX_BET + ")"]);
           return;
         }
         
+        // Check max games
         if (this.activeGames.size >= CONSTANTS.MAX_LOWCARD_GAMES) {
           this._safeSend(ws, ["gameLowCardError", "Server is busy"]);
           return;
         }
         
         const wsId = ws._wsId;
+        
+        // Create game
         const game = {
           room: room,
           players: new Map(),
@@ -1292,11 +1421,13 @@ export class GameServer {
           eliminated: new Set(),
           host: usernameClean,
           
+          // State
           _isActive: true,
           _gameEnded: false,
           _state: this.GAME_STATE.REGISTRATION,
           _stateChangedAt: Date.now(),
           
+          // Timers
           _regTimer: null,
           _drawTimer: null,
           _evalTimer: null,
@@ -1306,6 +1437,7 @@ export class GameServer {
           _drawNotifTimers: [],
           _botTimers: new Set(),
           
+          // Tracking
           _startedAt: Date.now(),
           _drawStartTime: null,
           _evalStartTime: null,
@@ -1313,6 +1445,7 @@ export class GameServer {
           _startedBy: 'user',
           _startedByRecording: false,
           
+          // Locks
           evaluationLocked: false,
           _isEvaluating: false,
           drawTimeExpired: false,
@@ -1320,18 +1453,25 @@ export class GameServer {
           useBots: false,
           _cleanupStarted: false,
           
+          // Player tracking
           playerWsId: new Map()
         };
         
+        // Add host
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
-        game.playerWsId.set(usernameClean, wsId);
+        if (wsId) {
+          game.playerWsId.set(usernameClean, wsId);
+        }
         this.activeGames.set(room, game);
         
+        // Add client
         this._addClient(room, ws, usernameClean);
         
+        // Broadcast
         this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
         this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         
+        // Start registration
         this._startRegistration(room, game);
         
       } finally {
@@ -1340,7 +1480,7 @@ export class GameServer {
       
     } catch(e) {
       console.error('Start game error:', e);
-      this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
+      this._safeSend(ws, ["gameLowCardError", "Failed to start game: " + e.message]);
     }
   }
 
@@ -1388,7 +1528,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CLOSE REGISTRATION - FIXED
+  // GAME: CLOSE REGISTRATION
   // ============================================================
   
   _closeRegistration(room, game) {
@@ -1396,7 +1536,7 @@ export class GameServer {
       if (!this._isGameActuallyRunning(game)) return;
       if (game._state !== this.GAME_STATE.REGISTRATION) return;
       
-      // ✅ CHECK FOR HUMAN PLAYERS
+      // Check for human players
       const humanPlayers = Array.from(game.players.keys())
         .filter(id => !id.startsWith('BOT_'));
       
@@ -1548,7 +1688,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: BOT DRAWS - FIXED
+  // GAME: BOT DRAWS
   // ============================================================
   
   _startBotDraws(room, game) {
@@ -1586,7 +1726,6 @@ export class GameServer {
     }
   }
 
-  // ✅ FIXED: Bot draw with delay to prevent race condition
   _handleBotDraw(room, botId, game) {
     try {
       if (!this._isGameActuallyRunning(game)) return;
@@ -1603,7 +1742,7 @@ export class GameServer {
       const botName = game.players.get(botId)?.name || botId;
       this._broadcastToRoom(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
       
-      // ✅ DELAY BEFORE CHECK ALL DRAWN TO AVOID RACE CONDITION
+      // Delay before check all drawn to avoid race condition
       setTimeout(() => {
         if (!game.evaluationLocked && !game._isEvaluating && 
             game._state === this.GAME_STATE.DRAW) {
@@ -1636,10 +1775,9 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CHECK ALL DRAWN - FIXED
+  // GAME: CHECK ALL DRAWN
   // ============================================================
   
-  // ✅ FIXED: Handle 1 player case
   _checkAllDrawn(room, game) {
     try {
       if (!this._isGameActuallyRunning(game)) return;
@@ -1650,7 +1788,7 @@ export class GameServer {
       const activeIds = this._getActivePlayerIds(game);
       const drawnCount = game.numbers.size;
       
-      // ✅ HANDLE 1 PLAYER
+      // Handle 1 player
       if (activeIds.length === 1) {
         const winnerId = activeIds[0];
         const winnerName = game.players.get(winnerId)?.name || winnerId;
@@ -1690,10 +1828,9 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: CLOSE DRAW PHASE - FIXED (ASYNC)
+  // GAME: CLOSE DRAW PHASE
   // ============================================================
   
-  // ✅ FIXED: Added 'async' keyword
   async _closeDrawPhase(room, game) {
     try {
       if (!this._isGameActuallyRunning(game)) return;
@@ -1771,7 +1908,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: EVALUATE ROUND - FIXED
+  // GAME: EVALUATE ROUND
   // ============================================================
   
   async _evaluateRound(room, game) {
@@ -1836,7 +1973,6 @@ export class GameServer {
       
       const entries = Array.from(numbers.entries());
       
-      // ✅ FIXED: Handle no entries
       if (entries.length === 0) {
         game._isEvaluating = false;
         game.evaluationLocked = false;
@@ -1864,7 +2000,6 @@ export class GameServer {
       const remaining = Array.from(players.keys())
         .filter(id => !eliminated.has(id));
       
-      // ✅ FIXED: Check remaining before processing
       if (remaining.length === 0) {
         game._isEvaluating = false;
         game.evaluationLocked = false;
@@ -1888,7 +2023,6 @@ export class GameServer {
       const loserNames = losers.map(id => players.get(id)?.name || id);
       const remainingNames = remaining.map(id => players.get(id)?.name || id);
       
-      // Handle all same
       if (allSame && remaining.length >= 2) {
         game._isEvaluating = false;
         game.evaluationLocked = false;
@@ -1903,7 +2037,6 @@ export class GameServer {
         return;
       }
       
-      // Handle single winner
       if (remaining.length === 1) {
         const winnerId = remaining[0];
         const winnerName = players.get(winnerId)?.name || winnerId;
@@ -1930,7 +2063,6 @@ export class GameServer {
         return;
       }
       
-      // Continue with next round
       this._broadcastToRoom(room, ["gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames]);
       
       game._isEvaluating = false;
@@ -2009,7 +2141,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: JOIN
+  // GAME: JOIN - FIXED
   // ============================================================
   
   async joinGame(ws, username) {
@@ -2025,16 +2157,23 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       
-      if (!room || room === this.DICE_ROOM) {
-        this._safeSend(ws, ["gameLowCardError", "Invalid room"]);
+      // ✅ FIX: Get room using helper
+      let room = this._getClientRoom(ws);
+      
+      if (!room) {
+        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
+        return;
+      }
+      
+      if (room === this.DICE_ROOM) {
+        this._safeSend(ws, ["gameLowCardError", "Cannot join game in Quiz room"]);
         return;
       }
       
       const game = this.activeGames.get(room);
       if (!game || !game._isActive || game._gameEnded) {
-        this._safeSend(ws, ["gameLowCardError", "No active game"]);
+        this._safeSend(ws, ["gameLowCardError", "No active game in this room"]);
         return;
       }
       
@@ -2057,9 +2196,12 @@ export class GameServer {
         return;
       }
       
+      // Add player
       const wsId = ws._wsId;
       game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
-      game.playerWsId.set(usernameClean, wsId);
+      if (wsId) {
+        game.playerWsId.set(usernameClean, wsId);
+      }
       this._addClient(room, ws, usernameClean);
       
       this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
@@ -2071,7 +2213,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: SUBMIT NUMBER
+  // GAME: SUBMIT NUMBER - FIXED
   // ============================================================
   
   async submitNumber(ws, number, tanda, username) {
@@ -2087,10 +2229,17 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       
-      if (!room || room === this.DICE_ROOM) {
-        this._safeSend(ws, ["gameLowCardError", "Invalid room"]);
+      // ✅ FIX: Get room using helper
+      let room = this._getClientRoom(ws);
+      
+      if (!room) {
+        this._safeSend(ws, ["gameLowCardError", "No room found"]);
+        return;
+      }
+      
+      if (room === this.DICE_ROOM) {
+        this._safeSend(ws, ["gameLowCardError", "Cannot submit in Quiz room"]);
         return;
       }
       
@@ -2166,7 +2315,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: START WITH RECORDING - FIXED
+  // GAME: START WITH RECORDING
   // ============================================================
   
   async _startGameWithRecording(ws, room, bet, username) {
@@ -2188,7 +2337,6 @@ export class GameServer {
         return;
       }
       
-      // ✅ TANGKAP ERROR DARI startGame
       try {
         await this.startGame(ws, bet, username);
       } catch(startError) {
@@ -2280,7 +2428,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM
+  // SWITCH ROOM - FIXED
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -2293,7 +2441,12 @@ export class GameServer {
       
       const roomName = room?.trim();
       if (!roomName) {
-        this._safeSend(ws, ["switchRoomError", "Invalid room"]);
+        this._safeSend(ws, ["switchRoomError", "Invalid room name"]);
+        return;
+      }
+      
+      if (roomName === "undefined" || roomName === "null" || roomName === "") {
+        this._safeSend(ws, ["switchRoomError", "Invalid room name"]);
         return;
       }
       
@@ -2304,10 +2457,20 @@ export class GameServer {
       }
       
       try {
-        const oldRoom = this.clientRooms.get(wsId);
         const user = username || ws.username;
         
+        // Remove from old room
+        const oldRoom = this.clientRooms.get(wsId);
         if (oldRoom) {
+          const oldClients = this.wsClients.get(oldRoom);
+          if (oldClients) {
+            oldClients.delete(wsId);
+            if (oldClients.size === 0) {
+              this.wsClients.delete(oldRoom);
+            }
+          }
+          
+          // Remove from old game
           const oldGame = this.activeGames.get(oldRoom);
           if (oldGame && oldGame.playerWsId && user) {
             for (const [player, playerWsId] of oldGame.playerWsId) {
@@ -2319,12 +2482,58 @@ export class GameServer {
           }
         }
         
-        this._addClient(roomName, ws, user);
+        // Ensure new room exists
+        if (!this.wsClients.has(roomName)) {
+          this.wsClients.set(roomName, new Set());
+        }
         
+        // Add to new room
+        const newClients = this.wsClients.get(roomName);
+        newClients.add(wsId);
+        this.clientRooms.set(wsId, roomName);
+        this.wsMap.set(wsId, ws);
+        
+        // Update ws properties
+        ws.room = roomName;
+        ws.roomname = roomName;
+        if (user) {
+          ws.username = user;
+        }
+        
+        // Update attachment
+        try {
+          ws.serializeAttachment({
+            wsId: wsId,
+            username: ws.username || null,
+            room: roomName,
+            roomname: roomName,
+            createdAt: ws._createdAt || Date.now()
+          });
+        } catch(e) {}
+        
+        // Update user connections
+        if (ws.username) {
+          let conn = this.userConnections.get(ws.username);
+          if (conn) {
+            conn.wsId = wsId;
+            conn.ws = ws;
+            conn.room = roomName;
+            conn.timestamp = Date.now();
+          } else {
+            this.userConnections.set(ws.username, {
+              wsId: wsId,
+              ws: ws,
+              room: roomName,
+              timestamp: Date.now()
+            });
+          }
+        }
+        
+        // Update game state for new room
         const newGame = this.activeGames.get(roomName);
-        if (newGame && newGame._isActive && !newGame._gameEnded && user) {
-          if (newGame.players.has(user)) {
-            newGame.playerWsId.set(user, wsId);
+        if (newGame && newGame._isActive && !newGame._gameEnded && ws.username) {
+          if (newGame.players.has(ws.username)) {
+            newGame.playerWsId.set(ws.username, wsId);
           }
           
           if (newGame._state === this.GAME_STATE.DRAW && !newGame._gameEnded) {
@@ -2345,9 +2554,11 @@ export class GameServer {
         
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         
+        // Send room state
         const isRecording = await this.dataManager.getRecordingStatus(roomName);
         this._safeSend(ws, ["recordingStatus", isRecording]);
         
+        // Send game status
         const game = this.activeGames.get(roomName);
         if (game && game._isActive && !game._gameEnded) {
           this._safeSend(ws, ["gameStatus", "true"]);
@@ -2361,7 +2572,7 @@ export class GameServer {
       
     } catch(e) {
       console.error('Switch room error:', e);
-      this._safeSend(ws, ["switchRoomError", e.message]);
+      this._safeSend(ws, ["switchRoomError", e.message || "Switch failed"]);
     }
   }
 
@@ -2400,7 +2611,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // DICE GAME
+  // DICE GAME - (SAME AS BEFORE, KEEP)
   // ============================================================
   
   _acquireDiceLock(lockName, timeoutMs = 5000) {
@@ -3202,7 +3413,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // WEBSOCKET HANDLERS - FIXED
+  // WEBSOCKET HANDLERS
   // ============================================================
   
   async webSocketMessage(ws, message) {
@@ -3465,7 +3676,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ✅ FIXED: WebSocket close with proper null checks
   async webSocketClose(ws, code, reason, wasClean) {
     try {
       if (!ws) return;
@@ -3476,7 +3686,6 @@ export class GameServer {
       
       if (room && username) {
         const game = this.activeGames.get(room);
-        // ✅ CHECK game AND game.players
         if (game && game._isActive && !game._gameEnded && game.players) {
           if (game.players.has(username)) {
             if (game.host === username && game._state === this.GAME_STATE.REGISTRATION) {
