@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 14.1.1 - FIXED ROOM SYNC
+// VERSION: 14.2.0 - FIXED BROADCAST & CLIENT SYNC
 // ============================================================
 
 // ============================================================
@@ -589,7 +589,6 @@ export class GameServer {
       
       this.alarmScheduler.ctx = this;
       
-      // === PENDING EVENTS QUEUE ===
       this._pendingEvents = [];
       this._isRestoring = false;
       this._restorePromise = null;
@@ -648,7 +647,6 @@ export class GameServer {
       this._tieLock = false;
       this._tieNotificationTimeouts = [];
       
-      // LOCKS
       this._gameLocks = new Map();
       this._joinLocks = new Map();
       this._switchLocks = new Map();
@@ -725,8 +723,6 @@ export class GameServer {
         }
         
         this._restored = true;
-        
-        // Process pending events
         await this._processPendingEvents();
         
       } catch(e) {
@@ -777,7 +773,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SYNC ALL ROOMS - DIPERBAIKI
+  // SYNC ALL ROOMS
   // ============================================================
   
   _syncAllRooms() {
@@ -786,10 +782,8 @@ export class GameServer {
       const clientRoomMap = new Map();
       const toRemove = new Set();
       
-      // 1. Kumpulkan semua WebSocket yang valid
       for (const [wsId, ws] of this.wsMap) {
         if (ws && ws.readyState === 1 && !ws._closing) {
-          // Coba dapatkan room dari berbagai sumber
           let room = ws.room || ws.roomname;
           
           if (!room) {
@@ -841,7 +835,6 @@ export class GameServer {
         }
       }
       
-      // 2. Hapus WebSocket yang tidak valid
       for (const wsId of toRemove) {
         this.wsMap.delete(wsId);
         this.clientRooms.delete(wsId);
@@ -853,13 +846,11 @@ export class GameServer {
         }
       }
       
-      // 3. Update wsClients
       this.wsClients.clear();
       for (const [room, wsIds] of roomMap) {
         this.wsClients.set(room, wsIds);
       }
       
-      // 4. Update clientRooms
       this.clientRooms.clear();
       for (const [wsId, room] of clientRoomMap) {
         this.clientRooms.set(wsId, room);
@@ -870,7 +861,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GET ROOM USERS - DIPERBAIKI
+  // GET ROOM USERS
   // ============================================================
   
   _getRoomUsers(room) {
@@ -880,7 +871,6 @@ export class GameServer {
       const seenWsIds = new Set();
       const roomSet = new Set();
       
-      // 1. Kumpulkan semua wsId dari berbagai sumber
       let wsIds = this.wsClients.get(room);
       if (wsIds && wsIds.size > 0) {
         for (const wsId of wsIds) {
@@ -909,7 +899,6 @@ export class GameServer {
         }
       }
       
-      // 2. Proses setiap wsId
       const toRemove = new Set();
       for (const wsId of roomSet) {
         if (seenWsIds.has(wsId)) continue;
@@ -962,7 +951,6 @@ export class GameServer {
         }
       }
       
-      // 3. Cleanup wsId yang tidak valid
       if (toRemove.size > 0) {
         const clients = this.wsClients.get(room);
         if (clients) {
@@ -984,7 +972,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // ADD CLIENT - DIPERBAIKI
+  // ADD CLIENT
   // ============================================================
   
   _addClient(room, ws, username = null) {
@@ -996,7 +984,6 @@ export class GameServer {
         return; 
       }
       
-      // Cek apakah client sudah ada di room lain
       if (this.clientRooms.has(wsId)) {
         const oldRoom = this.clientRooms.get(wsId);
         if (oldRoom && oldRoom !== room) {
@@ -1004,16 +991,16 @@ export class GameServer {
         }
       }
       
-      // Update attachment
-      ws.serializeAttachment({
-        wsId: wsId,
-        username: username,
-        room: room,
-        roomname: room,
-        createdAt: ws._createdAt || Date.now()
-      });
+      this.wsMap.set(wsId, ws);
+      this.clientRooms.set(wsId, room);
       
-      // Update username
+      let clients = this.wsClients.get(room);
+      if (!clients) { 
+        clients = new Set(); 
+        this.wsClients.set(room, clients); 
+      }
+      clients.add(wsId);
+      
       if (username) {
         let conn = this.userConnections.get(username);
         if (conn) { 
@@ -1027,22 +1014,17 @@ export class GameServer {
         this._reconnectAttempts.delete(username);
       }
       
-      // PASTIKAN wsClients terupdate
-      let clients = this.wsClients.get(room);
-      if (!clients) { 
-        clients = new Set(); 
-        this.wsClients.set(room, clients); 
-      }
-      
-      // Tambahkan wsId ke room
-      clients.add(wsId);
-      this.clientRooms.set(wsId, room);
-      this.wsMap.set(wsId, ws);
-      
-      // Update ws properties
       ws.room = room;
       ws.roomname = room;
       if (username) ws.username = username;
+      
+      ws.serializeAttachment({
+        wsId: wsId,
+        username: username || ws.username || null,
+        room: room,
+        roomname: room,
+        createdAt: ws._createdAt || Date.now()
+      });
       
     } catch(e) {}
   }
@@ -1161,47 +1143,78 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST
+  // BROADCAST TO ROOM - DIPERBAIKI
   // ============================================================
   
   _broadcastToRoom(room, message) {
     try {
       if (this.closing || this.isDestroyed || !room || !message) return 0;
-      const users = this._getRoomUsers(room);
-      if (!users || users.length === 0) return 0;
+      
+      const wsIds = new Set();
+      
+      const clients1 = this.wsClients.get(room);
+      if (clients1) {
+        for (const id of clients1) wsIds.add(id);
+      }
+      
+      for (const [wsId, clientRoom] of this.clientRooms) {
+        if (clientRoom === room) wsIds.add(wsId);
+      }
+      
+      for (const [username, conn] of this.userConnections) {
+        if (conn.room === room) wsIds.add(conn.wsId);
+      }
+      
+      for (const [wsId, ws] of this.wsMap) {
+        if (ws && ws.readyState === 1 && !ws._closing) {
+          const wsRoom = ws.room || ws.roomname;
+          if (wsRoom === room) wsIds.add(wsId);
+        }
+      }
+      
+      if (wsIds.size === 0) return 0;
+      
       const msgStr = JSON.stringify(message);
       let sentCount = 0;
       const toRemove = [];
-      for (const user of users) {
-        const ws = user.ws;
+      
+      for (const wsId of wsIds) {
+        let ws = this.wsMap.get(wsId);
+        
+        if (!ws) {
+          for (const [username, conn] of this.userConnections) {
+            if (conn.wsId === wsId) {
+              ws = conn.ws;
+              break;
+            }
+          }
+        }
+        
         if (ws && ws.readyState === 1 && !ws._closing) {
           try {
             ws.send(msgStr);
             sentCount++;
           } catch(e) {
-            toRemove.push(user.wsId);
+            toRemove.push(wsId);
           }
         } else {
-          toRemove.push(user.wsId);
+          toRemove.push(wsId);
         }
       }
-      if (toRemove.length > 0) {
+      
+      for (const wsId of toRemove) {
         const clients = this.wsClients.get(room);
-        if (clients) {
-          for (const wsId of toRemove) {
-            clients.delete(wsId);
-            this.clientRooms.delete(wsId);
-            this.wsMap.delete(wsId);
-            for (const [username, conn] of this.userConnections) {
-              if (conn.wsId === wsId) {
-                this.userConnections.delete(username);
-                break;
-              }
-            }
+        if (clients) clients.delete(wsId);
+        this.clientRooms.delete(wsId);
+        this.wsMap.delete(wsId);
+        for (const [username, conn] of this.userConnections) {
+          if (conn.wsId === wsId) {
+            this.userConnections.delete(username);
+            break;
           }
-          if (clients.size === 0) this.wsClients.delete(room);
         }
       }
+      
       return sentCount;
     } catch(e) { return 0; }
   }
@@ -1215,7 +1228,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SEND CURRENT GAME STATE - DIPERBAIKI
+  // SEND CURRENT GAME STATE
   // ============================================================
   
   _sendCurrentGameState(ws, room) {
@@ -1228,21 +1241,17 @@ export class GameServer {
         return;
       }
       
-      // Kirim status game aktif
       this._sendToUser(ws, ["gameStatus", "true"]);
       
       if (game._phase === 'registration' || game._state === 'registration') {
-        // Kirim informasi start
         this._sendToUser(ws, ["gameLowCardStart", game.betAmount]);
         this._sendToUser(ws, ["gameLowCardStartSuccess", game.hostName || game.hostId, game.betAmount]);
         
-        // Kirim semua pemain yang sudah join
         const players = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
         for (const player of players) {
           this._sendToUser(ws, ["gameLowCardJoin", player, game.betAmount]);
         }
         
-        // Kirim sisa waktu registrasi
         const elapsed = Date.now() - game._createdAt;
         const remaining = Math.max(0, CONSTANTS.REGISTRATION_TIME_MS - elapsed);
         if (remaining > 0) {
@@ -1258,14 +1267,12 @@ export class GameServer {
         this._sendToUser(ws, ["gameLowCardClosed", playersList]);
         this._sendToUser(ws, ["gameLowCardNextRound", game.round]);
         
-        // Kirim semua angka yang sudah di-draw
         for (const [id, number] of game.numbers) {
           const name = game.players.get(id)?.name || id;
           const tanda = game.tanda.get(id) || "";
           this._sendToUser(ws, ["gameLowCardPlayerDraw", name, number, tanda]);
         }
         
-        // Kirim sisa waktu draw
         if (game._drawPhaseStart) {
           const elapsed = Date.now() - game._drawPhaseStart;
           const remaining = Math.max(0, 20000 - elapsed);
@@ -1275,7 +1282,6 @@ export class GameServer {
           }
         }
         
-        // Kirim status evaluasi
         if (game._isEvaluating || game.evaluationLocked) {
           this._sendToUser(ws, ["gameLowCardWait", "wait results"]);
         }
@@ -1747,7 +1753,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // HANDLE EVENT INTERNAL - DIPERBAIKI
+  // HANDLE EVENT INTERNAL
   // ============================================================
   
   async _handleEventInternal(ws, data) {
@@ -1755,7 +1761,7 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
-      // ==================== SWITCH ROOM - DIPERBAIKI ====================
+      // ==================== SWITCH ROOM ====================
       if (evt === "switchRoom") {
         await this.switchRoom(ws, data[1], data[2]);
         return;
@@ -2101,7 +2107,7 @@ export class GameServer {
         return;
       }
 
-      // ==================== CHECK GAME RUNNING - DIPERBAIKI ====================
+      // ==================== CHECK GAME RUNNING ====================
       
       if (evt === "checkGameRunning") {
         await this.checkGameRunning(ws, data[1]);
@@ -2211,11 +2217,11 @@ export class GameServer {
       }
       
       const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
+      
       if (currentRoom === roomName) {
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceRoomState(ws);
         }
-        // KIRIM STATE GAME jika sudah di room yang sama
         const game = this.activeGames.get(roomName);
         if (game && game._isActive && !game._gameEnded) {
           this._sendCurrentGameState(ws, roomName);
@@ -2229,6 +2235,9 @@ export class GameServer {
           clients.delete(wsId);
           if (clients.size === 0) this.wsClients.delete(currentRoom);
         }
+        if (this.clientRooms.get(wsId) === currentRoom) {
+          this.clientRooms.delete(wsId);
+        }
       }
       
       if (!this.wsClients.has(roomName)) {
@@ -2236,18 +2245,7 @@ export class GameServer {
       }
       this.wsClients.get(roomName).add(wsId);
       this.clientRooms.set(wsId, roomName);
-      
-      ws.room = roomName;
-      ws.roomname = roomName;
-      if (username) ws.username = username;
-      
-      ws.serializeAttachment({
-        wsId: wsId,
-        username: username || ws.username || null,
-        room: roomName,
-        roomname: roomName,
-        createdAt: ws._createdAt || Date.now()
-      });
+      this.wsMap.set(wsId, ws);
       
       const finalUsername = username || ws.username;
       if (finalUsername) {
@@ -2262,7 +2260,18 @@ export class GameServer {
         }
       }
       
-      // KIRIM STATE GAME jika ada game aktif di room
+      ws.room = roomName;
+      ws.roomname = roomName;
+      if (username) ws.username = username;
+      
+      ws.serializeAttachment({
+        wsId: wsId,
+        username: finalUsername || null,
+        room: roomName,
+        roomname: roomName,
+        createdAt: ws._createdAt || Date.now()
+      });
+      
       const game = this.activeGames.get(roomName);
       if (game && game._isActive && !game._gameEnded) {
         this._sendCurrentGameState(ws, roomName);
@@ -2281,7 +2290,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // CHECK GAME RUNNING - DIPERBAIKI
+  // CHECK GAME RUNNING
   // ============================================================
   
   async checkGameRunning(ws, roomname) {
@@ -2493,7 +2502,6 @@ export class GameServer {
         
         const wsId = ws._wsId;
         
-        // 🔥 PASTIKAN semua client di room terdaftar di wsClients
         const roomClients = this.wsClients.get(room);
         if (!roomClients || roomClients.size === 0) {
           const newClients = new Set();
@@ -2514,19 +2522,15 @@ export class GameServer {
         this.activeGames.set(room, game);
         this._addClient(room, ws, usernameClean);
         
-        // 🔥 KIRIM STATE ke semua user yang sudah ada di room
-        const clients = this.wsClients.get(room);
-        if (clients && clients.size > 0) {
-          for (const id of clients) {
-            const clientWs = this.wsMap.get(id);
-            if (clientWs && clientWs !== ws && clientWs.readyState === 1 && !clientWs._closing) {
-              this._sendCurrentGameState(clientWs, room);
-            }
-          }
-        }
-        
         this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
         this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
+        
+        const allUsers = this._getRoomUsers(room);
+        for (const user of allUsers) {
+          if (user.ws && user.ws !== ws && user.ws.readyState === 1) {
+            this._sendCurrentGameState(user.ws, room);
+          }
+        }
         
         this._startRegistration(room, game);
         
@@ -3074,7 +3078,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: EVALUATE ROUND (LOWCARD) - TIDAK DIUBAH
+  // GAME: EVALUATE ROUND (LOWCARD)
   // ============================================================
   
   async _evaluateRound(room, game) {
@@ -3522,7 +3526,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // DICE GAME (TIDAK DIUBAH)
+  // DICE GAME
   // ============================================================
   
   _startDiceFast() {
@@ -3667,7 +3671,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // TIE BREAKER (TIDAK DIUBAH)
+  // TIE BREAKER
   // ============================================================
 
   async _startTieBreaker(room, players) {
@@ -3983,7 +3987,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SUBMIT DICE ANSWER (TIDAK DIUBAH)
+  // SUBMIT DICE ANSWER
   // ============================================================
   
   async submitDiceAnswer(ws, username, guess) {
@@ -4042,7 +4046,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // RECORDING HELPERS (TIDAK DIUBAH)
+  // RECORDING HELPERS
   // ============================================================
   
   async _broadcastLowCardWinners(room) {
@@ -4075,7 +4079,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // TIMER MANAGEMENT (TIDAK DIUBAH)
+  // TIMER MANAGEMENT
   // ============================================================
   
   _trackTimer(timer) {
@@ -4147,7 +4151,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // CLIENT MANAGEMENT (TIDAK DIUBAH)
+  // CLIENT MANAGEMENT
   // ============================================================
   
   _removeClientFromRoom(room, wsId) {
@@ -4166,7 +4170,7 @@ export class GameServer {
   _getWsId(ws) { return ws?._wsId || null; }
 
   // ============================================================
-  // LOCK HELPERS (TIDAK DIUBAH)
+  // LOCK HELPERS
   // ============================================================
   
   _acquireLock(lockMap, key, timeoutMs = 5000) {
@@ -4184,7 +4188,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // UTILITY (TIDAK DIUBAH)
+  // UTILITY
   // ============================================================
   
   _safeSend(ws, message) {
@@ -4247,7 +4251,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: FORCE CLEANUP (TIDAK DIUBAH)
+  // GAME: FORCE CLEANUP
   // ============================================================
   
   async _forceCleanupGame(room, game) {
@@ -4311,7 +4315,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // DESTROY (TIDAK DIUBAH)
+  // DESTROY
   // ============================================================
   
   async destroy() {
