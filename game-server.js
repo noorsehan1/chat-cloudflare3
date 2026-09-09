@@ -1,6 +1,6 @@
 // ============================================================
-// GAME-SERVER-D1-JAVA-COMPATIBLE.js
-// VERSION: 13.0.0 - FULL COMPATIBLE WITH JAVA CLIENT
+// GAME-SERVER-D1-JAVA-ONLY.js
+// VERSION: 13.1.0 - 100% MENGIKUTI CLIENT JAVA
 // ============================================================
 
 const CONSTANTS = {
@@ -508,7 +508,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - FULL COMPATIBLE WITH JAVA CLIENT
+// GAME SERVER - 100% MENGIKUTI CLIENT JAVA
 // ============================================================
 
 export class GameServer {
@@ -586,6 +586,10 @@ export class GameServer {
       this._lastErrorReset = Date.now();
       this._lastWinnerRequestTime = new Map();
       this._lastNotifTime = {};
+      
+      // ✅ STORE UNTUK FALLBACK
+      this._gameRoom = "";
+      this._gameUsername = "";
       
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
       this.GAME_STATE = CONSTANTS.GAME_STATE;
@@ -689,7 +693,6 @@ export class GameServer {
     const transitions = this._getValidTransitions();
     const allowed = transitions[game._state] || [];
     if (!allowed.includes(newState)) return false;
-    const oldState = game._state;
     game._state = newState;
     game._stateChangedAt = Date.now();
     return true;
@@ -759,7 +762,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GET CLIENT DATA - COMPATIBLE WITH JAVA CLIENT
+  // GET CLIENT DATA - 100% MENGIKUTI JAVA
   // ============================================================
   
   _getClientRoom(ws) {
@@ -780,6 +783,8 @@ export class GameServer {
         const conn = this.userConnections.get(ws.username);
         if (conn && conn.room) return conn.room;
       }
+      // ✅ FALLBACK: dari gameRoom yang tersimpan
+      if (this._gameRoom) return this._gameRoom;
       return null;
     } catch(e) { return null; }
   }
@@ -798,6 +803,8 @@ export class GameServer {
           if (conn.wsId === wsId) return username;
         }
       }
+      // ✅ FALLBACK: dari gameUsername yang tersimpan
+      if (this._gameUsername) return this._gameUsername;
       return null;
     } catch(e) { return null; }
   }
@@ -842,12 +849,15 @@ export class GameServer {
           });
         }
       }
+      // ✅ SIMPAN UNTUK FALLBACK
+      if (username) this._gameUsername = username;
+      if (room) this._gameRoom = room;
       return true;
     } catch(e) { return false; }
   }
 
   // ============================================================
-  // BROADCAST - SIMPLE
+  // BROADCAST
   // ============================================================
   
   _broadcastToRoom(room, message) {
@@ -946,6 +956,9 @@ export class GameServer {
       clients.add(wsId);
       this.clientRooms.set(wsId, room);
       this.wsMap.set(wsId, ws);
+      // ✅ SIMPAN FALLBACK
+      if (username) this._gameUsername = username;
+      if (room) this._gameRoom = room;
     } catch(e) {}
   }
 
@@ -985,7 +998,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: START - COMPATIBLE WITH JAVA CLIENT
+  // GAME: START - 100% MENGIKUTI JAVA
   // ============================================================
   
   async startGame(ws, bet, username) {
@@ -995,10 +1008,10 @@ export class GameServer {
         return;
       }
       
-      // Handle Java client format: ["gameLowCardStart", bet, username]
       let finalBet = typeof bet === 'number' ? bet : parseInt(bet, 10) || 0;
       let finalUsername = username;
       
+      // ✅ AUTO-GENERATE USERNAME JIKA TIDAK ADA
       if (!finalUsername || typeof finalUsername !== 'string' || finalUsername.trim() === '') {
         finalUsername = this._getClientUsername(ws);
       }
@@ -1007,8 +1020,8 @@ export class GameServer {
       }
       finalUsername = finalUsername.trim();
       
+      // ✅ AUTO-GENERATE ROOM JIKA TIDAK ADA
       let room = this._getClientRoom(ws);
-      
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
         return;
@@ -1601,7 +1614,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: JOIN - COMPATIBLE WITH JAVA CLIENT
+  // GAME: JOIN - 100% MENGIKUTI JAVA
   // ============================================================
   
   async joinGame(ws, username) {
@@ -1618,6 +1631,7 @@ export class GameServer {
         finalUsername = "Player_" + (ws._wsId || Date.now());
       }
       finalUsername = finalUsername.trim();
+      
       let room = this._getClientRoom(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
@@ -1659,7 +1673,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME: SUBMIT NUMBER - COMPATIBLE WITH JAVA CLIENT
+  // GAME: SUBMIT NUMBER - 100% MENGIKUTI JAVA
   // ============================================================
   
   async submitNumber(ws, number, tanda, username) {
@@ -1676,6 +1690,7 @@ export class GameServer {
         finalUsername = "Player_" + (ws._wsId || Date.now());
       }
       finalUsername = finalUsername.trim();
+      
       let room = this._getClientRoom(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "No room found"]);
@@ -1822,7 +1837,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - COMPATIBLE WITH JAVA CLIENT
+  // SWITCH ROOM - 100% MENGIKUTI JAVA
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1833,8 +1848,7 @@ export class GameServer {
         return;
       }
       
-      // Handle Java client format: ["switchRoom", "MainRoom"]
-      // or ["switchRoom", ["MainRoom", "Player1"]]
+      // ✅ TERIMA FORMAT DARI JAVA: ["switchRoom", "MainRoom"]
       let roomName = room;
       let userName = username;
       
@@ -1849,6 +1863,7 @@ export class GameServer {
         roomName = String(roomName).trim();
       }
       
+      // ✅ AUTO-GENERATE USERNAME JIKA TIDAK ADA
       if (!userName || typeof userName !== 'string' || userName.trim() === '') {
         userName = this._getClientUsername(ws);
       }
@@ -1928,6 +1943,11 @@ export class GameServer {
         } else {
           this._safeSend(ws, ["gameStatus", "false"]);
         }
+        
+        // ✅ SIMPAN FALLBACK
+        this._gameRoom = finalRoom;
+        this._gameUsername = finalUsername;
+        
       } finally {
         this._releaseLock(this._switchLocks, lockKey);
       }
@@ -2550,7 +2570,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // WEBSOCKET HANDLERS - COMPATIBLE WITH JAVA CLIENT
+  // WEBSOCKET HANDLERS - 100% MENGIKUTI JAVA
   // ============================================================
   
   async webSocketMessage(ws, message) {
@@ -2578,6 +2598,7 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
       
+      // ===== SWITCH ROOM - FORMAT JAVA =====
       if (evt === "switchRoom") {
         const roomParam = data.length > 1 ? data[1] : null;
         const usernameParam = data.length > 2 ? data[2] : null;
@@ -2590,6 +2611,7 @@ export class GameServer {
         return;
       }
       
+      // ===== RECORDING - FORMAT JAVA =====
       if (evt === "startRecordingWinners") {
         const roomName = data.length > 1 ? data[1]?.trim() : null;
         if (!roomName) {
@@ -2674,6 +2696,7 @@ export class GameServer {
         return;
       }
       
+      // ===== GAME - FORMAT JAVA =====
       if (evt === "startGameWithRecording") {
         const room = data.length > 1 ? data[1] : null;
         const bet = data.length > 2 ? data[2] : 0;
@@ -2703,7 +2726,7 @@ export class GameServer {
         return;
       }
       
-      // DICE EVENTS
+      // ===== DICE - FORMAT JAVA =====
       if (evt === "submitDiceAnswer") {
         const username = data.length > 1 ? data[1] : null;
         const guess = data.length > 2 ? data[2] : 0;
@@ -2931,7 +2954,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // FETCH - SIMPLE
+  // FETCH
   // ============================================================
   
   async fetch(req) {
