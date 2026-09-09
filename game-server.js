@@ -52,7 +52,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: "01:00", end: "02:00" },
-    { start: "16:00", end: "17:00" },
+    { start: "16:00", end: "17:15" },
     { start: "22:00", end: "23:00" }
   ],
   TIMEZONE_OFFSET: 8,
@@ -1001,7 +1001,7 @@ export class GameServer {
         return;
       }
       
-      this._sendToUser(ws, ["gameStatus", "true"]);
+      
       
       if (game._phase === 'registration') {
         this._sendToUser(ws, ["gameLowCardStart", game.betAmount]);
