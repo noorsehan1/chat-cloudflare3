@@ -1,6 +1,7 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 13.2.0 - 100% MENGIKUTI CLIENT JAVA
+// VERSION: 13.3.0 - 100% MENGIKUTI CLIENT JAVA
+// FIX: switchRoom TIDAK mengirim status otomatis
 // ============================================================
 
 // ============================================================
@@ -52,7 +53,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: "01:00", end: "02:00" },
-    { start: "17:00", end: "17:35" },
+    { start: "17:00", end: "18:00" },
     { start: "22:00", end: "23:00" }
   ],
   TIMEZONE_OFFSET: 8,
@@ -847,7 +848,7 @@ export class GameServer {
         return;
       }
       
-      // ✅ TANPA ["gameStatus", "true"] - HANYA STATE GAME
+      // TANPA ["gameStatus", "true"] - HANYA STATE GAME
       if (game._phase === 'registration') {
         this._sendToUser(ws, ["gameLowCardStart", game.betAmount]);
         this._sendToUser(ws, ["gameLowCardStartSuccess", game.hostName || game.host, game.betAmount]);
@@ -1151,7 +1152,7 @@ export class GameServer {
         }
       }
       
-      // ✅ PLAYER DISCONNECT - TANPA gameLowCardPlayerLeft & gameLowCardNewHost
+      // PLAYER DISCONNECT - TANPA gameLowCardPlayerLeft & gameLowCardNewHost
       if (room && username) {
         const game = this.activeGames.get(room);
         if (game && game._isActive && !game._gameEnded && game.players) {
@@ -1167,13 +1168,11 @@ export class GameServer {
             if (game._state === 'registration') {
               game.players.delete(username);
               game.playerWsId?.delete(username);
-              // ✅ HANYA gameLowCardError, BUKAN gameLowCardPlayerLeft
               this._broadcastToRoom(room, ["gameLowCardError", "Player left the game"]);
               if (game.host === username) {
                 const remaining = Array.from(game.players.keys());
                 if (remaining.length > 0) {
                   game.host = remaining[0];
-                  // ✅ HANYA gameLowCardError, BUKAN gameLowCardNewHost
                   this._broadcastToRoom(room, ["gameLowCardError", "New host: " + game.host]);
                 } else {
                   game._gameEnded = true;
@@ -1192,7 +1191,6 @@ export class GameServer {
             if (game._state === 'draw' || game._state === 'evaluating') {
               if (!game.eliminated.has(username)) {
                 game.eliminated.add(username);
-                // ✅ HANYA gameLowCardError, BUKAN gameLowCardPlayerLeft
                 this._broadcastToRoom(room, ["gameLowCardError", "Player left the game"]);
                 const active = this._getActivePlayers(game);
                 if (active.length <= 1) {
@@ -1547,7 +1545,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - TANPA switchRoomError
+  // SWITCH ROOM - FIX: TIDAK KIRIM STATUS OTOMATIS
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -1575,7 +1573,7 @@ export class GameServer {
       const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
-        this._sendCurrentGameState(ws, roomName);
+        // ✅ HANYA KIRIM switchRoomSuccess, TIDAK STATE OTOMATIS
         return;
       }
       
@@ -1618,23 +1616,22 @@ export class GameServer {
         }
       }
       
-      // ✅ KIRIM switchRoomSuccess
+      // ✅ KIRIM switchRoomSuccess SAJA
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
       
-      // ✅ KIRIM GAME STATE (TANPA gameStatus "true")
-      this._sendCurrentGameState(ws, roomName);
+      // ❌ TIDAK KIRIM GAME STATE OTOMATIS
+      // Client HARUS memanggil checkGameRunning untuk mendapatkan state
       
-      // ✅ KIRIM RECORDING STATUS
-      this._sendRoomStateToUser(ws, roomName);
+      // ❌ TIDAK KIRIM RECORDING STATUS OTOMATIS
+      // Client HARUS memanggil getRecordingStatus untuk mendapatkan status
       
     } catch(e) {
-      // ✅ TANPA switchRoomError - PAKAI gameLowCardError
       this._safeSend(ws, ["gameLowCardError", e.message || "Switch failed"]);
     }
   }
 
   // ============================================================
-  // CHECK GAME RUNNING
+  // CHECK GAME RUNNING - TETAP MENGIRIM STATUS & STATE
   // ============================================================
   
   async checkGameRunning(ws, roomname) {
@@ -1842,7 +1839,8 @@ export class GameServer {
           _startedByRecording: false, _startedBy: 'user',
           _notificationTimers: [],
           _drawNotificationTimers: [],
-          _cleanupStarted: false
+          _cleanupStarted: false,
+          _state: 'registration' // Tambahkan state untuk tracking
         };
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
         game.playerWsId.set(usernameClean, wsId);
@@ -1989,6 +1987,7 @@ export class GameServer {
       }
       
       game._phase = 'draw';
+      game._state = 'draw';
       game.drawTimeExpired = false;
       game.evaluationLocked = false;
       game._drawPhaseStart = Date.now();
@@ -2049,7 +2048,7 @@ export class GameServer {
         .filter(id => !game.eliminated.has(id) && !game.numbers.has(id));
       if (activeBotIds.length === 0) return;
       
-      // ✅ TANPA BATASAN - SEMUA BOT DRAW
+      // TANPA BATASAN - SEMUA BOT DRAW
       for (const botId of activeBotIds) {
         if (game.evaluationLocked || game._isEvaluating) break;
         if (game.drawTimeExpired) break;
@@ -2326,6 +2325,7 @@ export class GameServer {
         game.evaluationLocked = false;
         game.drawTimeExpired = false;
         game._phase = 'draw';
+        game._state = 'draw';
         game.numbers = new Map();
         game.tanda = new Map();
         game._botTimeouts = new Set();
@@ -2378,6 +2378,7 @@ export class GameServer {
       game.evaluationLocked = false;
       game.drawTimeExpired = false;
       game._phase = 'draw';
+      game._state = 'draw';
       game.numbers = new Map();
       game.tanda = new Map();
       game._botTimeouts = new Set();
@@ -2638,7 +2639,8 @@ export class GameServer {
         _startedByRecording: true, _startedBy: 'recording',
         _notificationTimers: [],
         _drawNotificationTimers: [],
-        _cleanupStarted: false
+        _cleanupStarted: false,
+        _state: 'registration'
       };
       game.players.set(username, { id: username, name: username });
       game.playerWsId.set(username, wsId);
@@ -2842,7 +2844,7 @@ export class GameServer {
     this.diceHasWinner = false;
     this.diceWinner = null;
     
-    // ✅ HANYA diceNotification, TANPA diceTieBreaker
+    // HANYA diceNotification, TANPA diceTieBreaker
     this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
       `Tie Round ${this._tieRound}: ${players.join(', ')}`
     ]);
@@ -2900,7 +2902,6 @@ export class GameServer {
     }
     
     if (answeredCount === 0) {
-      // ✅ HANYA diceNotification, TANPA diceTieAnswer
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
         `No one answered in Round ${this._tieRound} - Tie breaker ended`
       ]);
@@ -2913,7 +2914,6 @@ export class GameServer {
       const winner = entries[0].player;
       const answer = entries[0].answer;
       
-      // ✅ HANYA diceNotification, TANPA diceTieAnswer
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
         `${winner} answered with ${answer} - Auto win!`
       ]);
@@ -2949,7 +2949,6 @@ export class GameServer {
     
     const allSame = entries.every(e => e.answer === entries[0].answer);
     if (allSame) {
-      // ✅ HANYA diceNotification, TANPA diceTieAnswer
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
         `All answered same value: ${entries[0].answer} - Tie again!`
       ]);
@@ -2975,9 +2974,7 @@ export class GameServer {
     
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
-      const losers = players.filter(p => p !== winner);
       
-      // ✅ HANYA diceNotification, TANPA diceTieAnswer
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
         `${winner} wins with highest value: ${highest}`
       ]);
@@ -3012,7 +3009,6 @@ export class GameServer {
     }
     
     if (highestPlayers.length > 1) {
-      // ✅ HANYA diceNotification, TANPA diceTieAnswer
       this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
         `Tie again! Round ${this._tieRound + 1} between: ${highestPlayers.join(', ')}`
       ]);
