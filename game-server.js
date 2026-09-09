@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 13.5.0 - FIX BROADCAST COUNTDOWN ONCE
+// VERSION: 13.6.0 - FIX BOT TIDAK BERJALAN
 // ============================================================
 
 // ============================================================
@@ -2061,22 +2061,33 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // CLOSE REGISTRATION - FIX: BOT TIDAK BERJALAN
+  // ============================================================
+  
   _closeRegistration(room, game) {
     try {
       if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
       this._cleanupGameTimers(game);
       game.registrationOpen = false;
+      
+      // Hitung human players (bukan bot)
       const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
       const humanCount = humanPlayers.length;
-      if (!game._botsAdded) {
-        if (humanCount === 1 || humanCount === 0) {
+      
+      // Tambah bot jika kurang dari 2 human DAN bot belum ditambahkan
+      if (!game._botsAdded && humanCount < 2) {
+        // Jika 0 atau 1 human, tambah 4 bot
+        if (humanCount <= 1) {
           this._addBots(room, 4);
           game._botsAdded = true;
-        } else if (game.players.size < 2) {
-          const needed = Math.min(4 - game.players.size, CONSTANTS.MAX_BOTS_PER_GAME);
-          if (needed > 0) { this._addBots(room, needed); game._botsAdded = true; }
+        } else {
+          // humanCount >= 2, tidak perlu bot
+          game._botsAdded = true;
         }
       }
+      
+      // Cek apakah cukup player (human + bot) untuk memulai game
       if (this._isGameActuallyRunning(game) && game.players.size >= 2) {
         this._startDrawPhase(room, game);
       } else {
@@ -2086,15 +2097,24 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // ADD BOTS - FIX: TIDAK TERLALU KETAT
+  // ============================================================
+  
   _addBots(room, count) {
     try {
       const game = this.activeGames.get(room);
-      if (!this._isGameActuallyRunning(game)) return;
+      
+      // ✅ HAPUS CEK _isGameActuallyRunning - terlalu ketat
+      if (!game || game._gameEnded) return;
+      
       const botNames = ["moz1", "moz2", "moz3", "moz4"];
       const existingBots = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
       const existingBotCount = existingBots.length;
       const maxBotsToAdd = Math.min(count, CONSTANTS.MAX_BOTS_PER_GAME - existingBotCount);
+      
       if (maxBotsToAdd <= 0) return;
+      
       for (let i = 0; i < maxBotsToAdd; i++) {
         const botId = `BOT_${room}_${i}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
         const botName = botNames[(existingBotCount + i) % botNames.length];
