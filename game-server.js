@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 14.2.0 - FIXED BROADCAST
+// VERSION: 14.2.1 - ADDED DICE SESSION STATUS
 // ============================================================
 
 // ============================================================
@@ -563,6 +563,48 @@ class AlarmScheduler {
     return nextSession;
   }
 
+  // ============================================================
+  // NEW METHOD: GET TIME LEFT UNTIL NEXT DICE
+  // ============================================================
+  
+  _getTimeLeftUntilNextDice() {
+    try {
+      const witaTime = this._toWITA(new Date());
+      const currentTotal = witaTime.getHours() * 60 + witaTime.getMinutes();
+      let minDiff = Infinity;
+      let nextSession = null;
+      
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        const startTotal = parseTime(session.start);
+        let diff = startTotal - currentTotal;
+        if (diff < 0) diff += 24 * 60;
+        if (diff < minDiff) {
+          minDiff = diff;
+          nextSession = session;
+        }
+      }
+      
+      if (minDiff === Infinity) {
+        return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null };
+      }
+      
+      const hours = Math.floor(minDiff / 60);
+      const minutes = Math.floor(minDiff % 60);
+      const isRunning = this.isDiceTime();
+      
+      return { 
+        hours, 
+        minutes, 
+        totalMs: minDiff * 60 * 1000,
+        text: hours + "h " + minutes + "m", 
+        isRunning,
+        nextSession
+      };
+    } catch(e) {
+      return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null };
+    }
+  }
+
   async cleanup() {
     await this._clearAllAlarms();
   }
@@ -673,13 +715,9 @@ export class GameServer {
       
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
       
-      // ============================================================
-      // FIX 1: RESTORE ALL STATE - TUNGGU SELESAI SEBELUM SET _restored
-      // ============================================================
       this._restoreAllState()
         .then(() => {
           this._restored = true;
-          // Proses pending events setelah restore selesai
           this._processPendingEvents();
         })
         .catch(() => {
@@ -733,8 +771,6 @@ export class GameServer {
         }
         
         this._restored = true;
-        
-        // Process pending events
         await this._processPendingEvents();
         
       } catch(e) {
@@ -750,7 +786,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // FIX 2: RESTORE WEB SOCKETS - SYNC ROOM DENGAN BENAR
+  // RESTORE WEB SOCKETS
   // ============================================================
   
   async _restoreWebSockets() {
@@ -766,7 +802,6 @@ export class GameServer {
             ws._wsId = attachment.wsId || ++this._wsIdCounter;
             ws._closing = false;
             
-            // ✅ PASTIKAN ROOM TERDAFTAR DI wsClients
             if (!this.wsClients.has(attachment.room)) {
               this.wsClients.set(attachment.room, new Set());
             }
@@ -775,7 +810,6 @@ export class GameServer {
             this.wsMap.set(ws._wsId, ws);
             this.clientRooms.set(ws._wsId, attachment.room);
             
-            // ✅ Update userConnections
             let conn = this.userConnections.get(attachment.username);
             if (!conn) {
               conn = { wsId: ws._wsId, ws: ws, room: attachment.room, timestamp: Date.now() };
@@ -797,12 +831,11 @@ export class GameServer {
   }
 
   // ============================================================
-  // FIX 3: SYNC ALL ROOMS - PERBAIKAN
+  // SYNC ALL ROOMS
   // ============================================================
   
   _syncAllRooms() {
     try {
-      // Buat ulang semua room dari data yang ada
       const roomMap = new Map();
       const clientRoomMap = new Map();
       
@@ -815,7 +848,6 @@ export class GameServer {
         }
       }
       
-      // Juga cek dari userConnections
       for (const [username, conn] of this.userConnections) {
         if (conn && conn.room && conn.wsId) {
           const ws = this.wsMap.get(conn.wsId);
@@ -841,7 +873,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // FIX 4: PROCESS PENDING EVENTS - PERBAIKAN
+  // PROCESS PENDING EVENTS
   // ============================================================
   
   async _processPendingEvents() {
@@ -853,7 +885,6 @@ export class GameServer {
     for (const evt of events) {
       let ws = evt.ws;
       
-      // Cari ulang ws jika sudah tidak valid
       if (!ws || ws.readyState !== 1) {
         const wsId = evt.wsId;
         if (wsId && this.wsMap.has(wsId)) {
@@ -866,13 +897,11 @@ export class GameServer {
       if (!ws || ws.readyState !== 1 || ws._closing) continue;
       
       try {
-        // ✅ Pastikan room terdaftar di wsClients
         const room = evt.room || ws.room || ws.roomname;
         if (room) {
           this._ensureClientInRoom(ws, room, evt.username || ws.username);
         }
         
-        // Restore attachment jika ada
         if (evt.attachment) {
           try {
             ws.serializeAttachment(evt.attachment);
@@ -887,14 +916,12 @@ export class GameServer {
         if (Array.isArray(data) && data.length > 0) {
           await this._processWithTimeout(ws, data);
         }
-      } catch(e) {
-        // Log error tapi lanjutkan
-      }
+      } catch(e) {}
     }
   }
 
   // ============================================================
-  // FIX 5: ENSURE CLIENT IN ROOM - PERBAIKAN
+  // ENSURE CLIENT IN ROOM
   // ============================================================
   
   _ensureClientInRoom(ws, room, username = null) {
@@ -903,7 +930,6 @@ export class GameServer {
       const wsId = ws._wsId;
       if (!wsId) return false;
       
-      // ✅ Pastikan room ada di wsClients
       if (!this.wsClients.has(room)) {
         this.wsClients.set(room, new Set());
       }
@@ -919,7 +945,6 @@ export class GameServer {
       ws.roomname = room;
       if (username) ws.username = username;
       
-      // ✅ Update attachment
       try {
         ws.serializeAttachment({
           wsId: wsId,
@@ -930,7 +955,6 @@ export class GameServer {
         });
       } catch(e) {}
       
-      // ✅ Update userConnections
       if (ws.username) {
         let conn = this.userConnections.get(ws.username);
         if (conn) {
@@ -948,31 +972,27 @@ export class GameServer {
   }
 
   // ============================================================
-  // FIX 6: GET CLIENT ROOM - PERBAIKAN
+  // GET CLIENT ROOM
   // ============================================================
   
   _getClientRoom(ws) {
     try {
       if (!ws) return null;
       
-      // Cek dari property
       let room = ws.room || ws.roomname;
       if (room) return room;
       
-      // Cek dari wsId
       const wsId = ws._wsId;
       if (wsId) {
         room = this.clientRooms.get(wsId);
         if (room) return room;
       }
       
-      // Cek dari attachment
       try {
         const attachment = ws.deserializeAttachment();
         if (attachment && attachment.room) return attachment.room;
       } catch(e) {}
       
-      // Cek dari userConnections
       if (ws.username) {
         const conn = this.userConnections.get(ws.username);
         if (conn && conn.room) return conn.room;
@@ -983,7 +1003,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // DICE ROOM STATE
+  // DICE ROOM STATE - UPDATED
   // ============================================================
   
   _sendDiceRoomState(ws) {
@@ -993,12 +1013,14 @@ export class GameServer {
       const wsId = ws._wsId;
       if (!wsId) return;
       
-      // ✅ Pastikan ws terdaftar di room
       this._ensureClientInRoom(ws, CONSTANTS.DICE_ROOM, ws.username);
       
       const isDiceTime = this.alarmScheduler.isDiceTime();
       
       if (isDiceTime) {
+        // Kirim status aktif
+        this._safeSend(ws, ["diceSessionStatus", "active"]);
+        
         const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
         
         if (!this._diceGameStarted && !this.currentDiceRoll && !this._diceLock) {
@@ -1013,6 +1035,27 @@ export class GameServer {
             canAnswerNow: true,
             round: this._diceRound
           }]);
+        }
+      } else {
+        // Kirim status tidak aktif + info sesi berikutnya
+        const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
+        this._safeSend(ws, ["diceSessionStatus", "inactive"]);
+        
+        if (timeInfo && timeInfo.nextSession) {
+          this._safeSend(ws, ["diceNextSession", {
+            startTime: timeInfo.nextSession.start,
+            endTime: timeInfo.nextSession.end,
+            hoursLeft: timeInfo.hours,
+            minutesLeft: timeInfo.minutes,
+            text: timeInfo.text
+          }]);
+          
+          // Kirim notifikasi delay 5s
+          setTimeout(() => {
+            if (ws && ws.readyState === 1 && !ws._closing) {
+              this._safeSend(ws, ["diceNotification", "Next dice game in: " + timeInfo.text]);
+            }
+          }, CONSTANTS.DICE_BROADCAST_DELAY_MS || 5000);
         }
       }
     } catch(e) {}
@@ -1057,7 +1100,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GET ROOM USERS - PERBAIKAN
+  // GET ROOM USERS
   // ============================================================
   
   _getRoomUsers(room) {
@@ -1065,10 +1108,8 @@ export class GameServer {
       if (!room) return [];
       const users = [];
       
-      // ✅ Pastikan room ada di wsClients
       let wsIds = this.wsClients.get(room);
       if (!wsIds || wsIds.size === 0) {
-        // Coba rebuild dari clientRooms
         wsIds = new Set();
         for (const [wsId, clientRoom] of this.clientRooms) {
           if (clientRoom === room) wsIds.add(wsId);
@@ -1081,7 +1122,6 @@ export class GameServer {
         for (const wsId of wsIds) {
           const ws = this.wsMap.get(wsId);
           if (ws && ws.readyState === 1 && !ws._closing) {
-            // ✅ Pastikan ws memiliki room yang benar
             if (!ws.room || ws.room !== room) {
               ws.room = room;
               ws.roomname = room;
@@ -1101,7 +1141,6 @@ export class GameServer {
           }
         }
         
-        // Bersihkan yang tidak valid
         for (const wsId of toRemove) {
           wsIds.delete(wsId);
           this.clientRooms.delete(wsId);
@@ -1126,14 +1165,13 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST TO ROOM - PERBAIKAN
+  // BROADCAST TO ROOM
   // ============================================================
   
   _broadcastToRoom(room, message) {
     try {
       if (this.closing || this.isDestroyed || !room || !message) return 0;
       
-      // ✅ Pastikan room sync sebelum broadcast
       this._ensureRoomSync(room);
       
       const users = this._getRoomUsers(room);
@@ -1157,7 +1195,6 @@ export class GameServer {
         }
       }
       
-      // Bersihkan yang gagal
       if (toRemove.length > 0) {
         const clients = this.wsClients.get(room);
         if (clients) {
@@ -1181,20 +1218,18 @@ export class GameServer {
   }
 
   // ============================================================
-  // FIX 7: ENSURE ROOM SYNC - METHOD BARU
+  // ENSURE ROOM SYNC
   // ============================================================
   
   _ensureRoomSync(room) {
     try {
       if (!room || typeof room !== 'string') return false;
       
-      // Cek apakah room ada di wsClients
       let clients = this.wsClients.get(room);
       if (clients && clients.size > 0) {
         return true;
       }
       
-      // Coba rebuild dari clientRooms
       const toAdd = [];
       for (const [wsId, r] of this.clientRooms) {
         if (r === room) {
@@ -1215,7 +1250,6 @@ export class GameServer {
         return true;
       }
       
-      // Coba rebuild dari userConnections
       for (const [username, conn] of this.userConnections) {
         if (conn.room === room && conn.wsId) {
           const ws = this.wsMap.get(conn.wsId);
@@ -1237,14 +1271,13 @@ export class GameServer {
   }
 
   // ============================================================
-  // SEND TO USER - PERBAIKAN
+  // SEND TO USER
   // ============================================================
   
   _sendToUser(ws, message) {
     try {
       if (!ws || ws.readyState !== 1 || ws._closing) return false;
       
-      // ✅ Pastikan message di-stringify untuk Java client
       const msg = typeof message === 'string' ? message : JSON.stringify(message);
       ws.send(msg);
       return true;
@@ -1259,7 +1292,6 @@ export class GameServer {
     try {
       if (!ws || !room) return;
       
-      // ✅ Pastikan ws terdaftar di room
       this._ensureClientInRoom(ws, room, ws.username);
       
       const game = this.activeGames.get(room);
@@ -1526,7 +1558,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // WEBSOCKET HANDLERS - PERBAIKAN
+  // WEBSOCKET HANDLERS
   // ============================================================
   
   async webSocketMessage(ws, message) {
@@ -1542,7 +1574,6 @@ export class GameServer {
         return;
       }
       
-      // ✅ Simpan event dengan room dan username
       const room = this._getClientRoom(ws);
       const username = this._getClientUsername(ws);
       
@@ -1569,7 +1600,6 @@ export class GameServer {
         ws.roomname = attachment.roomname || null;
         ws._createdAt = attachment.createdAt || Date.now();
         
-        // ✅ Pastikan room terdaftar
         if (attachment.username && attachment.room) {
           this._ensureClientInRoom(ws, attachment.room, attachment.username);
         }
@@ -1613,7 +1643,6 @@ export class GameServer {
         }
       }
       
-      // Handle game cleanup...
       if (room && username) {
         const game = this.activeGames.get(room);
         if (game && game._isActive && !game._gameEnded && game.players) {
@@ -1763,14 +1792,13 @@ export class GameServer {
   }
 
   // ============================================================
-  // FIX 8: PROCESS EVENT ITEM - PERBAIKAN
+  // PROCESS EVENT ITEM
   // ============================================================
   
   async _processEventItem(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       
-      // ✅ Pastikan room valid sebelum process
       const room = this._getClientRoom(ws);
       if (room) {
         this._ensureClientInRoom(ws, room, ws.username);
@@ -1792,6 +1820,49 @@ export class GameServer {
       // ==================== SWITCH ROOM ====================
       if (evt === "switchRoom") {
         await this.switchRoom(ws, data[1], data[2]);
+        return;
+      }
+
+      // ==================== GET DICE SESSION STATUS - NEW ====================
+      if (evt === "getDiceSessionStatus") {
+        try {
+          const isDiceTime = this.alarmScheduler.isDiceTime();
+          const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
+          
+          if (isDiceTime) {
+            this._safeSend(ws, ["diceSessionStatus", "active"]);
+            if (isGameRunning) {
+              this._safeSend(ws, ["diceRoll", {
+                value: this.currentDiceRoll.value,
+                timestamp: this.currentDiceRoll.timestamp,
+                answerTime: 20,
+                canAnswerNow: true,
+                round: this._diceRound
+              }]);
+            }
+          } else {
+            const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
+            this._safeSend(ws, ["diceSessionStatus", "inactive"]);
+            
+            if (timeInfo && timeInfo.nextSession) {
+              this._safeSend(ws, ["diceNextSession", {
+                startTime: timeInfo.nextSession.start,
+                endTime: timeInfo.nextSession.end,
+                hoursLeft: timeInfo.hours,
+                minutesLeft: timeInfo.minutes,
+                text: timeInfo.text
+              }]);
+              
+              setTimeout(() => {
+                if (ws && ws.readyState === 1 && !ws._closing) {
+                  this._safeSend(ws, ["diceNotification", "Next dice game in: " + timeInfo.text]);
+                }
+              }, CONSTANTS.DICE_BROADCAST_DELAY_MS || 5000);
+            }
+          }
+        } catch(e) {
+          this._safeSend(ws, ["diceSessionStatus", "error"]);
+        }
         return;
       }
 
@@ -1950,7 +2021,6 @@ export class GameServer {
           
           const wsId = ws._wsId;
           
-          // PAKAI FACTORY METHOD - 1X SAJA
           const game = this._createGameObject(roomKey, betAmount, usernameClean, true);
           
           game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
@@ -2173,7 +2243,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // GAME FACTORY - BUAT GAME OBJECT 1X SAJA
+  // GAME FACTORY
   // ============================================================
   
   _createGameObject(room, betAmount, username, isRecording = false) {
@@ -2221,7 +2291,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SWITCH ROOM - PERBAIKAN
+  // SWITCH ROOM - UPDATED
   // ============================================================
   
   async switchRoom(ws, room, username = null) {
@@ -2251,6 +2321,7 @@ export class GameServer {
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceRoomState(ws);
         }
+        this._safeSend(ws, ["switchRoomSuccess", roomName]);
         return;
       }
       
@@ -2262,7 +2333,6 @@ export class GameServer {
         }
       }
       
-      // ✅ Pastikan room baru terdaftar
       if (!this.wsClients.has(roomName)) {
         this.wsClients.set(roomName, new Set());
       }
@@ -2294,6 +2364,8 @@ export class GameServer {
         }
       }
       
+      this._safeSend(ws, ["switchRoomSuccess", roomName]);
+      
       if (roomName === CONSTANTS.DICE_ROOM) {
         this._sendDiceRoomState(ws);
         if (this.alarmScheduler.isDiceTime() && !this._diceGameStarted && !this.currentDiceRoll) {
@@ -2307,7 +2379,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // CHECK GAME RUNNING - PERBAIKAN
+  // CHECK GAME RUNNING
   // ============================================================
   
   async checkGameRunning(ws, roomname) {
@@ -2322,7 +2394,6 @@ export class GameServer {
         return;
       }
       
-      // ✅ Pastikan ws terdaftar di room
       this._ensureClientInRoom(ws, room, ws.username);
       
       if (room === CONSTANTS.DICE_ROOM) {
@@ -2364,7 +2435,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // FIX 9: ADD CLIENT - PERBAIKAN
+  // ADD CLIENT
   // ============================================================
   
   _addClient(room, ws, username = null) {
@@ -2383,7 +2454,6 @@ export class GameServer {
         }
       }
       
-      // ✅ Pastikan room ada di wsClients
       if (!this.wsClients.has(room)) {
         this.wsClients.set(room, new Set());
       }
@@ -2532,7 +2602,6 @@ export class GameServer {
         
         const wsId = ws._wsId;
         
-        // PAKAI FACTORY METHOD - 1X SAJA
         const game = this._createGameObject(room, betAmount, usernameClean, false);
         
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
@@ -3573,7 +3642,6 @@ export class GameServer {
       
       const wsId = ws._wsId;
       
-      // PAKAI FACTORY METHOD - 1X SAJA
       const game = this._createGameObject(room, betAmount, username, true);
       
       game.players.set(username, { id: username, name: username });
@@ -3584,7 +3652,6 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
       this._broadcastToRoom(room, ["gameLowCardStartSuccess", username, betAmount]);
       
-      // KIRIM RESPONSE UNTUK JAVA CLIENT
       this._safeSend(ws, ["recordingGameStarted", {
         room: room,
         host: username,
@@ -4224,10 +4291,6 @@ export class GameServer {
   }
 
   // ============================================================
-  // CLIENT MANAGEMENT
-  // ============================================================
-  
-  // ============================================================
   // LOCK HELPERS
   // ============================================================
   
@@ -4252,7 +4315,6 @@ export class GameServer {
   _safeSend(ws, message) {
     try {
       if (!ws || ws.readyState !== 1) return false;
-      // Pastikan message selalu di-stringify untuk Java client
       const msg = typeof message === 'string' ? message : JSON.stringify(message);
       ws.send(msg);
       return true;
