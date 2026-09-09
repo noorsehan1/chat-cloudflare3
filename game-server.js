@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 14.2.0 - CLEANED VALIDATIONS
+// VERSION: 14.3.0 - WITH STATE BROADCAST ON RESTORE
 // ============================================================
 
 // ============================================================
@@ -50,6 +50,10 @@ const CONSTANTS = {
   
   DICE_SESSION_CHECK_INTERVAL_MS: 5000,
   DICE_BROADCAST_DELAY_MS: 5000,
+  
+  // ✅ Tambahan untuk restore broadcast
+  STATE_BROADCAST_DELAY_MS: 1000,
+  MAX_STATE_BROADCAST_RETRIES: 3,
 };
 
 const QUIZ_SCHEDULE = {
@@ -594,6 +598,10 @@ export class GameServer {
       this._isRestoring = false;
       this._restorePromise = null;
       
+      // ✅ Track rooms that need state broadcast
+      this._roomsNeedingBroadcast = new Set();
+      this._stateBroadcastSent = false;
+      
       this.activeGames = new Map();
       this.wsMap = new Map();
       this.wsClients = new Map();
@@ -675,8 +683,11 @@ export class GameServer {
       
       this._restoreAllState().then(() => {
         this._restored = true;
+        // ✅ Broadcast state ke semua user setelah restore
+        this._broadcastAllStateAfterRestore();
       }).catch(() => {
         this._restored = true;
+        this._broadcastAllStateAfterRestore();
       });
       
     } catch(e) {
@@ -729,6 +740,9 @@ export class GameServer {
         // Process pending events
         await this._processPendingEvents();
         
+        // ✅ Track rooms that need state broadcast
+        this._collectRoomsForBroadcast();
+        
       } catch(e) {
         this._restored = true;
         throw e;
@@ -741,6 +755,161 @@ export class GameServer {
     return this._restorePromise;
   }
 
+  // ============================================================
+  // ✅ BROADCAST STATE AFTER RESTORE
+  // ============================================================
+  
+  _collectRoomsForBroadcast() {
+    try {
+      this._roomsNeedingBroadcast = new Set();
+      
+      // Collect all rooms with active games
+      for (const [room, game] of this.activeGames) {
+        if (game && game._isActive && !game._gameEnded && game.players && game.players.size > 0) {
+          this._roomsNeedingBroadcast.add(room);
+        }
+      }
+      
+      // Collect all rooms with connected clients
+      for (const [room, clients] of this.wsClients) {
+        if (clients && clients.size > 0) {
+          this._roomsNeedingBroadcast.add(room);
+        }
+      }
+      
+      // Always add Dice room if there are clients
+      const diceClients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
+      if (diceClients && diceClients.size > 0) {
+        this._roomsNeedingBroadcast.add(CONSTANTS.DICE_ROOM);
+      }
+      
+    } catch(e) {}
+  }
+
+  _broadcastAllStateAfterRestore() {
+    try {
+      if (this._stateBroadcastSent) return;
+      
+      // ✅ Delay to ensure all clients are ready
+      setTimeout(() => {
+        try {
+          if (this.isDestroyed || this.closing) return;
+          
+          // Broadcast to all rooms that need state update
+          for (const room of this._roomsNeedingBroadcast) {
+            this._broadcastRoomState(room);
+          }
+          
+          // ✅ Broadcast recording status to all rooms
+          this._broadcastRecordingStatusToAll();
+          
+          // ✅ Broadcast dice state if active
+          if (this.currentDiceRoll && this._canSubmitDiceAnswer) {
+            this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceRoll", {
+              value: this.currentDiceRoll.value,
+              timestamp: this.currentDiceRoll.timestamp,
+              answerTime: 20,
+              canAnswerNow: true,
+              round: this._diceRound,
+              isRestored: true
+            }]);
+          }
+          
+          this._stateBroadcastSent = true;
+          
+        } catch(e) {}
+      }, CONSTANTS.STATE_BROADCAST_DELAY_MS || 1000);
+      
+    } catch(e) {}
+  }
+
+  _broadcastRoomState(room) {
+    try {
+      if (!room) return;
+      
+      // Check if it's Dice room
+      if (room === CONSTANTS.DICE_ROOM) {
+        if (this.currentDiceRoll && this._canSubmitDiceAnswer) {
+          this._broadcastToRoom(room, ["diceRoll", {
+            value: this.currentDiceRoll.value,
+            timestamp: this.currentDiceRoll.timestamp,
+            answerTime: 20,
+            canAnswerNow: true,
+            round: this._diceRound,
+            isRestored: true
+          }]);
+        }
+        return;
+      }
+      
+      // Broadcast game state for LowCard rooms
+      const game = this.activeGames.get(room);
+      if (!game || !game._isActive || game._gameEnded) {
+        this._broadcastToRoom(room, ["gameStatus", "false"]);
+        return;
+      }
+      
+      // Send current game state
+      const players = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
+      const activePlayers = this._getActivePlayers(game);
+      const activePlayerNames = activePlayers.map(p => p.name);
+      
+      if (game._phase === 'registration' || game._state === 'registration') {
+        this._broadcastToRoom(room, ["gameLowCardStart", game.betAmount]);
+        this._broadcastToRoom(room, ["gameLowCardStartSuccess", game.hostName || game.hostId, game.betAmount]);
+        for (const player of players) {
+          this._broadcastToRoom(room, ["gameLowCardJoin", player, game.betAmount]);
+        }
+        return;
+      }
+      
+      if (game._phase === 'draw' || game._state === 'draw' || 
+          game._phase === 'evaluating' || game._state === 'evaluating') {
+        
+        this._broadcastToRoom(room, ["gameLowCardClosed", activePlayerNames]);
+        this._broadcastToRoom(room, ["gameLowCardNextRound", game.round]);
+        
+        // Send all drawn numbers
+        for (const [id, number] of game.numbers) {
+          const name = game.players.get(id)?.name || id;
+          const tanda = game.tanda.get(id) || "";
+          this._broadcastToRoom(room, ["gameLowCardPlayerDraw", name, number, tanda]);
+        }
+        
+        // Send time left
+        if (game._drawPhaseStart) {
+          const elapsed = Date.now() - game._drawPhaseStart;
+          const remaining = Math.max(0, 20000 - elapsed);
+          if (remaining > 0) {
+            const seconds = Math.ceil(remaining / 1000);
+            this._broadcastToRoom(room, ["gameLowCardTimeLeft", seconds + "s"]);
+          }
+        }
+        
+        if (game._isEvaluating || game.evaluationLocked) {
+          this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
+        }
+      }
+      
+    } catch(e) {}
+  }
+
+  _broadcastRecordingStatusToAll() {
+    try {
+      for (const [room, clients] of this.wsClients) {
+        if (clients && clients.size > 0 && room !== CONSTANTS.DICE_ROOM) {
+          this.dataManager.getRecordingStatus(room).then(isRecording => {
+            this._broadcastToRoom(room, ["recordingStatus", isRecording]);
+          }).catch(() => {});
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // RESTORE WEBSOCKETS
+  // ============================================================
+  
   async _restoreWebSockets() {
     try {
       const webSockets = this.ctx.getWebSockets();
@@ -810,35 +979,130 @@ export class GameServer {
     const events = [...this._pendingEvents];
     this._pendingEvents = [];
     
+    // Group events by room for batch processing
+    const eventsByRoom = new Map();
     for (const evt of events) {
-      let ws = evt.ws;
-      if (!ws || ws.readyState !== 1) {
-        const wsId = evt.wsId || evt.ws?._wsId;
-        if (wsId && this.wsMap.has(wsId)) {
-          ws = this.wsMap.get(wsId);
-        } else {
-          continue;
-        }
-      }
-      
-      if (!ws || ws.readyState !== 1 || ws._closing) continue;
-      
       try {
-        if (evt.attachment) {
+        const data = JSON.parse(evt.message);
+        const room = evt.attachment?.room || data[1] || null;
+        if (room) {
+          if (!eventsByRoom.has(room)) eventsByRoom.set(room, []);
+          eventsByRoom.get(room).push(evt);
+        } else {
+          // Process events without room immediately
+          let ws = evt.ws;
+          if (!ws || ws.readyState !== 1) {
+            const wsId = evt.wsId || evt.ws?._wsId;
+            if (wsId && this.wsMap.has(wsId)) {
+              ws = this.wsMap.get(wsId);
+            } else {
+              continue;
+            }
+          }
+          if (!ws || ws.readyState !== 1 || ws._closing) continue;
+          
           try {
-            ws.serializeAttachment(evt.attachment);
-            ws._wsId = evt.attachment.wsId;
-            ws.username = evt.attachment.username;
-            ws.room = evt.attachment.room;
-            ws.roomname = evt.attachment.roomname;
+            if (evt.attachment) {
+              try {
+                ws.serializeAttachment(evt.attachment);
+                ws._wsId = evt.attachment.wsId;
+                ws.username = evt.attachment.username;
+                ws.room = evt.attachment.room;
+                ws.roomname = evt.attachment.roomname;
+              } catch(e) {}
+            }
+            const dataParsed = JSON.parse(evt.message);
+            if (Array.isArray(dataParsed) && dataParsed.length > 0) {
+              await this._processWithTimeout(ws, dataParsed);
+            }
           } catch(e) {}
         }
-        
-        const data = JSON.parse(evt.message);
-        if (Array.isArray(data) && data.length > 0) {
-          await this._processWithTimeout(ws, data);
-        }
       } catch(e) {}
+    }
+    
+    // Process events by room with proper ordering
+    for (const [room, roomEvents] of eventsByRoom) {
+      // Process switchRoom events first
+      const switchEvents = roomEvents.filter(e => {
+        try {
+          const data = JSON.parse(e.message);
+          return data[0] === 'switchRoom';
+        } catch(e) { return false; }
+      });
+      
+      const otherEvents = roomEvents.filter(e => {
+        try {
+          const data = JSON.parse(e.message);
+          return data[0] !== 'switchRoom';
+        } catch(e) { return true; }
+      });
+      
+      // Process switch events first
+      for (const evt of switchEvents) {
+        let ws = evt.ws;
+        if (!ws || ws.readyState !== 1) {
+          const wsId = evt.wsId || evt.ws?._wsId;
+          if (wsId && this.wsMap.has(wsId)) {
+            ws = this.wsMap.get(wsId);
+          } else {
+            continue;
+          }
+        }
+        if (!ws || ws.readyState !== 1 || ws._closing) continue;
+        
+        try {
+          if (evt.attachment) {
+            try {
+              ws.serializeAttachment(evt.attachment);
+              ws._wsId = evt.attachment.wsId;
+              ws.username = evt.attachment.username;
+              ws.room = evt.attachment.room;
+              ws.roomname = evt.attachment.roomname;
+            } catch(e) {}
+          }
+          const data = JSON.parse(evt.message);
+          if (Array.isArray(data) && data.length > 0) {
+            await this._processWithTimeout(ws, data);
+          }
+        } catch(e) {}
+      }
+      
+      // Then process other events
+      for (const evt of otherEvents) {
+        let ws = evt.ws;
+        if (!ws || ws.readyState !== 1) {
+          const wsId = evt.wsId || evt.ws?._wsId;
+          if (wsId && this.wsMap.has(wsId)) {
+            ws = this.wsMap.get(wsId);
+          } else {
+            continue;
+          }
+        }
+        if (!ws || ws.readyState !== 1 || ws._closing) continue;
+        
+        try {
+          if (evt.attachment) {
+            try {
+              ws.serializeAttachment(evt.attachment);
+              ws._wsId = evt.attachment.wsId;
+              ws.username = evt.attachment.username;
+              ws.room = evt.attachment.room;
+              ws.roomname = evt.attachment.roomname;
+            } catch(e) {}
+          }
+          const data = JSON.parse(evt.message);
+          if (Array.isArray(data) && data.length > 0) {
+            await this._processWithTimeout(ws, data);
+          }
+        } catch(e) {}
+      }
+      
+      // ✅ After processing all events in a room, broadcast current state
+      setTimeout(() => {
+        if (!this.isDestroyed && !this.closing) {
+          this._broadcastRoomState(room);
+        }
+      }, 500);
     }
   }
 
@@ -868,7 +1132,8 @@ export class GameServer {
             timestamp: this.currentDiceRoll.timestamp,
             answerTime: 20,
             canAnswerNow: true,
-            round: this._diceRound
+            round: this._diceRound,
+            isRestored: true
           }]);
         }
       }
@@ -2039,6 +2304,13 @@ export class GameServer {
           this._startDiceGameIfNotStarted();
         }
       }
+      
+      // ✅ Broadcast current state to the newly switched room
+      setTimeout(() => {
+        if (!this.isDestroyed && !this.closing) {
+          this._broadcastRoomState(roomName);
+        }
+      }, 500);
       
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", e.message || "Switch failed"]);
