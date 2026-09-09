@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-JAVA-COMPATIBLE-FINAL.js
-// VERSION: 14.3.0 - FIXED RESTORE & BROADCAST
+// VERSION: 14.3.1 - FIXED BROADCAST PER ROOM
 // ============================================================
 
 // ============================================================
@@ -744,13 +744,8 @@ export class GameServer {
         await this.alarmScheduler.scheduleAlarms();
         await this._checkAndForceResetIfMondayUTC();
         
-        // RESTORE WEB SOCKETS DENGAN CLIENT RECOVERY
         await this._restoreWebSockets();
-        
-        // SYNC SEMUA ROOM
         await this._syncAllRoomsComplete();
-        
-        // RESTORE ACTIVE GAMES
         await this._restoreActiveGames();
         
         this._initialized = true;
@@ -771,7 +766,6 @@ export class GameServer {
           this._diceGameStarted = false;
         }
         
-        // BROADCAST STATE KE SEMUA ROOM
         await this._broadcastStateToAllRooms();
         
         if (!this.closing && !this.isDestroyed) {
@@ -794,7 +788,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // RESTORE WEB SOCKETS - FIXED
+  // RESTORE WEB SOCKETS
   // ============================================================
   
   async _restoreWebSockets() {
@@ -814,7 +808,6 @@ export class GameServer {
             ws._closing = false;
             ws._restored = true;
             
-            // TAMBAHKAN ke room
             if (!this.wsClients.has(attachment.room)) {
               this.wsClients.set(attachment.room, new Set());
             }
@@ -823,7 +816,6 @@ export class GameServer {
             this.wsMap.set(wsId, ws);
             this.clientRooms.set(wsId, attachment.room);
             
-            // Update user connections
             let conn = this.userConnections.get(attachment.username);
             if (!conn) {
               conn = { 
@@ -842,11 +834,9 @@ export class GameServer {
               conn.restored = true;
             }
             
-            // KIRIM STATE setelah restore
             if (attachment.room === CONSTANTS.DICE_ROOM) {
               this._sendDiceRoomState(ws);
             } else {
-              // Untuk lowcard, kirim state jika ada game
               const game = this.activeGames.get(attachment.room);
               if (game?._isActive && !game._gameEnded) {
                 this._sendCurrentGameState(ws, attachment.room);
@@ -856,22 +846,19 @@ export class GameServer {
         } catch(e) {}
       }
       
-      // AFTER RESTORE: SYNC SEMUA ROOM
       this._syncAllRoomsComplete();
       
     } catch(e) {}
   }
 
   // ============================================================
-  // SYNC ALL ROOMS COMPLETE - FIXED
+  // SYNC ALL ROOMS COMPLETE
   // ============================================================
   
   _syncAllRoomsComplete() {
     try {
       const roomMap = new Map();
       
-      // Build room map dari semua sumber
-      // 1. Dari wsClients
       for (const [room, wsIds] of this.wsClients) {
         if (!roomMap.has(room)) roomMap.set(room, new Set());
         for (const wsId of wsIds) {
@@ -882,7 +869,6 @@ export class GameServer {
         }
       }
       
-      // 2. Dari clientRooms
       for (const [wsId, room] of this.clientRooms) {
         if (!roomMap.has(room)) roomMap.set(room, new Set());
         const ws = this.wsMap.get(wsId);
@@ -891,7 +877,6 @@ export class GameServer {
         }
       }
       
-      // 3. Dari userConnections
       for (const [username, conn] of this.userConnections) {
         if (conn && conn.room && conn.wsId) {
           if (!roomMap.has(conn.room)) roomMap.set(conn.room, new Set());
@@ -902,7 +887,6 @@ export class GameServer {
         }
       }
       
-      // Cleanup dan update
       this.wsClients.clear();
       this.clientRooms.clear();
       
@@ -925,7 +909,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // RESTORE ACTIVE GAMES - FIXED
+  // RESTORE ACTIVE GAMES
   // ============================================================
   
   async _restoreActiveGames() {
@@ -979,7 +963,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SAVE GAME STATE - FIXED
+  // SAVE GAME STATE
   // ============================================================
   
   async _saveGameState() {
@@ -1013,29 +997,29 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST STATE TO ALL ROOMS - FIXED
+  // BROADCAST STATE TO ALL ROOMS - HANYA YANG ADA GAME
   // ============================================================
   
   async _broadcastStateToAllRooms() {
     try {
-      for (const [room, wsIds] of this.wsClients) {
-        if (wsIds.size === 0) continue;
-        
-        if (room === CONSTANTS.DICE_ROOM) {
-          this._broadcastDiceStateToAll();
-          continue;
-        }
-        
-        const game = this.activeGames.get(room);
+      for (const [room, game] of this.activeGames) {
         if (game?._isActive && !game._gameEnded) {
-          this._broadcastGameStateToAll(room, game);
+          const clients = this.wsClients.get(room);
+          if (clients && clients.size > 0) {
+            this._broadcastGameStateToAll(room, game);
+          }
         }
+      }
+      
+      const diceClients = this.wsClients.get(CONSTANTS.DICE_ROOM);
+      if (diceClients && diceClients.size > 0) {
+        this._broadcastDiceStateToAll();
       }
     } catch(e) {}
   }
 
   // ============================================================
-  // BROADCAST GAME STATE TO ALL - FIXED
+  // BROADCAST GAME STATE TO ALL - HANYA 1 ROOM
   // ============================================================
   
   _broadcastGameStateToAll(room, game) {
@@ -1090,7 +1074,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST DICE STATE TO ALL - FIXED
+  // BROADCAST DICE STATE TO ALL - HANYA DICE ROOM
   // ============================================================
   
   _broadcastDiceStateToAll() {
@@ -1138,7 +1122,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // RECOVER ROOM CLIENTS - FIXED
+  // RECOVER ROOM CLIENTS
   // ============================================================
   
   _recoverRoomClients(room) {
@@ -1175,7 +1159,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // SYNC ROOM CLIENTS - FIXED
+  // SYNC ROOM CLIENTS
   // ============================================================
   
   _syncRoomClients(room) {
@@ -1601,7 +1585,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // BROADCAST TO ROOM - FIXED
+  // BROADCAST TO ROOM - HANYA 1 ROOM
   // ============================================================
   
   _broadcastToRoom(room, message) {
@@ -1687,7 +1671,6 @@ export class GameServer {
       
       const game = this.activeGames.get(room);
       if (!game || !game._isActive || game._gameEnded) {
-        // TIDAK KIRIM gameStatus false otomatis
         return;
       }
       
@@ -2803,7 +2786,6 @@ export class GameServer {
             this._startDiceGameIfNotStarted();
           }
         }
-        // UNTUK LOWCARD: TIDAK auto kirim status
         
       } finally {
         setTimeout(() => {
