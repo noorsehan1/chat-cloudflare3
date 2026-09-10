@@ -1,7 +1,8 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.1.4 - RESTORE WSS + CEK KONEKSI + CLEANUP OTOMATIS
+// VERSION: 15.1.5 - RESTORE WSS + CEK KONEKSI + CLEANUP OTOMATIS + DELAY REMOVEKURSI
 // ⚠️ 3 TRIGGER SAMA (ONDESTROY = WSCLOSE = WSERROR)
 // ⚠️ MULTI BEHAVIOR 100% SAMA DENGAN KODE AWAL — TIDAK DIUBAH
+// ⏱️ v15.1.5: DELAY 200ms BROADCAST removeKursi (non-multi) saat timeout/disconnect
 
 const C = {
   MAX_SEATS: 45,
@@ -21,6 +22,7 @@ const C = {
   RATE_LIMIT_WINDOW_MS: 60000,
   MAX_RESTORE_ATTEMPTS: 2,
   RESTORE_RETRY_DELAY_MS: 1500,
+  REMOVE_KURSI_DELAY_MS: 200,
 };
 
 const ROOMS = [
@@ -946,9 +948,9 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥 v15.1.4: CLEANUP — 4 LAPIS FALLBACK
+  // 🔥 v15.1.5: CLEANUP — 4 LAPIS FALLBACK
   // ⚠️ MULTI BEHAVIOR 100% SAMA DENGAN KODE AWAL
-  // ⚠️ PERUBAHAN HANYA DI URUTAN BROADCAST removeKursi (non-multi)
+  // ⏱️ DELAY 200ms BROADCAST removeKursi (non-multi)
   // ============================================================
   async _cleanupUserCompletely(ws) {
     if (!ws) return;
@@ -1075,6 +1077,7 @@ export class ChatServer {
       // 🔥 STEP 3: HAPUS DARI MEMORY + BROADCAST removeKursi
       //    Broadcast DULU (WS ini sudah tidak ada di roomClients)
       //    Baru hapus dari memory
+      //    ⏱️ v15.1.5: DELAY 200ms sebelum broadcast removeKursi
       // ============================================================
       if (username) {
         try {
@@ -1085,10 +1088,17 @@ export class ChatServer {
           if (!rBucket?.seat) continue;
           for (const [seat, data] of Object.entries(rBucket.seat)) {
             if (data?.namauser === username && data.isMulti !== true) {
-              // 🔥 BROADCAST DULU — roomClients sudah bersih dari WS ini
-              this.broadcast(rName, ["removeKursi", rName, parseInt(seat)]);
+              const seatNum = parseInt(seat);
 
-              // Baru hapus dari memory
+              // ⏱️ DELAY 200ms — biar client lain sempat proses disconnect dulu
+              //    Baru broadcast removeKursi
+              setTimeout(() => {
+                try {
+                  this.broadcast(rName, ["removeKursi", rName, seatNum]);
+                } catch (e) {}
+              }, C.REMOVE_KURSI_DELAY_MS);
+
+              // Baru hapus dari memory (instan)
               delete rBucket.seat[seat];
               if (rBucket.point) delete rBucket.point[seat];
 
@@ -1583,6 +1593,7 @@ export class ChatServer {
         // ============================================================
         // 🔥 FASE 3: CLEANUP WS MATI
         //    Broadcast removeKursi sekarang sudah ada target di roomClients
+        //    ⏱️ v15.1.5: delay 200ms di _cleanupUserCompletely
         // ============================================================
         for (const ws of deadWs) {
           try {
@@ -1854,6 +1865,7 @@ export class ChatServer {
 
         // 🔥 v15.1.4: onDestroy panggil _cleanupUserCompletely
         // ⚠️ 4 lapis fallback sama — MULTI BEHAVIOR TIDAK DIUBAH
+        // ⏱️ v15.1.5: delay 200ms di _cleanupUserCompletely
         if (evt === "onDestroy") {
           await this._cleanupUserCompletely(ws);
           return;
