@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.9.0 - TIME LEFT ONCE ONLY
+// VERSION: 16.9.1 - NO LEFT GAME NAME
 // ============================================================
 
 const CONSTANTS = {
@@ -642,7 +642,6 @@ export class GameServer {
       ws._closing = false;
       ws._cleaning = false;
       ws._createdAt = attachment?.createdAt || ws._createdAt || Date.now();
-      // ✅ JANGAN reset _nextSessionSent — biar tidak kirim time left berulang
       if (ws._nextSessionSent === undefined) ws._nextSessionSent = false;
 
       if (!this.wsSet.has(ws)) this.wsSet.add(ws);
@@ -1215,7 +1214,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // MARK PLAYER LEFT
+  // MARK PLAYER LEFT — ✅ TIDAK PERNAH UBAH NAMA PLAYER
   // ============================================================
 
   async _markPlayerLeft(room, username) {
@@ -1228,11 +1227,12 @@ export class GameServer {
       if (!game.players.has(username)) return;
       if (game.eliminated?.has(username)) return;
 
+      // ✅ HANYA set flag _left, JANGAN UBAH player.name
       const player = game.players.get(username);
       if (player) {
-        player.name = "left game";
         player._left = true;
         player._leftAt = Date.now();
+        // ❌ TIDAK ADA: player.name = "left game";
       }
 
       game.numbers?.delete(username);
@@ -1293,7 +1293,6 @@ export class GameServer {
           }]);
         }
       } else {
-        // ✅ KIRIM SEKALI SAJA saat masuk room — TANPA reset flag
         if (!ws._nextSessionSent) {
           ws._nextSessionSent = true;
           const timer = setTimeout(() => {
@@ -1778,7 +1777,6 @@ export class GameServer {
           this._diceGameStarted = false;
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session started!"]);
           
-          // ✅ RESET flag saat sesi mulai — biar user dapat notif baru saat sesi berakhir
           const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
           if (clients) {
             for (const ws of clients) {
@@ -1805,7 +1803,6 @@ export class GameServer {
         this._diceGameStarted = false;
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
         
-        // ✅ KIRIM time left SEKALI saat sesi berakhir
         try {
           const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
           if (timeInfo && timeInfo.text) {
@@ -1815,7 +1812,6 @@ export class GameServer {
           }
         } catch(e) {}
         
-        // ✅ RESET flag untuk SEMUA client — biar user baru masuk dapat notif
         {
           const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
           if (clients) {
@@ -1966,7 +1962,6 @@ export class GameServer {
               round: this._diceRound
             }]);
           }
-          // ❌ TIDAK kirim diceNotification — biar _sendDiceRoomState yang handle
         } catch(e) {}
         return;
       }
@@ -2097,7 +2092,6 @@ export class GameServer {
       }
 
       if (evt === "getDicePoints") {
-        // ❌ TIDAK kirim dicePoints — client tidak handle
         return;
       }
 
@@ -2113,14 +2107,12 @@ export class GameServer {
           let notification = "";
           
           if (isActive) {
-            // ✅ HANYA saat game aktif — hitung mundur real-time
             const elapsed = (Date.now() - this._diceStartTime) / 1000;
             const remaining = Math.max(0, 20 - elapsed);
             notification = Math.floor(remaining) + "s remaining";
           } else if (this.alarmScheduler.isDiceTime()) {
             notification = "Dice game starting soon...";
           } else {
-            // ❌ JANGAN kirim time left di sini — biar tidak loop
             notification = "Waiting...";
           }
           this.safeSend(ws, ["diceNotification", notification]);
@@ -2159,7 +2151,6 @@ export class GameServer {
       const currentRoom = ws.room || ws.roomname;
       if (currentRoom === roomName) {
         if (roomName === CONSTANTS.DICE_ROOM) {
-          // ❌ JANGAN reset flag — biar tidak kirim time left berulang
           this._sendDiceRoomState(ws);
         }
         this.safeSend(ws, ["switchRoomSuccess", roomName]);
@@ -2193,8 +2184,6 @@ export class GameServer {
       if (!_wsCleanupState.has(ws)) {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
-
-      // ❌ JANGAN reset flag _nextSessionSent di sini
 
       this.safeSend(ws, ["switchRoomSuccess", roomName]);
       if (roomName === CONSTANTS.DICE_ROOM) {
@@ -2640,6 +2629,7 @@ export class GameServer {
       const submittedIds = new Set(numbers.keys());
       const activeIds = this._getActivePlayerIds(game);
       
+      // ✅ Player yang tidak submit (time up) -> hanya di-eliminate, TIDAK diubah namanya
       for (const id of activeIds) { 
         if (!submittedIds.has(id)) eliminated.add(id); 
       }
@@ -2751,6 +2741,7 @@ export class GameServer {
         return;
       }
       
+      // ✅ Nama di Round Result SELALU pakai nama asli dari players.get(id).name
       const numbersArr = entries.map(([id, n]) => `${players.get(id)?.name || id}:${n}${tanda.get(id) ? `(${tanda.get(id)})` : ''}`);
       const loserNames = [...losers].map(id => players.get(id)?.name || id);
       const remainingNames = remaining.map(id => players.get(id)?.name || id);
@@ -2793,6 +2784,7 @@ export class GameServer {
           
           const player = game.players.get(usernameClean);
           if (player) {
+            // ✅ PASTIKAN nama tetap nama asli (tidak berubah jadi "left game")
             player.name = usernameClean;
             player._left = false;
             player._leftAt = null;
@@ -2887,6 +2879,7 @@ export class GameServer {
       
       const player = game.players.get(usernameClean);
       if (player) {
+        // ✅ PASTIKAN nama tetap nama asli
         player.name = usernameClean;
         player._left = false;
         player._leftAt = null;
