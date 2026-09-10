@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 14.7.3 - FIX CLEANUP (WS CLOSE/ERROR/DESTROY)
+// VERSION: 14.7.4 - FIX INSERT OR REPLACE INTO (_savePoint)
 // ⚠️ MULTI BEHAVIOR UNCHANGED
 
 const C = {
@@ -338,7 +338,7 @@ export class ChatServer {
         return;
       }
       await this.db
-        .prepare(`INSERT OR REPLACE FROM ${TABLE_NAME} (key, value) VALUES (?, ?)`)
+        .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
         .bind(key, JSON.stringify(pointData))
         .run();
     } catch(e) {}
