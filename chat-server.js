@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.1.3 - PURGE DEAD SESSIONS ON RESTORE
+// VERSION: 15.1.4 - PURGE DEAD SESSIONS + D1 BY KEY + D1 BY USERNAME
 // ⚠️ MULTI BEHAVIOR UNCHANGED
 
 const C = {
@@ -931,7 +931,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥🔥🔥 v15.1.3: CLEANUP — 4 LAPIS FALLBACK
+  // 🔥🔥🔥 v15.1.4: CLEANUP — 4 LAPIS FALLBACK
   // ============================================================
   async _cleanupUserCompletely(ws) {
     if (!ws) return;
@@ -1090,8 +1090,12 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥🔥🔥 v15.1.3: PURGE DEAD SESSIONS
+  // 🔥🔥🔥 v15.1.4: PURGE DEAD SESSIONS
   // Hapus semua data user yang WS-nya sudah tidak hidup
+  // - Hapus memory
+  // - Hapus D1 by key (seat_room_seat + point_room_seat)
+  // - Hapus D1 by username (jaring pengaman kedua)
+  // - Broadcast removeKursi
   // Dipanggil HANYA saat restore (server bangun)
   // ============================================================
   async _purgeDeadSessions() {
@@ -1133,9 +1137,10 @@ export class ChatServer {
 
       if (toDelete.length === 0) return 0;
 
-      // 3. Hapus dari memory + D1 + broadcast
+      // 3. Hapus dari memory + D1 (by key) + D1 (by username) + broadcast
       for (const item of toDelete) {
         try {
+          // ✅ HAPUS DARI MEMORY
           if (roomsData[item.room]?.seat) {
             delete roomsData[item.room].seat[item.seat];
           }
@@ -1143,6 +1148,7 @@ export class ChatServer {
             delete roomsData[item.room].point[item.seat];
           }
 
+          // ✅ HAPUS DARI D1 — by key (room + seat)
           if (this.db) {
             await this.db
               .prepare(`DELETE FROM ${TABLE_NAME} WHERE key IN (?, ?)`)
@@ -1150,6 +1156,14 @@ export class ChatServer {
               .run();
           }
 
+          // ✅ HAPUS DARI D1 — by username (jaring pengaman kedua)
+          if (this.db && item.username) {
+            try {
+              await this._forceDeleteFromD1(null, null, item.username);
+            } catch(e) {}
+          }
+
+          // ✅ BROADCAST KE CLIENT
           this.broadcast(item.room, ["removeKursi", item.room, item.seat]);
           this.updateRoomCount(item.room).catch(() => {});
         } catch(e) {}
@@ -1646,7 +1660,7 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      // 🔥🔥🔥 v15.1.3: HAPUS DATA YATIM SETELAH RESTORE
+      // 🔥🔥🔥 v15.1.4: HAPUS DATA YATIM SETELAH RESTORE
       await this._purgeDeadSessions();
 
       this._restored = true;
@@ -1664,7 +1678,7 @@ export class ChatServer {
       this._restoreFailed = true;
       this._isRestoring = false;
 
-      // 🔥🔥🔥 v15.1.3: Tetap coba purge walau restore gagal
+      // 🔥🔥🔥 v15.1.4: Tetap coba purge walau restore gagal
       try { await this._purgeDeadSessions(); } catch(e2) {}
 
       if (!this.closing && !this.isDestroyed) {
