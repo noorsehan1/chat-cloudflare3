@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.0.4 - FIX EVENT RECEIVE FROM OTHER USERS
+// VERSION: 16.0.5 - ALL EVENTS VISIBLE TO ALL USERS IN ROOM
 // ============================================================
 
 const CONSTANTS = {
@@ -823,7 +823,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // PROCESS PENDING EVENTS - FIXED
+  // PROCESS PENDING EVENTS
   // ============================================================
   
   async _processPendingEvents() {
@@ -908,43 +908,58 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // ✅ FIXED: _ensureClientInRoom — PERKUAT
+  // ============================================================
+  
   _ensureClientInRoom(ws, room, username = null) {
     try {
       if (!ws || !room) return false;
       const wsId = ws._wsId;
       if (!wsId) return false;
+
+      // Selalu update wsMap
+      this.wsMap.set(wsId, ws);
+
+      // Selalu pastikan room ada di wsClients
       if (!this.wsClients.has(room)) {
         this.wsClients.set(room, new Set());
       }
       const clients = this.wsClients.get(room);
       if (!clients.has(wsId)) {
         clients.add(wsId);
-        this.clientRooms.set(wsId, room);
-        this.wsMap.set(wsId, ws);
       }
+
+      // Selalu update clientRooms
+      this.clientRooms.set(wsId, room);
+
+      // Selalu update ws.room & ws.username
       ws.room = room;
       ws.roomname = room;
       if (username) ws.username = username;
+
+      // Selalu update attachment
       try {
+        const existingAtt = ws.deserializeAttachment?.() || {};
         ws.serializeAttachment({
           wsId: wsId,
-          username: ws.username || null,
+          username: ws.username || existingAtt.username || null,
           room: room,
           roomname: room,
-          createdAt: ws._createdAt || Date.now()
+          createdAt: existingAtt.createdAt || Date.now()
         });
       } catch(e) {}
+
+      // Selalu update userConnections
       if (ws.username) {
-        let conn = this.userConnections.get(ws.username);
-        if (conn) {
-          conn.wsId = wsId;
-          conn.ws = ws;
-          conn.room = room;
-          conn.timestamp = Date.now();
-        } else {
-          this.userConnections.set(ws.username, { wsId, ws, room, timestamp: Date.now() });
-        }
+        this.userConnections.set(ws.username, {
+          wsId: wsId,
+          ws: ws,
+          room: room,
+          timestamp: Date.now()
+        });
       }
+
       return true;
     } catch(e) { return false; }
   }
@@ -989,53 +1004,101 @@ export class GameServer {
     } catch(e) { return null; }
   }
 
+  // ============================================================
+  // ✅ FIXED: _getRoomUsers — REBUILD DARI 3 SUMBER
+  // ============================================================
+  
   _getRoomUsers(room) {
     try {
       if (!room) return [];
       const users = [];
-      let wsIds = this.wsClients.get(room);
-      if (!wsIds || wsIds.size === 0) {
-        wsIds = new Set();
-        for (const [wsId, clientRoom] of this.clientRooms) {
-          if (clientRoom === room) wsIds.add(wsId);
+      const seenWsIds = new Set();
+
+      // ============================================================
+      // SUMBER 1: Semua WS yang ws.room === room
+      // ============================================================
+      for (const [wsId, ws] of this.wsMap) {
+        if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
+        if (seenWsIds.has(wsId)) continue;
+
+        if (ws.room === room || ws.roomname === room) {
+          users.push({ wsId, ws, username: ws.username || 'Anonymous' });
+          seenWsIds.add(wsId);
         }
-        if (wsIds.size > 0) this.wsClients.set(room, wsIds);
       }
-      if (wsIds && wsIds.size > 0) {
-        const toRemove = [];
-        for (const wsId of wsIds) {
-          const ws = this.wsMap.get(wsId);
-          if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
-            users.push({ wsId, ws, username: ws.username || 'Anonymous' });
-          } else {
-            toRemove.push(wsId);
+
+      // ============================================================
+      // SUMBER 2: Semua WS yang attachment.room === room
+      // (untuk user yang reconnect tapi belum kirim switchRoom)
+      // ============================================================
+      for (const [wsId, ws] of this.wsMap) {
+        if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
+        if (seenWsIds.has(wsId)) continue;
+
+        try {
+          const att = ws.deserializeAttachment?.();
+          if (att && (att.room === room || att.roomname === room) && att.username) {
+            // Auto-fix: daftarkan ulang ke room
+            ws.room = room;
+            ws.roomname = room;
+            ws.username = att.username;
+
+            users.push({ wsId, ws, username: att.username });
+            seenWsIds.add(wsId);
           }
-        }
-        for (const wsId of toRemove) {
-          wsIds.delete(wsId);
-          this.clientRooms.delete(wsId);
-          this.wsMap.delete(wsId);
-        }
-        if (wsIds.size === 0) {
-          this.wsClients.delete(room);
+        } catch(e) {}
+      }
+
+      // ============================================================
+      // SUMBER 3: Semua WS di clientRooms yang room-nya sama
+      // ============================================================
+      for (const [wsId, clientRoom] of this.clientRooms) {
+        if (clientRoom !== room) continue;
+        if (seenWsIds.has(wsId)) continue;
+
+        const ws = this.wsMap.get(wsId);
+        if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
+          users.push({ wsId, ws, username: ws.username || 'Anonymous' });
+          seenWsIds.add(wsId);
         }
       }
+
+      // ============================================================
+      // SINKRONISASI: update wsClients.get(room) agar konsisten
+      // ============================================================
+      if (users.length > 0) {
+        const wsIds = new Set(users.map(u => u.wsId));
+        this.wsClients.set(room, wsIds);
+        for (const u of users) {
+          this.clientRooms.set(u.wsId, room);
+        }
+      }
+
       return users;
     } catch(e) { return []; }
   }
 
+  // ============================================================
+  // ✅ FIXED: _broadcastToRoom — PAKAI _getRoomUsers BARU
+  // ============================================================
+  
   _broadcastToRoom(room, message) {
     try {
       if (this.closing || this.isDestroyed || !room || !message) return 0;
-      this._ensureRoomSync(room);
+
+      // _getRoomUsers sudah rebuild dari wsMap + attachment
       const users = this._getRoomUsers(room);
       if (!users || users.length === 0) return 0;
+
       const msgStr = JSON.stringify(message);
       let sentCount = 0;
       const toRemove = [];
+
       for (const user of users) {
         const ws = user.ws;
-        if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
+        if (!ws) { toRemove.push(user.wsId); continue; }
+
+        if (ws.readyState === 1 && !ws._closing && !ws._cleaning) {
           try {
             ws.send(msgStr);
             sentCount++;
@@ -1046,44 +1109,64 @@ export class GameServer {
           toRemove.push(user.wsId);
         }
       }
+
+      // Cleanup WS yang gagal (JANGAN hapus dari wsMap)
       if (toRemove.length > 0) {
         const clients = this.wsClients.get(room);
         if (clients) {
           for (const wsId of toRemove) {
             clients.delete(wsId);
             this.clientRooms.delete(wsId);
-            this.wsMap.delete(wsId);
           }
-          if (clients.size === 0) this.wsClients.delete(room);
         }
       }
+
       return sentCount;
     } catch(e) { return 0; }
   }
 
+  // ============================================================
+  // ✅ FIXED: _ensureRoomSync — SELALU REBUILD
+  // ============================================================
+  
   _ensureRoomSync(room) {
     try {
       if (!room || typeof room !== 'string') return false;
-      let clients = this.wsClients.get(room);
-      if (clients && clients.size > 0) {
-        return true;
+
+      const wsIds = new Set();
+
+      // Scan wsMap untuk ws.room === room
+      for (const [wsId, ws] of this.wsMap) {
+        if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
+
+        if (ws.room === room || ws.roomname === room) {
+          wsIds.add(wsId);
+          this.clientRooms.set(wsId, room);
+          continue;
+        }
+
+        // Cek attachment untuk reconnect case
+        try {
+          const att = ws.deserializeAttachment?.();
+          if (att && (att.room === room || att.roomname === room) && att.username) {
+            wsIds.add(wsId);
+            this.clientRooms.set(wsId, room);
+          }
+        } catch(e) {}
       }
-      const toAdd = [];
-      for (const [wsId, r] of this.clientRooms) {
-        if (r === room) {
+
+      // Sync dari clientRooms
+      for (const [wsId, clientRoom] of this.clientRooms) {
+        if (clientRoom === room) {
           const ws = this.wsMap.get(wsId);
-          if (ws && ws.readyState === 1 && !ws._closing) {
-            toAdd.push(wsId);
+          if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
+            wsIds.add(wsId);
           }
         }
       }
-      if (toAdd.length > 0) {
-        if (!this.wsClients.has(room)) {
-          this.wsClients.set(room, new Set());
-        }
-        for (const wsId of toAdd) {
-          this.wsClients.get(room).add(wsId);
-        }
+
+      if (wsIds.size > 0) {
+        this.wsClients.set(room, wsIds);
         return true;
       }
       return false;
@@ -2079,10 +2162,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // PROCESS EVENT QUEUE - FIXED (RECURSIVE)
-  // ============================================================
-  
   async _processEventQueue() {
     if (this._processingQueue || this._eventQueue.length === 0) return;
     this._processingQueue = true;
@@ -2114,13 +2193,31 @@ export class GameServer {
     this._processingQueue = false;
   }
 
+  // ============================================================
+  // ✅ FIXED: _processEventItem — AUTO-FIX ROOM
+  // ============================================================
+  
   async _processEventItem(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
+
+      // Auto-fix: kalau ws.room kosong, ambil dari attachment
+      if (!ws.room) {
+        try {
+          const att = ws.deserializeAttachment?.();
+          if (att && att.room) {
+            ws.room = att.room;
+            ws.roomname = att.roomname || att.room;
+            if (att.username && !ws.username) ws.username = att.username;
+          }
+        } catch(e) {}
+      }
+
       const room = this._getClientRoom(ws);
       if (room) {
         this._ensureClientInRoom(ws, room, ws.username);
       }
+
       await this._handleEventInternal(ws, data);
     } catch(e) {}
   }
@@ -2582,25 +2679,33 @@ export class GameServer {
       ws.room = roomName;
       ws.roomname = roomName;
       if (username) ws.username = username;
+
+      const finalUser = username || ws.username || null;
       ws.serializeAttachment({
         wsId: wsId,
-        username: username || ws.username || null,
+        username: finalUser,
         room: roomName,
         roomname: roomName,
         createdAt: ws._createdAt || Date.now()
       });
-      const finalUsername = username || ws.username;
-      if (finalUsername) {
-        let conn = this.userConnections.get(finalUsername);
-        if (conn) { 
-          conn.room = roomName; 
-          conn.wsId = wsId; 
-          conn.ws = ws; 
-          conn.timestamp = Date.now(); 
-        } else { 
-          this.userConnections.set(finalUsername, { wsId, ws, room: roomName, timestamp: Date.now() }); 
-        }
+
+      // Sync semua map
+      this.wsMap.set(wsId, ws);
+      this.clientRooms.set(wsId, roomName);
+      if (!this.wsClients.has(roomName)) {
+        this.wsClients.set(roomName, new Set());
       }
+      this.wsClients.get(roomName).add(wsId);
+
+      if (finalUser) {
+        this.userConnections.set(finalUser, {
+          wsId: wsId,
+          ws: ws,
+          room: roomName,
+          timestamp: Date.now()
+        });
+      }
+
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
       if (roomName === CONSTANTS.DICE_ROOM) {
         this._sendDiceRoomState(ws);
