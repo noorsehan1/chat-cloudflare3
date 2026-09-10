@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.0.5 - LOGIKA WS SAMA PERSIS DENGAN CHATSERVER
+// VERSION: 16.1.0 - SAMA PERSIS CHATSERVER (MULTI DIHAPUS)
 // ============================================================
 
 const CONSTANTS = {
@@ -41,6 +41,10 @@ const CONSTANTS = {
   PROCESS_MAX_TIME_MS: 100,
   DICE_SESSION_CHECK_INTERVAL_MS: 5000,
   DICE_BROADCAST_DELAY_MS: 5000,
+  MAX_PENDING_EVENTS: 100,
+  CACHE_LOAD_TIMEOUT: 5000,
+  MAX_RESTORE_ATTEMPTS: 3,
+  RESTORE_RETRY_DELAY_MS: 2000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -53,6 +57,7 @@ const QUIZ_SCHEDULE = {
 };
 
 const TABLE_NAME = 'game_data';
+const _wsCleanupState = new WeakMap();
 
 function parseTime(timeStr) {
   const [hours, minutes] = timeStr.split(':').map(Number);
@@ -60,44 +65,25 @@ function parseTime(timeStr) {
 }
 
 // ============================================================
-// D1 DIRECT DATA MANAGER
+// D1 DATA MANAGER
 // ============================================================
 
 class DataManager {
-  constructor(db) {
-    this.db = db;
-  }
+  constructor(db) { this.db = db; }
 
   async init() {
     try {
-      await this.db.prepare(`
-        CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-      `).run();
+      await this.db.prepare(`CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run();
       return true;
-    } catch(e) {
-      return false;
-    }
+    } catch(e) { return false; }
   }
 
   async _get(key) {
     try {
-      const result = await this.db
-        .prepare(`SELECT value FROM ${TABLE_NAME} WHERE key = ?`)
-        .bind(key)
-        .first();
+      const result = await this.db.prepare(`SELECT value FROM ${TABLE_NAME} WHERE key = ?`).bind(key).first();
       if (!result || !result.value) return null;
-      try {
-        return JSON.parse(result.value);
-      } catch(e) {
-        return null;
-      }
-    } catch(e) {
-      return null;
-    }
+      try { return JSON.parse(result.value); } catch(e) { return null; }
+    } catch(e) { return null; }
   }
 
   async _set(key, value) {
@@ -105,20 +91,12 @@ class DataManager {
       if (value === null || value === undefined || 
           (typeof value === 'object' && Object.keys(value).length === 0) ||
           (Array.isArray(value) && value.length === 0)) {
-        await this.db
-          .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
-          .bind(key)
-          .run();
+        await this.db.prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`).bind(key).run();
         return true;
       }
-      await this.db
-        .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)`)
-        .bind(key, JSON.stringify(value))
-        .run();
+      await this.db.prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)`).bind(key, JSON.stringify(value)).run();
       return true;
-    } catch(e) {
-      return false;
-    }
+    } catch(e) { return false; }
   }
 
   async getRecordingStatus(room) {
@@ -128,33 +106,14 @@ class DataManager {
 
   async setRecordingStatus(room, enabled) {
     const map = await this._get('recordingStatusMap') || {};
-    if (enabled) {
-      map[room] = true;
-    } else {
-      delete map[room];
-    }
+    if (enabled) map[room] = true; else delete map[room];
     await this._set('recordingStatusMap', map);
     return true;
-  }
-
-  async getAllRecordingStatus() {
-    return await this._get('recordingStatusMap') || {};
   }
 
   async getWinners(room) {
     const map = await this._get('winnersMap') || {};
     return map[room] || {};
-  }
-
-  async setWinners(room, winners) {
-    const map = await this._get('winnersMap') || {};
-    if (winners && Object.keys(winners).length > 0) {
-      map[room] = winners;
-    } else {
-      delete map[room];
-    }
-    await this._set('winnersMap', map);
-    return true;
   }
 
   async addWinner(room, username) {
@@ -174,20 +133,14 @@ class DataManager {
     return true;
   }
 
-  async getAllWinners() {
-    return await this._get('winnersMap') || {};
-  }
-
-  async getDicePoints() {
-    return await this._get('dicePoints') || {};
-  }
+  async getDicePoints() { return await this._get('dicePoints') || {}; }
 
   async setDicePoints(points) {
     const cleanPoints = {};
     for (const [username, score] of Object.entries(points || {})) {
       if (username && typeof username === 'string') {
-        const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
-        if (numericScore > 0) cleanPoints[username] = numericScore;
+        const s = typeof score === 'number' ? score : parseInt(score, 10) || 0;
+        if (s > 0) cleanPoints[username] = s;
       }
     }
     await this._set('dicePoints', cleanPoints);
@@ -201,86 +154,37 @@ class DataManager {
     return points;
   }
 
-  async resetDicePoints() {
-    await this._set('dicePoints', {});
-    return true;
-  }
+  async resetDicePoints() { await this._set('dicePoints', {}); return true; }
 
   async getLeaderboard(limit = 10) {
     const points = await this.getDicePoints();
     if (!points || Object.keys(points).length === 0) return [];
     const safeLimit = Math.min(Math.max(limit, CONSTANTS.MIN_LEADERBOARD_LIMIT), CONSTANTS.MAX_LEADERBOARD_LIMIT);
-    const sorted = Object.entries(points)
-      .filter(([username, score]) => username && score > 0)
+    return Object.entries(points)
+      .filter(([u, s]) => u && s > 0)
       .sort((a, b) => b[1] - a[1])
-      .slice(0, safeLimit);
-    return sorted.map(([u, s]) => `${u}|${s}`);
+      .slice(0, safeLimit)
+      .map(([u, s]) => `${u}|${s}`);
   }
 
-  async getLastWeekWinner() {
-    return await this._get('lastWeekWinner');
-  }
-
-  async setLastWeekWinner(winnerData) {
-    await this._set('lastWeekWinner', winnerData);
-    return true;
-  }
-
-  async deleteLastWeekWinner() {
-    await this._set('lastWeekWinner', null);
-    return true;
-  }
-
-  async getLastResetWeek() {
-    return await this._get('lastResetWeek');
-  }
-
-  async setLastResetWeek(week) {
-    await this._set('lastResetWeek', week);
-    return true;
-  }
-
-  async getAlarms() {
-    return await this._get('scheduled_alarms') || {};
-  }
-
-  async setAlarms(alarms) {
-    await this._set('scheduled_alarms', alarms);
-    return true;
-  }
-
-  async deleteAlarms() {
-    await this._set('scheduled_alarms', {});
-    return true;
-  }
+  async getLastWeekWinner() { return await this._get('lastWeekWinner'); }
+  async setLastWeekWinner(d) { await this._set('lastWeekWinner', d); return true; }
+  async deleteLastWeekWinner() { await this._set('lastWeekWinner', null); return true; }
+  async getLastResetWeek() { return await this._get('lastResetWeek'); }
+  async setLastResetWeek(w) { await this._set('lastResetWeek', w); return true; }
+  async getAlarms() { return await this._get('scheduled_alarms') || {}; }
+  async setAlarms(a) { await this._set('scheduled_alarms', a); return true; }
+  async deleteAlarms() { await this._set('scheduled_alarms', {}); return true; }
 
   async getAllData() {
     try {
-      const result = await this.db
-        .prepare(`SELECT key, value FROM ${TABLE_NAME}`)
-        .all();
+      const result = await this.db.prepare(`SELECT key, value FROM ${TABLE_NAME}`).all();
       const data = {};
-      const results = result.results || [];
-      for (const row of results) {
-        try {
-          data[row.key] = JSON.parse(row.value);
-        } catch(e) {
-          data[row.key] = row.value;
-        }
+      for (const row of (result.results || [])) {
+        try { data[row.key] = JSON.parse(row.value); } catch(e) { data[row.key] = row.value; }
       }
       return data;
-    } catch(e) {
-      return {};
-    }
-  }
-
-  async deleteAllData() {
-    try {
-      await this.db.prepare(`DELETE FROM ${TABLE_NAME}`).run();
-      return true;
-    } catch(e) {
-      return false;
-    }
+    } catch(e) { return {}; }
   }
 
   getCurrentWeek() {
@@ -318,40 +222,32 @@ class AlarmScheduler {
         const startTotal = parseTime(session.start);
         const endTotal = parseTime(session.end);
         if (currentTotal >= startTotal && currentTotal < endTotal) {
-          currentSession = { ...session, startTotal, endTotal, status: 'active' };
+          currentSession = { ...session, startTotal, endTotal };
           break;
         }
       }
       
       if (currentSession) {
         const endDelay = (currentSession.endTotal - currentTotal) * 60 * 1000;
-        if (endDelay > 0) {
-          await this._scheduleAlarm('dice_session_end', endDelay);
-        }
+        if (endDelay > 0) await this._scheduleAlarm('dice_session_end', endDelay);
         await this._scheduleAlarm('dice_session_start_immediate', 1000);
         return true;
       }
       
-      let nextSession = null;
-      let minDiff = Infinity;
+      let nextSession = null, minDiff = Infinity;
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
         let diff = startTotal - currentTotal;
         if (diff < 0) diff += 24 * 60;
-        if (diff < minDiff) {
-          minDiff = diff;
-          nextSession = { ...session, startTotal, endTotal: parseTime(session.end), status: 'upcoming' };
-        }
+        if (diff < minDiff) { minDiff = diff; nextSession = { ...session, startTotal, endTotal: parseTime(session.end) }; }
       }
       
       if (nextSession) {
         let startDelay = minDiff * 60 * 1000;
         if (startDelay < 0) startDelay = 0;
         await this._scheduleAlarm('dice_session_start', startDelay);
-        const sessionDuration = (nextSession.endTotal - nextSession.startTotal) * 60 * 1000;
-        if (sessionDuration > 0) {
-          await this._scheduleAlarm('dice_session_end', startDelay + sessionDuration);
-        }
+        const dur = (nextSession.endTotal - nextSession.startTotal) * 60 * 1000;
+        if (dur > 0) await this._scheduleAlarm('dice_session_end', startDelay + dur);
       }
       return true;
     } catch(e) { return false; }
@@ -377,8 +273,7 @@ class AlarmScheduler {
   async _scheduleAlarm(name, delayMs) {
     try {
       if (delayMs < 1000) delayMs = 1000;
-      const scheduledAt = Date.now() + delayMs;
-      const alarm = { name, scheduledAt, delayMs, timestamp: Date.now() };
+      const alarm = { name, scheduledAt: Date.now() + delayMs, delayMs, timestamp: Date.now() };
       this._alarms.set(name, alarm);
       await this.dataManager.setAlarms(Object.fromEntries(this._alarms));
       await this._scheduleNearestAlarm();
@@ -411,15 +306,11 @@ class AlarmScheduler {
   async getPendingAlarms() {
     try {
       await this.restoreAlarms();
-      const pending = [];
+      const pending = [], expired = [];
       const now = Date.now();
-      const expired = [];
       for (const [name, alarm] of this._alarms) {
-        const scheduledTime = alarm.scheduledAt || alarm.timestamp + alarm.delayMs;
-        if (scheduledTime <= now) {
-          pending.push({ ...alarm, name });
-          expired.push(name);
-        }
+        const t = alarm.scheduledAt || alarm.timestamp + alarm.delayMs;
+        if (t <= now) { pending.push({ ...alarm, name }); expired.push(name); }
       }
       for (const name of expired) this._alarms.delete(name);
       if (expired.length > 0) await this.dataManager.setAlarms(Object.fromEntries(this._alarms));
@@ -432,8 +323,7 @@ class AlarmScheduler {
       const alarm = this._alarms.get(name);
       if (!alarm) {
         await this.restoreAlarms();
-        const restored = this._alarms.get(name);
-        if (!restored) return null;
+        if (!this._alarms.get(name)) return null;
       }
       this._alarms.delete(name);
       await this.dataManager.setAlarms(Object.fromEntries(this._alarms));
@@ -447,9 +337,7 @@ class AlarmScheduler {
       const stored = await this.dataManager.getAlarms();
       if (stored && typeof stored === 'object') {
         this._alarms.clear();
-        for (const [name, data] of Object.entries(stored)) {
-          this._alarms.set(name, data);
-        }
+        for (const [name, data] of Object.entries(stored)) this._alarms.set(name, data);
         await this._scheduleNearestAlarm();
         return true;
       }
@@ -467,64 +355,34 @@ class AlarmScheduler {
     const wita = this._toWITA(date || new Date());
     const currentTotal = wita.getHours() * 60 + wita.getMinutes();
     for (const session of QUIZ_SCHEDULE.SESSIONS) {
-      const startTotal = parseTime(session.start);
-      const endTotal = parseTime(session.end);
-      if (currentTotal >= startTotal && currentTotal < endTotal) return true;
+      if (currentTotal >= parseTime(session.start) && currentTotal < parseTime(session.end)) return true;
     }
     return false;
-  }
-
-  getNextSessionInfo() {
-    const wita = this._toWITA(new Date());
-    const currentTotal = wita.getHours() * 60 + wita.getMinutes();
-    let minDiff = Infinity;
-    let nextSession = null;
-    for (const session of QUIZ_SCHEDULE.SESSIONS) {
-      const startTotal = parseTime(session.start);
-      let diff = startTotal - currentTotal;
-      if (diff < 0) diff += 24 * 60;
-      if (diff < minDiff) {
-        minDiff = diff;
-        nextSession = { ...session, diff: minDiff };
-      }
-    }
-    return nextSession;
   }
 
   _getTimeLeftUntilNextDice() {
     try {
       const witaTime = this._toWITA(new Date());
       const currentTotal = witaTime.getHours() * 60 + witaTime.getMinutes();
-      let minDiff = Infinity;
-      let nextSession = null;
+      let minDiff = Infinity, nextSession = null;
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
         let diff = startTotal - currentTotal;
         if (diff < 0) diff += 24 * 60;
-        if (diff < minDiff) {
-          minDiff = diff;
-          nextSession = session;
-        }
+        if (diff < minDiff) { minDiff = diff; nextSession = session; }
       }
-      if (minDiff === Infinity) {
-        return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null };
-      }
+      if (minDiff === Infinity) return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null };
       const hours = Math.floor(minDiff / 60);
       const minutes = Math.floor(minDiff % 60);
-      const isRunning = this.isDiceTime();
-      return { hours, minutes, totalMs: minDiff * 60 * 1000, text: hours + "h " + minutes + "m", isRunning, nextSession };
-    } catch(e) {
-      return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null };
-    }
+      return { hours, minutes, totalMs: minDiff * 60 * 1000, text: hours + "h " + minutes + "m", isRunning: this.isDiceTime(), nextSession };
+    } catch(e) { return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null }; }
   }
 
-  async cleanup() {
-    await this._clearAllAlarms();
-  }
+  async cleanup() { await this._clearAllAlarms(); }
 }
 
 // ============================================================
-// GAME SERVER - FULL CLASS
+// GAME SERVER
 // ============================================================
 
 export class GameServer {
@@ -536,26 +394,28 @@ export class GameServer {
       this.closing = false;
       this.isDestroyed = false;
       this._wsIdCounter = 0;
+
+      // ✅ FLAG RESTORE — SAMA CHATSERVER
+      this._restored = false;
+      this._restoreDone = false;
+      this._restoreFailed = false;
+      this._restorePromise = null;
+      this._restoreAttempts = 0;
+      this._isRestoring = false;
       this._initialized = false;
-      
-      this.db = env.DB;
-      this.dataManager = new DataManager(this.db);
-      this.alarmScheduler = new AlarmScheduler(this.db, this.ctx);
-      this.alarmScheduler.ctx = this;
-      
-      this._pendingEvents = [];
-      this.activeGames = new Map();
-      this.wsMap = new Map();
-      this.wsClients = new Map();
-      this.clientRooms = new Map();
+
+      // ✅ VARIABEL WS — SAMA CHATSERVER
+      this.wsSet = new Set();
       this.userConnections = new Map();
+      this.roomClients = new Map();
+
+      this._pendingEvents = [];
       this._eventQueue = [];
+      this._processingQueue = false;
       this._allTimers = new Set();
-      this._lastNotifTime = {};
-      this._lastWinnerRequestTime = new Map();
-      this._notificationTimers = new Set();
-      this._cleanupTimers = new Map();
-      
+
+      // State game
+      this.activeGames = new Map();
       this.currentDiceRoll = null;
       this._diceLock = false;
       this._tieActive = false;
@@ -595,266 +455,314 @@ export class GameServer {
       this._tieInterval = null;
       this._tieLock = false;
       this._tieNotificationTimeouts = [];
+      this._lastNotifTime = {};
+      this._lastWinnerRequestTime = new Map();
+      this._cleanupTimers = new Map();
       this._gameLocks = new Map();
       this._joinLocks = new Map();
-      this._switchLocks = new Map();
-      this._switchRetries = new Map();
-      this._evaluationLocks = new Map();
-      this._gameOperationLocks = new Map();
-      this._drawLocks = new Map();
-      this._submitLocks = new Map();
-      this._checkLocks = new Map();
-      this._closeLocks = new Map();
+
       this._requestCount = 0;
       this._lastResetTime = Date.now();
       this._lastRequestDecay = Date.now();
       this._circuitOpen = false;
       this._errorCount = 0;
       this._lastErrorReset = Date.now();
-      this._reconnectAttempts = new Map();
-      this._processingQueue = false;
+
       this._diceLoopCounter = 0;
       this._maxDiceLoops = 10;
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
-      
-      this._init()
-        .then(() => { this._processPendingEvents(); })
-        .catch(() => { this._processPendingEvents(); });
-    } catch(e) {}
+
+      this.db = env.DB;
+      this.dataManager = new DataManager(this.db);
+      this.alarmScheduler = new AlarmScheduler(this.db, this.ctx);
+      this.alarmScheduler.ctx = this;
+
+      // ✅ SAMA CHATSERVER
+      this._restorePromise = this._restoreWithRetry();
+
+      const restoreTimeout = setTimeout(() => {
+        if (!this._restoreDone) {
+          this._restored = true;
+          this._restoreDone = true;
+          this._restoreFailed = true;
+          this._isRestoring = false;
+          this._initialized = true;
+          if (!this.closing && !this.isDestroyed) {
+            try { this._processPendingEvents(); } catch(e) {}
+          }
+        }
+      }, CONSTANTS.CACHE_LOAD_TIMEOUT || 5000);
+
+      this._restorePromise
+        .then(() => {
+          clearTimeout(restoreTimeout);
+          this._restored = true;
+          this._restoreDone = true;
+          this._isRestoring = false;
+          this._restoreFailed = false;
+          this._initialized = true;
+        })
+        .catch(() => {
+          clearTimeout(restoreTimeout);
+          this._restored = true;
+          this._restoreDone = true;
+          this._restoreFailed = true;
+          this._isRestoring = false;
+          this._initialized = true;
+        });
+
+    } catch(e) {
+      this._restored = true;
+      this._restoreDone = true;
+      this._restoreFailed = true;
+      this._isRestoring = false;
+      this._initialized = true;
+    }
   }
 
-  async _init() {
-    try {
-      await this.dataManager.init();
-      await this.alarmScheduler.restoreAlarms();
-      await this.alarmScheduler.scheduleAlarms();
-      await this._checkAndForceResetIfMondayUTC();
-      await this._initWebSockets();
-      this._syncAllRooms();
-      this._initialized = true;
-      
-      const isDiceTime = this.alarmScheduler.isDiceTime();
-      if (isDiceTime) {
-        this._diceSessionActive = true;
-        this._diceSessionEnded = false;
-        this._diceGameStarted = false;
-        const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-        if (clients && clients.size > 0) {
-          this._startDiceGameIfNotStarted();
+  // ✅ SAMA CHATSERVER
+  async _restoreWithRetry() {
+    let attempts = 0;
+    let lastError = null;
+    while (attempts < CONSTANTS.MAX_RESTORE_ATTEMPTS) {
+      try {
+        attempts++;
+        const result = await this._restoreAllState();
+        this._restoreAttempts = attempts;
+        return result;
+      } catch(e) {
+        lastError = e;
+        this._restoreAttempts = attempts;
+        if (attempts < CONSTANTS.MAX_RESTORE_ATTEMPTS) {
+          await new Promise(resolve => setTimeout(resolve, CONSTANTS.RESTORE_RETRY_DELAY_MS));
+          this._isRestoring = true;
         }
-      } else {
-        this._diceSessionActive = false;
-        this._diceSessionEnded = true;
-        this._diceGameStarted = false;
       }
+    }
+    this._restored = true;
+    this._restoreDone = true;
+    this._restoreFailed = true;
+    this._isRestoring = false;
+    this._initialized = true;
+    throw lastError;
+  }
+
+  // ✅ SAMA CHATSERVER
+  async _restoreAllState() {
+    try {
+      this._isRestoring = true;
+
+      try { await this.dataManager.init(); } catch(e) {}
+
+      try {
+        await this.alarmScheduler.restoreAlarms();
+        await this.alarmScheduler.scheduleAlarms();
+      } catch(e) {}
+
+      try { await this._checkAndForceResetIfMondayUTC(); } catch(e) {}
+
+      try {
+        const webSockets = this.ctx.getWebSockets();
+        const batchSize = 10;
+        for (let i = 0; i < webSockets.length; i += batchSize) {
+          const batch = webSockets.slice(i, i + batchSize);
+          await Promise.allSettled(batch.map(ws => this._restoreSingleWebSocket(ws)));
+        }
+      } catch(e) {}
+
+      this._restored = true;
+      this._restoreDone = true;
+      this._restoreFailed = false;
+      this._isRestoring = false;
+      this._initialized = true;
+
+      try {
+        const isDiceTime = this.alarmScheduler.isDiceTime();
+        if (isDiceTime) {
+          this._diceSessionActive = true;
+          this._diceSessionEnded = false;
+          this._diceGameStarted = false;
+          const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
+          if (clients && clients.size > 0) {
+            this._startDiceGameIfNotStarted();
+          }
+        } else {
+          this._diceSessionActive = false;
+          this._diceSessionEnded = true;
+          this._diceGameStarted = false;
+        }
+      } catch(e) {}
+
       await this._processPendingEvents();
+      return true;
     } catch(e) {
+      this._restored = true;
+      this._restoreDone = true;
+      this._restoreFailed = true;
+      this._isRestoring = false;
+      this._initialized = true;
+      await this._processPendingEvents();
       throw e;
     }
   }
 
-  async _initWebSockets() {
+  // ✅ SAMA CHATSERVER
+  async _restoreSingleWebSocket(ws) {
     try {
-      const webSockets = this.ctx.getWebSockets();
-      for (const ws of webSockets) {
+      const attachment = ws.deserializeAttachment();
+      if (!attachment || !attachment.username || !attachment.room) return;
+
+      ws.username = attachment.username;
+      ws._username = attachment.username;
+      ws.room = attachment.room;
+      ws.roomname = attachment.room;
+      ws._room = attachment.room;
+      ws._wsId = attachment.wsId || (++this._wsIdCounter);
+      ws._closing = false;
+      ws._cleaning = false;
+      ws._createdAt = attachment.createdAt || Date.now();
+
+      if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+
+      if (!this.roomClients.has(attachment.room)) {
+        this.roomClients.set(attachment.room, new Set());
+      }
+      const roomClients = this.roomClients.get(attachment.room);
+      if (!roomClients.has(ws)) roomClients.add(ws);
+
+      let conns = this.userConnections.get(attachment.username);
+      if (!conns) {
+        conns = new Set();
+        this.userConnections.set(attachment.username, conns);
+      }
+      if (!conns.has(ws)) conns.add(ws);
+
+      const state = _wsCleanupState.get(ws);
+      if (state) {
+        state.cleanupDone = false;
+        state.cleaning = false;
+        state.cleanupStart = null;
+      } else {
+        _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
+      }
+
+      if (attachment.room === CONSTANTS.DICE_ROOM) {
+        try { this._sendDiceRoomState(ws); } catch(e) {}
+      }
+    } catch(e) {}
+  }
+
+  async _processPendingEvents() {
+    try {
+      if (!this._pendingEvents || this._pendingEvents.length === 0) return;
+      const events = [...this._pendingEvents];
+      this._pendingEvents = [];
+
+      for (const evt of events) {
+        let ws = evt.ws;
+        if (!ws || ws.readyState !== 1) {
+          const wsId = evt.wsId;
+          if (wsId) {
+            for (const w of this.wsSet) {
+              if (w._wsId === wsId) { ws = w; break; }
+            }
+          }
+          if (!ws) continue;
+        }
+        if (!ws || ws.readyState !== 1 || ws._closing) continue;
+
         try {
-          const attachment = ws.deserializeAttachment();
-          if (attachment && attachment.username && attachment.room) {
-            ws.username = attachment.username;
-            ws.room = attachment.room;
-            ws.roomname = attachment.room;
-            ws._wsId = attachment.wsId || ++this._wsIdCounter;
-            ws._closing = false;
-            if (!this.wsClients.has(attachment.room)) {
-              this.wsClients.set(attachment.room, new Set());
-            }
-            this.wsClients.get(attachment.room).add(ws._wsId);
-            this.wsMap.set(ws._wsId, ws);
-            this.clientRooms.set(ws._wsId, attachment.room);
-            let conn = this.userConnections.get(attachment.username);
-            if (!conn) {
-              conn = { wsId: ws._wsId, ws: ws, room: attachment.room, timestamp: Date.now() };
-              this.userConnections.set(attachment.username, conn);
-            } else {
-              conn.wsId = ws._wsId;
-              conn.ws = ws;
-              conn.room = attachment.room;
-              conn.timestamp = Date.now();
-            }
-            if (attachment.room === CONSTANTS.DICE_ROOM) {
-              this._sendDiceRoomState(ws);
-            }
+          if (evt.attachment) {
+            try {
+              ws.serializeAttachment(evt.attachment);
+              ws._wsId = evt.attachment.wsId;
+              ws.username = evt.attachment.username;
+              ws.room = evt.attachment.room;
+              ws.roomname = evt.attachment.roomname;
+            } catch(e) {}
+          }
+
+          const data = JSON.parse(evt.message);
+          if (Array.isArray(data) && data.length > 0) {
+            await this._processWithTimeout(ws, data);
           }
         } catch(e) {}
       }
     } catch(e) {}
   }
 
-  _syncAllRooms() {
+  async _processWithTimeout(ws, data, timeoutMs = 500) {
     try {
-      const roomMap = new Map();
-      const clientRoomMap = new Map();
-      for (const [wsId, ws] of this.wsMap) {
-        if (ws && ws.room && ws.readyState === 1 && !ws._closing) {
-          const room = ws.room;
-          if (!roomMap.has(room)) roomMap.set(room, new Set());
-          roomMap.get(room).add(wsId);
-          clientRoomMap.set(wsId, room);
-        }
-      }
-      for (const [username, conn] of this.userConnections) {
-        if (conn && conn.room && conn.wsId) {
-          const ws = this.wsMap.get(conn.wsId);
-          if (ws && ws.readyState === 1 && !ws._closing) {
-            if (!roomMap.has(conn.room)) roomMap.set(conn.room, new Set());
-            roomMap.get(conn.room).add(conn.wsId);
-            clientRoomMap.set(conn.wsId, conn.room);
-          }
-        }
-      }
-      this.wsClients.clear();
-      for (const [room, wsIds] of roomMap) {
-        this.wsClients.set(room, wsIds);
-      }
-      this.clientRooms.clear();
-      for (const [wsId, room] of clientRoomMap) {
-        this.clientRooms.set(wsId, room);
-      }
-      return true;
-    } catch(e) { return false; }
+      const timeoutPromise = new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('Processing timeout')), timeoutMs);
+        this._trackTimer(timer);
+      });
+      await Promise.race([this.handleEvent(ws, data), timeoutPromise]);
+    } catch(e) {}
   }
 
-  async _processPendingEvents() {
-    if (!this._pendingEvents || this._pendingEvents.length === 0) return;
-    const events = [...this._pendingEvents];
-    this._pendingEvents = [];
-    for (const evt of events) {
-      let ws = evt.ws;
-      if (!ws || ws.readyState !== 1) {
-        const wsId = evt.wsId;
-        if (wsId && this.wsMap.has(wsId)) {
-          ws = this.wsMap.get(wsId);
-        } else {
-          continue;
-        }
+  async handleEvent(ws, data) {
+    try {
+      if (this.isDestroyed || !ws || !data?.[0]) return;
+      if (this._eventQueue.length > CONSTANTS.MAX_EVENT_QUEUE_SIZE) {
+        this.safeSend(ws, ["gameLowCardError", "Server busy"]);
+        return;
       }
-      if (!ws || ws.readyState !== 1 || ws._closing) continue;
-      try {
-        const room = evt.room || ws.room || ws.roomname;
-        if (room) {
-          this._ensureClientInRoom(ws, room, evt.username || ws.username);
-        }
-        if (evt.attachment) {
-          try {
-            ws.serializeAttachment(evt.attachment);
-            ws._wsId = evt.attachment.wsId;
-            ws.username = evt.attachment.username;
-            ws.room = evt.attachment.room;
-            ws.roomname = evt.attachment.roomname;
-          } catch(e) {}
-        }
-        const data = JSON.parse(evt.message);
-        if (Array.isArray(data) && data.length > 0) {
-          await this._processWithTimeout(ws, data);
-        }
-      } catch(e) {}
+      this._eventQueue.push({ ws, data });
+      if (!this._processingQueue) this._processEventQueue();
+    } catch(e) {}
+  }
+
+  async _processEventQueue() {
+    if (this._processingQueue || this._eventQueue.length === 0) return;
+    this._processingQueue = true;
+    try {
+      const startTime = Date.now();
+      let processed = 0;
+      const MAX_BATCH = CONSTANTS.PROCESS_BATCH_SIZE || 50;
+      const MAX_TIME = CONSTANTS.PROCESS_MAX_TIME_MS || 100;
+      while (this._eventQueue.length > 0 && processed < MAX_BATCH) {
+        if (Date.now() - startTime > MAX_TIME) break;
+        const item = this._eventQueue.shift();
+        try { await this._processEventItem(item.ws, item.data); } catch(e) {}
+        processed++;
+      }
+      if (this._eventQueue.length > 0 && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._processEventQueue(), 10);
+      }
+    } catch(e) {
+      this._handleError('processQueue', e);
+    } finally {
+      this._processingQueue = false;
     }
   }
 
-  _ensureClientInRoom(ws, room, username = null) {
+  async _processEventItem(ws, data) {
     try {
-      if (!ws || !room) return false;
-      const wsId = ws._wsId;
-      if (!wsId) return false;
-      if (!this.wsClients.has(room)) {
-        this.wsClients.set(room, new Set());
-      }
-      const clients = this.wsClients.get(room);
-      if (!clients.has(wsId)) {
-        clients.add(wsId);
-        this.clientRooms.set(wsId, room);
-        this.wsMap.set(wsId, ws);
-      }
-      ws.room = room;
-      ws.roomname = room;
-      if (username) ws.username = username;
-      try {
-        ws.serializeAttachment({
-          wsId: wsId,
-          username: ws.username || null,
-          room: room,
-          roomname: room,
-          createdAt: ws._createdAt || Date.now()
-        });
-      } catch(e) {}
-      if (ws.username) {
-        let conn = this.userConnections.get(ws.username);
-        if (conn) {
-          conn.wsId = wsId;
-          conn.ws = ws;
-          conn.room = room;
-          conn.timestamp = Date.now();
-        } else {
-          this.userConnections.set(ws.username, { wsId, ws, room, timestamp: Date.now() });
-        }
-      }
+      if (this.isDestroyed || !ws || !data || !data[0]) return;
+      const room = ws.room || ws.roomname;
+      if (room && !ws.room) ws.room = room;
+      await this._handleEventInternal(ws, data);
+    } catch(e) {}
+  }
+
+  // ✅ SAFESEND — SAMA CHATSERVER
+  safeSend(ws, msg) {
+    try {
+      if (!ws) return false;
+      if (ws.readyState !== 1 || ws._closing || ws._cleaning || this.closing || this.isDestroyed) return false;
+      ws.send(JSON.stringify(msg));
       return true;
     } catch(e) { return false; }
   }
 
-  _getClientRoom(ws) {
+  // ✅ BROADCAST — SAMA CHATSERVER
+  broadcast(room, msg) {
     try {
-      if (!ws) return null;
-      let room = ws.room || ws.roomname;
-      if (room) return room;
-      const wsId = ws._wsId;
-      if (wsId) {
-        room = this.clientRooms.get(wsId);
-        if (room) return room;
-      }
-      try {
-        const attachment = ws.deserializeAttachment();
-        if (attachment && attachment.room) return attachment.room;
-      } catch(e) {}
-      if (ws.username) {
-        const conn = this.userConnections.get(ws.username);
-        if (conn && conn.room) return conn.room;
-      }
-      return null;
-    } catch(e) { return null; }
-  }
+      if (this.closing || this.isDestroyed || !room || !msg) return 0;
 
-  _getClientUsername(ws) {
-    try {
-      if (!ws) return null;
-      if (ws.username) return ws.username;
-      try {
-        const attachment = ws.deserializeAttachment();
-        if (attachment && attachment.username) return attachment.username;
-      } catch(e) {}
-      const wsId = ws._wsId;
-      if (wsId) {
-        for (const [username, conn] of this.userConnections) {
-          if (conn.wsId === wsId) return username;
-        }
-      }
-      return null;
-    } catch(e) { return null; }
-  }
+      let clients = this.roomClients?.get(room);
 
-  // ============ ✅ BROADCAST — LOGIKA SAMA PERSIS CHATSERVER ============
-  // Cara kirim ke room: identik dengan broadcast() ChatServer.
-  // 1. Ambil dari wsClients
-  // 2. Kalau kosong → fallback getWebSockets()
-  // 3. Restore property WS dari attachment
-  // 4. Simpan hasil ke wsClients
-  // 5. Kirim ke semua WS valid
-  _broadcastToRoom(room, message) {
-    try {
-      if (this.closing || this.isDestroyed || !room || !message) return 0;
-      
-      let clients = this.wsClients?.get(room);
-      
       if (!clients || clients.size === 0) {
         try {
           const allWs = this.ctx?.getWebSockets?.() || [];
@@ -863,135 +771,390 @@ export class GameServer {
             for (const ws of allWs) {
               try {
                 if (!ws || ws.readyState !== 1) continue;
-                if (ws._closing) continue;
-                
+                if (ws._closing || ws._cleaning) continue;
+
                 let wsRoom = ws.room || ws.roomname;
-                let wsId = ws._wsId;
-                let username = ws.username;
-                
-                if (!wsRoom || !wsId || !username) {
+                if (!wsRoom) {
                   try {
                     const att = ws.deserializeAttachment();
                     if (att) {
-                      if (!wsRoom && att.room) wsRoom = att.room;
-                      if (!wsId && att.wsId) wsId = att.wsId;
-                      if (!username && att.username) username = att.username;
-                      if (att.wsId && !ws._wsId) ws._wsId = att.wsId;
+                      wsRoom = att.room;
                       if (att.username && !ws.username) ws.username = att.username;
                       if (att.room && !ws.room) ws.room = att.room;
                       if (att.room && !ws.roomname) ws.roomname = att.room;
-                      if (!ws._closing) ws._closing = false;
                     }
                   } catch(e) {}
                 }
-                
-                if (wsRoom === room && wsId) {
-                  clients.add(wsId);
-                  this.clientRooms.set(wsId, room);
-                  this.wsMap.set(wsId, ws);
-                  if (username) {
-                    let conn = this.userConnections.get(username);
-                    if (!conn) {
-                      this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() });
-                    } else {
-                      conn.wsId = wsId;
-                      conn.ws = ws;
-                      conn.room = room;
-                    }
+
+                if (wsRoom === room) {
+                  clients.add(ws);
+                  if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+                  if (ws.username) {
+                    let c = this.userConnections.get(ws.username);
+                    if (!c) { c = new Set(); this.userConnections.set(ws.username, c); }
+                    c.add(ws);
                   }
                 }
               } catch(e) {}
             }
-            
             if (clients.size > 0) {
-              try { this.wsClients.set(room, clients); } catch(e) {}
+              try { this.roomClients.set(room, clients); } catch(e) {}
             }
           }
         } catch(e) {}
       }
-      
+
       if (!clients || clients.size === 0) return 0;
-      
-      const msgStr = JSON.stringify(message);
-      const toRemove = [];
+
+      const msgStr = JSON.stringify(msg);
+      const toRemove = new Set();
       let sentCount = 0;
-      
-      for (const wsId of clients) {
-        const ws = this.wsMap.get(wsId);
-        if (!ws) { toRemove.push(wsId); continue; }
-        if (ws.readyState !== 1 || ws._closing) { toRemove.push(wsId); continue; }
+
+      for (const ws of clients) {
+        if (!ws) { try { toRemove.add(ws); } catch(e) {} continue; }
+        const state = _wsCleanupState.get(ws);
+        if (state && state.cleanupDone) { try { toRemove.add(ws); } catch(e) {} continue; }
         const wsRoom = ws.room || ws.roomname;
-        if (wsRoom && wsRoom !== room) { toRemove.push(wsId); continue; }
+        if (wsRoom && wsRoom !== room) { try { toRemove.add(ws); } catch(e) {} continue; }
         try {
-          ws.send(msgStr);
-          sentCount++;
-        } catch(e) {
-          toRemove.push(wsId);
+          if (ws.readyState === 1 && !ws._closing && !ws._cleaning) {
+            ws.send(msgStr);
+            sentCount++;
+          } else {
+            try { toRemove.add(ws); } catch(e) {}
+          }
+        } catch(e) { try { toRemove.add(ws); } catch(e) {} }
+      }
+
+      if (toRemove.size > 0) {
+        for (const ws of toRemove) {
+          try { clients.delete(ws); } catch(e) {}
         }
       }
-      
-      if (toRemove.length > 0) {
-        for (const wsId of toRemove) {
-          clients.delete(wsId);
-          this.clientRooms.delete(wsId);
-          this.wsMap.delete(wsId);
-        }
-        if (clients.size === 0) this.wsClients.delete(room);
-      }
-      
+
       return sentCount;
     } catch(e) { return 0; }
   }
 
-  _safeSend(ws, message) {
+  // ✅ FETCH — SAMA CHATSERVER
+  async fetch(req) {
     try {
-      if (!ws || ws.readyState !== 1) return false;
-      const msg = typeof message === 'string' ? message : JSON.stringify(message);
-      ws.send(msg);
-      return true;
-    } catch(e) { return false; }
+      if (this.closing || this.isDestroyed) return new Response("Shutting down", { status: 503 });
+
+      if (this._circuitOpen) {
+        const now = Date.now();
+        if (now - this._lastResetTime > 60000) {
+          this._circuitOpen = false;
+          this._requestCount = 0;
+          this._lastResetTime = now;
+          this._lastRequestDecay = now;
+        } else {
+          return new Response("Service temporarily unavailable", { status: 503, headers: { 'Retry-After': '30', 'Content-Type': 'text/plain' } });
+        }
+      }
+
+      const now = Date.now();
+      const elapsed = now - this._lastRequestDecay;
+      if (elapsed > 1000) {
+        const elapsedSeconds = Math.floor(elapsed / 1000);
+        this._requestCount = Math.max(0, this._requestCount - elapsedSeconds);
+        this._lastRequestDecay = now;
+      }
+
+      this._requestCount++;
+      if (this._requestCount > CONSTANTS.RATE_LIMIT_MAX) {
+        this._circuitOpen = true;
+        this._lastResetTime = now;
+        return new Response("Rate limit exceeded", { status: 429, headers: { 'Retry-After': '60', 'Content-Type': 'text/plain' } });
+      }
+
+      if (!this._restored && this._restorePromise) {
+        try {
+          await Promise.race([
+            this._restorePromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Restore timeout')), CONSTANTS.CACHE_LOAD_TIMEOUT || 5000))
+          ]);
+        } catch(e) {
+          if (!this._restored) {
+            this._restored = true;
+            this._restoreDone = true;
+            this._restoreFailed = true;
+            this._isRestoring = false;
+            this._initialized = true;
+          }
+        }
+      }
+
+      const url = new URL(req.url);
+      if (url.pathname === "/game/ws") {
+        const upgrade = req.headers.get("Upgrade");
+        if (upgrade !== "websocket") return new Response("WebSocket only", { status: 400 });
+        if (this.wsSet.size >= CONSTANTS.MAX_WS_CLIENTS) return new Response("Server full", { status: 503 });
+        if (this._eventQueue?.length > 500) return new Response("Server busy", { status: 503 });
+
+        const pair = new WebSocketPair();
+        const [client, server] = [pair[0], pair[1]];
+        const wsId = ++this._wsIdCounter;
+
+        try {
+          this.ctx.acceptWebSocket(server);
+        } catch(e) {
+          try { server.close(1008, "Accept failed"); } catch(err) {}
+          return new Response("WebSocket acceptance failed", { status: 500 });
+        }
+
+        server.serializeAttachment({ wsId, username: null, room: null, roomname: null, createdAt: Date.now() });
+        server._wsId = wsId;
+        server._closing = false;
+        server._cleaning = false;
+        server.username = null;
+        server._username = null;
+        server.room = null;
+        server.roomname = null;
+        server._room = null;
+        server._createdAt = Date.now();
+
+        _wsCleanupState.set(server, { cleanupDone: false, cleaning: false, cleanupStart: null });
+        this.wsSet.add(server);
+
+        return new Response(null, { status: 101, webSocket: client });
+      }
+      return new Response("Game Server", { status: 200 });
+    } catch(e) {
+      this._handleError('fetch', e);
+      return new Response(JSON.stringify({ error: "Internal Server Error" }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
   }
 
-  _sendToUser(ws, message) {
-    return this._safeSend(ws, message);
+  // ✅ WEB SOCKET MESSAGE — SAMA CHATSERVER
+  async webSocketMessage(ws, message) {
+    try {
+      if (!ws || ws._closing || this.closing || this.isDestroyed || ws._cleaning) return;
+      const state = _wsCleanupState.get(ws);
+      if (state && state.cleanupDone) return;
+
+      if (!this._restored || this._isRestoring) {
+        if (!this._pendingEvents) this._pendingEvents = [];
+        if (this._pendingEvents.length >= CONSTANTS.MAX_PENDING_EVENTS) {
+          try { this.safeSend(ws, ["gameLowCardError", "Server busy"]); } catch(e) {}
+          return;
+        }
+        let attachment = null;
+        try { attachment = ws.deserializeAttachment ? ws.deserializeAttachment() : null; } catch(e) {}
+        this._pendingEvents.push({
+          ws, message, timestamp: Date.now(), wsId: ws._wsId || Date.now(), attachment
+        });
+        return;
+      }
+
+      try {
+        await this.handleMessage(ws, message);
+      } catch(e) { this._handleError('webSocketMessage', e); }
+    } catch(e) { this._handleError('webSocketMessage', e); }
   }
+
+  async handleMessage(ws, raw) {
+    try {
+      if (!ws) return;
+      const state = _wsCleanupState.get(ws);
+      if (state && state.cleanupDone) return;
+      if (ws._cleaning || ws._closing) return;
+
+      if (!this._restored && this._restorePromise) {
+        try {
+          await Promise.race([
+            this._restorePromise,
+            new Promise(resolve => setTimeout(resolve, CONSTANTS.CACHE_LOAD_TIMEOUT))
+          ]);
+        } catch(e) { return; }
+        if (!this._restored) return;
+      }
+
+      try {
+        if (ws.readyState !== 1 || ws._closing || ws._cleaning || this.closing || this.isDestroyed) return;
+      } catch(e) { return; }
+
+      let str = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
+      if (str.length > 5000) return;
+      let data;
+      try { data = JSON.parse(str); } catch(e) { return; }
+      if (!Array.isArray(data) || !data.length) return;
+
+      await this._handleEventInternal(ws, data);
+    } catch(e) { this._handleError('handleMessage', e); }
+  }
+
+  // ✅ WS CLOSE — SYNC, SAMA CHATSERVER
+  webSocketClose(ws) {
+    try {
+      if (!ws || this.isDestroyed) return;
+      if (!ws._username && ws.username) ws._username = ws.username;
+      if (!ws._room && (ws.room || ws.roomname)) ws._room = ws.room || ws.roomname;
+      const state = _wsCleanupState.get(ws);
+      if (state && state.cleanupDone) return;
+      this._cleanupUserCompletely(ws).catch(() => {});
+    } catch(e) {}
+  }
+
+  // ✅ WS ERROR — SYNC, SAMA CHATSERVER
+  webSocketError(ws) {
+    try {
+      if (!ws || this.isDestroyed) return;
+      if (!ws._username && ws.username) ws._username = ws.username;
+      if (!ws._room && (ws.room || ws.roomname)) ws._room = ws.room || ws.roomname;
+      const state = _wsCleanupState.get(ws);
+      if (state && state.cleanupDone) return;
+      this._cleanupUserCompletely(ws).catch(() => {});
+    } catch(e) {}
+  }
+
+  // ✅ CLEANUP — SAMA CHATSERVER
+  async _cleanupUserCompletely(ws) {
+    try {
+      if (!ws) return;
+      let state = _wsCleanupState.get(ws);
+      if (!state) {
+        state = { cleanupDone: false, cleaning: false, cleanupStart: null };
+        try { _wsCleanupState.set(ws, state); } catch(e) {}
+      }
+      if (state.cleanupDone || state.cleaning) return;
+      state.cleaning = true;
+      state.cleanupStart = Date.now();
+
+      try {
+        const username = ws.username || ws._username;
+        const roomName = ws.room || ws.roomname || ws._room;
+
+        if (!username) {
+          if (this.wsSet) try { this.wsSet.delete(ws); } catch(e) {}
+          return;
+        }
+
+        if (ws && !ws._closing) ws._closing = true;
+        try { if (ws && ws.readyState === 1) ws.close(1000, "Cleanup"); } catch(e) {}
+
+        if (this.wsSet) try { this.wsSet.delete(ws); } catch(e) {}
+
+        const connections = this.userConnections?.get(username);
+        if (connections) {
+          try { connections.delete(ws); } catch(e) {}
+          if (connections.size === 0) {
+            try { this.userConnections.delete(username); } catch(e) {}
+          }
+        }
+
+        if (roomName) {
+          const roomClients = this.roomClients?.get(roomName);
+          if (roomClients) {
+            try { roomClients.delete(ws); } catch(e) {}
+            if (roomClients.size === 0) {
+              try { this.roomClients.delete(roomName); } catch(e) {}
+            }
+          }
+        }
+
+        if (roomName && username) {
+          try { await this._cleanupGameAsync(ws._wsId, username, roomName); } catch(e) {}
+        }
+
+        try { ws._closing = false; ws._cleaning = false; } catch(e) {}
+      } catch(e) {} finally {
+        state.cleanupDone = true;
+        state.cleaning = false;
+        state.cleanupStart = null;
+      }
+    } catch(e) {}
+  }
+
+  async _cleanupGameAsync(wsId, username, room) {
+    try {
+      if (!room || !username) return;
+      const game = this.activeGames.get(room);
+      if (!game || !game._isActive || game._gameEnded || !game.players) return;
+      if (!game.players.has(username)) return;
+      if (game.hostId === username && game._phase === 'registration') {
+        this.broadcast(room, ["gameLowCardError", "Host left the game"]);
+        game._gameEnded = true;
+        game._isActive = false;
+        this._forceCleanupGame(room, game);
+        return;
+      }
+      if (game._phase === 'registration') {
+        game.players.delete(username);
+        game.playerWsId?.delete(username);
+        this.broadcast(room, ["gameLowCardError", "Player left the game"]);
+        if (game.hostId === username) {
+          const remaining = Array.from(game.players.keys());
+          if (remaining.length > 0) {
+            game.hostId = remaining[0];
+            this.broadcast(room, ["gameLowCardError", "New host: " + game.hostId]);
+          } else {
+            game._gameEnded = true;
+            game._isActive = false;
+            this._forceCleanupGame(room, game);
+            return;
+          }
+        }
+        if (game.players.size === 0) {
+          game._gameEnded = true;
+          game._isActive = false;
+          this._forceCleanupGame(room, game);
+        }
+        return;
+      }
+      if (game._phase === 'draw' || game._phase === 'evaluating') {
+        if (!game.eliminated.has(username)) {
+          game.eliminated.add(username);
+          this.broadcast(room, ["gameLowCardError", "Player left the game"]);
+          const active = this._getActivePlayers(game);
+          if (active.length <= 1) {
+            if (active.length === 1) {
+              const winner = active[0].name;
+              const totalCoin = game.betAmount * game.players.size;
+              this.broadcast(room, ["gameLowCardWinner", winner, totalCoin]);
+            } else {
+              this.broadcast(room, ["gameLowCardError", "All players disconnected"]);
+            }
+            game._gameEnded = true;
+            game._isActive = false;
+            this._forceCleanupGame(room, game);
+          }
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // DICE LOGIC
+  // ============================================================
 
   _sendDiceRoomState(ws) {
     try {
       if (!ws || ws.readyState !== 1) return;
-      const wsId = ws._wsId;
-      if (!wsId) return;
-      this._ensureClientInRoom(ws, CONSTANTS.DICE_ROOM, ws.username);
       const isDiceTime = this.alarmScheduler.isDiceTime();
       if (isDiceTime) {
-        this._safeSend(ws, ["diceSessionStatus", "active"]);
+        this.safeSend(ws, ["diceSessionStatus", "active"]);
         const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
         if (!this._diceGameStarted && !this.currentDiceRoll && !this._diceLock) {
           this._startDiceGameIfNotStarted();
         }
         if (isGameRunning) {
-          this._safeSend(ws, ["diceRoll", {
-            value: this.currentDiceRoll.value,
-            timestamp: this.currentDiceRoll.timestamp,
-            answerTime: 20,
-            canAnswerNow: true,
-            round: this._diceRound
+          this.safeSend(ws, ["diceRoll", {
+            value: this.currentDiceRoll.value, timestamp: this.currentDiceRoll.timestamp,
+            answerTime: 20, canAnswerNow: true, round: this._diceRound
           }]);
         }
       } else {
         const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
-        this._safeSend(ws, ["diceSessionStatus", "inactive"]);
+        this.safeSend(ws, ["diceSessionStatus", "inactive"]);
         if (timeInfo && timeInfo.nextSession) {
-          this._safeSend(ws, ["diceNextSession", {
-            startTime: timeInfo.nextSession.start,
-            endTime: timeInfo.nextSession.end,
-            hoursLeft: timeInfo.hours,
-            minutesLeft: timeInfo.minutes,
-            text: timeInfo.text
+          this.safeSend(ws, ["diceNextSession", {
+            startTime: timeInfo.nextSession.start, endTime: timeInfo.nextSession.end,
+            hoursLeft: timeInfo.hours, minutesLeft: timeInfo.minutes, text: timeInfo.text
           }]);
           setTimeout(() => {
             if (ws && ws.readyState === 1 && !ws._closing) {
-              this._safeSend(ws, ["diceNotification", "Next dice game in: " + timeInfo.text]);
+              this.safeSend(ws, ["diceNotification", "Next dice game in: " + timeInfo.text]);
             }
           }, CONSTANTS.DICE_BROADCAST_DELAY_MS || 5000);
         }
@@ -1005,43 +1168,26 @@ export class GameServer {
       if (!this.alarmScheduler.isDiceTime()) return;
       if (this.currentDiceRoll || this._isShowingDice || this._diceLock) return;
       if (this._diceTimeUpCooldown) return;
-      const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
+      const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
       if (!clients || clients.size === 0) return;
       this._diceGameStarted = true;
       this._diceSessionActive = true;
       this._diceSessionEnded = false;
       this._diceStartedByUser = true;
       this._startDiceFast();
-    } catch(e) {
-      this._diceGameStarted = false;
-    }
+    } catch(e) { this._diceGameStarted = false; }
   }
 
   _startDiceFast() {
     try {
       if (this._diceGameStarted && this.currentDiceRoll) return;
-      const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-      if (!clients || clients.size === 0) {
-        this._diceLock = false;
-        this._isShowingDice = false;
-        this._diceGameStarted = false;
-        return;
-      }
-      if (!this._diceSessionActive || this._diceSessionEnded) {
-        this._diceLock = false;
-        this._isShowingDice = false;
-        this._diceGameStarted = false;
-        return;
-      }
+      const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
+      if (!clients || clients.size === 0) { this._diceLock = false; this._isShowingDice = false; this._diceGameStarted = false; return; }
+      if (!this._diceSessionActive || this._diceSessionEnded) { this._diceLock = false; this._isShowingDice = false; this._diceGameStarted = false; return; }
       if (this._diceLock || this.currentDiceRoll || this._isShowingDice) return;
       if (this._diceTimeUpCooldown) return;
       this._diceLoopCounter = (this._diceLoopCounter || 0) + 1;
-      if (this._diceLoopCounter > this._maxDiceLoops) {
-        this._diceLoopCounter = 0;
-        this._diceLock = false;
-        this._isShowingDice = false;
-        return;
-      }
+      if (this._diceLoopCounter > this._maxDiceLoops) { this._diceLoopCounter = 0; this._diceLock = false; this._isShowingDice = false; return; }
       this._diceLock = true;
       this._isShowingDice = true;
       this._diceGameStarted = true;
@@ -1055,65 +1201,41 @@ export class GameServer {
       this._playerAnswers = new Map();
       this.diceHasWinner = false;
       this.diceWinner = null;
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceRoll", { 
-        value, timestamp: Date.now(), answerTime: 20, canAnswerNow: true, round: this._diceRound
-      }]);
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "clik draw"]);
-      for (const timeout of this._diceNotificationTimeouts) { clearTimeout(timeout); }
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceRoll", { value, timestamp: Date.now(), answerTime: 20, canAnswerNow: true, round: this._diceRound }]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "clik draw"]);
+      for (const t of this._diceNotificationTimeouts) clearTimeout(t);
       this._diceNotificationTimeouts = [];
-      this._diceNotificationTimeouts.push(setTimeout(() => {
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "15s remaining"]);
-      }, 5000));
-      this._diceNotificationTimeouts.push(setTimeout(() => {
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "10s remaining"]);
-      }, 10000));
-      this._diceNotificationTimeouts.push(setTimeout(() => {
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "5s remaining"]);
-      }, 15000));
-      this._diceNotificationTimeouts.push(setTimeout(() => {
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "3s remaining"]);
-      }, 17000));
+      this._diceNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "15s remaining"]); }, 5000));
+      this._diceNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "10s remaining"]); }, 10000));
+      this._diceNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "5s remaining"]); }, 15000));
+      this._diceNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "3s remaining"]); }, 17000));
       this._diceTimeout = this._trackTimer(setTimeout(() => { this._endDiceRound(); }, 20000));
-    } catch(e) {
-      this._diceLock = false;
-      this._isShowingDice = false;
-      this._diceGameStarted = false;
-    }
+    } catch(e) { this._diceLock = false; this._isShowingDice = false; this._diceGameStarted = false; }
   }
 
   async _endDiceRound() {
     try {
       if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
-      for (const timeout of this._diceNotificationTimeouts) { clearTimeout(timeout); }
+      for (const t of this._diceNotificationTimeouts) clearTimeout(t);
       this._diceNotificationTimeouts = [];
       this._canSubmitDiceAnswer = false;
       this._isShowingDice = false;
       const diceValue = this.currentDiceRoll?.value;
       const roundNumber = this._diceRound || 1;
       const correctPlayers = [];
-      for (const player of this.diceAnswered) {
-        if (this._playerAnswers.get(player) === diceValue) correctPlayers.push(player);
-      }
+      for (const p of this.diceAnswered) { if (this._playerAnswers.get(p) === diceValue) correctPlayers.push(p); }
       if (correctPlayers.length === 0) {
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNoWinner", {
-          message: "No winner", value: diceValue, round: roundNumber
-        }]);
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceNoWinner", { message: "No winner", value: diceValue, round: roundNumber }]);
       } else if (correctPlayers.length === 1) {
         const winner = correctPlayers[0];
         try {
           const points = await this.dataManager.addDicePoint(winner);
-          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-            username: winner, totalPoints: points[winner] || 0, diceValue: diceValue, round: roundNumber
-          }]);
+          this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: points[winner] || 0, diceValue, round: roundNumber }]);
         } catch(e) {
-          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-            username: winner, totalPoints: 0, diceValue: diceValue, round: roundNumber
-          }]);
+          this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue, round: roundNumber }]);
         }
       } else if (correctPlayers.length > 1 && !this._tieActive) {
-        this.currentDiceRoll = null;
-        this._diceLock = false;
-        this._isShowingDice = false;
+        this.currentDiceRoll = null; this._diceLock = false; this._isShowingDice = false;
         await this._startTieBreaker(CONSTANTS.DICE_ROOM, correctPlayers);
         this._diceGameStarted = false;
         return;
@@ -1122,7 +1244,7 @@ export class GameServer {
       this._diceLock = false;
       this._diceGameStarted = false;
       this._diceTimeUpCooldown = true;
-      if (this._diceCooldownTimer) { clearTimeout(this._diceCooldownTimer); }
+      if (this._diceCooldownTimer) clearTimeout(this._diceCooldownTimer);
       this._diceCooldownTimer = setTimeout(() => {
         this._diceTimeUpCooldown = false;
         this._diceNotifiedFlags = { 20: false, 10: false, 5: false, timeup: false };
@@ -1130,19 +1252,13 @@ export class GameServer {
         this._diceLoopCounter = 0;
         this._diceGameStarted = false;
         if (this._diceSessionActive && !this._diceSessionEnded) {
-          const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-          if (clients && clients.size > 0) {
-            if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
-              this._startDiceGameIfNotStarted();
-            }
+          const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
+          if (clients && clients.size > 0 && !this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
+            this._startDiceGameIfNotStarted();
           }
         }
       }, 15000);
-    } catch(e) {
-      this._diceLock = false;
-      this._isShowingDice = false;
-      this._diceGameStarted = false;
-    }
+    } catch(e) { this._diceLock = false; this._isShowingDice = false; this._diceGameStarted = false; }
   }
 
   async _startTieBreaker(room, players) {
@@ -1157,9 +1273,7 @@ export class GameServer {
       const id = `tie_${Date.now()}`;
       this._tieBreakers.set(id, { players, round: 0, winner: null, status: 'waiting' });
       await this._runTieRound(room, id, players);
-    } finally {
-      setTimeout(() => { this._tieLock = false; }, 2000);
-    }
+    } finally { setTimeout(() => { this._tieLock = false; }, 2000); }
   }
 
   async _runTieRound(room, id, players) {
@@ -1167,7 +1281,7 @@ export class GameServer {
     if (!data) return;
     this._clearTimer(this._tieTimer);
     this._clearTimer(this._tieInterval);
-    for (const timeout of this._tieNotificationTimeouts) clearTimeout(timeout);
+    for (const t of this._tieNotificationTimeouts) clearTimeout(t);
     this._tieNotificationTimeouts = [];
     this._tieRound++;
     data.round = this._tieRound;
@@ -1182,38 +1296,24 @@ export class GameServer {
     this._isShowingDice = true;
     this.diceHasWinner = false;
     this.diceWinner = null;
-    this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
-      `Tie Round ${this._tieRound}: ${players.join(', ')}`
-    ]);
+    this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `Tie Round ${this._tieRound}: ${players.join(', ')}`]);
     const timeLimit = CONSTANTS.TIE_BREAKER_TIME_LIMIT || 20;
     let isProcessed = false;
-    this._tieNotificationTimeouts.push(setTimeout(() => {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "15s remaining"]);
-    }, 5000));
-    this._tieNotificationTimeouts.push(setTimeout(() => {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "10s remaining"]);
-    }, 10000));
-    this._tieNotificationTimeouts.push(setTimeout(() => {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "5s remaining"]);
-    }, 15000));
-    this._tieNotificationTimeouts.push(setTimeout(() => {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "3s remaining"]);
-    }, 17000));
+    this._tieNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "15s remaining"]); }, 5000));
+    this._tieNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "10s remaining"]); }, 10000));
+    this._tieNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "5s remaining"]); }, 15000));
+    this._tieNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "3s remaining"]); }, 17000));
     this._tieTimer = this._trackTimer(setTimeout(() => {
       if (!isProcessed) {
         isProcessed = true;
         this._canSubmitDiceAnswer = false;
         this._isShowingDice = false;
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "TIME UP"]);
-        for (const timeout of this._tieNotificationTimeouts) clearTimeout(timeout);
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "TIME UP"]);
+        for (const t of this._tieNotificationTimeouts) clearTimeout(t);
         this._tieNotificationTimeouts = [];
         const tieId = this._getActiveTieBreakerId();
-        if (tieId) {
-          this._processTieResults(room, tieId, players);
-        } else {
-          this._resetTieBreakerState(null);
-          this._startCooldownAfterTieBreaker();
-        }
+        if (tieId) { this._processTieResults(room, tieId, players); }
+        else { this._resetTieBreakerState(null); this._startCooldownAfterTieBreaker(); }
       }
     }, (timeLimit * 1000) + 2000));
   }
@@ -1222,9 +1322,7 @@ export class GameServer {
     const data = this._tieBreakers.get(id);
     if (!data) return;
     const entries = [];
-    let answeredCount = 0;
-    let highest = 0;
-    let highestPlayers = [];
+    let answeredCount = 0, highest = 0, highestPlayers = [];
     for (const player of players) {
       const answer = this._tieAnswers.get(player);
       if (answer !== undefined && answer >= 1 && answer <= 6) {
@@ -1235,9 +1333,7 @@ export class GameServer {
       }
     }
     if (answeredCount === 0) {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
-        `No one answered in Round ${this._tieRound} - Tie breaker ended`
-      ]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `No one answered in Round ${this._tieRound} - Tie breaker ended`]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
@@ -1245,22 +1341,12 @@ export class GameServer {
     if (answeredCount === 1) {
       const winner = entries[0].player;
       const answer = entries[0].answer;
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
-        `${winner} answered with ${answer} - Auto win!`
-      ]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `${winner} answered with ${answer} - Auto win!`]);
       try {
         const points = await this.dataManager.addDicePoint(winner);
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-          username: winner, totalPoints: points[winner] || 0, diceValue: answer,
-          round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound,
-          finalWinner: true, totalTieRounds: this._tieRound
-        }]);
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: points[winner] || 0, diceValue: answer, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       } catch(e) {
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-          username: winner, totalPoints: 0, diceValue: answer,
-          round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound,
-          finalWinner: true, totalTieRounds: this._tieRound
-        }]);
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: answer, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       }
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
@@ -1268,69 +1354,43 @@ export class GameServer {
     }
     const allSame = entries.every(e => e.answer === entries[0].answer);
     if (allSame) {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
-        `All answered same value: ${entries[0].answer} - Tie again!`
-      ]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `All answered same value: ${entries[0].answer} - Tie again!`]);
       const allPlayers = entries.map(e => e.player);
       this._tiePlayers = allPlayers;
       this._tieAnswers = new Map();
       data.players = allPlayers;
       data.status = 'waiting';
       const nextTimer = setTimeout(async () => {
-        if (this._tieActive && this._tiePlayers.length > 1) {
-          await this._runTieRound(room, id, this._tiePlayers);
-        } else if (this._tiePlayers.length === 1) {
-          await this._processSingleWinner(room, id, this._tiePlayers[0]);
-        } else {
-          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "No players remaining"]);
-          this._resetTieBreakerState(id);
-          this._startCooldownAfterTieBreaker();
-        }
+        if (this._tieActive && this._tiePlayers.length > 1) { await this._runTieRound(room, id, this._tiePlayers); }
+        else if (this._tiePlayers.length === 1) { await this._processSingleWinner(room, id, this._tiePlayers[0]); }
+        else { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "No players remaining"]); this._resetTieBreakerState(id); this._startCooldownAfterTieBreaker(); }
       }, 3000);
       this._trackTimer(nextTimer);
       return;
     }
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
-        `${winner} wins with highest value: ${highest}`
-      ]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `${winner} wins with highest value: ${highest}`]);
       try {
         const points = await this.dataManager.addDicePoint(winner);
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-          username: winner, totalPoints: points[winner] || 0, diceValue: highest,
-          round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound,
-          finalWinner: true, totalTieRounds: this._tieRound
-        }]);
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: points[winner] || 0, diceValue: highest, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       } catch(e) {
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-          username: winner, totalPoints: 0, diceValue: highest,
-          round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound,
-          finalWinner: true, totalTieRounds: this._tieRound
-        }]);
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: highest, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       }
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
     }
     if (highestPlayers.length > 1) {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", 
-        `Tie again! Round ${this._tieRound + 1} between: ${highestPlayers.join(', ')}`
-      ]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `Tie again! Round ${this._tieRound + 1} between: ${highestPlayers.join(', ')}`]);
       this._tiePlayers = highestPlayers;
       this._tieAnswers = new Map();
       data.players = highestPlayers;
       data.status = 'waiting';
       const nextTimer = setTimeout(async () => {
-        if (this._tieActive && this._tiePlayers.length > 1) {
-          await this._runTieRound(room, id, this._tiePlayers);
-        } else if (this._tiePlayers.length === 1) {
-          await this._processSingleWinner(room, id, this._tiePlayers[0]);
-        } else {
-          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "No players remaining"]);
-          this._resetTieBreakerState(id);
-          this._startCooldownAfterTieBreaker();
-        }
+        if (this._tieActive && this._tiePlayers.length > 1) { await this._runTieRound(room, id, this._tiePlayers); }
+        else if (this._tiePlayers.length === 1) { await this._processSingleWinner(room, id, this._tiePlayers[0]); }
+        else { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "No players remaining"]); this._resetTieBreakerState(id); this._startCooldownAfterTieBreaker(); }
       }, 3000);
       this._trackTimer(nextTimer);
       return;
@@ -1343,24 +1403,16 @@ export class GameServer {
     if (!winner) { this._resetTieBreakerState(id); this._startCooldownAfterTieBreaker(); return; }
     try {
       const points = await this.dataManager.addDicePoint(winner);
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-        username: winner, totalPoints: points[winner] || 0, diceValue: 'auto',
-        round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound,
-        finalWinner: true, totalTieRounds: this._tieRound
-      }]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: points[winner] || 0, diceValue: 'auto', round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
     } catch(e) {
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceWinner", {
-        username: winner, totalPoints: 0, diceValue: 'auto',
-        round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound,
-        finalWinner: true, totalTieRounds: this._tieRound
-      }]);
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: 'auto', round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
     }
     this._resetTieBreakerState(id);
     this._startCooldownAfterTieBreaker();
   }
 
   _startCooldownAfterTieBreaker() {
-    this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "wait 15s"]);
+    this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "wait 15s"]);
     this._diceTimeUpCooldown = true;
     this._clearTimer(this._diceTimeUpCooldownTimer);
     this._diceTimeUpCooldownTimer = this._trackTimer(setTimeout(() => {
@@ -1377,11 +1429,9 @@ export class GameServer {
       this._diceLoopCounter = 0;
       this._diceGameStarted = false;
       if (this._diceSessionActive && !this._diceSessionEnded) {
-        const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-        if (clients && clients.size > 0) {
-          if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
-            this._startDiceGameIfNotStarted();
-          }
+        const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
+        if (clients && clients.size > 0 && !this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
+          this._startDiceGameIfNotStarted();
         }
       }
     }, CONSTANTS.TIE_BREAKER_COOLDOWN || 15000));
@@ -1402,7 +1452,7 @@ export class GameServer {
     this.diceWinner = null;
     if (this._tieTimer) { this._clearTimer(this._tieTimer); this._tieTimer = null; }
     if (this._tieInterval) { this._clearTimer(this._tieInterval); this._tieInterval = null; }
-    for (const timeout of this._tieNotificationTimeouts) clearTimeout(timeout);
+    for (const t of this._tieNotificationTimeouts) clearTimeout(t);
     this._tieNotificationTimeouts = [];
   }
 
@@ -1416,57 +1466,39 @@ export class GameServer {
   async submitDiceAnswer(ws, username, guess) {
     try {
       if (!ws || !username) return;
-      if (!this._canSubmitDiceAnswer) { this._safeSend(ws, ["diceError", "Round ended"]); return; }
-      if (this.diceAnswered.has(username)) { this._safeSend(ws, ["diceError", "Already answered"]); return; }
+      if (!this._canSubmitDiceAnswer) { this.safeSend(ws, ["diceError", "Round ended"]); return; }
+      if (this.diceAnswered.has(username)) { this.safeSend(ws, ["diceError", "Already answered"]); return; }
       const guessValue = parseInt(guess, 10);
-      if (isNaN(guessValue) || guessValue < 1 || guessValue > 6) {
-        this._safeSend(ws, ["diceError", "invalid guess 1-6"]);
-        return;
-      }
+      if (isNaN(guessValue) || guessValue < 1 || guessValue > 6) { this.safeSend(ws, ["diceError", "invalid guess 1-6"]); return; }
       if (this._tieActive) {
-        if (!this._tiePlayers.includes(username)) {
-          this._safeSend(ws, ["diceError", "You are not in tie breaker"]);
-          return;
-        }
-        if (this._tieAnswers.has(username)) {
-          this._safeSend(ws, ["diceError", "You already answered"]);
-          return;
-        }
+        if (!this._tiePlayers.includes(username)) { this.safeSend(ws, ["diceError", "You are not in tie breaker"]); return; }
+        if (this._tieAnswers.has(username)) { this.safeSend(ws, ["diceError", "You already answered"]); return; }
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceAnswer", {
-          username, guess: guessValue, isTieBreaker: true, tieRound: this._tieRound
-        }]);
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceAnswer", { username, guess: guessValue, isTieBreaker: true, tieRound: this._tieRound }]);
         if (this._tieAnswers.size === this._tiePlayers.length) {
           this._canSubmitDiceAnswer = false;
           this._isShowingDice = false;
           if (this._tieTimer) { clearTimeout(this._tieTimer); this._tieTimer = null; }
           if (this._tieInterval) { clearInterval(this._tieInterval); this._tieInterval = null; }
           const tieId = this._getActiveTieBreakerId();
-          if (tieId) {
-            setTimeout(async () => {
-              await this._processTieResults(CONSTANTS.DICE_ROOM, tieId, this._tiePlayers);
-            }, 500);
-          } else {
-            this._resetTieBreakerState(null);
-            this._startCooldownAfterTieBreaker();
-          }
+          if (tieId) { setTimeout(async () => { await this._processTieResults(CONSTANTS.DICE_ROOM, tieId, this._tiePlayers); }, 500); }
+          else { this._resetTieBreakerState(null); this._startCooldownAfterTieBreaker(); }
         }
         return;
       }
-      if (!this.currentDiceRoll) { this._safeSend(ws, ["diceError", "No active round"]); return; }
+      if (!this.currentDiceRoll) { this.safeSend(ws, ["diceError", "No active round"]); return; }
       const diceValue = this.currentDiceRoll.value;
       this._playerAnswers.set(username, guessValue);
       this.diceAnswered.add(username);
-      this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceAnswer", {
-        username, guess: guessValue, round: this._diceRound || 1
-      }]);
-      if (guessValue === diceValue && !this.diceHasWinner) {
-        this.diceHasWinner = true;
-        this.diceWinner = username;
-      }
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceAnswer", { username, guess: guessValue, round: this._diceRound || 1 }]);
+      if (guessValue === diceValue && !this.diceHasWinner) { this.diceHasWinner = true; this.diceWinner = username; }
     } catch(e) {}
   }
+
+  // ============================================================
+  // LOWCARD LOGIC
+  // ============================================================
 
   async _broadcastLowCardWinners(room) {
     try {
@@ -1480,9 +1512,7 @@ export class GameServer {
       if (!this._lastNotifTime) this._lastNotifTime = {};
       if (this._lastNotifTime[key] && (now - this._lastNotifTime[key]) < 500) return;
       this._lastNotifTime[key] = now;
-      this._broadcastToRoom(roomKey, ["lowCardWinnerUpdate", {
-        winners: winners || {}, room: roomKey, recording: true
-      }]);
+      this.broadcast(roomKey, ["lowCardWinnerUpdate", { winners: winners || {}, room: roomKey, recording: true }]);
     } catch(e) {}
   }
 
@@ -1496,17 +1526,11 @@ export class GameServer {
   }
 
   async _getRecordingStatusFromKV(roomName) {
-    try {
-      if (!roomName) return false;
-      return await this.dataManager.getRecordingStatus(roomName);
-    } catch(e) { return false; }
+    try { if (!roomName) return false; return await this.dataManager.getRecordingStatus(roomName); } catch(e) { return false; }
   }
 
   async _getLowCardWinners(room) {
-    try {
-      if (!room) return {};
-      return await this.dataManager.getWinners(room);
-    } catch(e) { return {}; }
+    try { if (!room) return {}; return await this.dataManager.getWinners(room); } catch(e) { return {}; }
   }
 
   async _checkAndForceResetIfMondayUTC() {
@@ -1515,10 +1539,7 @@ export class GameServer {
       const currentDay = now.getUTCDay();
       const currentWeek = this.dataManager.getCurrentWeek();
       let lastResetWeek = await this.dataManager.getLastResetWeek();
-      if (!lastResetWeek) {
-        await this.dataManager.setLastResetWeek(currentWeek);
-        return true;
-      }
+      if (!lastResetWeek) { await this.dataManager.setLastResetWeek(currentWeek); return true; }
       if (lastResetWeek === currentWeek) return true;
       if (currentDay === CONSTANTS.WEEKLY_RESET_DAY) {
         await this._handleWeeklyReset();
@@ -1550,15 +1571,11 @@ export class GameServer {
   async _handleWeeklyReset() {
     try {
       const points = await this.dataManager.getDicePoints();
-      let winner = null;
-      let highestScore = 0;
+      let winner = null, highestScore = 0;
       for (const [username, score] of Object.entries(points)) {
         if (username && typeof username === 'string') {
           const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
-          if (numericScore > highestScore) {
-            highestScore = numericScore;
-            winner = username;
-          }
+          if (numericScore > highestScore) { highestScore = numericScore; winner = username; }
         }
       }
       const currentWeek = this.dataManager.getCurrentWeek();
@@ -1604,8 +1621,8 @@ export class GameServer {
           this._diceSessionActive = true;
           this._diceSessionEnded = false;
           this._diceGameStarted = false;
-          this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session started!"]);
-          const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
+          this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session started!"]);
+          const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
           if (clients && clients.size > 0) {
             if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock && !this._diceTimeUpCooldown) {
               this._diceStartedByUser = true;
@@ -1613,7 +1630,7 @@ export class GameServer {
             }
           } else {
             this._diceStartedByUser = false;
-            this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Waiting for players..."]);
+            this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Waiting for players..."]);
           }
         }
         break;
@@ -1623,10 +1640,8 @@ export class GameServer {
         this._diceSessionEnded = true;
         this._diceStartedByUser = false;
         this._diceGameStarted = false;
-        this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
-        if (this.currentDiceRoll || this._isShowingDice) {
-          this._endDiceRound();
-        }
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
+        if (this.currentDiceRoll || this._isShowingDice) this._endDiceRound();
         this.currentDiceRoll = null;
         this._diceLock = false;
         this._isShowingDice = false;
@@ -1639,568 +1654,180 @@ export class GameServer {
         if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
         if (this._diceCooldownTimer) { clearTimeout(this._diceCooldownTimer); this._diceCooldownTimer = null; }
         if (this._diceTimeUpCooldownTimer) { clearTimeout(this._diceTimeUpCooldownTimer); this._diceTimeUpCooldownTimer = null; }
-        for (const timeout of this._diceNotificationTimeouts) { clearTimeout(timeout); }
+        for (const t of this._diceNotificationTimeouts) { clearTimeout(t); }
         this._diceNotificationTimeouts = [];
         if (this._tieActive) this._resetTieBreakerState(null);
         break;
     }
   }
 
-  async fetch(req) {
+  _trackTimer(timer) { if (timer) this._allTimers.add(timer); return timer; }
+
+  _clearTimer(timer) {
+    if (timer) {
+      if (typeof timer === 'object' && timer._destroyed) return;
+      try { clearTimeout(timer); } catch(e) {}
+      try { clearInterval(timer); } catch(e) {}
+      this._allTimers.delete(timer);
+    }
+  }
+
+  _handleError(type, error) {
     try {
-      if (this._circuitOpen) {
-        const now = Date.now();
-        if (now - this._lastResetTime > 60000) {
-          this._circuitOpen = false;
-          this._requestCount = 0;
-          this._lastResetTime = now;
-          this._lastRequestDecay = now;
-        } else {
-          return new Response("Service temporarily unavailable", { status: 503, headers: { 'Retry-After': '30', 'Content-Type': 'text/plain' } });
-        }
-      }
       const now = Date.now();
-      const elapsed = now - (this._lastRequestDecay || now);
-      if (elapsed > 1000) {
-        const elapsedSeconds = Math.floor(elapsed / 1000);
-        this._requestCount = Math.max(0, this._requestCount - elapsedSeconds);
-        this._lastRequestDecay = now;
-      }
-      this._requestCount++;
-      if (this._requestCount > CONSTANTS.RATE_LIMIT_MAX) {
-        this._circuitOpen = true;
-        this._lastResetTime = Date.now();
-        return new Response("Rate limit exceeded", { status: 429, headers: { 'Retry-After': '60', 'Content-Type': 'text/plain' } });
-      }
-      const url = new URL(req.url);
-      if (url.pathname === "/game/ws") {
-        const upgrade = req.headers.get("Upgrade");
-        if (upgrade !== "websocket") return new Response("WebSocket only", { status: 400 });
-        if (this.wsMap.size >= CONSTANTS.MAX_WS_CLIENTS) return new Response("Server full", { status: 503 });
-        if (this._eventQueue?.length > 500) return new Response("Server busy", { status: 503 });
-        const pair = new WebSocketPair();
-        const [client, server] = [pair[0], pair[1]];
-        const wsId = ++this._wsIdCounter;
-        try {
-          this.ctx.acceptWebSocket(server);
-        } catch(e) {
-          try { server.close(1008, "Accept failed"); } catch(err) {}
-          return new Response("WebSocket acceptance failed", { status: 500 });
-        }
-        server.serializeAttachment({ wsId, username: null, room: null, roomname: null, createdAt: Date.now() });
-        server._wsId = wsId;
-        server._closing = false;
-        server.username = null;
-        server.room = null;
-        server.roomname = null;
-        server._createdAt = Date.now();
-        this.wsMap.set(wsId, server);
-        return new Response(null, { status: 101, webSocket: client });
-      }
-      return new Response("Game Server", { status: 200 });
-    } catch(e) {
-      this._handleError('fetch', e);
-      return new Response(JSON.stringify({ error: "Internal Server Error", message: e.message || "Unknown error" }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-    }
-  }
-
-  // ============ ✅ WS MESSAGE — LOGIKA SAMA CHATSERVER ============
-  async webSocketMessage(ws, message) {
-    if (!ws || ws._closing || this.closing || this.isDestroyed) return;
-    if (!this._initialized) {
-      if (!this._pendingEvents) this._pendingEvents = [];
-      if (this._pendingEvents.length >= 100) {
-        try { ws.send(JSON.stringify(["gameLowCardError", "Server busy"])); } catch(e) {}
-        return;
-      }
-      const room = this._getClientRoom(ws);
-      const username = this._getClientUsername(ws);
-      this._pendingEvents.push({ 
-        ws, message, timestamp: Date.now(), wsId: ws._wsId, room, username,
-        attachment: ws.deserializeAttachment ? ws.deserializeAttachment() : null
-      });
-      return;
-    }
-    try {
-      let attachment = null;
-      try { attachment = ws.deserializeAttachment(); } catch(e) {}
-      if (attachment && attachment.wsId) {
-        ws._wsId = attachment.wsId;
-        ws.username = attachment.username || null;
-        ws.room = attachment.room || null;
-        ws.roomname = attachment.roomname || null;
-        ws._createdAt = attachment.createdAt || Date.now();
-        if (attachment.username && attachment.room) {
-          this._ensureClientInRoom(ws, attachment.room, attachment.username);
-        }
-      }
-      const data = JSON.parse(message);
-      if (Array.isArray(data) && data.length > 0) {
-        await this._processWithTimeout(ws, data);
-      }
+      if (now - this._lastErrorReset > CONSTANTS.ERROR_RESET_INTERVAL_MS) { this._errorCount = 0; this._lastErrorReset = now; }
+      this._errorCount++;
+      if (this._errorCount > 20) { this._circuitOpen = true; this._lastResetTime = now; }
     } catch(e) {}
   }
 
-  // ============ ✅ WS CLOSE — SYNC, SAMA CHATSERVER ============
-  webSocketClose(ws, code, reason, wasClean) {
+  _getTimeLeftUntilNextDice() {
     try {
-      if (!ws) return;
-      const attachment = ws.deserializeAttachment ? ws.deserializeAttachment() : null;
-      const username = attachment?.username;
-      const room = attachment?.room;
-      const wsId = attachment?.wsId;
-      if (wsId) this._broadcastedCountdown.delete(`countdown_${wsId}`);
-      if (username) this.userConnections.delete(username);
-      if (room && wsId) {
-        const clients = this.wsClients.get(room);
-        if (clients) {
-          clients.delete(wsId);
-          if (clients.size === 0) this.wsClients.delete(room);
-        }
+      const witaTime = this._getCurrentWITATime();
+      const currentTotal = witaTime.totalMinutes;
+      let minDiff = Infinity;
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        const startTotal = parseTime(session.start);
+        let diff = startTotal - currentTotal;
+        if (diff < 0) diff += 24 * 60;
+        if (diff < minDiff) minDiff = diff;
       }
-      if (wsId) {
-        this.wsMap.delete(wsId);
-        this.clientRooms.delete(wsId);
-      }
-      try {
-        ws.serializeAttachment({ wsId, username: null, room: null, roomname: null, createdAt: Date.now() });
-      } catch(e) {}
-      if (room && username) {
-        this._cleanupGameAsync(wsId, username, room).catch(() => {});
-      }
-    } catch(e) {}
+      const hours = Math.floor(minDiff / 60);
+      const minutes = Math.floor(minDiff % 60);
+      return { hours, minutes, totalMs: minDiff * 60 * 1000, text: hours + "h " + minutes + "m", isRunning: this.alarmScheduler.isDiceTime() };
+    } catch(e) { return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false }; }
   }
 
-  // ============ ✅ WS ERROR — SYNC, SAMA CHATSERVER ============
-  webSocketError(ws) {
+  _getCurrentWITATime() {
     try {
-      if (!ws) return;
-      const attachment = ws.deserializeAttachment ? ws.deserializeAttachment() : null;
-      const username = attachment?.username;
-      const room = attachment?.room;
-      const wsId = attachment?.wsId;
-      if (username) this.userConnections.delete(username);
-      if (room && wsId) {
-        const clients = this.wsClients.get(room);
-        if (clients) {
-          clients.delete(wsId);
-          if (clients.size === 0) this.wsClients.delete(room);
-        }
-      }
-      if (wsId) {
-        this.wsMap.delete(wsId);
-        this.clientRooms.delete(wsId);
-      }
-      try {
-        ws.serializeAttachment({ wsId, username: null, room: null, roomname: null, createdAt: Date.now() });
-      } catch(e) {}
-      if (room && username) {
-        this._cleanupGameAsync(wsId, username, room).catch(() => {});
-      }
-    } catch(e) {}
+      const now = new Date();
+      const hours = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
+      const minutes = now.getUTCMinutes();
+      return { hours, minutes, totalMinutes: (hours * 60) + minutes };
+    } catch(e) { return { hours: 0, minutes: 0, totalMinutes: 0 }; }
   }
 
-  async _cleanupGameAsync(wsId, username, room) {
-    try {
-      if (!room || !username) return;
-      const game = this.activeGames.get(room);
-      if (!game || !game._isActive || game._gameEnded || !game.players) return;
-      if (!game.players.has(username)) return;
-      if (game.hostId === username && game._phase === 'registration') {
-        this._broadcastToRoom(room, ["gameLowCardError", "Host left the game"]);
-        game._gameEnded = true;
-        game._isActive = false;
-        this._forceCleanupGame(room, game);
-        this._cleanupWsData(wsId, username, room);
-        return;
-      }
-      if (game._phase === 'registration') {
-        game.players.delete(username);
-        game.playerWsId?.delete(username);
-        this._broadcastToRoom(room, ["gameLowCardError", "Player left the game"]);
-        if (game.hostId === username) {
-          const remaining = Array.from(game.players.keys());
-          if (remaining.length > 0) {
-            game.hostId = remaining[0];
-            this._broadcastToRoom(room, ["gameLowCardError", "New host: " + game.hostId]);
-          } else {
-            game._gameEnded = true;
-            game._isActive = false;
-            this._forceCleanupGame(room, game);
-            this._cleanupWsData(wsId, username, room);
-            return;
-          }
-        }
-        if (game.players.size === 0) {
-          game._gameEnded = true;
-          game._isActive = false;
-          this._forceCleanupGame(room, game);
-        }
-        this._cleanupWsData(wsId, username, room);
-        return;
-      }
-      if (game._phase === 'draw' || game._phase === 'evaluating') {
-        if (!game.eliminated.has(username)) {
-          game.eliminated.add(username);
-          this._broadcastToRoom(room, ["gameLowCardError", "Player left the game"]);
-          const active = this._getActivePlayers(game);
-          if (active.length <= 1) {
-            if (active.length === 1) {
-              const winner = active[0].name;
-              const totalCoin = game.betAmount * game.players.size;
-              this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
-            } else {
-              this._broadcastToRoom(room, ["gameLowCardError", "All players disconnected"]);
-            }
-            game._gameEnded = true;
-            game._isActive = false;
-            this._forceCleanupGame(room, game);
-            this._cleanupWsData(wsId, username, room);
-            return;
-          }
-          if (game._phase === 'draw' && !game.evaluationLocked) {
-            const activeIds = this._getActivePlayerIds(game);
-            const hasDrawn = activeIds.every(id => game.numbers.has(id) || game.eliminated.has(id));
-            if (hasDrawn && !game._isEvaluating) {
-              game.evaluationLocked = true;
-              const evalTimer = this._trackTimer(setTimeout(() => {
-                const currentGame = this.activeGames.get(room);
-                if (currentGame && currentGame === game && currentGame._isActive && !currentGame._gameEnded) {
-                  this._evaluateRound(room, game);
-                }
-              }, CONSTANTS.EVALUATION_DELAY_MS));
-              game._evalTimer = evalTimer;
-            }
-          }
-        }
-      }
-    } catch(e) {}
-  }
-
-  _cleanupWsData(wsId, username, room) {
-    try {
-      if (wsId) {
-        this.wsMap.delete(wsId);
-        this.clientRooms.delete(wsId);
-        if (username) this.userConnections.delete(username);
-        if (room) {
-          const clients = this.wsClients.get(room);
-          if (clients) {
-            clients.delete(wsId);
-            if (clients.size === 0) this.wsClients.delete(room);
-          }
-        }
-      }
-    } catch(e) {}
-  }
-
-  async _processWithTimeout(ws, data, timeoutMs = 500) {
-    try {
-      const timeoutPromise = new Promise((_, reject) => {
-        const timer = setTimeout(() => reject(new Error('Processing timeout')), timeoutMs);
-        this._trackTimer(timer);
-      });
-      await Promise.race([this.handleEvent(ws, data), timeoutPromise]);
-    } catch(e) {}
-  }
-
-  async handleEvent(ws, data) {
-    try {
-      if (this.isDestroyed || !ws || !data?.[0]) return;
-      if (this._eventQueue.length > CONSTANTS.MAX_EVENT_QUEUE_SIZE) {
-        this._safeSend(ws, ["gameLowCardError", "Server busy"]);
-        return;
-      }
-      this._eventQueue.push({ ws, data });
-      if (!this._processingQueue) this._processEventQueue();
-    } catch(e) {}
-  }
-
-  async _processEventQueue() {
-    if (this._processingQueue || this._eventQueue.length === 0) return;
-    this._processingQueue = true;
-    try {
-      const startTime = Date.now();
-      let processed = 0;
-      const MAX_BATCH = CONSTANTS.PROCESS_BATCH_SIZE || 50;
-      const MAX_TIME = CONSTANTS.PROCESS_MAX_TIME_MS || 100;
-      while (this._eventQueue.length > 0 && processed < MAX_BATCH) {
-        if (Date.now() - startTime > MAX_TIME) break;
-        const item = this._eventQueue.shift();
-        try { await this._processEventItem(item.ws, item.data); } catch(e) {}
-        processed++;
-      }
-      if (this._eventQueue.length > 0 && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._processEventQueue(), 10);
-      }
-    } catch(e) {
-      this._handleError('processQueue', e);
-    } finally {
-      this._processingQueue = false;
-    }
-  }
-
-  async _processEventItem(ws, data) {
-    try {
-      if (this.isDestroyed || !ws || !data || !data[0]) return;
-      const room = this._getClientRoom(ws);
-      if (room) {
-        this._ensureClientInRoom(ws, room, ws.username);
-      }
-      await this._handleEventInternal(ws, data);
-    } catch(e) {}
-  }
+  // ============================================================
+  // EVENT HANDLER — SEMUA PAKAI this.broadcast & this.safeSend
+  // ============================================================
 
   async _handleEventInternal(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
-      if (evt === "switchRoom") {
-        await this.switchRoom(ws, data[1], data[2]);
-        return;
-      }
+      if (evt === "switchRoom") { await this.switchRoom(ws, data[1], data[2]); return; }
 
       if (evt === "getDiceSessionStatus") {
         try {
           const isDiceTime = this.alarmScheduler.isDiceTime();
           const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
           if (isDiceTime) {
-            this._safeSend(ws, ["diceSessionStatus", "active"]);
+            this.safeSend(ws, ["diceSessionStatus", "active"]);
             if (isGameRunning) {
-              this._safeSend(ws, ["diceRoll", {
-                value: this.currentDiceRoll.value,
-                timestamp: this.currentDiceRoll.timestamp,
-                answerTime: 20, canAnswerNow: true, round: this._diceRound
-              }]);
+              this.safeSend(ws, ["diceRoll", { value: this.currentDiceRoll.value, timestamp: this.currentDiceRoll.timestamp, answerTime: 20, canAnswerNow: true, round: this._diceRound }]);
             }
           } else {
             const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
-            this._safeSend(ws, ["diceSessionStatus", "inactive"]);
+            this.safeSend(ws, ["diceSessionStatus", "inactive"]);
             if (timeInfo && timeInfo.nextSession) {
-              this._safeSend(ws, ["diceNextSession", {
-                startTime: timeInfo.nextSession.start,
-                endTime: timeInfo.nextSession.end,
-                hoursLeft: timeInfo.hours,
-                minutesLeft: timeInfo.minutes,
-                text: timeInfo.text
-              }]);
-              setTimeout(() => {
-                if (ws && ws.readyState === 1 && !ws._closing) {
-                  this._safeSend(ws, ["diceNotification", "Next dice game in: " + timeInfo.text]);
-                }
-              }, CONSTANTS.DICE_BROADCAST_DELAY_MS || 5000);
+              this.safeSend(ws, ["diceNextSession", { startTime: timeInfo.nextSession.start, endTime: timeInfo.nextSession.end, hoursLeft: timeInfo.hours, minutesLeft: timeInfo.minutes, text: timeInfo.text }]);
             }
           }
-        } catch(e) {
-          this._safeSend(ws, ["diceSessionStatus", "error"]);
-        }
+        } catch(e) { this.safeSend(ws, ["diceSessionStatus", "error"]); }
         return;
       }
 
       if (evt === "startRecordingWinners") {
         const roomName = data[1];
-        if (!roomName || typeof roomName !== 'string' || roomName.trim() === '') {
-          this._safeSend(ws, ["startRecordingResult", { success: false, message: "Room name required" }]);
-          return;
-        }
+        if (!roomName || typeof roomName !== 'string' || roomName.trim() === '') { this.safeSend(ws, ["startRecordingResult", { success: false, message: "Room name required" }]); return; }
         const room = roomName.trim();
         try {
           await this.dataManager.setRecordingStatus(room, true);
-          this._safeSend(ws, ["startRecordingResult", { success: true, message: "Recording started successfully" }]);
-          this._broadcastToRoom(room, ["recordingStatus", true]);
-        } catch(e) {
-          this._safeSend(ws, ["startRecordingResult", { success: false, message: e.message || "Failed to start recording" }]);
-        }
+          this.safeSend(ws, ["startRecordingResult", { success: true, message: "Recording started successfully" }]);
+          this.broadcast(room, ["recordingStatus", true]);
+        } catch(e) { this.safeSend(ws, ["startRecordingResult", { success: false, message: e.message || "Failed" }]); }
         return;
       }
 
       if (evt === "stopRecordingWinners") {
         const roomName = data[1];
-        if (!roomName || typeof roomName !== 'string' || roomName.trim() === '') {
-          this._safeSend(ws, ["stopRecordingResult", { success: false, message: "Room name required" }]);
-          return;
-        }
+        if (!roomName || typeof roomName !== 'string' || roomName.trim() === '') { this.safeSend(ws, ["stopRecordingResult", { success: false, message: "Room name required" }]); return; }
         const room = roomName.trim();
         try {
           await this.dataManager.setRecordingStatus(room, false);
           await this.dataManager.deleteAllWinners(room);
-          this._safeSend(ws, ["stopRecordingResult", { success: true, message: "Recording stopped successfully" }]);
-          this._broadcastToRoom(room, ["recordingStatus", false]);
-        } catch(e) {
-          this._safeSend(ws, ["stopRecordingResult", { success: false, message: e.message || "Failed to stop recording" }]);
-        }
+          this.safeSend(ws, ["stopRecordingResult", { success: true, message: "Recording stopped successfully" }]);
+          this.broadcast(room, ["recordingStatus", false]);
+        } catch(e) { this.safeSend(ws, ["stopRecordingResult", { success: false, message: e.message || "Failed" }]); }
         return;
       }
 
       if (evt === "getRecordingStatus") {
         const roomName = data[1];
-        if (!roomName || typeof roomName !== 'string' || roomName.trim() === '') {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        const room = roomName.trim();
+        if (!roomName || typeof roomName !== 'string' || roomName.trim() === '') { this.safeSend(ws, ["recordingError", "Room name required"]); return; }
         try {
-          const isRecording = await this.dataManager.getRecordingStatus(room);
-          this._safeSend(ws, ["recordingStatus", isRecording]);
-        } catch(e) {
-          this._safeSend(ws, ["recordingError", e.message || "Failed to get recording status"]);
-        }
+          const isRecording = await this.dataManager.getRecordingStatus(roomName.trim());
+          this.safeSend(ws, ["recordingStatus", isRecording]);
+        } catch(e) { this.safeSend(ws, ["recordingError", e.message]); }
         return;
       }
 
       if (evt === "sendWinnersToRoom") {
-        let room = data[1] || ws.room || this.clientRooms.get(ws._wsId);
-        if (!room || typeof room !== 'string' || room.trim() === '') {
-          this._safeSend(ws, ["sendWinnersResult", { success: false, message: "Room required" }]);
-          return;
-        }
-        const roomKey = room.trim();
+        let room = data[1] || ws.room || ws.roomname;
+        if (!room) { this.safeSend(ws, ["sendWinnersResult", { success: false, message: "Room required" }]); return; }
         try {
-          const isRecording = await this.dataManager.getRecordingStatus(roomKey);
-          if (!isRecording) {
-            this._safeSend(ws, ["sendWinnersResult", { success: false, message: "Recording is not enabled" }]);
-            return;
-          }
-          await this._broadcastLowCardWinners(roomKey);
-          this._safeSend(ws, ["sendWinnersResult", { success: true, message: "Winners sent successfully" }]);
-        } catch(e) {
-          this._safeSend(ws, ["sendWinnersResult", { success: false, message: e.message || "Failed to send winners" }]);
-        }
+          await this._broadcastLowCardWinners(room.trim());
+          this.safeSend(ws, ["sendWinnersResult", { success: true, message: "Winners sent" }]);
+        } catch(e) { this.safeSend(ws, ["sendWinnersResult", { success: false, message: e.message }]); }
         return;
       }
 
       if (evt === "getRoomWinners") {
-        let room = data[1] || ws.room || this.clientRooms.get(ws._wsId);
-        if (!room || typeof room !== 'string' || room.trim() === '') {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
+        let room = data[1] || ws.room || ws.roomname;
+        if (!room) { this.safeSend(ws, ["recordingError", "Room required"]); return; }
         const roomKey = room.trim();
         try {
           const isRecording = await this.dataManager.getRecordingStatus(roomKey);
           const winners = await this.dataManager.getWinners(roomKey);
-          this._safeSend(ws, ["roomWinnersResponse", {
-            winners: winners || {}, room: roomKey, recording: isRecording || false
-          }]);
-        } catch(e) {
-          this._safeSend(ws, ["recordingError", e.message || "Failed to get room winners"]);
-        }
+          this.safeSend(ws, ["roomWinnersResponse", { winners: winners || {}, room: roomKey, recording: isRecording || false }]);
+        } catch(e) { this.safeSend(ws, ["recordingError", e.message]); }
         return;
       }
 
       if (evt === "getAllData") {
-        try {
-          const allData = await this.dataManager.getAllData();
-          this._safeSend(ws, ["allDataResponse", allData]);
-        } catch(e) {
-          this._safeSend(ws, ["allDataResponse", {}]);
-        }
-        return;
-      }
-
-      if (evt === "startGameWithRecording") {
-        const [_, room, bet, username] = data;
-        if (!room || !username || typeof room !== 'string' || typeof username !== 'string') {
-          this._safeSend(ws, ["recordingError", "Room and username required"]);
-          return;
-        }
-        const roomKey = room.trim();
-        const usernameClean = username.trim();
-        const betAmount = parseInt(bet, 10) || 0;
-        if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
-          this._safeSend(ws, ["recordingError", "Invalid bet (0 or 100-100000)"]);
-          return;
-        }
-        try {
-          const isRecording = await this.dataManager.getRecordingStatus(roomKey);
-          if (!isRecording) {
-            this._safeSend(ws, ["recordingError", "Recording is not enabled in this room"]);
-            return;
-          }
-          const existingGame = this.activeGames.get(roomKey);
-          if (existingGame?._isActive && !existingGame._gameEnded) {
-            this._safeSend(ws, ["recordingError", "Game is already running"]);
-            return;
-          }
-          if (existingGame) await this._forceCleanupGame(roomKey, existingGame);
-          if (this.activeGames.size >= CONSTANTS.MAX_LOWCARD_GAMES) {
-            this._safeSend(ws, ["recordingError", "Server is busy"]);
-            return;
-          }
-          const wsId = ws._wsId;
-          const game = this._createGameObject(roomKey, betAmount, usernameClean, true);
-          game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
-          game.playerWsId.set(usernameClean, wsId);
-          this.activeGames.set(roomKey, game);
-          this._addClient(roomKey, ws, usernameClean);
-          this._broadcastToRoom(roomKey, ["gameLowCardStart", betAmount]);
-          this._broadcastToRoom(roomKey, ["gameLowCardStartSuccess", usernameClean, betAmount]);
-          this._safeSend(ws, ["recordingGameStarted", { room: roomKey, host: usernameClean, bet: betAmount }]);
-          this._startRegistration(roomKey, game);
-        } catch(e) {
-          this._safeSend(ws, ["recordingError", e.message || "Failed to start game"]);
-        }
+        try { const allData = await this.dataManager.getAllData(); this.safeSend(ws, ["allDataResponse", allData]); }
+        catch(e) { this.safeSend(ws, ["allDataResponse", {}]); }
         return;
       }
 
       if (evt === "addLowCardWinner") {
         const { room, username } = data[1] || {};
-        if (!room || !username || typeof room !== 'string' || typeof username !== 'string') {
-          this._safeSend(ws, ["error", "Room and username required"]);
-          return;
-        }
-        const roomKey = room.trim();
-        const userKey = username.trim();
+        if (!room || !username) { this.safeSend(ws, ["error", "Room and username required"]); return; }
         try {
-          const isRecording = await this.dataManager.getRecordingStatus(roomKey);
-          if (!isRecording) {
-            this._safeSend(ws, ["error", "Recording is not enabled"]);
-            return;
-          }
-          await this.dataManager.addWinner(roomKey, userKey);
-          const winners = await this.dataManager.getWinners(roomKey);
-          const count = parseInt(String(winners[userKey] || "0").replace("x", "")) || 0;
-          this._safeSend(ws, ["addWinnerResult", { success: true, username: userKey, count, room: roomKey }]);
-          this._broadcastLowCardWinners(roomKey);
-        } catch(e) {
-          this._safeSend(ws, ["error", e.message || "Failed to add winner"]);
-        }
+          const isRecording = await this.dataManager.getRecordingStatus(room.trim());
+          if (!isRecording) { this.safeSend(ws, ["error", "Recording is not enabled"]); return; }
+          await this.dataManager.addWinner(room.trim(), username.trim());
+          const winners = await this.dataManager.getWinners(room.trim());
+          const count = parseInt(String(winners[username.trim()] || "0").replace("x", "")) || 0;
+          this.safeSend(ws, ["addWinnerResult", { success: true, username: username.trim(), count, room: room.trim() }]);
+          this._broadcastLowCardWinners(room.trim());
+        } catch(e) { this.safeSend(ws, ["error", e.message]); }
         return;
       }
 
       if (evt === "deleteAllWinners") {
         const room = data[1];
-        if (!room || typeof room !== 'string' || room.trim() === '') {
-          this._safeSend(ws, ["error", "Room required"]);
-          return;
-        }
-        const roomKey = room.trim();
+        if (!room) { this.safeSend(ws, ["error", "Room required"]); return; }
         try {
-          await this.dataManager.deleteAllWinners(roomKey);
-          this._safeSend(ws, ["deleteWinnersResult", { success: true, message: "All winners deleted", room: roomKey }]);
-          this._broadcastToRoom(roomKey, ["recordingStatus", false]);
-        } catch(e) {
-          this._safeSend(ws, ["error", e.message || "Failed to delete winners"]);
-        }
+          await this.dataManager.deleteAllWinners(room.trim());
+          this.safeSend(ws, ["deleteWinnersResult", { success: true, message: "Deleted", room: room.trim() }]);
+          this.broadcast(room.trim(), ["recordingStatus", false]);
+        } catch(e) { this.safeSend(ws, ["error", e.message]); }
         return;
       }
 
-      if (evt === "lowCardWinnerUpdate") {
-        let room = data[1] || ws.room || this.clientRooms.get(ws._wsId);
-        if (!room || typeof room !== 'string' || room.trim() === '') {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        const roomKey = room.trim();
-        await this._broadcastLowCardWinners(roomKey);
-        return;
-      }
-
-      if (evt === "submitDiceAnswer") {
-        await this.submitDiceAnswer(ws, data[1], data[2]);
-        return;
-      }
+      if (evt === "submitDiceAnswer") { await this.submitDiceAnswer(ws, data[1], data[2]); return; }
 
       if (evt === "getDiceLastWeekWinner") {
         try {
@@ -2211,222 +1838,137 @@ export class GameServer {
           if (now - lastReq < 5000) return;
           this._lastWinnerRequestTime.set(wsId, now);
           const winner = await this.dataManager.getLastWeekWinner();
-          if (winner && typeof winner === 'object' && winner.username) {
-            this._safeSend(ws, ["diceLastWeekWinner", String(winner.username), parseInt(winner.score, 10) || 0, String(winner.week || '')]);
+          if (winner && winner.username) {
+            this.safeSend(ws, ["diceLastWeekWinner", String(winner.username), parseInt(winner.score, 10) || 0, String(winner.week || '')]);
           } else {
-            this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
+            this.safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
           }
-        } catch(e) {
-          this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
-        }
+        } catch(e) { this.safeSend(ws, ["diceLastWeekWinner", "", 0, ""]); }
         return;
       }
 
       if (evt === "deleteDiceLastWeekWinner") {
-        try {
-          await this.dataManager.deleteLastWeekWinner();
-          this._safeSend(ws, ["diceLastWeekWinnerDeleted", true, "Deleted"]);
-        } catch(e) { 
-          this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, e.message]); 
-        }
+        try { await this.dataManager.deleteLastWeekWinner(); this.safeSend(ws, ["diceLastWeekWinnerDeleted", true, "Deleted"]); }
+        catch(e) { this.safeSend(ws, ["diceLastWeekWinnerDeleted", false, e.message]); }
         return;
       }
 
       if (evt === "getDiceLeaderboard") {
         try {
           let limit = CONSTANTS.DEFAULT_LEADERBOARD_LIMIT;
-          if (data.length > 1 && typeof data[1] === 'number') {
-            limit = Math.min(Math.max(data[1], CONSTANTS.MIN_LEADERBOARD_LIMIT), CONSTANTS.MAX_LEADERBOARD_LIMIT);
-          }
+          if (data.length > 1 && typeof data[1] === 'number') limit = Math.min(Math.max(data[1], CONSTANTS.MIN_LEADERBOARD_LIMIT), CONSTANTS.MAX_LEADERBOARD_LIMIT);
           const leaderboard = await this.dataManager.getLeaderboard(limit);
-          this._safeSend(ws, ["diceLeaderboard", leaderboard]);
-        } catch(e) { 
-          this._safeSend(ws, ["diceLeaderboard", []]);
-        }
+          this.safeSend(ws, ["diceLeaderboard", leaderboard]);
+        } catch(e) { this.safeSend(ws, ["diceLeaderboard", []]); }
         return;
       }
 
       if (evt === "getDicePoints") {
-        try {
-          const points = await this.dataManager.getDicePoints();
-          this._safeSend(ws, ["dicePoints", points]);
-        } catch(e) { 
-          this._safeSend(ws, ["dicePoints", {}]);
-        }
+        try { const points = await this.dataManager.getDicePoints(); this.safeSend(ws, ["dicePoints", points]); }
+        catch(e) { this.safeSend(ws, ["dicePoints", {}]); }
         return;
       }
 
       if (evt === "getDiceStatus") {
         const isActive = !!this.currentDiceRoll && this._canSubmitDiceAnswer;
-        this._safeSend(ws, ["diceStatus", isActive, this._diceRound || 1]);
+        this.safeSend(ws, ["diceStatus", isActive, this._diceRound || 1]);
         return;
       }
 
       if (evt === "getDiceNotification") {
         try {
-          const isDiceTime = this.alarmScheduler.isDiceTime();
           const isActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
           const timeLeft = this._getTimeLeftUntilNextDice();
           let notification = "";
           if (isActive) {
             const elapsed = (Date.now() - this._diceStartTime) / 1000;
-            const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
-            const remaining = Math.max(0, totalTime - elapsed);
+            const remaining = Math.max(0, 20 - elapsed);
             notification = Math.floor(remaining) + "s remaining";
-          } else if (isDiceTime) {
+          } else if (this.alarmScheduler.isDiceTime()) {
             notification = "Dice game starting soon...";
           } else if (timeLeft && timeLeft.text) {
             notification = "Next dice game in: " + timeLeft.text;
           } else {
             notification = "Waiting...";
           }
-          this._safeSend(ws, ["diceNotification", notification]);
-        } catch(e) {
-          this._safeSend(ws, ["diceNotification", "Waiting..."]);
-        }
+          this.safeSend(ws, ["diceNotification", notification]);
+        } catch(e) { this.safeSend(ws, ["diceNotification", "Waiting..."]); }
         return;
       }
 
-      if (evt === "checkGameRunning") {
-        await this.checkGameRunning(ws, data[1]);
-        return;
-      }
+      if (evt === "checkGameRunning") { await this.checkGameRunning(ws, data[1]); return; }
 
-      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-      if (!room || typeof room !== 'string' || room.trim() === '') {
-        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
-        return;
-      }
-      if (room === CONSTANTS.DICE_ROOM) {
-        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
-        return;
-      }
+      const room = ws.room || ws.roomname;
+      if (!room) { this.safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
+      if (room === CONSTANTS.DICE_ROOM) { this.safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]); return; }
 
       switch (evt) {
-        case "gameLowCardStart": 
-          await this.startGame(ws, data[1], data[2]); 
-          break;
-        case "gameLowCardJoin": 
-          await this.joinGame(ws, data[1]); 
-          break;
-        case "gameLowCardNumber": 
-          await this.submitNumber(ws, data[1], data[2] || "", data[3]); 
-          break;
-        case "gameLowCardLeave":
-          await this.leaveGame(ws, data[1]);
-          break;
-        default: 
-          break;
+        case "gameLowCardStart": await this.startGame(ws, data[1], data[2]); break;
+        case "gameLowCardJoin": await this.joinGame(ws, data[1]); break;
+        case "gameLowCardNumber": await this.submitNumber(ws, data[1], data[2] || "", data[3]); break;
+        case "gameLowCardLeave": await this.leaveGame(ws, data[1]); break;
       }
     } catch(e) {}
-  }
-
-  _createGameObject(room, betAmount, username, isRecording = false) {
-    return {
-      room, players: new Map(), botPlayers: new Map(), registrationOpen: true, round: 1,
-      numbers: new Map(), tanda: new Map(), eliminated: new Set(), betAmount: betAmount,
-      hostId: username, hostName: username, useBots: false, evaluationLocked: false,
-      drawTimeExpired: false, _isActive: true, _gameEnded: false, _phase: 'registration',
-      _state: 'registration', _botTimeouts: new Set(), _botTimers: new Set(), _botsAdded: false,
-      _registrationTimer: null, _drawTimer: null, _evalTimer: null, _safetyTimer: null,
-      _isEvaluating: false, _evalStartTime: null, _createdAt: Date.now(), _drawPhaseStart: null,
-      _endTime: null, playerWsId: new Map(), _startedByRecording: isRecording,
-      _startedBy: isRecording ? 'recording' : 'user', _notificationTimers: [],
-      _drawNotificationTimers: [], _cleanupStarted: false, _evalLocks: new Map(),
-      _gameId: `${room}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, _version: 0
-    };
   }
 
   async switchRoom(ws, room, username = null) {
     try {
-      if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
-      if (!room || typeof room !== 'string' || room.trim() === "") { this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); return; }
+      if (this.isDestroyed) { this.safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
+      if (!room || typeof room !== 'string' || room.trim() === "") { this.safeSend(ws, ["gameLowCardError", "Invalid room name"]); return; }
       const roomName = room.trim();
       const wsId = ws._wsId;
-      if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
-      if (ws.readyState !== 1 || ws._closing) { this._safeSend(ws, ["gameLowCardError", "Connection closed"]); return; }
-      const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
+      if (!wsId) { this.safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
+      if (ws.readyState !== 1 || ws._closing) { this.safeSend(ws, ["gameLowCardError", "Connection closed"]); return; }
+
+      const currentRoom = ws.room || ws.roomname;
       if (currentRoom === roomName) {
         if (roomName === CONSTANTS.DICE_ROOM) this._sendDiceRoomState(ws);
-        this._safeSend(ws, ["switchRoomSuccess", roomName]);
+        this.safeSend(ws, ["switchRoomSuccess", roomName]);
         return;
       }
+
       if (currentRoom) {
-        const clients = this.wsClients.get(currentRoom);
-        if (clients) {
-          clients.delete(wsId);
-          if (clients.size === 0) this.wsClients.delete(currentRoom);
-        }
+        const clients = this.roomClients.get(currentRoom);
+        if (clients) { clients.delete(ws); if (clients.size === 0) this.roomClients.delete(currentRoom); }
       }
-      if (!this.wsClients.has(roomName)) this.wsClients.set(roomName, new Set());
-      this.wsClients.get(roomName).add(wsId);
-      this.clientRooms.set(wsId, roomName);
+
+      if (!this.roomClients.has(roomName)) this.roomClients.set(roomName, new Set());
+      this.roomClients.get(roomName).add(ws);
+
       ws.room = roomName;
       ws.roomname = roomName;
-      if (username) ws.username = username;
+      ws._room = roomName;
+      if (username) { ws.username = username; ws._username = username; }
+
       ws.serializeAttachment({ wsId, username: username || ws.username || null, room: roomName, roomname: roomName, createdAt: ws._createdAt || Date.now() });
+
       const finalUsername = username || ws.username;
       if (finalUsername) {
-        let conn = this.userConnections.get(finalUsername);
-        if (conn) { conn.room = roomName; conn.wsId = wsId; conn.ws = ws; conn.timestamp = Date.now(); }
-        else { this.userConnections.set(finalUsername, { wsId, ws, room: roomName, timestamp: Date.now() }); }
+        let conns = this.userConnections.get(finalUsername);
+        if (!conns) { conns = new Set(); this.userConnections.set(finalUsername, conns); }
+        conns.add(ws);
       }
-      this._safeSend(ws, ["switchRoomSuccess", roomName]);
+
+      this.safeSend(ws, ["switchRoomSuccess", roomName]);
       if (roomName === CONSTANTS.DICE_ROOM) {
         this._sendDiceRoomState(ws);
         if (this.alarmScheduler.isDiceTime() && !this._diceGameStarted && !this.currentDiceRoll) this._startDiceGameIfNotStarted();
       }
-    } catch(e) { this._safeSend(ws, ["gameLowCardError", e.message || "Switch failed"]); }
+    } catch(e) { this.safeSend(ws, ["gameLowCardError", e.message || "Switch failed"]); }
   }
 
   async checkGameRunning(ws, roomname) {
     try {
-      if (this.isDestroyed) { this._safeSend(ws, ["gameStatus", "false"]); return; }
-      let room = roomname || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-      if (!room || typeof room !== 'string' || room.trim() === '') { this._safeSend(ws, ["gameStatus", "false"]); return; }
-      this._ensureClientInRoom(ws, room, ws.username);
+      if (this.isDestroyed) { this.safeSend(ws, ["gameStatus", "false"]); return; }
+      let room = roomname || ws.room || ws.roomname;
+      if (!room) { this.safeSend(ws, ["gameStatus", "false"]); return; }
       if (room === CONSTANTS.DICE_ROOM) { this._sendDiceRoomState(ws); return; }
       const game = this.activeGames.get(room);
       const isRunning = game?._isActive && !game._gameEnded && game.players?.size > 0;
-      this._safeSend(ws, ["gameStatus", isRunning ? "true" : "false"]);
+      this.safeSend(ws, ["gameStatus", isRunning ? "true" : "false"]);
     } catch(e) {}
   }
 
-  _addClient(room, ws, username = null) {
-    try {
-      if (!ws) return;
-      const wsId = this._getWsId(ws);
-      if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
-      if (this.clientRooms.has(wsId)) {
-        const oldRoom = this.clientRooms.get(wsId);
-        if (oldRoom && oldRoom !== room) this._removeClientFromRoom(oldRoom, wsId);
-      }
-      if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
-      this.wsClients.get(room).add(wsId);
-      this.clientRooms.set(wsId, room);
-      this.wsMap.set(wsId, ws);
-      ws.room = room;
-      ws.roomname = room;
-      if (username) ws.username = username;
-      ws.serializeAttachment({ wsId, username: username || null, room, roomname: room, createdAt: ws._createdAt || Date.now() });
-      if (username) {
-        let conn = this.userConnections.get(username);
-        if (conn) { conn.room = room; conn.timestamp = Date.now(); conn.ws = ws; conn.wsId = wsId; }
-        else { this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() }); }
-        this._reconnectAttempts.delete(username);
-      }
-    } catch(e) {}
-  }
-
-  _removeClientFromRoom(room, wsId) {
-    try {
-      if (!room || !wsId) return;
-      const clients = this.wsClients.get(room);
-      if (clients) { clients.delete(wsId); if (clients.size === 0) this.wsClients.delete(room); }
-    } catch(e) {}
-  }
-
-  _getWsId(ws) { return ws?._wsId || null; }
   _isGameActuallyRunning(game) { return game?._isActive === true && !game?._gameEnded && game?.players?.size > 0; }
 
   _getActivePlayers(game) {
@@ -2453,27 +1995,27 @@ export class GameServer {
 
   async startGame(ws, bet, username) {
     try {
-      if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
-      if (!username?.trim()) { this._safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
+      if (this.isDestroyed) { this.safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
+      if (!username?.trim()) { this.safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
       const usernameClean = username.trim();
-      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-      if (!room) { this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
-      if (room === CONSTANTS.DICE_ROOM) { this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]); return; }
+      const room = ws.room || ws.roomname;
+      if (!room) { this.safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
+      if (room === CONSTANTS.DICE_ROOM) { this.safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]); return; }
       const lockKey = `game_start_${room}`;
-      if (this._gameLocks.has(lockKey)) { this._safeSend(ws, ["gameLowCardError", "Game is starting, please wait"]); return; }
+      if (this._gameLocks.has(lockKey)) { this.safeSend(ws, ["gameLowCardError", "Game is starting, please wait"]); return; }
       this._gameLocks.set(lockKey, Date.now());
       try {
         const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
-        if (isRecordingEnabled) { this._safeSend(ws, ["gameLowCardError", "Recording is ACTIVE in this room. Users cannot start games."]); return; }
+        if (isRecordingEnabled) { this.safeSend(ws, ["gameLowCardError", "Recording is ACTIVE in this room. Users cannot start games."]); return; }
         const existingGame = this.activeGames.get(room);
-        if (existingGame?._isActive && !existingGame._gameEnded) { this._safeSend(ws, ["gameLowCardError", "Game is already running"]); return; }
+        if (existingGame?._isActive && !existingGame._gameEnded) { this.safeSend(ws, ["gameLowCardError", "Game is already running"]); return; }
         if (existingGame) await this._forceCleanupGame(room, existingGame);
         const betAmount = parseInt(bet, 10) || 0;
         if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
-          this._safeSend(ws, ["gameLowCardError", `Invalid bet (0 or 100-${CONSTANTS.MAX_BET})`]);
+          this.safeSend(ws, ["gameLowCardError", `Invalid bet (0 or 100-${CONSTANTS.MAX_BET})`]);
           return;
         }
-        if (this.activeGames.size >= CONSTANTS.MAX_LOWCARD_GAMES) { this._safeSend(ws, ["gameLowCardError", "Server is busy"]); return; }
+        if (this.activeGames.size >= CONSTANTS.MAX_LOWCARD_GAMES) { this.safeSend(ws, ["gameLowCardError", "Server is busy"]); return; }
         const wsId = ws._wsId;
         const game = {
           room, players: new Map(), botPlayers: new Map(), registrationOpen: true, round: 1,
@@ -2488,9 +2030,10 @@ export class GameServer {
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
         game.playerWsId.set(usernameClean, wsId);
         this.activeGames.set(room, game);
-        this._addClient(room, ws, usernameClean);
-        this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
-        this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
+        if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
+        this.roomClients.get(room).add(ws);
+        this.broadcast(room, ["gameLowCardStart", betAmount]);
+        this.broadcast(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._startRegistration(room, game);
       } finally {
         setTimeout(() => { this._gameLocks.delete(lockKey); }, 3000);
@@ -2510,11 +2053,11 @@ export class GameServer {
             if (game._registrationTimer === timer) game._registrationTimer = null;
             return;
           }
-          if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+          if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) this.broadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
           if (timeLeft === 0) {
             this._clearTimer(timer);
             game._registrationTimer = null;
-            this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
+            this.broadcast(room, ["gameLowCardTimeLeft", "TIME UP"]);
             this._closeRegistration(room, game);
           }
           timeLeft--;
@@ -2542,7 +2085,7 @@ export class GameServer {
       else {
         game._gameEnded = true;
         game._isActive = false;
-        this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
+        this.broadcast(room, ["gameLowCardError", "Not enough players"]);
         this._scheduleGameCleanup(room, game);
       }
     } catch(e) {}
@@ -2595,16 +2138,16 @@ export class GameServer {
             if (game._startedByRecording) {
               await this._addLowCardWinner(room, winner);
               const winners = await this._getLowCardWinners(room);
-              this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+              this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
             }
             game._gameEnded = true;
             game._isActive = false;
-            this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
+            this.broadcast(room, ["gameLowCardWinner", winner, totalCoin]);
             this._scheduleGameCleanup(room, game);
           } else {
             game._gameEnded = true;
             game._isActive = false;
-            this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
+            this.broadcast(room, ["gameLowCardError", "Not enough players"]);
             this._scheduleGameCleanup(room, game);
           }
           return;
@@ -2616,8 +2159,8 @@ export class GameServer {
       game._drawPhaseStart = Date.now();
       if (!game._botTimeouts) game._botTimeouts = new Set();
       const playersList = this._getActivePlayers(game).map(p => p.name);
-      this._broadcastToRoom(room, ["gameLowCardClosed", playersList]);
-      this._broadcastToRoom(room, ["gameLowCardNextRound", game.round]);
+      this.broadcast(room, ["gameLowCardClosed", playersList]);
+      this.broadcast(room, ["gameLowCardNextRound", game.round]);
       this._startDrawCountdown(room, game);
       if (game.botPlayers?.size > 0 && this._isGameActuallyRunning(game)) this._startBotDraws(room, game);
     } catch(e) {}
@@ -2635,11 +2178,11 @@ export class GameServer {
             if (game._drawTimer === timer) game._drawTimer = null;
             return;
           }
-          if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+          if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) this.broadcast(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
           if (timeLeft === 0) {
             this._clearTimer(timer);
             game._drawTimer = null;
-            this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
+            this.broadcast(room, ["gameLowCardTimeLeft", "TIME UP"]);
             this._closeDrawPhase(room, game);
           }
           timeLeft--;
@@ -2682,11 +2225,11 @@ export class GameServer {
       game.numbers.set(botId, number);
       game.tanda.set(botId, tanda);
       const botName = game.players.get(botId)?.name || botId;
-      this._broadcastToRoom(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
+      this.broadcast(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
       const activeIds = this._getActivePlayerIds(game);
       if (game.numbers.size === activeIds.length && !game.evaluationLocked && !game.drawTimeExpired && this._isGameActuallyRunning(game)) {
         game.evaluationLocked = true;
-        this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
+        this.broadcast(room, ["gameLowCardWait", "wait results"]);
         const evalTimer = this._trackTimer(setTimeout(() => { try { this._evaluateRound(room, game); } catch(e) {} }, CONSTANTS.EVALUATION_DELAY_MS));
         game._evalTimer = evalTimer;
       }
@@ -2702,7 +2245,7 @@ export class GameServer {
       game.numbers.set(botId, number);
       game.tanda.set(botId, tanda);
       const botName = game.players.get(botId)?.name || botId;
-      this._broadcastToRoom(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
+      this.broadcast(room, ["gameLowCardPlayerDraw", botName, number, tanda]);
     } catch(e) {}
   }
 
@@ -2716,7 +2259,7 @@ export class GameServer {
         const activeBotIds = Array.from(game.botPlayers.keys()).filter(id => !game.eliminated?.has(id) && !game.numbers?.has(id));
         for (const botId of activeBotIds) this._forceBotDraw(room, botId, game);
       }
-      this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
+      this.broadcast(room, ["gameLowCardWait", "wait results"]);
       if (game._evalTimer) { this._clearTimer(game._evalTimer); game._evalTimer = null; }
       const evalTimer = this._trackTimer(setTimeout(() => {
         try {
@@ -2751,7 +2294,7 @@ export class GameServer {
       if (entries.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-        this._broadcastToRoom(room, ["gameLowCardError", "No numbers drawn this round"]);
+        this.broadcast(room, ["gameLowCardError", "No numbers drawn this round"]);
         game._gameEnded = true;
         game._isActive = false;
         this._scheduleGameCleanup(room, game);
@@ -2764,9 +2307,9 @@ export class GameServer {
         if (game._startedByRecording) {
           await this._addLowCardWinner(room, winnerName);
           const winners = await this._getLowCardWinners(room);
-          this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+          this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
         }
-        this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
+        this.broadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         game._gameEnded = true;
         game._isActive = false;
         game._isEvaluating = false;
@@ -2801,7 +2344,7 @@ export class GameServer {
         game.tanda = new Map();
         game._botTimeouts = new Set();
         const remainingNames = remaining.map(id => players.get(id)?.name || id);
-        this._broadcastToRoom(room, ["gameLowCardRoundResult", game.round - 1,
+        this.broadcast(room, ["gameLowCardRoundResult", game.round - 1,
           entries.map(([id, n]) => `${players.get(id)?.name || id}:${n}${tanda.get(id) ? `(${tanda.get(id)})` : ''}`),
           [], remainingNames, true
         ]);
@@ -2815,9 +2358,9 @@ export class GameServer {
         if (game._startedByRecording) {
           await this._addLowCardWinner(room, winnerName);
           const winners = await this._getLowCardWinners(room);
-          this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+          this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
         }
-        this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
+        this.broadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         game._gameEnded = true;
         game._isActive = false;
         game._isEvaluating = false;
@@ -2830,14 +2373,14 @@ export class GameServer {
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
         game._gameEnded = true;
         game._isActive = false;
-        this._broadcastToRoom(room, ["gameLowCardError", "All players eliminated"]);
+        this.broadcast(room, ["gameLowCardError", "All players eliminated"]);
         this._scheduleGameCleanup(room, game);
         return;
       }
       const numbersArr = entries.map(([id, n]) => `${players.get(id)?.name || id}:${n}${tanda.get(id) ? `(${tanda.get(id)})` : ''}`);
       const loserNames = [...losers].map(id => players.get(id)?.name || id);
       const remainingNames = remaining.map(id => players.get(id)?.name || id);
-      this._broadcastToRoom(room, ["gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames]);
+      this.broadcast(room, ["gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames]);
       numbers.clear();
       tanda.clear();
       game.round++;
@@ -2855,33 +2398,42 @@ export class GameServer {
 
   async joinGame(ws, username) {
     try {
-      if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
-      if (!username?.trim()) { this._safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
+      if (this.isDestroyed) { this.safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
+      if (!username?.trim()) { this.safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
       const usernameClean = username.trim();
       const wsId = ws._wsId;
-      const room = ws.room || ws.roomname || this.clientRooms.get(wsId);
-      if (!room) { this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
+      const room = ws.room || ws.roomname;
+      if (!room) { this.safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
       const lockKey = `join_${room}_${usernameClean}`;
-      if (this._joinLocks.has(lockKey)) { this._safeSend(ws, ["gameLowCardError", "Please wait"]); return; }
+      if (this._joinLocks.has(lockKey)) { this.safeSend(ws, ["gameLowCardError", "Please wait"]); return; }
       this._joinLocks.set(lockKey, Date.now());
       try {
         const game = this.activeGames.get(room);
-        if (!game?._isActive || game._gameEnded || !game.players) { this._safeSend(ws, ["gameLowCardError", "No active game in this room"]); return; }
+        if (!game?._isActive || game._gameEnded || !game.players) { this.safeSend(ws, ["gameLowCardError", "No active game in this room"]); return; }
         if (game.players.has(usernameClean)) {
-          if (game.eliminated?.has(usernameClean)) { this._safeSend(ws, ["gameLowCardError", "You have been eliminated"]); return; }
-          if (game.numbers.has(usernameClean)) this._safeSend(ws, ["gameLowCardPlayerDraw", usernameClean, game.numbers.get(usernameClean), game.tanda.get(usernameClean) || ""]);
+          if (game.eliminated?.has(usernameClean)) { this.safeSend(ws, ["gameLowCardError", "You have been eliminated"]); return; }
+          if (game.numbers.has(usernameClean)) this.safeSend(ws, ["gameLowCardPlayerDraw", usernameClean, game.numbers.get(usernameClean), game.tanda.get(usernameClean) || ""]);
           return;
         }
         if (!game.registrationOpen) {
-          this._safeSend(ws, ["gameLowCardNoJoin", usernameClean, game.betAmount]);
-          this._safeSend(ws, ["gameLowCardError", "Registration is closed"]);
+          this.safeSend(ws, ["gameLowCardNoJoin", usernameClean, game.betAmount]);
+          this.safeSend(ws, ["gameLowCardError", "Registration is closed"]);
           return;
         }
-        if (game.players.size >= CONSTANTS.MAX_PLAYERS_PER_GAME) { this._safeSend(ws, ["gameLowCardError", "Game is full"]); return; }
+        if (game.players.size >= CONSTANTS.MAX_PLAYERS_PER_GAME) { this.safeSend(ws, ["gameLowCardError", "Game is full"]); return; }
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
-        this._addClient(room, ws, usernameClean);
+        if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
+        this.roomClients.get(room).add(ws);
+        ws.room = room;
+        ws.roomname = room;
+        ws.username = usernameClean;
+        ws._wsId = wsId;
+        ws.serializeAttachment({ wsId, username: usernameClean, room, roomname: room, createdAt: ws._createdAt || Date.now() });
+        let conns = this.userConnections.get(usernameClean);
+        if (!conns) { conns = new Set(); this.userConnections.set(usernameClean, conns); }
+        conns.add(ws);
         game.playerWsId.set(usernameClean, wsId);
-        this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
+        this.broadcast(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
       } finally {
         setTimeout(() => { this._joinLocks.delete(lockKey); }, 2000);
       }
@@ -2890,31 +2442,30 @@ export class GameServer {
 
   async submitNumber(ws, number, tanda, username) {
     try {
-      if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
-      if (!username?.trim()) { this._safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
+      if (this.isDestroyed) { this.safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
+      if (!username?.trim()) { this.safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
       const usernameClean = username.trim();
-      const wsId = ws._wsId;
-      const room = ws.room || ws.roomname || this.clientRooms.get(wsId);
-      if (!room) { this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
+      const room = ws.room || ws.roomname;
+      if (!room) { this.safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
       const game = this.activeGames.get(room);
-      if (!game?._isActive || game._gameEnded || !game.players) { this._safeSend(ws, ["gameLowCardError", "No active game"]); return; }
-      if (game.players.has(usernameClean) && game.eliminated?.has(usernameClean)) { this._safeSend(ws, ["gameLowCardError", "You have been eliminated"]); return; }
-      if (game.registrationOpen || game.evaluationLocked || game.drawTimeExpired || game._phase !== 'draw') { this._safeSend(ws, ["gameLowCardError", "Cannot submit now"]); return; }
-      if (!game.players.has(usernameClean)) { this._safeSend(ws, ["gameLowCardError", "You are not in this game"]); return; }
-      if (game.numbers.has(usernameClean)) { this._safeSend(ws, ["gameLowCardError", "You have already submitted"]); return; }
+      if (!game?._isActive || game._gameEnded || !game.players) { this.safeSend(ws, ["gameLowCardError", "No active game"]); return; }
+      if (game.players.has(usernameClean) && game.eliminated?.has(usernameClean)) { this.safeSend(ws, ["gameLowCardError", "You have been eliminated"]); return; }
+      if (game.registrationOpen || game.evaluationLocked || game.drawTimeExpired || game._phase !== 'draw') { this.safeSend(ws, ["gameLowCardError", "Cannot submit now"]); return; }
+      if (!game.players.has(usernameClean)) { this.safeSend(ws, ["gameLowCardError", "You are not in this game"]); return; }
+      if (game.numbers.has(usernameClean)) { this.safeSend(ws, ["gameLowCardError", "You have already submitted"]); return; }
       const n = parseInt(number, 10);
-      if (isNaN(n) || n < 1 || n > 12) { this._safeSend(ws, ["gameLowCardError", "Invalid number (1-12)"]); return; }
+      if (isNaN(n) || n < 1 || n > 12) { this.safeSend(ws, ["gameLowCardError", "Invalid number (1-12)"]); return; }
       const validTandas = ["C1", "C2", "C3", "C4", ""];
       if (!validTandas.includes(tanda)) tanda = "";
       game.numbers.set(usernameClean, n);
       game.tanda.set(usernameClean, tanda);
-      this._broadcastToRoom(room, ["gameLowCardPlayerDraw", usernameClean, n, tanda]);
+      this.broadcast(room, ["gameLowCardPlayerDraw", usernameClean, n, tanda]);
       const activeIds = this._getActivePlayerIds(game);
       if (game.numbers.size === activeIds.length && !game.evaluationLocked && !game.drawTimeExpired &&
           this._isGameActuallyRunning(game) && game._isActive && !game._gameEnded) {
         game.evaluationLocked = true;
         if (game._evalTimer) { this._clearTimer(game._evalTimer); game._evalTimer = null; }
-        this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
+        this.broadcast(room, ["gameLowCardWait", "wait results"]);
         const evalTimer = this._trackTimer(setTimeout(() => {
           try {
             const currentGame = this.activeGames.get(room);
@@ -2928,14 +2479,14 @@ export class GameServer {
 
   async leaveGame(ws, username) {
     try {
-      if (this.isDestroyed) { this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
-      if (!username?.trim()) { this._safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
+      if (this.isDestroyed) { this.safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
+      if (!username?.trim()) { this.safeSend(ws, ["gameLowCardError", "Username is required"]); return; }
       const usernameClean = username.trim();
-      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-      if (!room) { this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
+      const room = ws.room || ws.roomname;
+      if (!room) { this.safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
       const game = this.activeGames.get(room);
-      if (!game?._isActive || game._gameEnded || !game.players) { this._safeSend(ws, ["gameLowCardError", "No active game in this room"]); return; }
-      if (!game.players.has(usernameClean)) { this._safeSend(ws, ["gameLowCardError", "You are not in this game"]); return; }
+      if (!game?._isActive || game._gameEnded || !game.players) { this.safeSend(ws, ["gameLowCardError", "No active game in this room"]); return; }
+      if (!game.players.has(usernameClean)) { this.safeSend(ws, ["gameLowCardError", "You are not in this game"]); return; }
       this._removePlayerFromGame(usernameClean, room);
     } catch(e) {}
   }
@@ -2948,7 +2499,7 @@ export class GameServer {
       game.eliminated.add(username);
       game.numbers?.delete(username);
       game.tanda?.delete(username);
-      this._broadcastToRoom(room, ["gameLowCardError", `${username} has been eliminated`]);
+      this.broadcast(room, ["gameLowCardError", `${username} has been eliminated`]);
       const checkTimer = setTimeout(() => {
         try {
           const currentGame = this.activeGames.get(room);
@@ -2971,7 +2522,7 @@ export class GameServer {
         if (notSubmitted.length > 0) return;
         game._gameEnded = true;
         game._isActive = false;
-        this._broadcastToRoom(room, ["gameLowCardEnd", []]);
+        this.broadcast(room, ["gameLowCardEnd", []]);
         this._scheduleGameCleanup(room, game);
         return;
       }
@@ -2980,7 +2531,7 @@ export class GameServer {
         const submittedIds = Array.from(game.numbers?.keys() || []);
         const notSubmitted = activeIds.filter(id => !submittedIds.includes(id));
         if (notSubmitted.length > 0) {
-          this._broadcastToRoom(room, ["gameLowCardTimeLeft", `Waiting for ${notSubmitted.length} player(s)`]);
+          this.broadcast(room, ["gameLowCardTimeLeft", `Waiting for ${notSubmitted.length} player(s)`]);
           return;
         }
         const winner = activePlayers[0]?.name || "Unknown";
@@ -2988,11 +2539,11 @@ export class GameServer {
         if (game._startedByRecording) {
           await this._addLowCardWinner(room, winner);
           const winners = await this._getLowCardWinners(room);
-          this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+          this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
         }
         game._gameEnded = true;
         game._isActive = false;
-        this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
+        this.broadcast(room, ["gameLowCardWinner", winner, totalCoin]);
         this._scheduleGameCleanup(room, game);
       }
     } catch(e) {}
@@ -3028,7 +2579,7 @@ export class GameServer {
       this.activeGames.delete(room);
       this._gameLocks.delete(room);
       this._joinLocks.delete(room);
-      this._broadcastToRoom(room, ["gameLowCardEnd", []]);
+      this.broadcast(room, ["gameLowCardEnd", []]);
     } catch(e) {}
   }
 
@@ -3060,59 +2611,12 @@ export class GameServer {
       game._gameEnded = true;
       game._isActive = false;
       game._endTime = Date.now();
-      this._broadcastToRoom(room, ["gameLowCardEnd", []]);
+      this.broadcast(room, ["gameLowCardEnd", []]);
       this.activeGames.delete(room);
       if (this._cleanupTimers.has(room)) { this._clearTimer(this._cleanupTimers.get(room)); this._cleanupTimers.delete(room); }
       this._gameLocks.delete(room);
       this._joinLocks.delete(room);
     } catch(e) {}
-  }
-
-  _trackTimer(timer) { if (timer) this._allTimers.add(timer); return timer; }
-
-  _clearTimer(timer) {
-    if (timer) {
-      if (typeof timer === 'object' && timer._destroyed) return;
-      try { clearTimeout(timer); } catch(e) {}
-      try { clearInterval(timer); } catch(e) {}
-      this._allTimers.delete(timer);
-    }
-  }
-
-  _handleError(type, error) {
-    try {
-      const now = Date.now();
-      if (now - this._lastErrorReset > CONSTANTS.ERROR_RESET_INTERVAL_MS) { this._errorCount = 0; this._lastErrorReset = now; }
-      this._errorCount++;
-      if (this._errorCount > 20) { this._circuitOpen = true; this._lastResetTime = now; }
-    } catch(e) {}
-  }
-
-  _getTimeLeftUntilNextDice() {
-    try {
-      const witaTime = this._getCurrentWITATime();
-      const currentTotal = witaTime.totalMinutes;
-      let minDiff = Infinity;
-      for (const session of QUIZ_SCHEDULE.SESSIONS) {
-        const startTotal = parseTime(session.start);
-        let diff = startTotal - currentTotal;
-        if (diff < 0) diff += 24 * 60;
-        if (diff < minDiff) minDiff = diff;
-      }
-      const hours = Math.floor(minDiff / 60);
-      const minutes = Math.floor(minDiff % 60);
-      const isRunning = this.alarmScheduler.isDiceTime();
-      return { hours, minutes, totalMs: minDiff * 60 * 1000, text: hours + "h " + minutes + "m", isRunning };
-    } catch(e) { return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false }; }
-  }
-
-  _getCurrentWITATime() {
-    try {
-      const now = new Date();
-      const hours = (now.getUTCHours() + QUIZ_SCHEDULE.TIMEZONE_OFFSET) % 24;
-      const minutes = now.getUTCMinutes();
-      return { hours, minutes, totalMinutes: (hours * 60) + minutes };
-    } catch(e) { return { hours: 0, minutes: 0, totalMinutes: 0 }; }
   }
 
   async destroy() {
@@ -3125,42 +2629,34 @@ export class GameServer {
       if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
       if (this._diceCooldownTimer) { clearTimeout(this._diceCooldownTimer); this._diceCooldownTimer = null; }
       if (this._diceTimeUpCooldownTimer) { clearTimeout(this._diceTimeUpCooldownTimer); this._diceTimeUpCooldownTimer = null; }
-      for (const timeout of this._diceNotificationTimeouts) { clearTimeout(timeout); }
+      for (const t of this._diceNotificationTimeouts) { clearTimeout(t); }
       this._diceNotificationTimeouts = [];
       if (this._tieTimer) { clearTimeout(this._tieTimer); this._tieTimer = null; }
       if (this._tieInterval) { clearInterval(this._tieInterval); this._tieInterval = null; }
-      for (const timeout of this._tieNotificationTimeouts) { clearTimeout(timeout); }
+      for (const t of this._tieNotificationTimeouts) { clearTimeout(t); }
       this._tieNotificationTimeouts = [];
       for (const [room, game] of this.activeGames) {
         if (game._isActive && !game._gameEnded) {
           game._gameEnded = true;
           game._isActive = false;
-          this._broadcastToRoom(room, ["gameLowCardEnd", ["Server shutting down"]]);
+          this.broadcast(room, ["gameLowCardEnd", ["Server shutting down"]]);
         }
-        this._cleanupGame(game);
         this._forceCleanupGame(room, game);
       }
       this.activeGames.clear();
       this._eventQueue = [];
       this._processingQueue = false;
       this.userConnections.clear();
+      this.roomClients.clear();
       this._tieBreakers.clear();
-      this._reconnectAttempts.clear();
       this._gameLocks.clear();
       this._joinLocks.clear();
-      this._switchLocks.clear();
-      this._switchRetries.clear();
-      this._submitLocks.clear();
-      this._checkLocks.clear();
-      this._closeLocks.clear();
       this._cleanupTimers.clear();
       if (this.alarmScheduler) { await this.alarmScheduler.cleanup(); }
-      for (const [wsId, ws] of this.wsMap) {
+      for (const ws of this.wsSet) {
         try { if (ws && ws.readyState === 1) ws.close(1000, "Server shutting down"); } catch(e) {}
       }
-      this.wsMap.clear();
-      this.wsClients.clear();
-      this.clientRooms.clear();
+      this.wsSet.clear();
       try { await this.ctx.storage.deleteAlarm(); } catch(e) {}
     } catch(e) {}
   }
