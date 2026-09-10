@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.7.0 - CLEAN DICE EVENTS + NO DUPLICATE
+// VERSION: 16.8.0 - CLEAN DICE EVENTS + TIME LEFT ONLY
 // ============================================================
 
 const CONSTANTS = {
@@ -1292,16 +1292,16 @@ export class GameServer {
           }]);
         }
       } else {
-        // ✅ SATU-SATUNYA sumber untuk user baru: diceNotification
+        // ✅ HANYA time left — TANPA jam
         if (!ws._nextSessionSent) {
           ws._nextSessionSent = true;
           const timer = setTimeout(() => {
             try {
               if (!ws || ws.readyState !== 1 || ws._closing) return;
               const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
-              if (timeInfo && timeInfo.nextSession) {
+              if (timeInfo && timeInfo.text) {
                 this.safeSend(ws, ["diceNotification", 
-                  `Next dice game in: ${timeInfo.text} (${timeInfo.nextSession.start} - ${timeInfo.nextSession.end})`
+                  `Next dice game in: ${timeInfo.text}`
                 ]);
               } else {
                 this.safeSend(ws, ["diceNotification", "Waiting..."]);
@@ -1779,7 +1779,6 @@ export class GameServer {
           this._diceGameStarted = false;
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session started!"]);
           
-          // ✅ Reset flag nextSessionSent untuk semua client
           const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
           if (clients) {
             for (const ws of clients) {
@@ -1806,12 +1805,12 @@ export class GameServer {
         this._diceGameStarted = false;
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
         
-        // ✅ KIRIM next session via diceNotification
+        // ✅ HANYA time left — TANPA jam
         try {
           const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
-          if (timeInfo && timeInfo.nextSession) {
+          if (timeInfo && timeInfo.text) {
             this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", 
-              `Next dice game in: ${timeInfo.text} (${timeInfo.nextSession.start} - ${timeInfo.nextSession.end})`
+              `Next dice game in: ${timeInfo.text}`
             ]);
           }
         } catch(e) {}
@@ -1957,7 +1956,6 @@ export class GameServer {
               round: this._diceRound
             }]);
           }
-          // ❌ TIDAK kirim diceNotification — biar _sendDiceRoomState yang handle
         } catch(e) {}
         return;
       }
@@ -2110,7 +2108,7 @@ export class GameServer {
           } else if (this.alarmScheduler.isDiceTime()) {
             notification = "Dice game starting soon...";
           } else {
-            // ✅ Cukup time left — TANPA next session (biar tidak dobel)
+            // ✅ HANYA time left — TANPA jam
             const timeLeft = this._getTimeLeftUntilNextDice();
             notification = timeLeft && timeLeft.text 
               ? "Next dice game in: " + timeLeft.text 
@@ -2291,7 +2289,7 @@ export class GameServer {
         this.broadcast(roomName, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._startRegistration(roomName, game);
         
-        // ❌ TIDAK kirim startGameWithRecordingResult — client tidak handle
+        // ❌ TIDAK kirim startGameWithRecordingResult
       } finally {
         setTimeout(() => { this._gameLocks.delete(lockKey); }, 3000);
       }
