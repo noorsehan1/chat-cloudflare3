@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.0.3 - FIX RESTORE EVENT (SAMA SEPERTI CHAT-SERVER)
+// VERSION: 16.0.4 - FIX EVENT RECEIVE FROM OTHER USERS
 // ============================================================
 
 const CONSTANTS = {
@@ -538,7 +538,6 @@ export class GameServer {
       this.isDestroyed = false;
       this._wsIdCounter = 0;
       
-      // 🔧 FIX: pisahkan _initialized dan _restored
       this._initialized = false;
       this._restored = false;
       this._restoreDone = false;
@@ -623,8 +622,8 @@ export class GameServer {
       this._diceLoopCounter = 0;
       this._maxDiceLoops = 10;
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
+      this._restoreFallbackTimer = null;
       
-      // 🔧 FIX: _init() tidak throw — selalu set _initialized & _restored
       this._init()
         .then(() => { this._processPendingEvents(); })
         .catch(() => {
@@ -634,12 +633,30 @@ export class GameServer {
           this._restoreFailed = true;
           this._processPendingEvents();
         });
+
+      this._restoreFallbackTimer = setTimeout(() => {
+        if (!this._restored) {
+          this._initialized = true;
+          this._restored = true;
+          this._restoreDone = true;
+          this._restoreFailed = true;
+          this._processPendingEvents();
+        }
+      }, 5000);
     } catch(e) {
-      // 🔧 FIX: fallback kalau constructor gagal
       this._initialized = true;
       this._restored = true;
       this._restoreDone = true;
       this._restoreFailed = true;
+      this._pendingEvents = [];
+      this.activeGames = new Map();
+      this.wsMap = new Map();
+      this.wsClients = new Map();
+      this.clientRooms = new Map();
+      this.userConnections = new Map();
+      this._eventQueue = [];
+      this._allTimers = new Set();
+      this._cleanupTimers = new Map();
     }
   }
 
@@ -656,7 +673,6 @@ export class GameServer {
       await this._initWebSockets();
       this._syncAllRooms();
       
-      // 🔧 FIX: set kedua flag
       this._initialized = true;
       this._restored = true;
       this._restoreDone = true;
@@ -679,7 +695,6 @@ export class GameServer {
       
       await this._processPendingEvents();
     } catch(e) {
-      // 🔧 FIX: jangan throw — set flag tetap true
       this._initialized = true;
       this._restored = true;
       this._restoreDone = true;
@@ -699,7 +714,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // 🔧 FIX: method baru — restore WS satu per satu
   async _restoreSingleWebSocket(ws) {
     try {
       if (!ws) return;
@@ -710,7 +724,6 @@ export class GameServer {
         attachment = null;
       }
       
-      // 🔧 FIX: cukup butuh username — room dicari dari attachment / activeGames
       if (!attachment || !attachment.username) {
         return;
       }
@@ -719,8 +732,8 @@ export class GameServer {
       ws.username = username;
       ws._wsId = attachment.wsId || ++this._wsIdCounter;
       ws._closing = false;
+      ws._cleaning = false;
       
-      // 🔧 FIX: cari room — dari attachment dulu, lalu activeGames
       let room = attachment.room || attachment.roomname || null;
       if (!room) {
         for (const [r, g] of this.activeGames) {
@@ -730,7 +743,6 @@ export class GameServer {
           }
         }
       }
-      // Kalau masih tidak ada, cek dice room
       if (!room && attachment.room === CONSTANTS.DICE_ROOM) {
         room = CONSTANTS.DICE_ROOM;
       }
@@ -747,7 +759,6 @@ export class GameServer {
       
       this.wsMap.set(ws._wsId, ws);
       
-      // 🔧 FIX: restore userConnections
       if (username) {
         let conn = this.userConnections.get(username);
         if (!conn) {
@@ -761,7 +772,6 @@ export class GameServer {
         }
       }
       
-      // 🔧 FIX: re-attach attachment supaya konsisten
       try {
         ws.serializeAttachment({
           wsId: ws._wsId,
@@ -772,7 +782,6 @@ export class GameServer {
         });
       } catch(e) {}
       
-      // Kalau dice room, kirim state
       if (room === CONSTANTS.DICE_ROOM) {
         this._sendDiceRoomState(ws);
       }
@@ -813,7 +822,10 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
-  // 🔧 FIX: guard _processingPending + fallback cari WS
+  // ============================================================
+  // PROCESS PENDING EVENTS - FIXED
+  // ============================================================
+  
   async _processPendingEvents() {
     try {
       if (!this._pendingEvents || this._pendingEvents.length === 0) return;
@@ -821,7 +833,19 @@ export class GameServer {
       
       this._processingPending = true;
       try {
+        this._restored = true;
+        this._restoreDone = true;
+        this._initialized = true;
+        
+        let safetyCounter = 0;
+        const MAX_SAFETY = 1000;
+        
         while (this._pendingEvents.length > 0 && !this.closing && !this.isDestroyed) {
+          if (++safetyCounter > MAX_SAFETY) {
+            this._pendingEvents = [];
+            break;
+          }
+          
           const events = this._pendingEvents.splice(0, 20);
           if (events.length === 0) break;
           
@@ -830,12 +854,10 @@ export class GameServer {
               let ws = evt.ws;
               
               if (!ws || ws.readyState !== 1) {
-                // 🔧 FIX: cari via wsId di wsMap
                 const wsId = evt.wsId;
                 if (wsId && this.wsMap.has(wsId)) {
                   ws = this.wsMap.get(wsId);
                 } else {
-                  // 🔧 FIX: fallback cari via username+room di ctx.getWebSockets()
                   try {
                     const allWs = this.ctx.getWebSockets() || [];
                     for (const w of allWs) {
@@ -854,7 +876,7 @@ export class GameServer {
                 }
               }
               
-              if (!ws || ws.readyState !== 1 || ws._closing) continue;
+              if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
               
               try {
                 const room = evt.room || ws.room || ws.roomname;
@@ -983,7 +1005,7 @@ export class GameServer {
         const toRemove = [];
         for (const wsId of wsIds) {
           const ws = this.wsMap.get(wsId);
-          if (ws && ws.readyState === 1 && !ws._closing) {
+          if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
             users.push({ wsId, ws, username: ws.username || 'Anonymous' });
           } else {
             toRemove.push(wsId);
@@ -1013,7 +1035,7 @@ export class GameServer {
       const toRemove = [];
       for (const user of users) {
         const ws = user.ws;
-        if (ws && ws.readyState === 1 && !ws._closing) {
+        if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
           try {
             ws.send(msgStr);
             sentCount++;
@@ -1815,11 +1837,19 @@ export class GameServer {
         server.serializeAttachment({ wsId, username: null, room: null, roomname: null, createdAt: Date.now() });
         server._wsId = wsId;
         server._closing = false;
+        server._cleaning = false;
         server.username = null;
         server.room = null;
         server.roomname = null;
         server._createdAt = Date.now();
         this.wsMap.set(wsId, server);
+        
+        if (this._initialized && !this._restored) {
+          this._restored = true;
+          this._restoreDone = true;
+          this._processPendingEvents();
+        }
+        
         return new Response(null, { status: 101, webSocket: client });
       }
       return new Response("Game Server", { status: 200 });
@@ -1829,9 +1859,8 @@ export class GameServer {
     }
   }
 
-  // 🔧 FIX: pakai _restored, bukan _initialized
   async webSocketMessage(ws, message) {
-    if (!ws || ws._closing || this.closing || this.isDestroyed) return;
+    if (!ws || ws._closing || ws._cleaning || this.closing || this.isDestroyed) return;
     
     if (!this._restored) {
       if (!this._pendingEvents) this._pendingEvents = [];
@@ -1843,7 +1872,7 @@ export class GameServer {
       const username = this._getClientUsername(ws);
       this._pendingEvents.push({ 
         ws, message, timestamp: Date.now(), 
-        wsId: ws._wsId || null,   // 🔧 FIX: fallback null
+        wsId: ws._wsId || null,
         room, username,
         attachment: ws.deserializeAttachment ? ws.deserializeAttachment() : null
       });
@@ -2050,6 +2079,10 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // PROCESS EVENT QUEUE - FIXED (RECURSIVE)
+  // ============================================================
+  
   async _processEventQueue() {
     if (this._processingQueue || this._eventQueue.length === 0) return;
     this._processingQueue = true;
@@ -2058,20 +2091,27 @@ export class GameServer {
       let processed = 0;
       const MAX_BATCH = CONSTANTS.PROCESS_BATCH_SIZE || 50;
       const MAX_TIME = CONSTANTS.PROCESS_MAX_TIME_MS || 100;
+      
       while (this._eventQueue.length > 0 && processed < MAX_BATCH) {
         if (Date.now() - startTime > MAX_TIME) break;
         const item = this._eventQueue.shift();
-        try { await this._processEventItem(item.ws, item.data); } catch(e) {}
+        try { 
+          await this._processEventItem(item.ws, item.data); 
+        } catch(e) {}
         processed++;
       }
+      
       if (this._eventQueue.length > 0 && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._processEventQueue(), 10);
+        setTimeout(() => {
+          this._processingQueue = false;
+          this._processEventQueue();
+        }, 10);
+        return;
       }
     } catch(e) {
       this._handleError('processQueue', e);
-    } finally {
-      this._processingQueue = false;
     }
+    this._processingQueue = false;
   }
 
   async _processEventItem(ws, data) {
@@ -3512,6 +3552,10 @@ export class GameServer {
       if (this.isDestroyed) return;
       this.isDestroyed = true;
       this.closing = true;
+      if (this._restoreFallbackTimer) {
+        clearTimeout(this._restoreFallbackTimer);
+        this._restoreFallbackTimer = null;
+      }
       for (const timer of this._allTimers) { 
         try { clearTimeout(timer); } catch(e) {} 
       }
@@ -3536,7 +3580,9 @@ export class GameServer {
       }
       this.activeGames.clear();
       this._eventQueue = [];
+      this._pendingEvents = [];
       this._processingQueue = false;
+      this._processingPending = false;
       this.userConnections.clear();
       this._tieBreakers.clear();
       this._reconnectAttempts.clear();
