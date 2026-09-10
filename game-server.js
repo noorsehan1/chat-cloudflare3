@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.1.0 - SAMA PERSIS CHATSERVER (MULTI DIHAPUS)
+// VERSION: 16.2.0 - HIBERNASI-SAFE (FULL RESTORE)
 // ============================================================
 
 const CONSTANTS = {
@@ -88,7 +88,7 @@ class DataManager {
 
   async _set(key, value) {
     try {
-      if (value === null || value === undefined || 
+      if (value === null || value === undefined ||
           (typeof value === 'object' && Object.keys(value).length === 0) ||
           (Array.isArray(value) && value.length === 0)) {
         await this.db.prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`).bind(key).run();
@@ -216,7 +216,7 @@ class AlarmScheduler {
       const currentTotal = witaNow.getHours() * 60 + witaNow.getMinutes();
       await this._clearAllAlarms();
       await this._scheduleWeeklyResetUTC();
-      
+
       let currentSession = null;
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
@@ -226,14 +226,14 @@ class AlarmScheduler {
           break;
         }
       }
-      
+
       if (currentSession) {
         const endDelay = (currentSession.endTotal - currentTotal) * 60 * 1000;
         if (endDelay > 0) await this._scheduleAlarm('dice_session_end', endDelay);
         await this._scheduleAlarm('dice_session_start_immediate', 1000);
         return true;
       }
-      
+
       let nextSession = null, minDiff = Infinity;
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
@@ -241,7 +241,7 @@ class AlarmScheduler {
         if (diff < 0) diff += 24 * 60;
         if (diff < minDiff) { minDiff = diff; nextSession = { ...session, startTotal, endTotal: parseTime(session.end) }; }
       }
-      
+
       if (nextSession) {
         let startDelay = minDiff * 60 * 1000;
         if (startDelay < 0) startDelay = 0;
@@ -395,7 +395,6 @@ export class GameServer {
       this.isDestroyed = false;
       this._wsIdCounter = 0;
 
-      // ✅ FLAG RESTORE — SAMA CHATSERVER
       this._restored = false;
       this._restoreDone = false;
       this._restoreFailed = false;
@@ -404,7 +403,6 @@ export class GameServer {
       this._isRestoring = false;
       this._initialized = false;
 
-      // ✅ VARIABEL WS — SAMA CHATSERVER
       this.wsSet = new Set();
       this.userConnections = new Map();
       this.roomClients = new Map();
@@ -414,8 +412,9 @@ export class GameServer {
       this._processingQueue = false;
       this._allTimers = new Set();
 
-      // State game
       this.activeGames = new Map();
+
+      // ============ RESET SEMUA FLAG DICE (anti-stuck setelah hibernasi) ============
       this.currentDiceRoll = null;
       this._diceLock = false;
       this._tieActive = false;
@@ -477,11 +476,13 @@ export class GameServer {
       this.alarmScheduler = new AlarmScheduler(this.db, this.ctx);
       this.alarmScheduler.ctx = this;
 
-      // ✅ SAMA CHATSERVER
+      // ✅ Restore di background
       this._restorePromise = this._restoreWithRetry();
 
+      // ✅ Timeout pengaman
       const restoreTimeout = setTimeout(() => {
         if (!this._restoreDone) {
+          console.log('[RESTORE] Timeout — forcing partial restore');
           this._restored = true;
           this._restoreDone = true;
           this._restoreFailed = true;
@@ -496,22 +497,15 @@ export class GameServer {
       this._restorePromise
         .then(() => {
           clearTimeout(restoreTimeout);
-          this._restored = true;
-          this._restoreDone = true;
-          this._isRestoring = false;
-          this._restoreFailed = false;
-          this._initialized = true;
+          console.log('[RESTORE] Success');
         })
-        .catch(() => {
+        .catch((e) => {
           clearTimeout(restoreTimeout);
-          this._restored = true;
-          this._restoreDone = true;
-          this._restoreFailed = true;
-          this._isRestoring = false;
-          this._initialized = true;
+          console.error('[RESTORE] Failed:', e);
         });
 
     } catch(e) {
+      console.error('[CONSTRUCTOR] Fatal:', e);
       this._restored = true;
       this._restoreDone = true;
       this._restoreFailed = true;
@@ -520,19 +514,24 @@ export class GameServer {
     }
   }
 
-  // ✅ SAMA CHATSERVER
+  // ============================================================
+  // RESTORE
+  // ============================================================
+
   async _restoreWithRetry() {
     let attempts = 0;
     let lastError = null;
     while (attempts < CONSTANTS.MAX_RESTORE_ATTEMPTS) {
       try {
         attempts++;
+        console.log(`[RESTORE] Attempt ${attempts}/${CONSTANTS.MAX_RESTORE_ATTEMPTS}`);
         const result = await this._restoreAllState();
         this._restoreAttempts = attempts;
         return result;
       } catch(e) {
         lastError = e;
         this._restoreAttempts = attempts;
+        console.error(`[RESTORE] Attempt ${attempts} failed:`, e);
         if (attempts < CONSTANTS.MAX_RESTORE_ATTEMPTS) {
           await new Promise(resolve => setTimeout(resolve, CONSTANTS.RESTORE_RETRY_DELAY_MS));
           this._isRestoring = true;
@@ -547,28 +546,50 @@ export class GameServer {
     throw lastError;
   }
 
-  // ✅ SAMA CHATSERVER
   async _restoreAllState() {
     try {
       this._isRestoring = true;
 
+      // 1. Init DB
       try { await this.dataManager.init(); } catch(e) {}
 
+      // 2. Restore alarms
       try {
         await this.alarmScheduler.restoreAlarms();
         await this.alarmScheduler.scheduleAlarms();
       } catch(e) {}
 
+      // 3. Weekly reset check
       try { await this._checkAndForceResetIfMondayUTC(); } catch(e) {}
 
+      // 4. ✅ RESTORE SEMUA WEBSOCKETS
       try {
         const webSockets = this.ctx.getWebSockets();
-        const batchSize = 10;
-        for (let i = 0; i < webSockets.length; i += batchSize) {
-          const batch = webSockets.slice(i, i + batchSize);
-          await Promise.allSettled(batch.map(ws => this._restoreSingleWebSocket(ws)));
+        console.log(`[RESTORE] Found ${webSockets.length} WebSockets from ctx`);
+
+        // Reset registry dulu
+        this.wsSet.clear();
+        this.roomClients.clear();
+        this.userConnections.clear();
+
+        let restoredCount = 0;
+        for (const ws of webSockets) {
+          try {
+            if (!ws || ws.readyState !== 1) continue;
+            await this._restoreSingleWebSocket(ws);
+            restoredCount++;
+          } catch(e) {
+            console.error('[RESTORE] WS restore failed:', e);
+          }
         }
-      } catch(e) {}
+
+        console.log(`[RESTORE] Restored ${restoredCount} WS`);
+        for (const [room, clients] of this.roomClients) {
+          console.log(`[RESTORE]   Room "${room}": ${clients.size} clients`);
+        }
+      } catch(e) {
+        console.error('[RESTORE] WS scan failed:', e);
+      }
 
       this._restored = true;
       this._restoreDone = true;
@@ -576,6 +597,7 @@ export class GameServer {
       this._isRestoring = false;
       this._initialized = true;
 
+      // 5. Set dice session state
       try {
         const isDiceTime = this.alarmScheduler.isDiceTime();
         if (isDiceTime) {
@@ -583,9 +605,7 @@ export class GameServer {
           this._diceSessionEnded = false;
           this._diceGameStarted = false;
           const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
-          if (clients && clients.size > 0) {
-            this._startDiceGameIfNotStarted();
-          }
+          if (clients && clients.size > 0) this._startDiceGameIfNotStarted();
         } else {
           this._diceSessionActive = false;
           this._diceSessionEnded = true;
@@ -593,6 +613,7 @@ export class GameServer {
         }
       } catch(e) {}
 
+      // 6. Process pending events
       await this._processPendingEvents();
       return true;
     } catch(e) {
@@ -606,37 +627,45 @@ export class GameServer {
     }
   }
 
-  // ✅ SAMA CHATSERVER
   async _restoreSingleWebSocket(ws) {
     try {
-      const attachment = ws.deserializeAttachment();
-      if (!attachment || !attachment.username || !attachment.room) return;
+      if (!ws || ws.readyState !== 1) return;
 
-      ws.username = attachment.username;
-      ws._username = attachment.username;
-      ws.room = attachment.room;
-      ws.roomname = attachment.room;
-      ws._room = attachment.room;
-      ws._wsId = attachment.wsId || (++this._wsIdCounter);
+      let attachment = null;
+      try { attachment = ws.deserializeAttachment(); } catch(e) {}
+
+      const room = attachment?.room || ws.room || ws.roomname || ws._room;
+      const username = attachment?.username || ws.username || ws._username;
+      const wsId = attachment?.wsId || ws._wsId || (++this._wsIdCounter);
+
+      if (!room) {
+        console.log('[RESTORE] WS without room, skipping');
+        return;
+      }
+
+      // Set semua field
+      ws.username = username;
+      ws._username = username;
+      ws.room = room;
+      ws.roomname = room;
+      ws._room = room;
+      ws._wsId = wsId;
       ws._closing = false;
       ws._cleaning = false;
-      ws._createdAt = attachment.createdAt || Date.now();
+      ws._createdAt = attachment?.createdAt || ws._createdAt || Date.now();
 
+      // Daftarkan ke semua registry
       if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+      if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
+      this.roomClients.get(room).add(ws);
 
-      if (!this.roomClients.has(attachment.room)) {
-        this.roomClients.set(attachment.room, new Set());
+      if (username) {
+        let conns = this.userConnections.get(username);
+        if (!conns) { conns = new Set(); this.userConnections.set(username, conns); }
+        conns.add(ws);
       }
-      const roomClients = this.roomClients.get(attachment.room);
-      if (!roomClients.has(ws)) roomClients.add(ws);
 
-      let conns = this.userConnections.get(attachment.username);
-      if (!conns) {
-        conns = new Set();
-        this.userConnections.set(attachment.username, conns);
-      }
-      if (!conns.has(ws)) conns.add(ws);
-
+      // Reset cleanup state
       const state = _wsCleanupState.get(ws);
       if (state) {
         state.cleanupDone = false;
@@ -646,39 +675,66 @@ export class GameServer {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
 
-      if (attachment.room === CONSTANTS.DICE_ROOM) {
+      // Kirim dice room state kalau di Quiz
+      if (room === CONSTANTS.DICE_ROOM) {
         try { this._sendDiceRoomState(ws); } catch(e) {}
       }
-    } catch(e) {}
+    } catch(e) {
+      console.error('[RESTORE] _restoreSingleWebSocket error:', e);
+    }
   }
+
+  // ============================================================
+  // PENDING EVENTS
+  // ============================================================
 
   async _processPendingEvents() {
     try {
       if (!this._pendingEvents || this._pendingEvents.length === 0) return;
       const events = [...this._pendingEvents];
       this._pendingEvents = [];
+      console.log(`[PENDING] Processing ${events.length} events`);
 
       for (const evt of events) {
         let ws = evt.ws;
+
+        // Cari ulang WS valid
         if (!ws || ws.readyState !== 1) {
           const wsId = evt.wsId;
           if (wsId) {
-            for (const w of this.wsSet) {
-              if (w._wsId === wsId) { ws = w; break; }
+            try {
+              const allWs = this.ctx.getWebSockets();
+              for (const w of allWs) {
+                if (w._wsId === wsId && w.readyState === 1) { ws = w; break; }
+              }
+            } catch(e) {}
+            if (!ws) {
+              for (const w of this.wsSet) {
+                if (w._wsId === wsId && w.readyState === 1) { ws = w; break; }
+              }
             }
           }
-          if (!ws) continue;
         }
+
         if (!ws || ws.readyState !== 1 || ws._closing) continue;
 
         try {
-          if (evt.attachment) {
+          // Restore attachment kalau perlu
+          if (evt.attachment && !ws.room) {
             try {
               ws.serializeAttachment(evt.attachment);
               ws._wsId = evt.attachment.wsId;
               ws.username = evt.attachment.username;
+              ws._username = evt.attachment.username;
               ws.room = evt.attachment.room;
-              ws.roomname = evt.attachment.roomname;
+              ws.roomname = evt.attachment.room;
+              ws._room = evt.attachment.room;
+
+              if (evt.attachment.room) {
+                if (!this.roomClients.has(evt.attachment.room)) this.roomClients.set(evt.attachment.room, new Set());
+                this.roomClients.get(evt.attachment.room).add(ws);
+                if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+              }
             } catch(e) {}
           }
 
@@ -686,7 +742,9 @@ export class GameServer {
           if (Array.isArray(data) && data.length > 0) {
             await this._processWithTimeout(ws, data);
           }
-        } catch(e) {}
+        } catch(e) {
+          console.error('[PENDING] Process failed:', e);
+        }
       }
     } catch(e) {}
   }
@@ -700,6 +758,10 @@ export class GameServer {
       await Promise.race([this.handleEvent(ws, data), timeoutPromise]);
     } catch(e) {}
   }
+
+  // ============================================================
+  // EVENT HANDLING
+  // ============================================================
 
   async handleEvent(ws, data) {
     try {
@@ -740,13 +802,50 @@ export class GameServer {
   async _processEventItem(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
-      const room = ws.room || ws.roomname;
-      if (room && !ws.room) ws.room = room;
+
+      // ✅ RESTORE WS DARI ATTACHMENT
+      let room = ws.room || ws.roomname || ws._room;
+      let username = ws.username || ws._username;
+      let wsId = ws._wsId;
+
+      if (!room || !username) {
+        try {
+          const att = ws.deserializeAttachment?.();
+          if (att) {
+            if (!room && att.room) room = att.room;
+            if (!username && att.username) username = att.username;
+            if (!wsId && att.wsId) wsId = att.wsId;
+          }
+        } catch(e) {}
+      }
+
+      if (room) {
+        ws.room = room;
+        ws.roomname = room;
+        ws._room = room;
+      }
+      if (username) {
+        ws.username = username;
+        ws._username = username;
+      }
+      if (wsId) ws._wsId = wsId;
+
+      // ✅ Daftarkan ke registry
+      if (room) {
+        if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
+        this.roomClients.get(room).add(ws);
+        if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+        if (username) {
+          let conns = this.userConnections.get(username);
+          if (!conns) { conns = new Set(); this.userConnections.set(username, conns); }
+          conns.add(ws);
+        }
+      }
+
       await this._handleEventInternal(ws, data);
     } catch(e) {}
   }
 
-  // ✅ SAFESEND — SAMA CHATSERVER
   safeSend(ws, msg) {
     try {
       if (!ws) return false;
@@ -756,52 +855,61 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
-  // ✅ BROADCAST — SAMA CHATSERVER
+  // ============================================================
+  // ✅ BROADCAST — HIBERNASI-SAFE
+  // ============================================================
+
   broadcast(room, msg) {
     try {
       if (this.closing || this.isDestroyed || !room || !msg) return 0;
 
       let clients = this.roomClients?.get(room);
+      let needScan = !clients || clients.size === 0;
 
-      if (!clients || clients.size === 0) {
-        try {
-          const allWs = this.ctx?.getWebSockets?.() || [];
-          if (allWs.length > 0) {
-            clients = new Set();
-            for (const ws of allWs) {
+      // Scan semua WS + restore dari attachment
+      if (needScan) {
+        clients = new Set();
+        let allWs = [];
+        try { allWs = this.ctx?.getWebSockets?.() || []; } catch(e) {}
+
+        for (const ws of allWs) {
+          try {
+            if (!ws || ws.readyState !== 1) continue;
+            if (ws._closing || ws._cleaning) continue;
+
+            // Restore room dari attachment
+            let wsRoom = ws.room || ws.roomname || ws._room;
+            if (!wsRoom) {
               try {
-                if (!ws || ws.readyState !== 1) continue;
-                if (ws._closing || ws._cleaning) continue;
-
-                let wsRoom = ws.room || ws.roomname;
-                if (!wsRoom) {
-                  try {
-                    const att = ws.deserializeAttachment();
-                    if (att) {
-                      wsRoom = att.room;
-                      if (att.username && !ws.username) ws.username = att.username;
-                      if (att.room && !ws.room) ws.room = att.room;
-                      if (att.room && !ws.roomname) ws.roomname = att.room;
-                    }
-                  } catch(e) {}
-                }
-
-                if (wsRoom === room) {
-                  clients.add(ws);
-                  if (!this.wsSet.has(ws)) this.wsSet.add(ws);
-                  if (ws.username) {
-                    let c = this.userConnections.get(ws.username);
-                    if (!c) { c = new Set(); this.userConnections.set(ws.username, c); }
-                    c.add(ws);
-                  }
+                const att = ws.deserializeAttachment?.();
+                if (att?.room) {
+                  wsRoom = att.room;
+                  ws.room = att.room;
+                  ws.roomname = att.room;
+                  ws._room = att.room;
+                  if (att.username) { ws.username = att.username; ws._username = att.username; }
+                  if (att.wsId) ws._wsId = att.wsId;
+                  if (!ws._createdAt) ws._createdAt = att.createdAt || Date.now();
                 }
               } catch(e) {}
             }
-            if (clients.size > 0) {
-              try { this.roomClients.set(room, clients); } catch(e) {}
+
+            // ✅ WAJIB match room persis
+            if (wsRoom !== room) continue;
+
+            clients.add(ws);
+            if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+            if (ws.username) {
+              let conns = this.userConnections.get(ws.username);
+              if (!conns) { conns = new Set(); this.userConnections.set(ws.username, conns); }
+              conns.add(ws);
             }
-          }
-        } catch(e) {}
+          } catch(e) {}
+        }
+
+        if (clients.size > 0) {
+          try { this.roomClients.set(room, clients); } catch(e) {}
+        }
       }
 
       if (!clients || clients.size === 0) return 0;
@@ -811,35 +919,66 @@ export class GameServer {
       let sentCount = 0;
 
       for (const ws of clients) {
-        if (!ws) { try { toRemove.add(ws); } catch(e) {} continue; }
+        if (!ws) { toRemove.add(ws); continue; }
+
         const state = _wsCleanupState.get(ws);
-        if (state && state.cleanupDone) { try { toRemove.add(ws); } catch(e) {} continue; }
-        const wsRoom = ws.room || ws.roomname;
-        if (wsRoom && wsRoom !== room) { try { toRemove.add(ws); } catch(e) {} continue; }
+        if (state && state.cleanupDone) { toRemove.add(ws); continue; }
+
+        // Validasi room
+        let wsRoom = ws.room || ws.roomname || ws._room;
+        if (!wsRoom) {
+          try {
+            const att = ws.deserializeAttachment?.();
+            if (att?.room) {
+              wsRoom = att.room;
+              ws.room = att.room;
+              ws.roomname = att.room;
+              ws._room = att.room;
+            }
+          } catch(e) {}
+        }
+
+        // ✅ WAJIB match — skip yang beda room
+        if (wsRoom !== room) { toRemove.add(ws); continue; }
+
         try {
           if (ws.readyState === 1 && !ws._closing && !ws._cleaning) {
             ws.send(msgStr);
             sentCount++;
           } else {
-            try { toRemove.add(ws); } catch(e) {}
+            toRemove.add(ws);
           }
-        } catch(e) { try { toRemove.add(ws); } catch(e) {} }
+        } catch(e) { toRemove.add(ws); }
       }
 
       if (toRemove.size > 0) {
-        for (const ws of toRemove) {
-          try { clients.delete(ws); } catch(e) {}
-        }
+        for (const ws of toRemove) { try { clients.delete(ws); } catch(e) {} }
       }
 
       return sentCount;
     } catch(e) { return 0; }
   }
 
-  // ✅ FETCH — SAMA CHATSERVER
+  // ============================================================
+  // FETCH
+  // ============================================================
+
   async fetch(req) {
     try {
       if (this.closing || this.isDestroyed) return new Response("Shutting down", { status: 503 });
+
+      // ✅ PAKSA RESTORE SEBELUM PROSES APAPUN
+      if (!this._restoreDone) {
+        try {
+          await Promise.race([
+            this._restorePromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+          ]);
+        } catch(e) {
+          console.log('[FETCH] Restore timeout — forcing restore');
+          try { await this._restoreAllState(); } catch(e2) {}
+        }
+      }
 
       if (this._circuitOpen) {
         const now = Date.now();
@@ -866,23 +1005,6 @@ export class GameServer {
         this._circuitOpen = true;
         this._lastResetTime = now;
         return new Response("Rate limit exceeded", { status: 429, headers: { 'Retry-After': '60', 'Content-Type': 'text/plain' } });
-      }
-
-      if (!this._restored && this._restorePromise) {
-        try {
-          await Promise.race([
-            this._restorePromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Restore timeout')), CONSTANTS.CACHE_LOAD_TIMEOUT || 5000))
-          ]);
-        } catch(e) {
-          if (!this._restored) {
-            this._restored = true;
-            this._restoreDone = true;
-            this._restoreFailed = true;
-            this._isRestoring = false;
-            this._initialized = true;
-          }
-        }
       }
 
       const url = new URL(req.url);
@@ -926,13 +1048,54 @@ export class GameServer {
     }
   }
 
-  // ✅ WEB SOCKET MESSAGE — SAMA CHATSERVER
+  // ============================================================
+  // WEBSOCKET HANDLERS
+  // ============================================================
+
   async webSocketMessage(ws, message) {
     try {
       if (!ws || ws._closing || this.closing || this.isDestroyed || ws._cleaning) return;
       const state = _wsCleanupState.get(ws);
       if (state && state.cleanupDone) return;
 
+      // ✅ RESTORE WS DARI ATTACHMENT (KUNCI!)
+      if (!ws.room && !ws.roomname && !ws._room) {
+        try {
+          const att = ws.deserializeAttachment?.();
+          if (att?.room) {
+            ws.room = att.room;
+            ws.roomname = att.room;
+            ws._room = att.room;
+            if (att.username) { ws.username = att.username; ws._username = att.username; }
+            if (att.wsId) ws._wsId = att.wsId;
+            if (!ws._createdAt) ws._createdAt = att.createdAt || Date.now();
+          }
+        } catch(e) {}
+      }
+
+      // Pastikan flag ada
+      if (ws._closing === undefined) ws._closing = false;
+      if (ws._cleaning === undefined) ws._cleaning = false;
+      if (!ws._createdAt) ws._createdAt = Date.now();
+
+      // Daftarkan ke registry
+      const room = ws.room || ws.roomname || ws._room;
+      if (room) {
+        if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
+        this.roomClients.get(room).add(ws);
+        if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+        if (ws.username) {
+          let conns = this.userConnections.get(ws.username);
+          if (!conns) { conns = new Set(); this.userConnections.set(ws.username, conns); }
+          conns.add(ws);
+        }
+      }
+
+      if (!_wsCleanupState.has(ws)) {
+        _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
+      }
+
+      // Kalau belum restore, pending
       if (!this._restored || this._isRestoring) {
         if (!this._pendingEvents) this._pendingEvents = [];
         if (this._pendingEvents.length >= CONSTANTS.MAX_PENDING_EVENTS) {
@@ -960,14 +1123,28 @@ export class GameServer {
       if (state && state.cleanupDone) return;
       if (ws._cleaning || ws._closing) return;
 
+      // Restore WS kalau perlu
+      if (!ws.room && !ws.roomname && !ws._room) {
+        try {
+          const att = ws.deserializeAttachment?.();
+          if (att?.room) {
+            ws.room = att.room;
+            ws.roomname = att.room;
+            ws._room = att.room;
+            if (att.username) { ws.username = att.username; ws._username = att.username; }
+            if (att.wsId) ws._wsId = att.wsId;
+          }
+        } catch(e) {}
+      }
+
+      // Tunggu restore (maks 3 detik)
       if (!this._restored && this._restorePromise) {
         try {
           await Promise.race([
             this._restorePromise,
-            new Promise(resolve => setTimeout(resolve, CONSTANTS.CACHE_LOAD_TIMEOUT))
+            new Promise(resolve => setTimeout(resolve, 3000))
           ]);
-        } catch(e) { return; }
-        if (!this._restored) return;
+        } catch(e) {}
       }
 
       try {
@@ -984,7 +1161,6 @@ export class GameServer {
     } catch(e) { this._handleError('handleMessage', e); }
   }
 
-  // ✅ WS CLOSE — SYNC, SAMA CHATSERVER
   webSocketClose(ws) {
     try {
       if (!ws || this.isDestroyed) return;
@@ -996,7 +1172,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ✅ WS ERROR — SYNC, SAMA CHATSERVER
   webSocketError(ws) {
     try {
       if (!ws || this.isDestroyed) return;
@@ -1008,7 +1183,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ✅ CLEANUP — SAMA CHATSERVER
   async _cleanupUserCompletely(ws) {
     try {
       if (!ws) return;
@@ -1125,7 +1299,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // DICE LOGIC
+  // DICE ROOM
   // ============================================================
 
   _sendDiceRoomState(ws) {
@@ -1497,7 +1671,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // LOWCARD LOGIC
+  // LOW CARD HELPERS
   // ============================================================
 
   async _broadcastLowCardWinners(room) {
@@ -1592,6 +1766,10 @@ export class GameServer {
       return false;
     }
   }
+
+  // ============================================================
+  // ALARM
+  // ============================================================
 
   async alarm() {
     if (this.closing || this.isDestroyed) return;
@@ -1708,12 +1886,57 @@ export class GameServer {
   }
 
   // ============================================================
-  // EVENT HANDLER — SEMUA PAKAI this.broadcast & this.safeSend
+  // EVENT DISPATCHER
   // ============================================================
 
   async _handleEventInternal(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
+
+      // ✅ RESTORE + DAFTARKAN SETIAP EVENT
+      let currentRoom = ws.room || ws.roomname || ws._room;
+      let currentUser = ws.username || ws._username;
+      let currentWsId = ws._wsId;
+
+      if (!currentRoom || !currentUser || !currentWsId) {
+        try {
+          const att = ws.deserializeAttachment?.();
+          if (att) {
+            if (!currentRoom && att.room) currentRoom = att.room;
+            if (!currentUser && att.username) currentUser = att.username;
+            if (!currentWsId && att.wsId) currentWsId = att.wsId;
+          }
+        } catch(e) {}
+      }
+
+      if (currentRoom) {
+        ws.room = currentRoom;
+        ws.roomname = currentRoom;
+        ws._room = currentRoom;
+      }
+      if (currentUser) {
+        ws.username = currentUser;
+        ws._username = currentUser;
+      }
+      if (currentWsId) ws._wsId = currentWsId;
+      if (!ws._createdAt) ws._createdAt = Date.now();
+      if (ws._closing === undefined) ws._closing = false;
+      if (ws._cleaning === undefined) ws._cleaning = false;
+
+      if (currentRoom) {
+        if (!this.roomClients.has(currentRoom)) this.roomClients.set(currentRoom, new Set());
+        this.roomClients.get(currentRoom).add(ws);
+        if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+        if (currentUser) {
+          let conns = this.userConnections.get(currentUser);
+          if (!conns) { conns = new Set(); this.userConnections.set(currentUser, conns); }
+          conns.add(ws);
+        }
+        if (!_wsCleanupState.has(ws)) {
+          _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
+        }
+      }
+
       const evt = data[0];
 
       if (evt === "switchRoom") { await this.switchRoom(ws, data[1], data[2]); return; }
@@ -1911,12 +2134,16 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // SWITCH ROOM
+  // ============================================================
+
   async switchRoom(ws, room, username = null) {
     try {
       if (this.isDestroyed) { this.safeSend(ws, ["gameLowCardError", "Server is shutting down"]); return; }
       if (!room || typeof room !== 'string' || room.trim() === "") { this.safeSend(ws, ["gameLowCardError", "Invalid room name"]); return; }
       const roomName = room.trim();
-      const wsId = ws._wsId;
+      const wsId = ws._wsId || (++this._wsIdCounter);
       if (!wsId) { this.safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
       if (ws.readyState !== 1 || ws._closing) { this.safeSend(ws, ["gameLowCardError", "Connection closed"]); return; }
 
@@ -1934,10 +2161,12 @@ export class GameServer {
 
       if (!this.roomClients.has(roomName)) this.roomClients.set(roomName, new Set());
       this.roomClients.get(roomName).add(ws);
+      if (!this.wsSet.has(ws)) this.wsSet.add(ws);
 
       ws.room = roomName;
       ws.roomname = roomName;
       ws._room = roomName;
+      ws._wsId = wsId;
       if (username) { ws.username = username; ws._username = username; }
 
       ws.serializeAttachment({ wsId, username: username || ws.username || null, room: roomName, roomname: roomName, createdAt: ws._createdAt || Date.now() });
@@ -1947,6 +2176,10 @@ export class GameServer {
         let conns = this.userConnections.get(finalUsername);
         if (!conns) { conns = new Set(); this.userConnections.set(finalUsername, conns); }
         conns.add(ws);
+      }
+
+      if (!_wsCleanupState.has(ws)) {
+        _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
 
       this.safeSend(ws, ["switchRoomSuccess", roomName]);
@@ -1968,6 +2201,10 @@ export class GameServer {
       this.safeSend(ws, ["gameStatus", isRunning ? "true" : "false"]);
     } catch(e) {}
   }
+
+  // ============================================================
+  // LOW CARD GAME LOGIC
+  // ============================================================
 
   _isGameActuallyRunning(game) { return game?._isActive === true && !game?._gameEnded && game?.players?.size > 0; }
 
@@ -2030,8 +2267,22 @@ export class GameServer {
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
         game.playerWsId.set(usernameClean, wsId);
         this.activeGames.set(room, game);
+
+        ws.room = room;
+        ws.roomname = room;
+        ws._room = room;
+        ws.username = usernameClean;
+        ws._username = usernameClean;
+        ws._wsId = wsId;
+        ws.serializeAttachment({ wsId, username: usernameClean, room, roomname: room, createdAt: ws._createdAt || Date.now() });
+
         if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
         this.roomClients.get(room).add(ws);
+        if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+        let conns = this.userConnections.get(usernameClean);
+        if (!conns) { conns = new Set(); this.userConnections.set(usernameClean, conns); }
+        conns.add(ws);
+
         this.broadcast(room, ["gameLowCardStart", betAmount]);
         this.broadcast(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._startRegistration(room, game);
@@ -2205,7 +2456,7 @@ export class GameServer {
         const timeout = this._trackTimer(setTimeout(() => {
           const currentGame = this.activeGames.get(room);
           if (this._isGameActuallyRunning(currentGame) && !currentGame.drawTimeExpired &&
-              !currentGame.evaluationLocked && !currentGame.numbers?.has(botId) && 
+              !currentGame.evaluationLocked && !currentGame.numbers?.has(botId) &&
               !currentGame.eliminated?.has(botId)) {
             this._handleBotDraw(room, botId, currentGame);
           }
@@ -2422,16 +2673,22 @@ export class GameServer {
         }
         if (game.players.size >= CONSTANTS.MAX_PLAYERS_PER_GAME) { this.safeSend(ws, ["gameLowCardError", "Game is full"]); return; }
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
-        if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
-        this.roomClients.get(room).add(ws);
+
         ws.room = room;
         ws.roomname = room;
+        ws._room = room;
         ws.username = usernameClean;
+        ws._username = usernameClean;
         ws._wsId = wsId;
         ws.serializeAttachment({ wsId, username: usernameClean, room, roomname: room, createdAt: ws._createdAt || Date.now() });
+
+        if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
+        this.roomClients.get(room).add(ws);
+        if (!this.wsSet.has(ws)) this.wsSet.add(ws);
         let conns = this.userConnections.get(usernameClean);
         if (!conns) { conns = new Set(); this.userConnections.set(usernameClean, conns); }
         conns.add(ws);
+
         game.playerWsId.set(usernameClean, wsId);
         this.broadcast(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
       } finally {
@@ -2618,6 +2875,10 @@ export class GameServer {
       this._joinLocks.delete(room);
     } catch(e) {}
   }
+
+  // ============================================================
+  // DESTROY
+  // ============================================================
 
   async destroy() {
     try {
