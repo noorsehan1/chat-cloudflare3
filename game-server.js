@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.0.7 - HIBERNATION FIX: ALL CLIENTS RECEIVE EVENTS
+// VERSION: 17.0.0 - SLOT-BASED ROOM (45 SLOTS PER ROOM)
 // ============================================================
 
 const CONSTANTS = {
@@ -42,6 +42,7 @@ const CONSTANTS = {
   DICE_SESSION_CHECK_INTERVAL_MS: 5000,
   DICE_BROADCAST_DELAY_MS: 5000,
   MAX_PENDING_EVENTS: 100,
+  MAX_SLOTS_PER_ROOM: 45,
 };
 
 const QUIZ_SCHEDULE = {
@@ -58,6 +59,130 @@ const TABLE_NAME = 'game_data';
 function parseTime(timeStr) {
   const [hours, minutes] = timeStr.split(':').map(Number);
   return hours * 60 + minutes;
+}
+
+// ============================================================
+// SLOT-BASED ROOM
+// ============================================================
+
+class SlotRoom {
+  constructor(roomName) {
+    this.roomName = roomName;
+    this.slots = new Array(CONSTANTS.MAX_SLOTS_PER_ROOM).fill(null);
+  }
+
+  _findEmptySlot() {
+    for (let i = 0; i < this.slots.length; i++) {
+      if (this.slots[i] === null) return i;
+    }
+    return -1;
+  }
+
+  _findSlotByWsId(wsId) {
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (s && s.wsId === wsId) return i;
+    }
+    return -1;
+  }
+
+  _findSlotByUsername(username) {
+    if (!username) return -1;
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (s && s.username === username) return i;
+    }
+    return -1;
+  }
+
+  add(ws, username = null) {
+    const wsId = ws._wsId;
+    if (!wsId) return -1;
+
+    const existing = this._findSlotByWsId(wsId);
+    if (existing !== -1) {
+      this.slots[existing].ws = ws;
+      if (username) this.slots[existing].username = username;
+      return existing;
+    }
+
+    const byUser = this._findSlotByUsername(username);
+    if (byUser !== -1) {
+      this.slots[byUser].wsId = wsId;
+      this.slots[byUser].ws = ws;
+      this.slots[byUser].joinedAt = Date.now();
+      return byUser;
+    }
+
+    const idx = this._findEmptySlot();
+    if (idx === -1) return -1;
+
+    this.slots[idx] = {
+      wsId,
+      ws,
+      username: username || null,
+      joinedAt: Date.now()
+    };
+    return idx;
+  }
+
+  remove(wsId) {
+    const idx = this._findSlotByWsId(wsId);
+    if (idx === -1) return false;
+    this.slots[idx] = null;
+    return true;
+  }
+
+  removeByUsername(username) {
+    const idx = this._findSlotByUsername(username);
+    if (idx === -1) return false;
+    this.slots[idx] = null;
+    return true;
+  }
+
+  getOccupied() {
+    const result = [];
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (s && s.ws && s.ws.readyState === 1 && !s.ws._closing && !s.ws._cleaning) {
+        result.push({ slotIndex: i, ...s });
+      }
+    }
+    return result;
+  }
+
+  count() {
+    let c = 0;
+    for (const s of this.slots) if (s) c++;
+    return c;
+  }
+
+  emptyCount() {
+    let c = 0;
+    for (const s of this.slots) if (!s) c++;
+    return c;
+  }
+
+  cleanupDeadSlots() {
+    let cleaned = 0;
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (s && (!s.ws || s.ws.readyState !== 1 || s.ws._closing || s.ws._cleaning)) {
+        this.slots[i] = null;
+        cleaned++;
+      }
+    }
+    return cleaned;
+  }
+
+  debug() {
+    const out = [];
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (s) out.push(`[${i}]${s.username || '?'}(ws${s.wsId})`);
+    }
+    return out.join(' ') || '(empty)';
+  }
 }
 
 // ============================================================
@@ -525,7 +650,7 @@ class AlarmScheduler {
 }
 
 // ============================================================
-// GAME SERVER - FULL CLASS
+// GAME SERVER
 // ============================================================
 
 export class GameServer {
@@ -554,6 +679,11 @@ export class GameServer {
       this.wsClients = new Map();
       this.clientRooms = new Map();
       this.userConnections = new Map();
+
+      // ✅ SLOT-BASED ROOM
+      this.roomSlots = new Map();   // room -> SlotRoom
+      this.wsIdToRoom = new Map();  // wsId -> room
+
       this._eventQueue = [];
       this._allTimers = new Set();
       this._lastNotifTime = {};
@@ -654,6 +784,8 @@ export class GameServer {
       this.wsClients = new Map();
       this.clientRooms = new Map();
       this.userConnections = new Map();
+      this.roomSlots = new Map();
+      this.wsIdToRoom = new Map();
       this._eventQueue = [];
       this._allTimers = new Set();
       this._cleanupTimers = new Map();
@@ -683,8 +815,8 @@ export class GameServer {
         this._diceSessionActive = true;
         this._diceSessionEnded = false;
         this._diceGameStarted = false;
-        const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-        if (clients && clients.size > 0) {
+        const sr = this.roomSlots.get(CONSTANTS.DICE_ROOM);
+        if (sr && sr.count() > 0) {
           this._startDiceGameIfNotStarted();
         }
       } else {
@@ -703,7 +835,6 @@ export class GameServer {
     }
   }
 
-  // ✅ PATCH 1: retry + selalu daftarkan
   async _initWebSockets() {
     try {
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -725,7 +856,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ✅ PATCH 2: jangan skip WS tanpa attachment
   async _restoreSingleWebSocket(ws) {
     try {
       if (!ws) return;
@@ -761,27 +891,10 @@ export class GameServer {
         room = CONSTANTS.DICE_ROOM;
       }
 
-      if (room) {
-        ws.room = room;
-        ws.roomname = room;
-        if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
-        this.wsClients.get(room).add(wsId);
-        this.clientRooms.set(wsId, room);
-      }
-
       this.wsMap.set(wsId, ws);
 
-      if (username) {
-        let conn = this.userConnections.get(username);
-        if (!conn) {
-          conn = { wsId, ws, room: room || null, timestamp: Date.now() };
-          this.userConnections.set(username, conn);
-        } else {
-          conn.wsId = wsId;
-          conn.ws = ws;
-          conn.room = room || conn.room;
-          conn.timestamp = Date.now();
-        }
+      if (room) {
+        this._joinRoomSlot(ws, room, username);
       }
 
       try {
@@ -821,6 +934,8 @@ export class GameServer {
         roomMap.get(room).add(wsId);
         clientRoomMap.set(wsId, room);
         this.wsMap.set(wsId, ws);
+        // Masukkan ke slot
+        this._joinRoomSlot(ws, room, ws.username);
       }
 
       for (const [wsId, ws] of this.wsMap) {
@@ -853,7 +968,111 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
-  // ✅ PATCH 7: rebuild WS sebelum proses pending events
+  // ============================================================
+  // SLOT HELPERS
+  // ============================================================
+
+  _getOrCreateSlotRoom(room) {
+    try {
+      if (!room || typeof room !== 'string') return null;
+      let sr = this.roomSlots.get(room);
+      if (!sr) {
+        sr = new SlotRoom(room);
+        this.roomSlots.set(room, sr);
+      }
+      return sr;
+    } catch(e) { return null; }
+  }
+
+  _joinRoomSlot(ws, room, username = null) {
+    try {
+      if (!ws || !room) return -1;
+      const wsId = ws._wsId;
+      if (!wsId) return -1;
+
+      // Lepas dari room lama kalau beda
+      const oldRoom = this.wsIdToRoom.get(wsId);
+      if (oldRoom && oldRoom !== room) {
+        this._leaveRoomSlot(wsId, oldRoom);
+      }
+
+      const sr = this._getOrCreateSlotRoom(room);
+      if (!sr) return -1;
+
+      const idx = sr.add(ws, username);
+      if (idx === -1) return -1; // room penuh
+
+      this.wsIdToRoom.set(wsId, room);
+
+      ws.room = room;
+      ws.roomname = room;
+      if (username) ws.username = username;
+
+      if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
+      this.wsClients.get(room).add(wsId);
+      this.clientRooms.set(wsId, room);
+      this.wsMap.set(wsId, ws);
+
+      try {
+        ws.serializeAttachment({
+          wsId,
+          username: ws.username || null,
+          room,
+          roomname: room,
+          createdAt: ws._createdAt || Date.now()
+        });
+      } catch(e) {}
+
+      if (username) {
+        this.userConnections.set(username, {
+          wsId, ws, room, timestamp: Date.now()
+        });
+      }
+
+      return idx;
+    } catch(e) { return -1; }
+  }
+
+  _leaveRoomSlot(wsId, room = null) {
+    try {
+      if (!wsId) return false;
+      const actualRoom = room || this.wsIdToRoom.get(wsId);
+      if (!actualRoom) return false;
+
+      const sr = this.roomSlots.get(actualRoom);
+      if (sr) sr.remove(wsId);
+
+      this.wsIdToRoom.delete(wsId);
+
+      const clients = this.wsClients.get(actualRoom);
+      if (clients) {
+        clients.delete(wsId);
+        if (clients.size === 0) this.wsClients.delete(actualRoom);
+      }
+      this.clientRooms.delete(wsId);
+
+      return true;
+    } catch(e) { return false; }
+  }
+
+  _getRoomSlotUsers(room) {
+    try {
+      const sr = this.roomSlots.get(room);
+      if (!sr) return [];
+      sr.cleanupDeadSlots();
+      return sr.getOccupied().map(s => ({
+        wsId: s.wsId,
+        ws: s.ws,
+        username: s.username || 'Anonymous',
+        slotIndex: s.slotIndex
+      }));
+    } catch(e) { return []; }
+  }
+
+  // ============================================================
+  // PENDING EVENTS
+  // ============================================================
+
   async _processPendingEvents() {
     try {
       if (!this._pendingEvents || this._pendingEvents.length === 0) return;
@@ -912,7 +1131,7 @@ export class GameServer {
               try {
                 const room = evt.room || ws.room || ws.roomname;
                 if (room) {
-                  this._ensureClientInRoom(ws, room, evt.username || ws.username);
+                  this._joinRoomSlot(ws, room, evt.username || ws.username);
                 }
                 if (evt.attachment) {
                   try {
@@ -949,42 +1168,7 @@ export class GameServer {
       const wsId = ws._wsId;
       if (!wsId) return false;
 
-      this.wsMap.set(wsId, ws);
-
-      if (!this.wsClients.has(room)) {
-        this.wsClients.set(room, new Set());
-      }
-      const clients = this.wsClients.get(room);
-      if (!clients.has(wsId)) {
-        clients.add(wsId);
-      }
-
-      this.clientRooms.set(wsId, room);
-
-      ws.room = room;
-      ws.roomname = room;
-      if (username) ws.username = username;
-
-      try {
-        const existingAtt = ws.deserializeAttachment?.() || {};
-        ws.serializeAttachment({
-          wsId: wsId,
-          username: ws.username || existingAtt.username || null,
-          room: room,
-          roomname: room,
-          createdAt: existingAtt.createdAt || Date.now()
-        });
-      } catch(e) {}
-
-      if (ws.username) {
-        this.userConnections.set(ws.username, {
-          wsId: wsId,
-          ws: ws,
-          room: room,
-          timestamp: Date.now()
-        });
-      }
-
+      this._joinRoomSlot(ws, room, username || ws.username);
       return true;
     } catch(e) { return false; }
   }
@@ -996,7 +1180,7 @@ export class GameServer {
       if (room) return room;
       const wsId = ws._wsId;
       if (wsId) {
-        room = this.clientRooms.get(wsId);
+        room = this.clientRooms.get(wsId) || this.wsIdToRoom.get(wsId);
         if (room) return room;
       }
       try {
@@ -1029,104 +1213,71 @@ export class GameServer {
     } catch(e) { return null; }
   }
 
-  // ✅ PATCH 5: scan ctx.getWebSockets() sebagai sumber #1
   _getRoomUsers(room) {
     try {
       if (!room) return [];
+
+      // Sumber utama: slot
+      const slotUsers = this._getRoomSlotUsers(room);
+      if (slotUsers.length > 0) return slotUsers;
+
+      // Fallback: scan wsMap
       const users = [];
-      const seenWsIds = new Set();
-
-      let allWs = [];
-      try { allWs = this.ctx.getWebSockets() || []; } catch(e) { allWs = []; }
-
-      for (const ws of allWs) {
-        if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
-
-        let att = null;
-        try { att = ws.deserializeAttachment?.(); } catch(e) {}
-
-        let wsId = ws._wsId || att?.wsId;
-        if (!wsId) continue;
-        if (seenWsIds.has(wsId)) continue;
-
-        const wsRoom = ws.room || ws.roomname || att?.room || att?.roomname;
-        if (wsRoom === room) {
-          const username = ws.username || att?.username || 'Anonymous';
-          if (!ws.username && att?.username) ws.username = att.username;
-          ws.room = room;
-          ws.roomname = room;
-          this.wsMap.set(wsId, ws);
-          this.clientRooms.set(wsId, room);
-          users.push({ wsId, ws, username });
-          seenWsIds.add(wsId);
-        }
-      }
-
+      const seen = new Set();
       for (const [wsId, ws] of this.wsMap) {
         if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
-        if (seenWsIds.has(wsId)) continue;
-
+        if (seen.has(wsId)) continue;
         if (ws.room === room || ws.roomname === room) {
           users.push({ wsId, ws, username: ws.username || 'Anonymous' });
-          seenWsIds.add(wsId);
+          seen.add(wsId);
         }
       }
-
-      for (const [wsId, clientRoom] of this.clientRooms) {
-        if (clientRoom !== room) continue;
-        if (seenWsIds.has(wsId)) continue;
-
-        const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
-          users.push({ wsId, ws, username: ws.username || 'Anonymous' });
-          seenWsIds.add(wsId);
-        }
-      }
-
-      if (users.length > 0) {
-        const wsIds = new Set(users.map(u => u.wsId));
-        this.wsClients.set(room, wsIds);
-        for (const u of users) this.clientRooms.set(u.wsId, room);
-      }
-
       return users;
     } catch(e) { return []; }
   }
 
-  // ✅ PATCH 4: rebuild room dulu sebelum broadcast
   _broadcastToRoom(room, message) {
     try {
       if (this.closing || this.isDestroyed || !room || !message) return 0;
 
+      // Rebuild dari ctx untuk sinkronisasi
       this._ensureRoomSync(room);
 
-      const users = this._getRoomUsers(room);
+      const users = this._getRoomSlotUsers(room);
       if (!users || users.length === 0) return 0;
 
       const msgStr = JSON.stringify(message);
       let sentCount = 0;
-      const toRemove = [];
+      const deadWsIds = [];
 
       for (const user of users) {
         const ws = user.ws;
-        if (!ws) { toRemove.push(user.wsId); continue; }
+        if (!ws) { deadWsIds.push(user.wsId); continue; }
 
         if (ws.readyState === 1 && !ws._closing && !ws._cleaning) {
           try {
             ws.send(msgStr);
             sentCount++;
           } catch(e) {
-            toRemove.push(user.wsId);
+            deadWsIds.push(user.wsId);
           }
         } else {
-          toRemove.push(user.wsId);
+          deadWsIds.push(user.wsId);
         }
       }
 
-      if (toRemove.length > 0) {
+      // Bersihkan slot mati
+      if (deadWsIds.length > 0) {
+        const sr = this.roomSlots.get(room);
+        if (sr) {
+          for (const wsId of deadWsIds) {
+            sr.remove(wsId);
+            this.wsIdToRoom.delete(wsId);
+          }
+        }
         const clients = this.wsClients.get(room);
         if (clients) {
-          for (const wsId of toRemove) {
+          for (const wsId of deadWsIds) {
             clients.delete(wsId);
             this.clientRooms.delete(wsId);
           }
@@ -1137,15 +1288,20 @@ export class GameServer {
     } catch(e) { return 0; }
   }
 
-  // ✅ PATCH 3: scan ctx.getWebSockets() sebagai sumber kebenaran
   _ensureRoomSync(room) {
     try {
       if (!room || typeof room !== 'string') return false;
 
-      const wsIds = new Set();
+      const sr = this._getOrCreateSlotRoom(room);
+      if (!sr) return false;
 
       let allWs = [];
       try { allWs = this.ctx.getWebSockets() || []; } catch(e) { allWs = []; }
+
+      const slottedWsIds = new Set();
+      for (const s of sr.slots) {
+        if (s) slottedWsIds.add(s.wsId);
+      }
 
       for (const ws of allWs) {
         if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
@@ -1155,43 +1311,28 @@ export class GameServer {
 
         let wsId = ws._wsId || att?.wsId;
         if (!wsId) continue;
-
-        this.wsMap.set(wsId, ws);
+        if (slottedWsIds.has(wsId)) continue;
 
         const wsRoom = ws.room || ws.roomname || att?.room || att?.roomname;
         if (wsRoom === room) {
-          if (!ws.username && att?.username) ws.username = att.username;
+          const username = ws.username || att?.username || null;
+          if (username && !ws.username) ws.username = username;
           ws.room = room;
           ws.roomname = room;
-          wsIds.add(wsId);
-          this.clientRooms.set(wsId, room);
+          this.wsMap.set(wsId, ws);
+
+          const idx = sr.add(ws, username);
+          if (idx !== -1) {
+            this.wsIdToRoom.set(wsId, room);
+            this.clientRooms.set(wsId, room);
+            if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
+            this.wsClients.get(room).add(wsId);
+          }
         }
       }
 
-      for (const [wsId, ws] of this.wsMap) {
-        if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
-        if (wsIds.has(wsId)) continue;
-
-        if (ws.room === room || ws.roomname === room) {
-          wsIds.add(wsId);
-          this.clientRooms.set(wsId, room);
-        }
-      }
-
-      for (const [wsId, clientRoom] of this.clientRooms) {
-        if (clientRoom !== room) continue;
-        if (wsIds.has(wsId)) continue;
-        const ws = this.wsMap.get(wsId);
-        if (ws && ws.readyState === 1 && !ws._closing && !ws._cleaning) {
-          wsIds.add(wsId);
-        }
-      }
-
-      if (wsIds.size > 0) {
-        this.wsClients.set(room, wsIds);
-        return true;
-      }
-      return false;
+      sr.cleanupDeadSlots();
+      return sr.count() > 0;
     } catch(e) { return false; }
   }
 
@@ -1257,8 +1398,8 @@ export class GameServer {
       if (!this.alarmScheduler.isDiceTime()) return;
       if (this.currentDiceRoll || this._isShowingDice || this._diceLock) return;
       if (this._diceTimeUpCooldown) return;
-      const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-      if (!clients || clients.size === 0) return;
+      const sr = this.roomSlots.get(CONSTANTS.DICE_ROOM);
+      if (!sr || sr.count() === 0) return;
       this._diceGameStarted = true;
       this._diceSessionActive = true;
       this._diceSessionEnded = false;
@@ -1272,8 +1413,8 @@ export class GameServer {
   _startDiceFast() {
     try {
       if (this._diceGameStarted && this.currentDiceRoll) return;
-      const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-      if (!clients || clients.size === 0) {
+      const sr = this.roomSlots.get(CONSTANTS.DICE_ROOM);
+      if (!sr || sr.count() === 0) {
         this._diceLock = false;
         this._isShowingDice = false;
         this._diceGameStarted = false;
@@ -1382,8 +1523,8 @@ export class GameServer {
         this._diceLoopCounter = 0;
         this._diceGameStarted = false;
         if (this._diceSessionActive && !this._diceSessionEnded) {
-          const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-          if (clients && clients.size > 0) {
+          const sr = this.roomSlots.get(CONSTANTS.DICE_ROOM);
+          if (sr && sr.count() > 0) {
             if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
               this._startDiceGameIfNotStarted();
             }
@@ -1629,8 +1770,8 @@ export class GameServer {
       this._diceLoopCounter = 0;
       this._diceGameStarted = false;
       if (this._diceSessionActive && !this._diceSessionEnded) {
-        const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-        if (clients && clients.size > 0) {
+        const sr = this.roomSlots.get(CONSTANTS.DICE_ROOM);
+        if (sr && sr.count() > 0) {
           if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock) {
             this._startDiceGameIfNotStarted();
           }
@@ -1857,8 +1998,8 @@ export class GameServer {
           this._diceSessionEnded = false;
           this._diceGameStarted = false;
           this._broadcastToRoom(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session started!"]);
-          const clients = this.wsClients?.get(CONSTANTS.DICE_ROOM);
-          if (clients && clients.size > 0) {
+          const sr = this.roomSlots.get(CONSTANTS.DICE_ROOM);
+          if (sr && sr.count() > 0) {
             if (!this.currentDiceRoll && !this._isShowingDice && !this._diceLock && !this._diceTimeUpCooldown) {
               this._diceStartedByUser = true;
               this._startDiceGameIfNotStarted();
@@ -1964,7 +2105,6 @@ export class GameServer {
     }
   }
 
-  // ✅ PATCH 8: rebuild WS setiap ada pesan masuk
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || ws._cleaning || this.closing || this.isDestroyed) return;
 
@@ -2002,8 +2142,8 @@ export class GameServer {
         }
       }
 
-      if (ws.room && ws.username && ws._wsId) {
-        this._ensureClientInRoom(ws, ws.room, ws.username);
+      if (ws.room && ws._wsId) {
+        this._joinRoomSlot(ws, ws.room, ws.username);
       }
 
       const data = JSON.parse(message);
@@ -2020,30 +2160,18 @@ export class GameServer {
       const username = attachment?.username || ws.username;
       const room = attachment?.room || ws.room;
       const wsId = attachment?.wsId || ws._wsId;
+
       if (wsId) {
         this._broadcastedCountdown.delete(`countdown_${wsId}`);
+        this._leaveRoomSlot(wsId, room);
+        this.wsMap.delete(wsId);
       }
       if (username) this.userConnections.delete(username);
-      if (room && wsId) {
-        const clients = this.wsClients.get(room);
-        if (clients) {
-          clients.delete(wsId);
-          if (clients.size === 0) this.wsClients.delete(room);
-        }
-      }
-      if (wsId) {
-        this.wsMap.delete(wsId);
-        this.clientRooms.delete(wsId);
-      }
-      for (const [r, clients] of this.wsClients) {
-        if (wsId && clients.has(wsId)) {
-          clients.delete(wsId);
-          if (clients.size === 0) this.wsClients.delete(r);
-        }
-      }
+
       try {
         ws.serializeAttachment({ wsId, username: null, room: null, roomname: null, createdAt: Date.now() });
       } catch(e) {}
+
       if (room && username) {
         this._cleanupGameAsync(wsId, username, room).catch(() => {});
       }
@@ -2057,21 +2185,17 @@ export class GameServer {
       const username = attachment?.username || ws.username;
       const room = attachment?.room || ws.room;
       const wsId = attachment?.wsId || ws._wsId;
-      if (username) this.userConnections.delete(username);
-      if (room && wsId) {
-        const clients = this.wsClients.get(room);
-        if (clients) {
-          clients.delete(wsId);
-          if (clients.size === 0) this.wsClients.delete(room);
-        }
-      }
+
       if (wsId) {
+        this._leaveRoomSlot(wsId, room);
         this.wsMap.delete(wsId);
-        this.clientRooms.delete(wsId);
       }
+      if (username) this.userConnections.delete(username);
+
       try {
         ws.serializeAttachment({ wsId, username: null, room: null, roomname: null, createdAt: Date.now() });
       } catch(e) {}
+
       if (room && username) {
         this._cleanupGameAsync(wsId, username, room).catch(() => {});
       }
@@ -2089,7 +2213,6 @@ export class GameServer {
         game._gameEnded = true;
         game._isActive = false;
         this._forceCleanupGame(room, game);
-        this._cleanupWsData(wsId, username, room);
         return;
       }
       if (game._phase === 'registration') {
@@ -2105,7 +2228,6 @@ export class GameServer {
             game._gameEnded = true;
             game._isActive = false;
             this._forceCleanupGame(room, game);
-            this._cleanupWsData(wsId, username, room);
             return;
           }
         }
@@ -2114,7 +2236,6 @@ export class GameServer {
           game._isActive = false;
           this._forceCleanupGame(room, game);
         }
-        this._cleanupWsData(wsId, username, room);
         return;
       }
       if (game._phase === 'draw' || game._phase === 'evaluating') {
@@ -2133,7 +2254,6 @@ export class GameServer {
             game._gameEnded = true;
             game._isActive = false;
             this._forceCleanupGame(room, game);
-            this._cleanupWsData(wsId, username, room);
             return;
           }
           if (game._phase === 'draw' && !game.evaluationLocked) {
@@ -2149,23 +2269,6 @@ export class GameServer {
               }, CONSTANTS.EVALUATION_DELAY_MS));
               game._evalTimer = evalTimer;
             }
-          }
-        }
-      }
-    } catch(e) {}
-  }
-
-  _cleanupWsData(wsId, username, room) {
-    try {
-      if (wsId) {
-        this.wsMap.delete(wsId);
-        this.clientRooms.delete(wsId);
-        if (username) this.userConnections.delete(username);
-        if (room) {
-          const clients = this.wsClients.get(room);
-          if (clients) {
-            clients.delete(wsId);
-            if (clients.size === 0) this.wsClients.delete(room);
           }
         }
       }
@@ -2225,7 +2328,6 @@ export class GameServer {
     this._processingQueue = false;
   }
 
-  // ✅ PATCH 6: rebuild room sebelum handle event
   async _processEventItem(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
@@ -2246,8 +2348,8 @@ export class GameServer {
       }
 
       const room = this._getClientRoom(ws);
-      if (room && ws.username) {
-        this._ensureClientInRoom(ws, room, ws.username);
+      if (room && ws._wsId) {
+        this._joinRoomSlot(ws, room, ws.username);
       }
 
       await this._handleEventInternal(ws, data);
@@ -2261,6 +2363,18 @@ export class GameServer {
 
       if (evt === "switchRoom") {
         await this.switchRoom(ws, data[1], data[2]);
+        return;
+      }
+
+      if (evt === "debugSlots") {
+        const room = data[1] || ws.room;
+        const sr = this.roomSlots.get(room);
+        this._safeSend(ws, ["debugSlotsResult", {
+          room,
+          debug: sr ? sr.debug() : "(no slot room)",
+          count: sr ? sr.count() : 0,
+          empty: sr ? sr.emptyCount() : 0
+        }]);
         return;
       }
 
@@ -2668,7 +2782,6 @@ export class GameServer {
     };
   }
 
-  // ✅ switchRoom — sync attachment + semua map
   async switchRoom(ws, room, username = null) {
     try {
       if (this.isDestroyed) {
@@ -2689,74 +2802,34 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Connection closed"]);
         return;
       }
-      const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
-      if (currentRoom === roomName) {
-        const finalUser = username || ws.username || null;
-        try {
-          ws.serializeAttachment({
-            wsId: wsId,
-            username: finalUser,
-            room: roomName,
-            roomname: roomName,
-            createdAt: ws._createdAt || Date.now()
-          });
-        } catch(e) {}
-        this.wsMap.set(wsId, ws);
-        this.clientRooms.set(wsId, roomName);
-        if (!this.wsClients.has(roomName)) {
-          this.wsClients.set(roomName, new Set());
-        }
-        this.wsClients.get(roomName).add(wsId);
-        if (finalUser) {
-          this.userConnections.set(finalUser, {
-            wsId: wsId, ws: ws, room: roomName, timestamp: Date.now()
-          });
-        }
 
-        if (roomName === CONSTANTS.DICE_ROOM) {
-          this._sendDiceRoomState(ws);
-        }
+      const finalUser = username || ws.username || null;
+      const currentRoom = this.wsIdToRoom.get(wsId) ||
+                          ws.room || ws.roomname ||
+                          this.clientRooms.get(wsId);
+
+      if (currentRoom === roomName) {
+        this._joinRoomSlot(ws, roomName, finalUser);
+        if (roomName === CONSTANTS.DICE_ROOM) this._sendDiceRoomState(ws);
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         return;
       }
+
+      // Cek kapasitas room baru (kalau wsId belum ada di room itu)
+      const sr = this._getOrCreateSlotRoom(roomName);
+      if (sr && sr.emptyCount() === 0 && sr._findSlotByWsId(wsId) === -1) {
+        this._safeSend(ws, ["gameLowCardError", `Room full (${CONSTANTS.MAX_SLOTS_PER_ROOM}/${CONSTANTS.MAX_SLOTS_PER_ROOM})`]);
+        return;
+      }
+
       if (currentRoom) {
-        const clients = this.wsClients.get(currentRoom);
-        if (clients) {
-          clients.delete(wsId);
-          if (clients.size === 0) this.wsClients.delete(currentRoom);
-        }
+        this._leaveRoomSlot(wsId, currentRoom);
       }
 
-      ws.room = roomName;
-      ws.roomname = roomName;
-      if (username) ws.username = username;
-
-      const finalUser = username || ws.username || null;
-
-      try {
-        ws.serializeAttachment({
-          wsId: wsId,
-          username: finalUser,
-          room: roomName,
-          roomname: roomName,
-          createdAt: ws._createdAt || Date.now()
-        });
-      } catch(e) {}
-
-      this.wsMap.set(wsId, ws);
-      this.clientRooms.set(wsId, roomName);
-      if (!this.wsClients.has(roomName)) {
-        this.wsClients.set(roomName, new Set());
-      }
-      this.wsClients.get(roomName).add(wsId);
-
-      if (finalUser) {
-        this.userConnections.set(finalUser, {
-          wsId: wsId,
-          ws: ws,
-          room: roomName,
-          timestamp: Date.now()
-        });
+      const idx = this._joinRoomSlot(ws, roomName, finalUser);
+      if (idx === -1) {
+        this._safeSend(ws, ["gameLowCardError", "Room is full"]);
+        return;
       }
 
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
@@ -2795,45 +2868,15 @@ export class GameServer {
 
   _addClient(room, ws, username = null) {
     try {
-      if (!ws) return;
+      if (!ws || !room) return;
       const wsId = this._getWsId(ws);
       if (!wsId) {
         this._safeSend(ws, ["gameLowCardError", "Connection error"]);
         return;
       }
-      if (this.clientRooms.has(wsId)) {
-        const oldRoom = this.clientRooms.get(wsId);
-        if (oldRoom && oldRoom !== room) {
-          this._removeClientFromRoom(oldRoom, wsId);
-        }
-      }
-      if (!this.wsClients.has(room)) {
-        this.wsClients.set(room, new Set());
-      }
-      this.wsClients.get(room).add(wsId);
-      this.clientRooms.set(wsId, room);
-      this.wsMap.set(wsId, ws);
-      ws.room = room;
-      ws.roomname = room;
-      if (username) ws.username = username;
-      ws.serializeAttachment({
-        wsId: wsId,
-        username: username || null,
-        room: room,
-        roomname: room,
-        createdAt: ws._createdAt || Date.now()
-      });
-      if (username) {
-        let conn = this.userConnections.get(username);
-        if (conn) {
-          conn.room = room;
-          conn.timestamp = Date.now();
-          conn.ws = ws;
-          conn.wsId = wsId;
-        } else {
-          this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() });
-        }
-        this._reconnectAttempts.delete(username);
+      const idx = this._joinRoomSlot(ws, room, username);
+      if (idx === -1) {
+        this._safeSend(ws, ["gameLowCardError", "Room is full"]);
       }
     } catch(e) {}
   }
@@ -2841,13 +2884,7 @@ export class GameServer {
   _removeClientFromRoom(room, wsId) {
     try {
       if (!room || !wsId) return;
-      const clients = this.wsClients.get(room);
-      if (clients) {
-        clients.delete(wsId);
-        if (clients.size === 0) {
-          this.wsClients.delete(room);
-        }
-      }
+      this._leaveRoomSlot(wsId, room);
     } catch(e) {}
   }
 
@@ -3752,6 +3789,8 @@ export class GameServer {
       this._checkLocks.clear();
       this._closeLocks.clear();
       this._cleanupTimers.clear();
+      this.roomSlots.clear();
+      this.wsIdToRoom.clear();
       if (this.alarmScheduler) {
         await this.alarmScheduler.cleanup();
       }
