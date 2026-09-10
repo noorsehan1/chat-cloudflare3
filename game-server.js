@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.6.0 - NEXT DICE ONCE + RECORDING ADMIN + 4 BOT RULES
+// VERSION: 16.7.0 - CLEAN DICE EVENTS + NO DUPLICATE
 // ============================================================
 
 const CONSTANTS = {
@@ -642,7 +642,7 @@ export class GameServer {
       ws._closing = false;
       ws._cleaning = false;
       ws._createdAt = attachment?.createdAt || ws._createdAt || Date.now();
-      ws._nextSessionSent = false;  // ✅ RESET flag
+      ws._nextSessionSent = false;
 
       if (!this.wsSet.has(ws)) this.wsSet.add(ws);
       if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
@@ -1012,7 +1012,7 @@ export class GameServer {
         server.roomname = null;
         server._room = null;
         server._createdAt = Date.now();
-        server._nextSessionSent = false;  // ✅ INIT flag
+        server._nextSessionSent = false;
 
         _wsCleanupState.set(server, { cleanupDone: false, cleaning: false, cleanupStart: null });
         this.wsSet.add(server);
@@ -1239,7 +1239,6 @@ export class GameServer {
 
       this.broadcast(room, ["gameLowCardError", `${username} left the game`]);
 
-      // ✅ BOT: WAJIB 4 kalau human ≤ 1
       if (game._phase !== 'registration' && !game._botsAdded) {
         const humanCount = this._countHumanPlayers(game);
         if (humanCount <= 1) {
@@ -1277,35 +1276,39 @@ export class GameServer {
     try {
       if (!ws || ws.readyState !== 1) return;
       const isDiceTime = this.alarmScheduler.isDiceTime();
+      
       if (isDiceTime) {
-        this.safeSend(ws, ["diceSessionStatus", "active"]);
         const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
         if (!this._diceGameStarted && !this.currentDiceRoll && !this._diceLock) {
           this._startDiceGameIfNotStarted();
         }
         if (isGameRunning) {
           this.safeSend(ws, ["diceRoll", {
-            value: this.currentDiceRoll.value, timestamp: this.currentDiceRoll.timestamp,
-            answerTime: 20, canAnswerNow: true, round: this._diceRound
+            value: this.currentDiceRoll.value,
+            timestamp: this.currentDiceRoll.timestamp,
+            answerTime: 20,
+            canAnswerNow: true,
+            round: this._diceRound
           }]);
         }
       } else {
-        // ✅ KIRIM next session HANYA SEKALI per WS
+        // ✅ SATU-SATUNYA sumber untuk user baru: diceNotification
         if (!ws._nextSessionSent) {
-          const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
-          this.safeSend(ws, ["diceSessionStatus", "inactive"]);
-          if (timeInfo && timeInfo.nextSession) {
-            this.safeSend(ws, ["diceNextSession", {
-              startTime: timeInfo.nextSession.start, 
-              endTime: timeInfo.nextSession.end,
-              hoursLeft: timeInfo.hours, 
-              minutesLeft: timeInfo.minutes, 
-              text: timeInfo.text
-            }]);
-            ws._nextSessionSent = true;
-          }
-        } else {
-          this.safeSend(ws, ["diceSessionStatus", "inactive"]);
+          ws._nextSessionSent = true;
+          const timer = setTimeout(() => {
+            try {
+              if (!ws || ws.readyState !== 1 || ws._closing) return;
+              const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
+              if (timeInfo && timeInfo.nextSession) {
+                this.safeSend(ws, ["diceNotification", 
+                  `Next dice game in: ${timeInfo.text} (${timeInfo.nextSession.start} - ${timeInfo.nextSession.end})`
+                ]);
+              } else {
+                this.safeSend(ws, ["diceNotification", "Waiting..."]);
+              }
+            } catch(e) {}
+          }, 5000);
+          this._trackTimer(timer);
         }
       }
     } catch(e) {}
@@ -1776,7 +1779,7 @@ export class GameServer {
           this._diceGameStarted = false;
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session started!"]);
           
-          // ✅ RESET flag nextSessionSent untuk semua client
+          // ✅ Reset flag nextSessionSent untuk semua client
           const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
           if (clients) {
             for (const ws of clients) {
@@ -1803,25 +1806,13 @@ export class GameServer {
         this._diceGameStarted = false;
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "Dice session ended"]);
         
-        // ✅ KIRIM next session ke SEMUA client — SEKALI
+        // ✅ KIRIM next session via diceNotification
         try {
           const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
           if (timeInfo && timeInfo.nextSession) {
-            this.broadcast(CONSTANTS.DICE_ROOM, ["diceNextSession", {
-              startTime: timeInfo.nextSession.start,
-              endTime: timeInfo.nextSession.end,
-              hoursLeft: timeInfo.hours,
-              minutesLeft: timeInfo.minutes,
-              text: timeInfo.text
-            }]);
-            
-            // ✅ Set flag nextSessionSent untuk semua client
-            const clients = this.roomClients?.get(CONSTANTS.DICE_ROOM);
-            if (clients) {
-              for (const ws of clients) {
-                try { ws._nextSessionSent = true; } catch(e) {}
-              }
-            }
+            this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", 
+              `Next dice game in: ${timeInfo.text} (${timeInfo.nextSession.start} - ${timeInfo.nextSession.end})`
+            ]);
           }
         } catch(e) {}
         
@@ -1947,7 +1938,6 @@ export class GameServer {
 
       if (evt === "switchRoom") { await this.switchRoom(ws, data[1], data[2]); return; }
 
-      // ✅ EVENT BARU: startGameWithRecording
       if (evt === "startGameWithRecording") {
         await this.startGameWithRecording(ws, data[1], data[2], data[3]);
         return;
@@ -1957,24 +1947,18 @@ export class GameServer {
         try {
           const isDiceTime = this.alarmScheduler.isDiceTime();
           const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
-          if (isDiceTime) {
-            this.safeSend(ws, ["diceSessionStatus", "active"]);
-            if (isGameRunning) {
-              this.safeSend(ws, ["diceRoll", { value: this.currentDiceRoll.value, timestamp: this.currentDiceRoll.timestamp, answerTime: 20, canAnswerNow: true, round: this._diceRound }]);
-            }
-          } else {
-            if (!ws._nextSessionSent) {
-              const timeInfo = this.alarmScheduler._getTimeLeftUntilNextDice();
-              this.safeSend(ws, ["diceSessionStatus", "inactive"]);
-              if (timeInfo && timeInfo.nextSession) {
-                this.safeSend(ws, ["diceNextSession", { startTime: timeInfo.nextSession.start, endTime: timeInfo.nextSession.end, hoursLeft: timeInfo.hours, minutesLeft: timeInfo.minutes, text: timeInfo.text }]);
-                ws._nextSessionSent = true;
-              }
-            } else {
-              this.safeSend(ws, ["diceSessionStatus", "inactive"]);
-            }
+          
+          if (isDiceTime && isGameRunning) {
+            this.safeSend(ws, ["diceRoll", {
+              value: this.currentDiceRoll.value,
+              timestamp: this.currentDiceRoll.timestamp,
+              answerTime: 20,
+              canAnswerNow: true,
+              round: this._diceRound
+            }]);
           }
-        } catch(e) { this.safeSend(ws, ["diceSessionStatus", "error"]); }
+          // ❌ TIDAK kirim diceNotification — biar _sendDiceRoomState yang handle
+        } catch(e) {}
         return;
       }
 
@@ -2104,8 +2088,7 @@ export class GameServer {
       }
 
       if (evt === "getDicePoints") {
-        try { const points = await this.dataManager.getDicePoints(); this.safeSend(ws, ["dicePoints", points]); }
-        catch(e) { this.safeSend(ws, ["dicePoints", {}]); }
+        // ❌ TIDAK kirim dicePoints — client tidak handle
         return;
       }
 
@@ -2118,18 +2101,20 @@ export class GameServer {
       if (evt === "getDiceNotification") {
         try {
           const isActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
-          const timeLeft = this._getTimeLeftUntilNextDice();
           let notification = "";
+          
           if (isActive) {
             const elapsed = (Date.now() - this._diceStartTime) / 1000;
             const remaining = Math.max(0, 20 - elapsed);
             notification = Math.floor(remaining) + "s remaining";
           } else if (this.alarmScheduler.isDiceTime()) {
             notification = "Dice game starting soon...";
-          } else if (timeLeft && timeLeft.text) {
-            notification = "Next dice game in: " + timeLeft.text;
           } else {
-            notification = "Waiting...";
+            // ✅ Cukup time left — TANPA next session (biar tidak dobel)
+            const timeLeft = this._getTimeLeftUntilNextDice();
+            notification = timeLeft && timeLeft.text 
+              ? "Next dice game in: " + timeLeft.text 
+              : "Waiting...";
           }
           this.safeSend(ws, ["diceNotification", notification]);
         } catch(e) { this.safeSend(ws, ["diceNotification", "Waiting..."]); }
@@ -2167,7 +2152,7 @@ export class GameServer {
       const currentRoom = ws.room || ws.roomname;
       if (currentRoom === roomName) {
         if (roomName === CONSTANTS.DICE_ROOM) {
-          ws._nextSessionSent = false;  // ✅ RESET flag
+          ws._nextSessionSent = false;
           this._sendDiceRoomState(ws);
         }
         this.safeSend(ws, ["switchRoomSuccess", roomName]);
@@ -2202,7 +2187,6 @@ export class GameServer {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
 
-      // ✅ RESET flag saat masuk Quiz
       if (roomName === CONSTANTS.DICE_ROOM) {
         ws._nextSessionSent = false;
       }
@@ -2246,7 +2230,6 @@ export class GameServer {
         return;
       }
       
-      // ✅ CEK RECORDING — WAJIB AKTIF
       const isRecordingEnabled = await this._getRecordingStatusFromKV(roomName);
       if (!isRecordingEnabled) {
         this.safeSend(ws, ["gameLowCardError", "Recording is NOT active in this room"]);
@@ -2308,13 +2291,11 @@ export class GameServer {
         this.broadcast(roomName, ["gameLowCardStartSuccess", usernameClean, betAmount]);
         this._startRegistration(roomName, game);
         
-        this.safeSend(ws, ["startGameWithRecordingResult", { success: true, room: roomName, bet: betAmount, username: usernameClean }]);
+        // ❌ TIDAK kirim startGameWithRecordingResult — client tidak handle
       } finally {
         setTimeout(() => { this._gameLocks.delete(lockKey); }, 3000);
       }
-    } catch(e) {
-      this.safeSend(ws, ["startGameWithRecordingResult", { success: false, message: e.message || "Failed" }]);
-    }
+    } catch(e) {}
   }
 
   // ============================================================
@@ -2340,7 +2321,6 @@ export class GameServer {
     } catch(e) { return []; }
   }
 
-  // ✅ HITUNG HUMAN PLAYER (bukan bot)
   _countHumanPlayers(game) {
     try {
       if (!game?.players) return 0;
@@ -2370,7 +2350,6 @@ export class GameServer {
       if (this._gameLocks.has(lockKey)) { this.safeSend(ws, ["gameLowCardError", "Game is starting, please wait"]); return; }
       this._gameLocks.set(lockKey, Date.now());
       try {
-        // ✅ CEK RECORDING — kalau aktif, TOLAK
         const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
         if (isRecordingEnabled) { 
           this.safeSend(ws, ["gameLowCardError", "Recording is ACTIVE in this room. Users cannot start games."]); 
@@ -2458,7 +2437,6 @@ export class GameServer {
       game.registrationOpen = false;
       if (game._registrationTimer) { this._clearTimer(game._registrationTimer); game._registrationTimer = null; }
       
-      // ✅ BOT: WAJIB 4 kalau human ≤ 1
       if (!game._botsAdded) {
         const humanCount = this._countHumanPlayers(game);
         if (humanCount <= 1) {
@@ -2512,7 +2490,6 @@ export class GameServer {
       game.evaluationLocked = false;
       game.drawTimeExpired = false;
       
-      // ✅ BOT: WAJIB 4 kalau human ≤ 1
       if (!game._botsAdded) {
         const humanCount = this._countHumanPlayers(game);
         if (humanCount <= 1) {
