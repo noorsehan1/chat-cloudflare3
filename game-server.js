@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER-D1-DIRECT.js
-// VERSION: 16.0.0 - LOWCARD IDENTICAL TO FILE 1 (NO gameState)
+// VERSION: 16.0.1 - SIMPLE FLOW (DICE & LOWCARD)
 // ============================================================
 
 // ============================================================
@@ -2875,7 +2875,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // LOWCARD GAME METHODS — IDENTICAL TO FILE 1
+  // LOWCARD GAME METHODS — SIMPLE FLOW
   // ============================================================
   
   async startGame(ws, bet, username) {
@@ -3043,12 +3043,18 @@ export class GameServer {
   async _startDrawPhase(room, game) {
     try {
       if (!this._isGameActuallyRunning(game)) return;
+      
+      // Clear semua timer round lama — cegah race condition
       if (game._drawTimer) { this._clearTimer(game._drawTimer); game._drawTimer = null; }
       if (game._evalTimer) { this._clearTimer(game._evalTimer); game._evalTimer = null; }
+      if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
       if (game._botTimeouts) {
         for (const id of game._botTimeouts) this._clearTimer(id);
         game._botTimeouts.clear();
       }
+      game._isEvaluating = false;
+      game.evaluationLocked = false;
+      game.drawTimeExpired = false;
       
       const activePlayers = this._getActivePlayers(game);
       if (activePlayers.length < 2) {
@@ -3271,9 +3277,11 @@ export class GameServer {
       
       const activePlayerIds = this._getActivePlayerIds(game);
       if (game.numbers.size < activePlayerIds.length) {
-        game._isEvaluating = false;
-        if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-        return;
+        // Yang tidak submit = kalah, game tetap lanjut
+        const submittedIdsInner = new Set(game.numbers.keys());
+        for (const id of activePlayerIds) {
+          if (!submittedIdsInner.has(id)) eliminated.add(id);
+        }
       }
       
       const values = entries.map(([, n]) => n);
