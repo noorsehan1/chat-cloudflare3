@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.2.0 - HIBERNASI-SAFE (FULL RESTORE)
+// VERSION: 16.2.1 - HIBERNASI-SAFE (LEFT GAME HANDLER)
 // ============================================================
 
 const CONSTANTS = {
@@ -550,24 +550,19 @@ export class GameServer {
     try {
       this._isRestoring = true;
 
-      // 1. Init DB
       try { await this.dataManager.init(); } catch(e) {}
 
-      // 2. Restore alarms
       try {
         await this.alarmScheduler.restoreAlarms();
         await this.alarmScheduler.scheduleAlarms();
       } catch(e) {}
 
-      // 3. Weekly reset check
       try { await this._checkAndForceResetIfMondayUTC(); } catch(e) {}
 
-      // 4. ✅ RESTORE SEMUA WEBSOCKETS
       try {
         const webSockets = this.ctx.getWebSockets();
         console.log(`[RESTORE] Found ${webSockets.length} WebSockets from ctx`);
 
-        // Reset registry dulu
         this.wsSet.clear();
         this.roomClients.clear();
         this.userConnections.clear();
@@ -597,7 +592,6 @@ export class GameServer {
       this._isRestoring = false;
       this._initialized = true;
 
-      // 5. Set dice session state
       try {
         const isDiceTime = this.alarmScheduler.isDiceTime();
         if (isDiceTime) {
@@ -613,7 +607,6 @@ export class GameServer {
         }
       } catch(e) {}
 
-      // 6. Process pending events
       await this._processPendingEvents();
       return true;
     } catch(e) {
@@ -643,7 +636,6 @@ export class GameServer {
         return;
       }
 
-      // Set semua field
       ws.username = username;
       ws._username = username;
       ws.room = room;
@@ -654,7 +646,6 @@ export class GameServer {
       ws._cleaning = false;
       ws._createdAt = attachment?.createdAt || ws._createdAt || Date.now();
 
-      // Daftarkan ke semua registry
       if (!this.wsSet.has(ws)) this.wsSet.add(ws);
       if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
       this.roomClients.get(room).add(ws);
@@ -665,7 +656,6 @@ export class GameServer {
         conns.add(ws);
       }
 
-      // Reset cleanup state
       const state = _wsCleanupState.get(ws);
       if (state) {
         state.cleanupDone = false;
@@ -675,7 +665,6 @@ export class GameServer {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
 
-      // Kirim dice room state kalau di Quiz
       if (room === CONSTANTS.DICE_ROOM) {
         try { this._sendDiceRoomState(ws); } catch(e) {}
       }
@@ -698,7 +687,6 @@ export class GameServer {
       for (const evt of events) {
         let ws = evt.ws;
 
-        // Cari ulang WS valid
         if (!ws || ws.readyState !== 1) {
           const wsId = evt.wsId;
           if (wsId) {
@@ -719,7 +707,6 @@ export class GameServer {
         if (!ws || ws.readyState !== 1 || ws._closing) continue;
 
         try {
-          // Restore attachment kalau perlu
           if (evt.attachment && !ws.room) {
             try {
               ws.serializeAttachment(evt.attachment);
@@ -803,7 +790,6 @@ export class GameServer {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
 
-      // ✅ RESTORE WS DARI ATTACHMENT
       let room = ws.room || ws.roomname || ws._room;
       let username = ws.username || ws._username;
       let wsId = ws._wsId;
@@ -830,7 +816,6 @@ export class GameServer {
       }
       if (wsId) ws._wsId = wsId;
 
-      // ✅ Daftarkan ke registry
       if (room) {
         if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
         this.roomClients.get(room).add(ws);
@@ -866,7 +851,6 @@ export class GameServer {
       let clients = this.roomClients?.get(room);
       let needScan = !clients || clients.size === 0;
 
-      // Scan semua WS + restore dari attachment
       if (needScan) {
         clients = new Set();
         let allWs = [];
@@ -877,7 +861,6 @@ export class GameServer {
             if (!ws || ws.readyState !== 1) continue;
             if (ws._closing || ws._cleaning) continue;
 
-            // Restore room dari attachment
             let wsRoom = ws.room || ws.roomname || ws._room;
             if (!wsRoom) {
               try {
@@ -894,7 +877,6 @@ export class GameServer {
               } catch(e) {}
             }
 
-            // ✅ WAJIB match room persis
             if (wsRoom !== room) continue;
 
             clients.add(ws);
@@ -924,7 +906,6 @@ export class GameServer {
         const state = _wsCleanupState.get(ws);
         if (state && state.cleanupDone) { toRemove.add(ws); continue; }
 
-        // Validasi room
         let wsRoom = ws.room || ws.roomname || ws._room;
         if (!wsRoom) {
           try {
@@ -938,7 +919,6 @@ export class GameServer {
           } catch(e) {}
         }
 
-        // ✅ WAJIB match — skip yang beda room
         if (wsRoom !== room) { toRemove.add(ws); continue; }
 
         try {
@@ -967,7 +947,6 @@ export class GameServer {
     try {
       if (this.closing || this.isDestroyed) return new Response("Shutting down", { status: 503 });
 
-      // ✅ PAKSA RESTORE SEBELUM PROSES APAPUN
       if (!this._restoreDone) {
         try {
           await Promise.race([
@@ -1058,7 +1037,6 @@ export class GameServer {
       const state = _wsCleanupState.get(ws);
       if (state && state.cleanupDone) return;
 
-      // ✅ RESTORE WS DARI ATTACHMENT (KUNCI!)
       if (!ws.room && !ws.roomname && !ws._room) {
         try {
           const att = ws.deserializeAttachment?.();
@@ -1073,12 +1051,10 @@ export class GameServer {
         } catch(e) {}
       }
 
-      // Pastikan flag ada
       if (ws._closing === undefined) ws._closing = false;
       if (ws._cleaning === undefined) ws._cleaning = false;
       if (!ws._createdAt) ws._createdAt = Date.now();
 
-      // Daftarkan ke registry
       const room = ws.room || ws.roomname || ws._room;
       if (room) {
         if (!this.roomClients.has(room)) this.roomClients.set(room, new Set());
@@ -1095,7 +1071,6 @@ export class GameServer {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
 
-      // Kalau belum restore, pending
       if (!this._restored || this._isRestoring) {
         if (!this._pendingEvents) this._pendingEvents = [];
         if (this._pendingEvents.length >= CONSTANTS.MAX_PENDING_EVENTS) {
@@ -1123,7 +1098,6 @@ export class GameServer {
       if (state && state.cleanupDone) return;
       if (ws._cleaning || ws._closing) return;
 
-      // Restore WS kalau perlu
       if (!ws.room && !ws.roomname && !ws._room) {
         try {
           const att = ws.deserializeAttachment?.();
@@ -1137,7 +1111,6 @@ export class GameServer {
         } catch(e) {}
       }
 
-      // Tunggu restore (maks 3 detik)
       if (!this._restored && this._restorePromise) {
         try {
           await Promise.race([
@@ -1227,8 +1200,9 @@ export class GameServer {
           }
         }
 
+        // ✅ FIX: JANGAN HENTIKAN GAME — hanya tandai player left
         if (roomName && username) {
-          try { await this._cleanupGameAsync(ws._wsId, username, roomName); } catch(e) {}
+          try { await this._markPlayerLeft(roomName, username); } catch(e) {}
         }
 
         try { ws._closing = false; ws._cleaning = false; } catch(e) {}
@@ -1240,59 +1214,72 @@ export class GameServer {
     } catch(e) {}
   }
 
-  async _cleanupGameAsync(wsId, username, room) {
+  // ============================================================
+  // ✅ NEW: MARK PLAYER AS LEFT (GANTI NAMA JADI "left game")
+  // ============================================================
+
+  async _markPlayerLeft(room, username) {
     try {
       if (!room || !username) return;
       const game = this.activeGames.get(room);
       if (!game || !game._isActive || game._gameEnded || !game.players) return;
       if (!game.players.has(username)) return;
-      if (game.hostId === username && game._phase === 'registration') {
-        this.broadcast(room, ["gameLowCardError", "Host left the game"]);
+
+      // Tandai eliminated
+      if (!game.eliminated) game.eliminated = new Set();
+      game.eliminated.add(username);
+
+      // ✅ GANTI NAMA JADI "left game"
+      const player = game.players.get(username);
+      if (player) {
+        player.name = "left game";
+      }
+
+      // Hapus data draw
+      game.numbers?.delete(username);
+      game.tanda?.delete(username);
+
+      // Notifikasi ke room
+      this.broadcast(room, ["gameLowCardError", `${username} left the game`]);
+
+      // Cek apakah game masih bisa lanjut
+      const activePlayers = this._getActivePlayers(game);
+      const activeIds = this._getActivePlayerIds(game);
+
+      // Kalau semua player sudah left → baru hentikan
+      if (activePlayers.length === 0) {
+        const allPlayers = Array.from(game.players.keys());
+        const submitted = Array.from(game.numbers?.keys() || []);
+        const notSubmitted = allPlayers.filter(id => !submitted.includes(id) && !game.eliminated?.has(id));
+        if (notSubmitted.length > 0) return;
+
         game._gameEnded = true;
         game._isActive = false;
-        this._forceCleanupGame(room, game);
+        this.broadcast(room, ["gameLowCardError", "All players left the game"]);
+        this._scheduleGameCleanup(room, game);
         return;
       }
-      if (game._phase === 'registration') {
-        game.players.delete(username);
-        game.playerWsId?.delete(username);
-        this.broadcast(room, ["gameLowCardError", "Player left the game"]);
-        if (game.hostId === username) {
-          const remaining = Array.from(game.players.keys());
-          if (remaining.length > 0) {
-            game.hostId = remaining[0];
-            this.broadcast(room, ["gameLowCardError", "New host: " + game.hostId]);
-          } else {
-            game._gameEnded = true;
-            game._isActive = false;
-            this._forceCleanupGame(room, game);
-            return;
+
+      // Kalau tersisa 1 player & fase draw → cek apakah sudah submit
+      if (activePlayers.length === 1 && !game._gameEnded && game._phase !== 'registration') {
+        const submittedIds = Array.from(game.numbers?.keys() || []);
+        const notSubmitted = activeIds.filter(id => !submittedIds.includes(id));
+        if (notSubmitted.length === 0) {
+          const winner = activePlayers[0]?.name || "Unknown";
+          const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
+
+          if (game._startedByRecording) {
+            try {
+              await this._addLowCardWinner(room, winner);
+              const winners = await this._getLowCardWinners(room);
+              this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+            } catch(e) {}
           }
-        }
-        if (game.players.size === 0) {
+
           game._gameEnded = true;
           game._isActive = false;
-          this._forceCleanupGame(room, game);
-        }
-        return;
-      }
-      if (game._phase === 'draw' || game._phase === 'evaluating') {
-        if (!game.eliminated.has(username)) {
-          game.eliminated.add(username);
-          this.broadcast(room, ["gameLowCardError", "Player left the game"]);
-          const active = this._getActivePlayers(game);
-          if (active.length <= 1) {
-            if (active.length === 1) {
-              const winner = active[0].name;
-              const totalCoin = game.betAmount * game.players.size;
-              this.broadcast(room, ["gameLowCardWinner", winner, totalCoin]);
-            } else {
-              this.broadcast(room, ["gameLowCardError", "All players disconnected"]);
-            }
-            game._gameEnded = true;
-            game._isActive = false;
-            this._forceCleanupGame(room, game);
-          }
+          this.broadcast(room, ["gameLowCardWinner", winner, totalCoin]);
+          this._scheduleGameCleanup(room, game);
         }
       }
     } catch(e) {}
@@ -1893,7 +1880,6 @@ export class GameServer {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
 
-      // ✅ RESTORE + DAFTARKAN SETIAP EVENT
       let currentRoom = ws.room || ws.roomname || ws._room;
       let currentUser = ws.username || ws._username;
       let currentWsId = ws._wsId;
@@ -2748,19 +2734,39 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // ✅ FIX: TIDAK HENTIKAN GAME — GANTI NAMA JADI "left game"
+  // ============================================================
+
   _removePlayerFromGame(username, room) {
     try {
       const game = this.activeGames.get(room);
       if (!game || !game.players?.has(username) || !game._isActive || game._gameEnded || game._isEvaluating || game.evaluationLocked) return false;
+
+      // Tandai eliminated
       if (!game.eliminated) game.eliminated = new Set();
       game.eliminated.add(username);
+
+      // ✅ GANTI NAMA JADI "left game"
+      const player = game.players.get(username);
+      if (player) {
+        player.name = "left game";
+      }
+
+      // Hapus data draw
       game.numbers?.delete(username);
       game.tanda?.delete(username);
-      this.broadcast(room, ["gameLowCardError", `${username} has been eliminated`]);
+
+      // Notifikasi
+      this.broadcast(room, ["gameLowCardError", `${username} left the game`]);
+
+      // Cek apakah game masih bisa lanjut
       const checkTimer = setTimeout(() => {
         try {
           const currentGame = this.activeGames.get(room);
-          if (currentGame && currentGame === game && !game._gameEnded) this._checkGameCanContinue(room, game);
+          if (currentGame && currentGame === game && !game._gameEnded) {
+            this._checkGameCanContinue(room, game);
+          }
         } catch(e) {}
       }, 1000);
       this._trackTimer(checkTimer);
@@ -2771,33 +2777,43 @@ export class GameServer {
   async _checkGameCanContinue(room, game) {
     try {
       if (!game?._isActive || game._gameEnded || !game.players || game._isEvaluating || game.evaluationLocked || game.registrationOpen) return;
+
       const activePlayers = this._getActivePlayers(game);
+
+      // Kalau semua player sudah left → baru hentikan
       if (activePlayers.length === 0) {
         const allPlayers = Array.from(game.players.keys());
         const submitted = Array.from(game.numbers?.keys() || []);
         const notSubmitted = allPlayers.filter(id => !submitted.includes(id) && !game.eliminated?.has(id));
         if (notSubmitted.length > 0) return;
+
         game._gameEnded = true;
         game._isActive = false;
         this.broadcast(room, ["gameLowCardEnd", []]);
         this._scheduleGameCleanup(room, game);
         return;
       }
+
+      // Kalau tersisa 1 player & sudah submit → menang
       if (activePlayers.length === 1 && !game._gameEnded) {
         const activeIds = this._getActivePlayerIds(game);
         const submittedIds = Array.from(game.numbers?.keys() || []);
         const notSubmitted = activeIds.filter(id => !submittedIds.includes(id));
+
         if (notSubmitted.length > 0) {
           this.broadcast(room, ["gameLowCardTimeLeft", `Waiting for ${notSubmitted.length} player(s)`]);
           return;
         }
+
         const winner = activePlayers[0]?.name || "Unknown";
         const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
+
         if (game._startedByRecording) {
           await this._addLowCardWinner(room, winner);
           const winners = await this._getLowCardWinners(room);
           this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
         }
+
         game._gameEnded = true;
         game._isActive = false;
         this.broadcast(room, ["gameLowCardWinner", winner, totalCoin]);
