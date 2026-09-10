@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 14.7.2 - HEMAT DURABLE OBJECTS + FIX ERROR + SYNC WS HANDLER
+// VERSION: 14.7.3 - FIX CLEANUP (WS CLOSE/ERROR/DESTROY)
 // ⚠️ MULTI BEHAVIOR UNCHANGED
 
 const C = {
@@ -123,7 +123,7 @@ export class ChatServer {
           this._cacheInitialized = true;
           this.currentNumber = 1;
 
-          if (!this.closing && !this.isDestroyed) {
+          if (!this.closing) {
             try {
               this.ctx?.storage?.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
             } catch(e) {}
@@ -338,7 +338,7 @@ export class ChatServer {
         return;
       }
       await this.db
-        .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
+        .prepare(`INSERT OR REPLACE FROM ${TABLE_NAME} (key, value) VALUES (?, ?)`)
         .bind(key, JSON.stringify(pointData))
         .run();
     } catch(e) {}
@@ -369,7 +369,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ 🔥 FORCE DELETE FROM D1 - HEMAT ============
+  // ============ 🔥 FORCE DELETE FROM D1 - FIX FALLBACK ============
   async _forceDeleteFromD1(roomName, seatNumber, username) {
     try {
       if (!this.db) return false;
@@ -377,7 +377,7 @@ export class ChatServer {
       let seat = seatNumber;
       let room = roomName;
 
-      // 🔧 FIX: Kalau room/seat tidak diketahui, ambil dari CACHE dulu (cepat)
+      // LAPIS 1: Coba cache dulu (cepat)
       if ((!seat || !room) && username) {
         try {
           const found = await this._findUserInAnyRoom(username);
@@ -388,7 +388,29 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      // LAPIS 1: Cari seat via SELECT — DIBATASI PER ROOM
+      // LAPIS 2: FALLBACK — baca D1 langsung kalau cache gagal
+      if ((!seat || !room) && username) {
+        try {
+          const result = await this.db
+            .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%'`)
+            .all();
+
+          const rows = result?.results || [];
+          for (const row of rows) {
+            try {
+              const val = JSON.parse(row.value);
+              if (val?.namauser === username && val.isMulti !== true) {
+                const parts = row.key.split('_');
+                room = parts[1];
+                seat = parseInt(parts[2]);
+                break;
+              }
+            } catch(e) {}
+          }
+        } catch(e) {}
+      }
+
+      // LAPIS 3: Kalau ada room tapi seat tidak ada, cari di room itu
       if (!seat && room && username) {
         try {
           const result = await this.db
@@ -412,7 +434,7 @@ export class ChatServer {
 
       if (!seat || !room) return false;
 
-      // LAPIS 3: GUARD MULTI - cek dulu sebelum hapus
+      // LAPIS 4: GUARD MULTI - cek dulu sebelum hapus
       try {
         const check = await this.db
           .prepare(`SELECT value FROM ${TABLE_NAME} WHERE key = ?`)
@@ -948,7 +970,7 @@ export class ChatServer {
     }
   }
 
-  // ============ 🔥 CLEANUP - FIX RACE CONDITION ============
+  // ============ 🔥 CLEANUP - FIX FINAL ============
   async _cleanupUserCompletely(ws) {
     try {
       if (!ws) return;
@@ -963,15 +985,40 @@ export class ChatServer {
         try { _wsCleanupState.set(ws, state); } catch(e) {}
       }
 
-      // 🔧 FIX: guard cleaning untuk cegah eksekusi paralel
-      if (state.cleanupDone || state.cleaning) return;
+      // 🔧 FIX: cegah paralel, tapi JANGAN cegah retry
+      if (state.cleaning) return;
       state.cleaning = true;
       state.cleanupStart = Date.now();
 
       try {
-        const username = ws.username || ws._username;
-        const roomName = ws.room || ws.roomname || ws._room;
+        let username = ws.username || ws._username;
+        let roomName = ws.room || ws.roomname || ws._room;
         const isMulti = this.wsActiveMulti?.has(ws) || false;
+
+        // 🔧 FIX: kalau username null, coba dari attachment
+        if (!username) {
+          try {
+            const att = ws.deserializeAttachment?.();
+            if (att?.username) {
+              username = att.username;
+              ws.username = username;
+              ws._username = username;
+            }
+          } catch(e) {}
+        }
+
+        // 🔧 FIX: kalau masih null, cari di D1 via userConnections
+        if (!username && !isMulti) {
+          // Cari dari userConnections berdasarkan ws
+          for (const [user, conns] of (this.userConnections || new Map())) {
+            if (conns?.has?.(ws)) {
+              username = user;
+              ws.username = username;
+              ws._username = username;
+              break;
+            }
+          }
+        }
 
         if (!username && !isMulti) {
           if (this.wsSet) try { this.wsSet.delete(ws); } catch(e) {}
@@ -1153,40 +1200,73 @@ export class ChatServer {
         state.cleanupDone = true;
         state.cleaning = false;
         state.cleanupStart = null;
+
+        // 🔧 FIX: VERIFIKASI D1 — retry kalau masih ada sisa
+        try {
+          const username = ws?.username || ws?._username;
+          if (username && this.db) {
+            const result = await this.db
+              .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%'`)
+              .all();
+            const rows = result?.results || [];
+            for (const row of rows) {
+              try {
+                const val = JSON.parse(row.value);
+                if (val?.namauser === username && val.isMulti !== true) {
+                  // Masih ada sisa — hapus paksa
+                  const parts = row.key.split('_');
+                  await this.db
+                    .prepare(`DELETE FROM ${TABLE_NAME} WHERE key IN (?, ?)`)
+                    .bind(row.key, `point_${parts[1]}_${parts[2]}`)
+                    .run();
+                }
+              } catch(e) {}
+            }
+          }
+        } catch(e) {}
       }
     } catch(e) {}
   }
 
-  // ✅ FIX: Sync handler untuk mencegah DO stuck saat close/error
-  // Runtime TIDAK menunggu handler ini, jadi jangan await cleanup
+  // ✅ FIX: Sync handler — pakai waitUntil kalau tersedia
   webSocketClose(ws) {
     try {
-      if (!ws || this.isDestroyed) return;
+      if (!ws) return;
 
       if (!ws._username && ws.username) ws._username = ws.username;
       if (!ws._room && (ws.room || ws.roomname)) ws._room = ws.room || ws.roomname;
 
       const state = _wsCleanupState.get(ws);
-      if (state && state.cleanupDone) return;
+      if (state && state.cleaning) return;
 
-      // ✅ Panggil cleanup TANPA await — biarkan jalan di background
-      this._cleanupUserCompletely(ws).catch(() => {});
+      // 🔧 FIX: pakai waitUntil kalau ada — jaminan cleanup selesai
+      const promise = this._cleanupUserCompletely(ws).catch(() => {});
+      try {
+        if (this.ctx?.waitUntil) {
+          this.ctx.waitUntil(promise);
+        }
+      } catch(e) {}
     } catch(e) {}
   }
 
-  // ✅ FIX: Sync handler untuk mencegah DO stuck saat close/error
+  // ✅ FIX: Sync handler — pakai waitUntil kalau tersedia
   webSocketError(ws) {
     try {
-      if (!ws || this.isDestroyed) return;
+      if (!ws) return;
 
       if (!ws._username && ws.username) ws._username = ws.username;
       if (!ws._room && (ws.room || ws.roomname)) ws._room = ws.room || ws.roomname;
 
       const state = _wsCleanupState.get(ws);
-      if (state && state.cleanupDone) return;
+      if (state && state.cleaning) return;
 
-      // ✅ Panggil cleanup TANPA await — biarkan jalan di background
-      this._cleanupUserCompletely(ws).catch(() => {});
+      // 🔧 FIX: pakai waitUntil kalau ada — jaminan cleanup selesai
+      const promise = this._cleanupUserCompletely(ws).catch(() => {});
+      try {
+        if (this.ctx?.waitUntil) {
+          this.ctx.waitUntil(promise);
+        }
+      } catch(e) {}
     } catch(e) {}
   }
 
@@ -1322,7 +1402,6 @@ export class ChatServer {
         }
 
         if (this._eventQueue.length > 0 && !this.closing && !this.isDestroyed) {
-          // ✅ BIARKAN: self-reschedule queue, hanya jalan kalau ada isi
           setTimeout(() => this._processEventQueue(), 10);
         }
       } finally {
@@ -1779,7 +1858,7 @@ export class ChatServer {
             ws._room = ws.room || ws.roomname;
           }
 
-          if (state && state.cleanupDone) {
+          if (state && state.cleaning) {
             return;
           }
 
@@ -2186,7 +2265,6 @@ export class ChatServer {
           break;
         }
 
-        // ✅ HEMAT: getOnlineUsers pakai cache 5 detik
         case "getOnlineUsers": {
           const now = Date.now();
           if (this._onlineUsersCache && (now - this._onlineUsersCacheTime) < 5000) {
@@ -2233,7 +2311,6 @@ export class ChatServer {
           break;
         }
 
-        // ✅ HEMAT: getAllRoomsUserCount pakai cache 3 detik
         case "getAllRoomsUserCount": {
           const now = Date.now();
           if (this._roomCountsCache && (now - this._roomCountsCacheTime) < 3000) {
@@ -2341,7 +2418,7 @@ export class ChatServer {
   // ✅ HEMAT: fetch() tanpa setTimeout rate limit
   async fetch(req) {
     try {
-      if (this.closing || this.isDestroyed) {
+      if (this.closing) {
         return new Response("Shutting down", { status: 503 });
       }
 
@@ -2361,7 +2438,6 @@ export class ChatServer {
       }
 
       // 🔧 FIX: decay rate limit berbasis waktu — TANPA setTimeout
-      // Decay 1 per detik. Counter reset penuh dalam 100 detik kalau idle.
       const now = Date.now();
       const elapsed = now - this._lastRequestDecay;
       if (elapsed > 1000) {
@@ -2468,11 +2544,11 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // 🔧 FIX: isDestroyed di-set di AKHIR — biar cleanup bisa jalan
   async destroy() {
     try {
       if (this.isDestroyed) return;
       this.closing = true;
-      this.isDestroyed = true;
 
       if (this._joinLocks) this._joinLocks.clear();
       if (this._kursiLocks) this._kursiLocks.clear();
@@ -2566,7 +2642,12 @@ export class ChatServer {
           try { clients.clear(); } catch(e) {}
         }
       }
-    } catch(e) {}
+
+      // 🔧 FIX: isDestroyed di-set di AKHIR — biar cleanup sudah selesai
+      this.isDestroyed = true;
+    } catch(e) {
+      this.isDestroyed = true;
+    }
   }
 }
 
