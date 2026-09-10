@@ -1,5 +1,6 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.1.5 - PURGE DEAD SESSIONS AGRESSIVE
+// VERSION: 15.1.3 - RESTORE WSS + CEK KONEKSI + CLEANUP OTOMATIS
+// ⚠️ 3 TRIGGER SAMA (ONDESTROY = WSCLOSE = WSERROR)
 // ⚠️ MULTI BEHAVIOR UNCHANGED
 
 const C = {
@@ -174,6 +175,20 @@ export class ChatServer {
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
       }
+    }
+  }
+
+  // ============================================================
+  // 🔥 v15.1.3: HELPER — CEK WS MASIH HIDUP ATAU TIDAK
+  // ============================================================
+  _isWsAlive(ws) {
+    try {
+      if (!ws) return false;
+      if (typeof ws.readyState !== 'number') return false;
+      // 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+      return ws.readyState === 1;
+    } catch (e) {
+      return false;
     }
   }
 
@@ -931,7 +946,8 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥🔥🔥 v15.1.5: CLEANUP — 4 LAPIS FALLBACK
+  // 🔥 v15.1.3: CLEANUP — 4 LAPIS FALLBACK (SAMA UNTUK SEMUA TRIGGER)
+  // Dipakai oleh: onDestroy, webSocketClose, webSocketError, RESTORE
   // ============================================================
   async _cleanupUserCompletely(ws) {
     if (!ws) return;
@@ -945,6 +961,11 @@ export class ChatServer {
     state.cleaning = true;
 
     try {
+      // ============================================================
+      // 4 LAPIS FALLBACK USERNAME & ROOM
+      // ============================================================
+
+      // Lapis 1: field WS langsung + sinkronkan antar field
       let username = ws.username || ws._username;
       let roomName = ws.room || ws.roomname || ws._room;
 
@@ -955,6 +976,7 @@ export class ChatServer {
       if (!ws.room && ws.roomname) ws.room = ws.roomname;
       if (!ws.roomname && ws.room) ws.roomname = ws.room;
 
+      // Lapis 2: attachment
       if (!username || !roomName) {
         try {
           const att = ws.deserializeAttachment?.();
@@ -978,6 +1000,7 @@ export class ChatServer {
         } catch (e) {}
       }
 
+      // Lapis 3: scan userConnections
       if (!username) {
         for (const [user, conns] of (this.userConnections || new Map())) {
           if (conns?.has?.(ws)) {
@@ -989,6 +1012,7 @@ export class ChatServer {
         }
       }
 
+      // Lapis 4: scan roomClients (untuk room)
       if (!roomName) {
         for (const [rName, clients] of (this.roomClients || new Map())) {
           if (clients?.has?.(ws)) {
@@ -1001,6 +1025,9 @@ export class ChatServer {
         }
       }
 
+      // ============================================================
+      // SKIP MULTI — logika asli tidak diubah
+      // ============================================================
       const isMulti = this.wsActiveMulti?.has(ws) || false;
       if (isMulti) {
         if (username) {
@@ -1022,12 +1049,18 @@ export class ChatServer {
         return;
       }
 
+      // ============================================================
+      // STEP 1: HAPUS D1 DULU
+      // ============================================================
       if (username) {
         try {
           await this._forceDeleteFromD1(roomName, null, username);
         } catch (e) {}
       }
 
+      // ============================================================
+      // STEP 2: HAPUS MEMORY
+      // ============================================================
       if (username) {
         try {
           await this._ensureCacheInitialized();
@@ -1046,6 +1079,7 @@ export class ChatServer {
         }
       }
 
+      // Hapus dari userConnections
       if (this.userConnections && username) {
         const conns = this.userConnections.get(username);
         if (conns) {
@@ -1056,6 +1090,7 @@ export class ChatServer {
         }
       }
 
+      // Hapus dari roomClients
       if (this.roomClients) {
         for (const [, clients] of this.roomClients) {
           try { clients.delete(ws); } catch (e) {}
@@ -1065,11 +1100,13 @@ export class ChatServer {
       try { this.wsSet?.delete(ws); } catch (e) {}
       try { this.wsActiveMulti?.delete(ws); } catch (e) {}
 
+      // Invalidate cache
       this._onlineUsersCache = null;
       this._onlineUsersCacheTime = 0;
       this._roomCountsCache = null;
       this._roomCountsCacheTime = 0;
 
+      // Tutup WS
       try {
         if (ws.readyState === 1) ws.close(1000, "Cleanup");
       } catch (e) {}
@@ -1083,121 +1120,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥🔥🔥 v15.1.5: PURGE DEAD SESSIONS — AGRESSIVE
-  // ============================================================
-  async _purgeDeadSessions() {
-    try {
-      await this._ensureCacheInitialized();
-
-      const liveWs = this.ctx?.getWebSockets?.() || [];
-      const liveUsernames = new Set();
-
-      for (const ws of liveWs) {
-        try {
-          if (ws.readyState !== 1) continue;
-          const att = ws.deserializeAttachment?.();
-          if (!att?.username) continue;
-          if (typeof att.username !== 'string' || att.username.trim() === '') continue;
-          liveUsernames.add(att.username);
-        } catch(e) {}
-      }
-
-      const roomsData = this._storageCache?.roomsData || {};
-      const toDelete = [];
-
-      let totalNonMulti = 0;
-      for (const [, roomBucket] of Object.entries(roomsData)) {
-        if (!roomBucket?.seat) continue;
-        for (const [, data] of Object.entries(roomBucket.seat)) {
-          if (data?.namauser && data.isMulti !== true) totalNonMulti++;
-        }
-      }
-
-      if (liveUsernames.size === 0 && totalNonMulti > 0) {
-        for (const [roomName, roomBucket] of Object.entries(roomsData)) {
-          if (!roomBucket?.seat) continue;
-          for (const [seat, data] of Object.entries(roomBucket.seat)) {
-            if (!data?.namauser) continue;
-            if (data.isMulti === true) continue;
-            toDelete.push({
-              room: roomName,
-              seat: parseInt(seat),
-              username: data.namauser
-            });
-          }
-        }
-      } else {
-        for (const [roomName, roomBucket] of Object.entries(roomsData)) {
-          if (!roomBucket?.seat) continue;
-          for (const [seat, data] of Object.entries(roomBucket.seat)) {
-            if (!data?.namauser) continue;
-            if (data.isMulti === true) continue;
-
-            if (!liveUsernames.has(data.namauser)) {
-              toDelete.push({
-                room: roomName,
-                seat: parseInt(seat),
-                username: data.namauser
-              });
-            }
-          }
-        }
-      }
-
-      if (toDelete.length === 0) return 0;
-
-      for (const item of toDelete) {
-        try {
-          if (roomsData[item.room]?.seat) {
-            delete roomsData[item.room].seat[item.seat];
-          }
-          if (roomsData[item.room]?.point) {
-            delete roomsData[item.room].point[item.seat];
-          }
-
-          if (this.db) {
-            await this.db
-              .prepare(`DELETE FROM ${TABLE_NAME} WHERE key IN (?, ?)`)
-              .bind(`seat_${item.room}_${item.seat}`, `point_${item.room}_${item.seat}`)
-              .run();
-          }
-
-          if (this.db && item.username) {
-            try {
-              await this._forceDeleteFromD1(null, null, item.username);
-            } catch(e) {}
-          }
-
-          this.broadcast(item.room, ["removeKursi", item.room, item.seat]);
-          this.updateRoomCount(item.room).catch(() => {});
-        } catch(e) {}
-      }
-
-      if (this.userConnections) {
-        for (const [user, conns] of this.userConnections) {
-          let hasLive = false;
-          for (const c of conns) {
-            if (c?.readyState === 1) { hasLive = true; break; }
-          }
-          if (!hasLive) {
-            this.userConnections.delete(user);
-          }
-        }
-      }
-
-      this._onlineUsersCache = null;
-      this._onlineUsersCacheTime = 0;
-      this._roomCountsCache = null;
-      this._roomCountsCacheTime = 0;
-
-      return toDelete.length;
-    } catch(e) {
-      return 0;
-    }
-  }
-
-  // ============================================================
-  // 🔥 3 TRIGGER
+  // 🔥 3 TRIGGER — SEMUA PANGGIL _cleanupUserCompletely (SAMA)
   // ============================================================
   async webSocketClose(ws) {
     try {
@@ -1603,6 +1526,9 @@ export class ChatServer {
       try {
         const webSockets = this.ctx?.getWebSockets?.() || [];
 
+        // ============================================================
+        // 🔥 v15.1.3: RESTORE SETIAP WS + CEK KONEKSI
+        // ============================================================
         const batchSize = 10;
         for (let i = 0; i < webSockets.length; i += batchSize) {
           const batch = webSockets.slice(i, i + batchSize);
@@ -1611,8 +1537,15 @@ export class ChatServer {
           );
         }
 
+        // ============================================================
+        // 🔥 v15.1.3: Loop kedua — HANYA proses WS yang MASIH HIDUP
+        //            WS mati sudah di-cleanup di _restoreSingleWebSocket
+        // ============================================================
         for (const ws of webSockets) {
           try {
+            // ⚠️ SKIP WS MATI — sudah di-cleanup di _restoreSingleWebSocket
+            if (!this._isWsAlive(ws)) continue;
+
             const st = _wsCleanupState.get(ws);
             if (st) {
               st.cleanupDone = false;
@@ -1651,6 +1584,26 @@ export class ChatServer {
           } catch(e) {}
         }
 
+        // ============================================================
+        // 🔥 v15.1.3: SWEEP ZOMBIE — pastikan tidak ada WS mati tersisa
+        // ============================================================
+        try {
+          const zombieWs = new Set();
+          for (const ws of (this.wsSet || new Set())) {
+            if (!this._isWsAlive(ws)) zombieWs.add(ws);
+          }
+          for (const ws of (this.wsActiveMulti?.keys?.() || [])) {
+            if (!this._isWsAlive(ws)) zombieWs.add(ws);
+          }
+          for (const ws of zombieWs) {
+            try { await this._cleanupUserCompletely(ws); } catch (e) {}
+            try { this.wsSet?.delete(ws); } catch (e) {}
+            try { this.wsActiveMulti?.delete(ws); } catch (e) {}
+            try { _wsCleanupState.delete(ws); } catch (e) {}
+          }
+        } catch (e) {}
+
+        // Bersihkan userConnections kosong
         for (const [user, conns] of this.userConnections) {
           if (conns.size === 0) this.userConnections.delete(user);
         }
@@ -1661,9 +1614,6 @@ export class ChatServer {
           await this.ctx?.storage?.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
         } catch(e) {}
       }
-
-      // 🔥🔥🔥 v15.1.5: HAPUS DATA YATIM SETELAH RESTORE
-      await this._purgeDeadSessions();
 
       this._restored = true;
       this._restoreDone = true;
@@ -1680,9 +1630,6 @@ export class ChatServer {
       this._restoreFailed = true;
       this._isRestoring = false;
 
-      // 🔥🔥🔥 v15.1.5: Tetap coba purge walau restore gagal
-      try { await this._purgeDeadSessions(); } catch(e2) {}
-
       if (!this.closing && !this.isDestroyed) {
         try {
           await this.ctx?.storage?.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
@@ -1695,16 +1642,81 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // 🔥 v15.1.3: RESTORE 1 WS + CEK KONEKSI + CLEANUP OTOMATIS
+  // ============================================================
   async _restoreSingleWebSocket(ws) {
     try {
-      const attachment = ws.deserializeAttachment();
-      if (!attachment?.username) {
+      if (!ws) return;
+
+      // --------------------------------------------------------
+      // STEP 1: CEK KONEKSI MASIH HIDUP ATAU TIDAK
+      // --------------------------------------------------------
+      const isAlive = this._isWsAlive(ws);
+
+      // --------------------------------------------------------
+      // STEP 2: AMBIL ATTACHMENT
+      // --------------------------------------------------------
+      let attachment = null;
+      try {
+        attachment = ws.deserializeAttachment?.();
+      } catch (e) {
+        attachment = null;
+      }
+
+      // --------------------------------------------------------
+      // STEP 3: JIKA WS MATI → LANGSUNG CLEANUP (SAMA SEPERTI WS CLOSE/ERROR)
+      // --------------------------------------------------------
+      if (!isAlive) {
         try {
-          if (ws.readyState === 1) ws.close(1000, "No attachment");
-        } catch(e) {}
+          // Pastikan field terisi supaya cleanup 4 lapis bisa bekerja
+          if (attachment?.username) {
+            ws.username = ws.username || attachment.username;
+            ws._username = ws._username || attachment.username;
+          }
+          if (attachment?.seatInfo?.room) {
+            ws.room = ws.room || attachment.seatInfo.room;
+            ws._room = ws._room || attachment.seatInfo.room;
+            ws.roomname = ws.roomname || attachment.seatInfo.room;
+          }
+          if (attachment?.room) {
+            ws.room = ws.room || attachment.room;
+            ws._room = ws._room || attachment.room;
+            ws.roomname = ws.roomname || attachment.room;
+          }
+
+          // 🔥 Pakai cleanup yang sama dengan webSocketClose / webSocketError
+          await this._cleanupUserCompletely(ws);
+        } catch (e) {}
+
+        // Hapus dari semua maps
+        try { this.wsSet?.delete(ws); } catch (e) {}
+        try { this.wsActiveMulti?.delete(ws); } catch (e) {}
+
         return;
       }
 
+      // --------------------------------------------------------
+      // STEP 4: WS HIDUP — TAPI TIDAK ADA ATTACHMENT/USERNAME
+      //         → TUTUP + CLEANUP
+      // --------------------------------------------------------
+      if (!attachment?.username) {
+        try {
+          ws._closing = true;
+          if (ws.readyState === 1) ws.close(1000, "No attachment");
+        } catch (e) {}
+
+        try {
+          await this._cleanupUserCompletely(ws);
+        } catch (e) {}
+
+        try { this.wsSet?.delete(ws); } catch (e) {}
+        return;
+      }
+
+      // --------------------------------------------------------
+      // STEP 5: CEK USER MASIH ADA DI STORAGE
+      // --------------------------------------------------------
       const found = await this._findUserInAnyRoom(attachment.username);
       if (!found) {
         try {
@@ -1715,13 +1727,23 @@ export class ChatServer {
           ws.idtarget = null;
           ws._username = null;
           ws._room = null;
-          _wsCleanupState.delete(ws);
-          this.wsSet?.delete(ws);
+          ws._closing = true;
           if (ws.readyState === 1) ws.close(1000, "User not found");
-        } catch(e) {}
+        } catch (e) {}
+
+        try {
+          await this._cleanupUserCompletely(ws);
+        } catch (e) {}
+
+        _wsCleanupState.delete(ws);
+        try { this.wsSet?.delete(ws); } catch (e) {}
+        try { this.wsActiveMulti?.delete(ws); } catch (e) {}
         return;
       }
 
+      // --------------------------------------------------------
+      // STEP 6: WS HIDUP + USER ADA → REGISTER KE MAPS
+      // --------------------------------------------------------
       ws.username = attachment.username;
       ws.room = found.room;
       ws.roomname = found.room;
@@ -1742,20 +1764,20 @@ export class ChatServer {
 
       const roomClients = this.roomClients?.get(found.room);
       if (roomClients && !roomClients.has(ws)) {
-        try { roomClients.add(ws); } catch(e) {}
+        try { roomClients.add(ws); } catch (e) {}
       }
 
       let conns = this.userConnections?.get(attachment.username);
       if (!conns) {
         conns = new Set();
-        try { this.userConnections?.set(attachment.username, conns); } catch(e) {}
+        try { this.userConnections?.set(attachment.username, conns); } catch (e) {}
       }
       if (!conns.has(ws)) {
-        try { conns.add(ws); } catch(e) {}
+        try { conns.add(ws); } catch (e) {}
       }
 
       if (!this.wsSet?.has(ws)) {
-        try { this.wsSet?.add(ws); } catch(e) {}
+        try { this.wsSet?.add(ws); } catch (e) {}
       }
 
       try {
@@ -1763,9 +1785,16 @@ export class ChatServer {
           username: attachment.username,
           seatInfo: found
         });
-      } catch(e) {}
+      } catch (e) {}
 
-    } catch(e) {}
+    } catch (e) {
+      // Kalau error apapun → anggap WS mati → cleanup
+      try {
+        await this._cleanupUserCompletely(ws);
+      } catch (e2) {}
+      try { this.wsSet?.delete(ws); } catch (e2) {}
+      try { this.wsActiveMulti?.delete(ws); } catch (e2) {}
+    }
   }
 
   async _handleSetId(ws, username, isNewUser) {
@@ -1852,6 +1881,8 @@ export class ChatServer {
         if (!Array.isArray(data) || !data.length) return;
         const [evt, ...args] = data;
 
+        // 🔥 v15.1.3: onDestroy cukup panggil _cleanupUserCompletely
+        // 4 lapis fallback sudah ada di dalamnya — SAMA dengan webSocketClose/Error
         if (evt === "onDestroy") {
           await this._cleanupUserCompletely(ws);
           return;
