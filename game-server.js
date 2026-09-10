@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.0.2 - HEMAT DO + FIX ERROR + SYNC WS HANDLER
+// VERSION: 16.0.3 - FIX RESTORE EVENT (SAMA SEPERTI CHAT-SERVER)
 // ============================================================
 
 const CONSTANTS = {
@@ -41,6 +41,7 @@ const CONSTANTS = {
   PROCESS_MAX_TIME_MS: 100,
   DICE_SESSION_CHECK_INTERVAL_MS: 5000,
   DICE_BROADCAST_DELAY_MS: 5000,
+  MAX_PENDING_EVENTS: 100,
 };
 
 const QUIZ_SCHEDULE = {
@@ -536,7 +537,12 @@ export class GameServer {
       this.closing = false;
       this.isDestroyed = false;
       this._wsIdCounter = 0;
+      
+      // 🔧 FIX: pisahkan _initialized dan _restored
       this._initialized = false;
+      this._restored = false;
+      this._restoreDone = false;
+      this._restoreFailed = false;
       
       this.db = env.DB;
       this.dataManager = new DataManager(this.db);
@@ -613,16 +619,34 @@ export class GameServer {
       this._lastErrorReset = Date.now();
       this._reconnectAttempts = new Map();
       this._processingQueue = false;
+      this._processingPending = false;
       this._diceLoopCounter = 0;
       this._maxDiceLoops = 10;
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
       
+      // 🔧 FIX: _init() tidak throw — selalu set _initialized & _restored
       this._init()
         .then(() => { this._processPendingEvents(); })
-        .catch(() => { this._processPendingEvents(); });
-    } catch(e) {}
+        .catch(() => {
+          this._initialized = true;
+          this._restored = true;
+          this._restoreDone = true;
+          this._restoreFailed = true;
+          this._processPendingEvents();
+        });
+    } catch(e) {
+      // 🔧 FIX: fallback kalau constructor gagal
+      this._initialized = true;
+      this._restored = true;
+      this._restoreDone = true;
+      this._restoreFailed = true;
+    }
   }
 
+  // ============================================================
+  // INIT
+  // ============================================================
+  
   async _init() {
     try {
       await this.dataManager.init();
@@ -631,7 +655,12 @@ export class GameServer {
       await this._checkAndForceResetIfMondayUTC();
       await this._initWebSockets();
       this._syncAllRooms();
+      
+      // 🔧 FIX: set kedua flag
       this._initialized = true;
+      this._restored = true;
+      this._restoreDone = true;
+      this._restoreFailed = false;
       
       const isDiceTime = this.alarmScheduler.isDiceTime();
       if (isDiceTime) {
@@ -647,8 +676,14 @@ export class GameServer {
         this._diceSessionEnded = true;
         this._diceGameStarted = false;
       }
+      
       await this._processPendingEvents();
     } catch(e) {
+      // 🔧 FIX: jangan throw — set flag tetap true
+      this._initialized = true;
+      this._restored = true;
+      this._restoreDone = true;
+      this._restoreFailed = true;
       throw e;
     }
   }
@@ -658,34 +693,88 @@ export class GameServer {
       const webSockets = this.ctx.getWebSockets();
       for (const ws of webSockets) {
         try {
-          const attachment = ws.deserializeAttachment();
-          if (attachment && attachment.username && attachment.room) {
-            ws.username = attachment.username;
-            ws.room = attachment.room;
-            ws.roomname = attachment.room;
-            ws._wsId = attachment.wsId || ++this._wsIdCounter;
-            ws._closing = false;
-            if (!this.wsClients.has(attachment.room)) {
-              this.wsClients.set(attachment.room, new Set());
-            }
-            this.wsClients.get(attachment.room).add(ws._wsId);
-            this.wsMap.set(ws._wsId, ws);
-            this.clientRooms.set(ws._wsId, attachment.room);
-            let conn = this.userConnections.get(attachment.username);
-            if (!conn) {
-              conn = { wsId: ws._wsId, ws: ws, room: attachment.room, timestamp: Date.now() };
-              this.userConnections.set(attachment.username, conn);
-            } else {
-              conn.wsId = ws._wsId;
-              conn.ws = ws;
-              conn.room = attachment.room;
-              conn.timestamp = Date.now();
-            }
-            if (attachment.room === CONSTANTS.DICE_ROOM) {
-              this._sendDiceRoomState(ws);
-            }
-          }
+          await this._restoreSingleWebSocket(ws);
         } catch(e) {}
+      }
+    } catch(e) {}
+  }
+
+  // 🔧 FIX: method baru — restore WS satu per satu
+  async _restoreSingleWebSocket(ws) {
+    try {
+      if (!ws) return;
+      let attachment = null;
+      try {
+        attachment = ws.deserializeAttachment();
+      } catch(e) {
+        attachment = null;
+      }
+      
+      // 🔧 FIX: cukup butuh username — room dicari dari attachment / activeGames
+      if (!attachment || !attachment.username) {
+        return;
+      }
+      
+      const username = attachment.username;
+      ws.username = username;
+      ws._wsId = attachment.wsId || ++this._wsIdCounter;
+      ws._closing = false;
+      
+      // 🔧 FIX: cari room — dari attachment dulu, lalu activeGames
+      let room = attachment.room || attachment.roomname || null;
+      if (!room) {
+        for (const [r, g] of this.activeGames) {
+          if (g?.players?.has?.(username)) {
+            room = r;
+            break;
+          }
+        }
+      }
+      // Kalau masih tidak ada, cek dice room
+      if (!room && attachment.room === CONSTANTS.DICE_ROOM) {
+        room = CONSTANTS.DICE_ROOM;
+      }
+      
+      if (room) {
+        ws.room = room;
+        ws.roomname = room;
+        if (!this.wsClients.has(room)) {
+          this.wsClients.set(room, new Set());
+        }
+        this.wsClients.get(room).add(ws._wsId);
+        this.clientRooms.set(ws._wsId, room);
+      }
+      
+      this.wsMap.set(ws._wsId, ws);
+      
+      // 🔧 FIX: restore userConnections
+      if (username) {
+        let conn = this.userConnections.get(username);
+        if (!conn) {
+          conn = { wsId: ws._wsId, ws: ws, room: room || null, timestamp: Date.now() };
+          this.userConnections.set(username, conn);
+        } else {
+          conn.wsId = ws._wsId;
+          conn.ws = ws;
+          conn.room = room || conn.room;
+          conn.timestamp = Date.now();
+        }
+      }
+      
+      // 🔧 FIX: re-attach attachment supaya konsisten
+      try {
+        ws.serializeAttachment({
+          wsId: ws._wsId,
+          username: username,
+          room: room,
+          roomname: room,
+          createdAt: attachment.createdAt || Date.now()
+        });
+      } catch(e) {}
+      
+      // Kalau dice room, kirim state
+      if (room === CONSTANTS.DICE_ROOM) {
+        this._sendDiceRoomState(ws);
       }
     } catch(e) {}
   }
@@ -724,41 +813,77 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
+  // 🔧 FIX: guard _processingPending + fallback cari WS
   async _processPendingEvents() {
-    if (!this._pendingEvents || this._pendingEvents.length === 0) return;
-    const events = [...this._pendingEvents];
-    this._pendingEvents = [];
-    for (const evt of events) {
-      let ws = evt.ws;
-      if (!ws || ws.readyState !== 1) {
-        const wsId = evt.wsId;
-        if (wsId && this.wsMap.has(wsId)) {
-          ws = this.wsMap.get(wsId);
-        } else {
-          continue;
-        }
-      }
-      if (!ws || ws.readyState !== 1 || ws._closing) continue;
+    try {
+      if (!this._pendingEvents || this._pendingEvents.length === 0) return;
+      if (this._processingPending) return;
+      
+      this._processingPending = true;
       try {
-        const room = evt.room || ws.room || ws.roomname;
-        if (room) {
-          this._ensureClientInRoom(ws, room, evt.username || ws.username);
+        while (this._pendingEvents.length > 0 && !this.closing && !this.isDestroyed) {
+          const events = this._pendingEvents.splice(0, 20);
+          if (events.length === 0) break;
+          
+          for (const evt of events) {
+            try {
+              let ws = evt.ws;
+              
+              if (!ws || ws.readyState !== 1) {
+                // 🔧 FIX: cari via wsId di wsMap
+                const wsId = evt.wsId;
+                if (wsId && this.wsMap.has(wsId)) {
+                  ws = this.wsMap.get(wsId);
+                } else {
+                  // 🔧 FIX: fallback cari via username+room di ctx.getWebSockets()
+                  try {
+                    const allWs = this.ctx.getWebSockets() || [];
+                    for (const w of allWs) {
+                      try {
+                        const att = w.deserializeAttachment?.();
+                        if (att && att.username === evt.username) {
+                          if (!evt.room || att.room === evt.room) {
+                            ws = w;
+                            ws._wsId = att.wsId || ws._wsId;
+                            break;
+                          }
+                        }
+                      } catch(e) {}
+                    }
+                  } catch(e) {}
+                }
+              }
+              
+              if (!ws || ws.readyState !== 1 || ws._closing) continue;
+              
+              try {
+                const room = evt.room || ws.room || ws.roomname;
+                if (room) {
+                  this._ensureClientInRoom(ws, room, evt.username || ws.username);
+                }
+                if (evt.attachment) {
+                  try {
+                    ws.serializeAttachment(evt.attachment);
+                    if (evt.attachment.wsId) ws._wsId = evt.attachment.wsId;
+                    if (evt.attachment.username) ws.username = evt.attachment.username;
+                    if (evt.attachment.room) {
+                      ws.room = evt.attachment.room;
+                      ws.roomname = evt.attachment.roomname || evt.attachment.room;
+                    }
+                  } catch(e) {}
+                }
+                const data = JSON.parse(evt.message);
+                if (Array.isArray(data) && data.length > 0) {
+                  await this._processWithTimeout(ws, data);
+                }
+              } catch(e) {}
+            } catch(e) {}
+          }
         }
-        if (evt.attachment) {
-          try {
-            ws.serializeAttachment(evt.attachment);
-            ws._wsId = evt.attachment.wsId;
-            ws.username = evt.attachment.username;
-            ws.room = evt.attachment.room;
-            ws.roomname = evt.attachment.roomname;
-          } catch(e) {}
-        }
-        const data = JSON.parse(evt.message);
-        if (Array.isArray(data) && data.length > 0) {
-          await this._processWithTimeout(ws, data);
-        }
-      } catch(e) {}
-    }
+      } finally {
+        this._processingPending = false;
+      }
+    } catch(e) {}
   }
 
   _ensureClientInRoom(ws, room, username = null) {
@@ -1704,18 +1829,22 @@ export class GameServer {
     }
   }
 
+  // 🔧 FIX: pakai _restored, bukan _initialized
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
-    if (!this._initialized) {
+    
+    if (!this._restored) {
       if (!this._pendingEvents) this._pendingEvents = [];
-      if (this._pendingEvents.length >= 100) {
+      if (this._pendingEvents.length >= CONSTANTS.MAX_PENDING_EVENTS) {
         try { ws.send(JSON.stringify(["gameLowCardError", "Server busy"])); } catch(e) {}
         return;
       }
       const room = this._getClientRoom(ws);
       const username = this._getClientUsername(ws);
       this._pendingEvents.push({ 
-        ws, message, timestamp: Date.now(), wsId: ws._wsId, room, username,
+        ws, message, timestamp: Date.now(), 
+        wsId: ws._wsId || null,   // 🔧 FIX: fallback null
+        room, username,
         attachment: ws.deserializeAttachment ? ws.deserializeAttachment() : null
       });
       return;
