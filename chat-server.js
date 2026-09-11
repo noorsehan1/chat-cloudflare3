@@ -1,6 +1,6 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.3.0 - RESTORE 2 FASE (LIVE DULU, CLEANUP MATI TERAKHIR)
-// ✅ FIX: removeKursi sekarang sampai ke client online saat server bangun
+// VERSION: 15.5.0 - VERIFIKASI KURSI D1 vs WS AKTIF SAAT RESTORE
+// ✅ FIX: Kursi orphan di D1 (user tanpa WS) → removeKursi dengan nomor benar
 // ⚠️ MULTI BEHAVIOR UNCHANGED
 
 const C = {
@@ -932,8 +932,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥🔥🔥 v15.3.0: CLEANUP — 4 LAPIS FALLBACK
-  // Dipakai oleh: onDestroy, webSocketClose, webSocketError, restore WS mati
+  // 🔥🔥🔥 CLEANUP — 4 LAPIS FALLBACK
   // ============================================================
   async _cleanupUserCompletely(ws) {
     if (!ws) return;
@@ -947,10 +946,6 @@ export class ChatServer {
     state.cleaning = true;
 
     try {
-      // ============================================================
-      // 4 LAPIS FALLBACK USERNAME & ROOM
-      // ============================================================
-
       let username = ws.username || ws._username;
       let roomName = ws.room || ws.roomname || ws._room;
 
@@ -1007,9 +1002,6 @@ export class ChatServer {
         }
       }
 
-      // ============================================================
-      // SKIP MULTI
-      // ============================================================
       const isMulti = this.wsActiveMulti?.has(ws) || false;
       if (isMulti) {
         if (username) {
@@ -1031,18 +1023,12 @@ export class ChatServer {
         return;
       }
 
-      // ============================================================
-      // STEP 1: HAPUS D1
-      // ============================================================
       if (username) {
         try {
           await this._forceDeleteFromD1(roomName, null, username);
         } catch (e) {}
       }
 
-      // ============================================================
-      // STEP 2: HAPUS MEMORY + BROADCAST removeKursi
-      // ============================================================
       if (username) {
         try {
           await this._ensureCacheInitialized();
@@ -1054,7 +1040,6 @@ export class ChatServer {
             if (data?.namauser === username && data.isMulti !== true) {
               delete rBucket.seat[seat];
               if (rBucket.point) delete rBucket.point[seat];
-              // 🔥 Broadcast removeKursi
               this.broadcast(rName, ["removeKursi", rName, parseInt(seat)]);
               this.updateRoomCount(rName).catch(() => {});
             }
@@ -1099,7 +1084,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥 3 TRIGGER — SEMUA PANGGIL _cleanupUserCompletely (SAMA)
+  // 3 TRIGGER
   // ============================================================
   async webSocketClose(ws) {
     try {
@@ -1295,6 +1280,9 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // 🔥 BROADCAST — jangan buang WS yang ws.room kosong (sedang transisi)
+  // ============================================================
   broadcast(room, msg) {
     try {
       if (this.closing || this.isDestroyed || !room || !msg) return 0;
@@ -1318,6 +1306,10 @@ export class ChatServer {
         }
 
         const wsRoom = ws.room || ws.roomname;
+        // 🔥 FIX: kalau wsRoom kosong, skip saja (jangan remove)
+        if (!wsRoom) {
+          continue;
+        }
         if (wsRoom !== room) {
           try { toRemove.add(ws); } catch(e) {}
           continue;
@@ -1486,9 +1478,135 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥🔥🔥 v15.3.0: RESTORE 2 FASE
-  // FASE 1: Restore WS HIDUP dulu → roomClients terisi
-  // FASE 2: Cleanup WS MATI → broadcast removeKursi sampai ke client online
+  // 🔥🔥🔥 v15.5.0: VERIFIKASI KURSI D1 vs WS AKTIF
+  // Iterasi SEMUA kursi di _storageCache (dari D1), cek apakah ada WS aktif.
+  // Kalau tidak ada → hapus D1 + memory + broadcast removeKursi (nomor benar).
+  // ============================================================
+  async _verifyAndCleanupOrphanSeats(liveWsList) {
+    try {
+      await this._ensureCacheInitialized();
+      const roomsData = this._storageCache?.roomsData || {};
+
+      // ============================================================
+      // Bangun Set username yang PUNYA WS aktif
+      // ============================================================
+      const liveUsernames = new Set();
+      for (const ws of (liveWsList || [])) {
+        try {
+          if (!ws || ws.readyState !== 1) continue;
+
+          let uname = ws.username || ws._username;
+
+          if (!uname) {
+            try {
+              const att = ws.deserializeAttachment?.();
+              if (att?.username) uname = att.username;
+            } catch(e) {}
+          }
+
+          if (!uname) {
+            for (const [user, conns] of (this.userConnections || new Map())) {
+              if (conns?.has?.(ws)) { uname = user; break; }
+            }
+          }
+
+          if (uname) liveUsernames.add(uname);
+        } catch(e) {}
+      }
+
+      // ============================================================
+      // Iterasi SEMUA kursi di memory (yang sudah di-load dari D1)
+      // ============================================================
+      const orphanSeats = [];
+
+      for (const [roomName, roomBucket] of Object.entries(roomsData)) {
+        if (!ROOMS_SET.has(roomName)) continue;
+        if (!roomBucket?.seat) continue;
+
+        for (const [seatStr, seatData] of Object.entries(roomBucket.seat)) {
+          if (!seatData?.namauser) continue;
+
+          const seatNum = parseInt(seatStr);
+          if (isNaN(seatNum) || seatNum < 1 || seatNum > C.MAX_SEATS) continue;
+
+          const username = seatData.namauser;
+          const isMulti = seatData.isMulti === true;
+
+          let hasLiveWs = false;
+
+          if (isMulti) {
+            // Multi user → cek di wsActiveMulti
+            for (const [wsKey, data] of (this.wsActiveMulti || new Map())) {
+              if (data?.username === username) {
+                let alive = false;
+                try { alive = (wsKey.readyState === 1); } catch(e) {}
+                if (alive) { hasLiveWs = true; break; }
+              }
+            }
+          } else {
+            if (liveUsernames.has(username)) {
+              hasLiveWs = true;
+            }
+          }
+
+          if (!hasLiveWs) {
+            orphanSeats.push({
+              room: roomName,
+              seat: seatNum,
+              username: username,
+              isMulti: isMulti
+            });
+          }
+        }
+      }
+
+      // ============================================================
+      // Hapus kursi orphan + broadcast removeKursi (nomor BENAR dari key)
+      // ============================================================
+      for (const orphan of orphanSeats) {
+        const { room, seat } = orphan;
+
+        try {
+          // Hapus dari memory
+          const roomBucket = this._storageCache?.roomsData?.[room];
+          if (roomBucket?.seat) {
+            delete roomBucket.seat[seat];
+          }
+          if (roomBucket?.point) {
+            delete roomBucket.point[seat];
+          }
+
+          // Hapus dari D1 — key spesifik
+          if (this.db) {
+            try {
+              await this.db
+                .prepare(`DELETE FROM ${TABLE_NAME} WHERE key IN (?, ?)`)
+                .bind(`seat_${room}_${seat}`, `point_${room}_${seat}`)
+                .run();
+            } catch(e) {}
+          }
+
+          // 🔥 Broadcast removeKursi — nomor kursi BENAR
+          this.broadcast(room, ["removeKursi", room, seat]);
+
+          // Update count
+          try { await this.updateRoomCount(room); } catch(e) {}
+
+        } catch(e) {}
+      }
+
+      return orphanSeats.length;
+    } catch(e) {
+      return 0;
+    }
+  }
+
+  // ============================================================
+  // 🔥🔥🔥 v15.5.0: RESTORE 4 FASE
+  // FASE 1  : Restore WS HIDUP dulu (biar roomClients terisi)
+  // FASE 1.5: VERIFIKASI KURSI D1 vs WS AKTIF (ini kunci utama!)
+  // FASE 2  : Cleanup WS MATI (bersihkan Set/Map)
+  // FASE 3  : Refresh count ke client online
   // ============================================================
   async _restoreAllState() {
     try {
@@ -1510,9 +1628,9 @@ export class ChatServer {
 
         // ============================================================
         // FASE 1: RESTORE WS HIDUP DULU
-        // Kumpulkan WS mati untuk cleanup di FASE 2
         // ============================================================
         const deadWebSockets = [];
+        const liveWebSockets = [];
 
         const batchSize = 10;
         for (let i = 0; i < webSockets.length; i += batchSize) {
@@ -1523,24 +1641,39 @@ export class ChatServer {
               try { isAlive = (ws.readyState === 1); } catch(e) { isAlive = false; }
 
               if (!isAlive) {
-                // Tunda cleanup — kumpulkan dulu
                 deadWebSockets.push(ws);
                 return;
               }
 
-              // Restore WS hidup → masuk ke roomClients, userConnections, wsSet
               await this._restoreLiveWebSocket(ws);
+
+              // Cek lagi — mungkin di-close oleh _restoreLiveWebSocket
+              let stillAlive = false;
+              try { stillAlive = (ws.readyState === 1); } catch(e) { stillAlive = false; }
+
+              if (stillAlive) {
+                liveWebSockets.push(ws);
+              } else {
+                deadWebSockets.push(ws);
+              }
             })
           );
         }
 
         // ============================================================
-        // FASE 2: CLEANUP WS MATI
-        // roomClients sudah terisi WS hidup → broadcast removeKursi NYAMPE
+        // 🔥 FASE 1.5: VERIFIKASI KURSI D1 vs WS AKTIF
+        // Ini yang memastikan kursi orphan di D1 dihapus + removeKursi
+        // di-broadcast dengan nomor kursi BENAR dari key D1.
+        // ============================================================
+        try {
+          await this._verifyAndCleanupOrphanSeats(liveWebSockets);
+        } catch(e) {}
+
+        // ============================================================
+        // FASE 2: CLEANUP WS MATI (bersihkan Set/Map)
         // ============================================================
         for (const ws of deadWebSockets) {
           try {
-            // Isi field dari attachment supaya fallback cleanup dapat data
             try {
               const att = ws.deserializeAttachment?.();
               if (att?.username) {
@@ -1566,8 +1699,7 @@ export class ChatServer {
         }
 
         // ============================================================
-        // FASE 3 (opsional): refresh count semua room yang ada client
-        // supaya client online dapat update terbaru
+        // FASE 3: Refresh count ke client online
         // ============================================================
         for (const [room, clients] of this.roomClients) {
           if (clients && clients.size > 0) {
@@ -1604,14 +1736,12 @@ export class ChatServer {
       }
 
       await this._processPendingEvents();
-
       throw e;
     }
   }
 
   // ============================================================
-  // 🔥 RESTORE HANYA WS YANG HIDUP (readyState === 1)
-  // Masukkan ke roomClients, userConnections, wsSet
+  // RESTORE WS HIDUP → masukkan ke roomClients, userConnections, wsSet
   // ============================================================
   async _restoreLiveWebSocket(ws) {
     try {
@@ -1619,31 +1749,52 @@ export class ChatServer {
 
       let isAlive = false;
       try { isAlive = (ws.readyState === 1); } catch(e) { isAlive = false; }
-      if (!isAlive) return; // safety
+      if (!isAlive) return;
+
+      try { await this._ensureCacheInitialized(); } catch(e) {}
 
       const attachment = ws.deserializeAttachment?.();
       if (!attachment?.username) {
-        // WS hidup tapi tidak punya identitas → tutup, biarkan cleanup nanti
         try { ws.close(1000, "No attachment"); } catch(e) {}
         return;
       }
 
       const found = await this._findUserInAnyRoom(attachment.username);
-      if (!found) {
-        // WS hidup tapi user tidak ada di kursi → tutup, cleanup nanti
+
+      let finalRoom = found?.room;
+      let finalSeat = found?.seat;
+
+      if (!finalRoom) {
+        const attRoom = attachment.seatInfo?.room || attachment.room;
+        if (attRoom && ROOMS_SET.has(attRoom)) {
+          finalRoom = attRoom;
+          finalSeat = attachment.seatInfo?.seat || null;
+          try {
+            const roomBucket = await this._getRoomBucket(attRoom);
+            if (roomBucket?.seat && finalSeat) {
+              const seatData = roomBucket.seat[finalSeat];
+              if (!seatData || seatData.namauser !== attachment.username) {
+                try { ws.close(1000, "User not in seat"); } catch(e) {}
+                return;
+              }
+            }
+          } catch(e) {}
+        }
+      }
+
+      if (!finalRoom) {
         try { ws.close(1000, "User not found"); } catch(e) {}
         return;
       }
 
-      // Restore normal
       ws.username = attachment.username;
-      ws.room = found.room;
-      ws.roomname = found.room;
+      ws.room = finalRoom;
+      ws.roomname = finalRoom;
       ws.idtarget = attachment.username;
       ws._closing = false;
       ws._cleaning = false;
       ws._username = attachment.username;
-      ws._room = found.room;
+      ws._room = finalRoom;
       ws._wsId = Date.now() + Math.random();
 
       const state = _wsCleanupState.get(ws);
@@ -1654,8 +1805,7 @@ export class ChatServer {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false });
       }
 
-      // 🔥 Masukkan ke roomClients — INI KUNCI supaya broadcast nyampe
-      const roomClients = this.roomClients?.get(found.room);
+      const roomClients = this.roomClients?.get(finalRoom);
       if (roomClients && !roomClients.has(ws)) {
         try { roomClients.add(ws); } catch(e) {}
       }
@@ -1676,17 +1826,14 @@ export class ChatServer {
       try {
         ws.serializeAttachment({
           username: attachment.username,
-          seatInfo: found
+          seatInfo: { room: finalRoom, seat: finalSeat }
         });
       } catch(e) {}
-    } catch(e) {
-      // Kalau error → biarkan fase 2 cleanup
-    }
+    } catch(e) {}
   }
 
   // ============================================================
-  // Wrapper: kalau hidup → restore, kalau mati → cleanup
-  // (dipertahankan untuk kompatibilitas pemanggil lain)
+  // Wrapper (dipertahankan untuk kompatibilitas)
   // ============================================================
   async _restoreSingleWebSocket(ws) {
     try {
@@ -1694,7 +1841,6 @@ export class ChatServer {
       try { isAlive = (ws.readyState === 1); } catch(e) { isAlive = false; }
 
       if (!isAlive) {
-        // Isi field dari attachment supaya fallback cleanup dapat data
         try {
           const att = ws.deserializeAttachment?.();
           if (att?.username) {
