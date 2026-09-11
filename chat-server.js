@@ -1,9 +1,8 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.9.0 - REMOVEKURSI LANGSUNG (SAMA SEPERTI ROOMUSERCOUNT)
-// ✅ _restoreRemovedSeats: kumpulkan kursi yang dihapus selama restore
-// ✅ Broadcast removeKursi di loop TERAKHIR _restoreAllState (setelah roomClients terisi)
+// VERSION: 15.9.1 - FIX POINT D1 + REMOVEKURSI SAMPAI
+// ✅ _forceDeleteFromD1: SELECT dulu → DELETE point → DELETE seat (fix point tidak terhapus di D1)
+// ✅ _restoreRemovedSeats: broadcast removeKursi di loop TERAKHIR _restoreAllState
 // ✅ Loop yang SAMA dengan updateRoomCount → PASTI sampai ke user
-// ✅ Tidak pakai pending, tidak pakai event lain
 // ✅ Multi user (isMulti:true) TIDAK PERNAH dihapus
 // ⚠️ MULTI BEHAVIOR UNCHANGED
 
@@ -60,7 +59,7 @@ export class ChatServer {
       this._processingQueue = false;
       this._processingPending = false;
 
-      // 🔥🔥🔥 REMOVED SEATS SELAMA RESTORE — broadcast setelah restore selesai
+      // 🔥 REMOVED SEATS selama restore — broadcast setelah restore selesai
       this._restoreRemovedSeats = [];
 
       this.wsSet = new Set();
@@ -382,12 +381,65 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // 🔥🔥🔥 _forceDeleteFromD1 — FIXED
+  // STEP 1: SELECT kursi DULU (untuk tahu point mana yang harus dihapus)
+  // STEP 2: DELETE point untuk setiap kursi non-multi user ini
+  // STEP 3: Baru DELETE kursi (seat) — filter isMulti
+  // ============================================================
   async _forceDeleteFromD1(username) {
     if (!this.db) return true;
     if (!username) return true;
 
     const u = String(username);
 
+    // 🔥 STEP 1: SELECT dulu kursi non-multi user ini
+    let seatRows = [];
+    try {
+      const rows = await this.db
+        .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND json_extract(value, '$.namauser') = ?`)
+        .bind(u)
+        .all();
+      seatRows = rows?.results || [];
+    } catch(e) {
+      // Fallback: LIKE tanpa json_extract
+      try {
+        const rows = await this.db
+          .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND value LIKE ?`)
+          .bind(`%"namauser":"${u}"%`)
+          .all();
+        seatRows = rows?.results || [];
+      } catch(e2) {
+        try {
+          const rows = await this.db
+            .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND value LIKE ?`)
+            .bind(`%"namauser": "${u}"%`)
+            .all();
+          seatRows = rows?.results || [];
+        } catch(e3) {}
+      }
+    }
+
+    // 🔥 STEP 2: Hapus point untuk setiap kursi non-multi user ini
+    for (const r of seatRows) {
+      let isMultiRow = false;
+      try {
+        const v = JSON.parse(r.value);
+        if (v?.isMulti === true) isMultiRow = true;
+      } catch(e) {}
+      if (isMultiRow) continue;
+
+      const p = r.key.split('_');
+      if (p.length >= 3) {
+        try {
+          await this.db.prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
+            .bind(`point_${p[1]}_${p[2]}`)
+            .run();
+        } catch(e) {}
+      }
+    }
+
+    // 🔥 STEP 3: Baru hapus kursi (seat) — filter isMulti
     try {
       await this.db
         .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND json_extract(value, '$.namauser') = ? AND json_extract(value, '$.isMulti') IS NOT 1`)
@@ -407,28 +459,6 @@ export class ChatServer {
           .run();
       } catch (e2) {}
     }
-
-    try {
-      const rows = await this.db
-        .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND json_extract(value, '$.namauser') = ?`)
-        .bind(u)
-        .all();
-      for (const r of (rows?.results || [])) {
-        let isMultiRow = false;
-        try {
-          const v = JSON.parse(r.value);
-          if (v?.isMulti === true) isMultiRow = true;
-        } catch(e) {}
-        if (isMultiRow) continue;
-
-        const p = r.key.split('_');
-        if (p.length >= 3) {
-          try {
-            await this.db.prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`).bind(`point_${p[1]}_${p[2]}`).run();
-          } catch (e) {}
-        }
-      }
-    } catch (e) {}
 
     return true;
   }
@@ -1040,7 +1070,7 @@ export class ChatServer {
         return result;
       }
 
-      // STEP 1: hapus D1 (filter isMulti)
+      // STEP 1: hapus D1 (SELECT dulu → DELETE point → DELETE seat)
       if (username) {
         try { await this._forceDeleteFromD1(username); } catch (e) {}
       }
@@ -1059,9 +1089,8 @@ export class ChatServer {
 
               result.removedSeats.push({ room: rName, seat: seatNum, username: username });
 
-              // 🔥🔥🔥 Kalau sedang restore, catat ke _restoreRemovedSeats
-              // Ini yang akan di-broadcast di loop TERAKHIR _restoreAllState
-              // (setelah roomClients terisi lengkap) → PASTI sampai ke user
+              // 🔥 Kalau sedang restore, catat ke _restoreRemovedSeats
+              // akan di-broadcast di loop TERAKHIR _restoreAllState
               if (this._isRestoring) {
                 if (!this._restoreRemovedSeats) this._restoreRemovedSeats = [];
                 this._restoreRemovedSeats.push({ room: rName, seat: seatNum });
@@ -1581,7 +1610,7 @@ export class ChatServer {
             } catch(e) {}
           }
 
-          // 🔥🔥🔥 Catat ke _restoreRemovedSeats (kalau sedang restore)
+          // 🔥 Catat ke _restoreRemovedSeats (kalau sedang restore)
           if (this._isRestoring) {
             if (!this._restoreRemovedSeats) this._restoreRemovedSeats = [];
             this._restoreRemovedSeats.push({ room, seat });
@@ -1692,8 +1721,6 @@ export class ChatServer {
         }
 
         // FASE 3: Cleanup WS MATI
-        // Panggil _cleanupUserCompletely dengan skipBroadcast:true
-        // Di dalamnya, karena _isRestoring === true, kursi dicatat ke _restoreRemovedSeats
         for (const ws of deadWebSockets) {
           try {
             try {
@@ -1717,7 +1744,6 @@ export class ChatServer {
         }
 
         // FASE 4: Verifikasi orphan D1
-        // Di dalamnya, karena _isRestoring === true, kursi dicatat ke _restoreRemovedSeats
         try {
           await this._verifyAndCleanupOrphanSeats(liveWebSockets);
         } catch(e) {}
@@ -1730,9 +1756,6 @@ export class ChatServer {
         // ============================================================
         // 🔥🔥🔥 LOOP TERAKHIR — SAMA SEPERTI updateRoomCount
         // Broadcast removeKursi dari _restoreRemovedSeats
-        // Loop ini PASTI sampai ke user karena:
-        //   1. roomClients sudah terisi lengkap (dari FASE 2)
-        //   2. Loop yang SAMA dengan updateRoomCount yang sudah WORK
         // ============================================================
         if (this._restoreRemovedSeats?.length) {
           for (const item of this._restoreRemovedSeats) {
@@ -1745,7 +1768,6 @@ export class ChatServer {
         }
 
         // Refresh count ke semua room yang ada client
-        // Loop yang SAMA — ini yang bikin roomUserCount WORK
         for (const [room, clients] of this.roomClients) {
           if (clients && clients.size > 0) {
             try { await this.updateRoomCount(room); } catch(e) {}
