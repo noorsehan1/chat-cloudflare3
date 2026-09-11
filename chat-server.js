@@ -1,9 +1,10 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.8.0 - RESTORE = CLOSE/ERROR (BROADCAST LANGSUNG)
-// ✅ Restore WS hidup DULU → roomClients terisi → cleanup WS mati broadcast LANGSUNG
-// ✅ Verifikasi orphan D1 → broadcast LANGSUNG + kirim ke liveWsList (jaring pengaman)
+// VERSION: 15.8.1 - RESTORE FIX = BROADCAST removeKursi EKSPLISIT
+// ✅ Restore WS hidup DULU → roomClients terisi → cleanup WS mati catat kursi
+// ✅ Broadcast removeKursi EKSPLISIT ke roomClients + liveWsList (jaring pengaman)
+// ✅ updateRoomCount dipanggil SETELAH broadcast removeKursi
+// ✅ Verifikasi orphan D1 → broadcast LANGSUNG
 // ✅ Multi user (isMulti:true) TIDAK PERNAH dihapus
-// ✅ Kode bersih — tidak ada pending queue / restoreMode yang tidak terpakai
 // ⚠️ MULTI BEHAVIOR UNCHANGED
 
 const C = {
@@ -1052,7 +1053,7 @@ export class ChatServer {
               delete rBucket.seat[seat];
               if (rBucket.point) delete rBucket.point[seat];
 
-              // 🔥 BROADCAST LANGSUNG (sama seperti close/error)
+              // 🔥 BROADCAST LANGSUNG
               this.broadcast(rName, ["removeKursi", rName, parseInt(seat)]);
               this.updateRoomCount(rName).catch(() => {});
             }
@@ -1315,7 +1316,21 @@ export class ChatServer {
           continue;
         }
 
-        const wsRoom = ws.room || ws.roomname;
+        let wsRoom = ws.room || ws.roomname || ws._room;
+
+        // Fallback ke attachment kalau room kosong
+        if (!wsRoom) {
+          try {
+            const att = ws.deserializeAttachment?.();
+            wsRoom = att?.seatInfo?.room || att?.room;
+            if (wsRoom) {
+              ws.room = wsRoom;
+              ws.roomname = wsRoom;
+              ws._room = wsRoom;
+            }
+          } catch(e) {}
+        }
+
         if (!wsRoom) {
           continue;
         }
@@ -1488,8 +1503,6 @@ export class ChatServer {
 
   // ============================================================
   // 🔥🔥🔥 VERIFIKASI KURSI D1 — BROADCAST LANGSUNG
-  // Sama seperti close/error. Multi user skip.
-  // Jaring pengaman: kirim langsung ke liveWsList kalau roomClients belum lengkap.
   // ============================================================
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
@@ -1557,7 +1570,7 @@ export class ChatServer {
             } catch(e) {}
           }
 
-          // 🔥 BROADCAST LANGSUNG (sama seperti close/error)
+          // 🔥 BROADCAST LANGSUNG
           const msgArr = ["removeKursi", room, seat];
           const msg = JSON.stringify(msgArr);
           const sentTo = new Set();
@@ -1569,7 +1582,7 @@ export class ChatServer {
               for (const ws of clients) {
                 try {
                   if (!ws || ws.readyState !== 1) continue;
-                  const wsRoom = ws.room || ws.roomname;
+                  const wsRoom = ws.room || ws.roomname || ws._room;
                   if (wsRoom !== room) continue;
                   ws.send(msg);
                   sentTo.add(ws);
@@ -1609,10 +1622,10 @@ export class ChatServer {
   }
 
   // ============================================================
-  // 🔥🔥🔥 RESTORE — 4 FASE
+  // 🔥🔥🔥 RESTORE — 4 FASE (FIXED)
   // FASE 1: Kumpulkan WS hidup & mati
   // FASE 2: RESTORE WS hidup DULU → roomClients terisi lengkap
-  // FASE 3: Cleanup WS mati (MODE NORMAL) → broadcast removeKursi LANGSUNG
+  // FASE 3: Cleanup WS mati → catat kursi → broadcast EKSPLISIT
   // FASE 4: Verifikasi orphan D1 → broadcast LANGSUNG
   // ============================================================
   async _restoreAllState() {
@@ -1633,7 +1646,9 @@ export class ChatServer {
       try {
         const webSockets = this.ctx?.getWebSockets?.() || [];
 
-        // FASE 1: kumpulkan WS
+        // ============================================================
+        // FASE 1: Kumpulkan WS hidup & mati
+        // ============================================================
         const deadWebSockets = [];
         const liveWebSockets = [];
 
@@ -1649,7 +1664,9 @@ export class ChatServer {
           }
         }
 
+        // ============================================================
         // FASE 2: RESTORE WS HIDUP DULU (supaya roomClients terisi)
+        // ============================================================
         const batchSize = 10;
         for (let i = 0; i < liveWebSockets.length; i += batchSize) {
           const batch = liveWebSockets.slice(i, i + batchSize);
@@ -1658,7 +1675,14 @@ export class ChatServer {
           );
         }
 
-        // FASE 3: Cleanup WS MATI (MODE NORMAL — broadcast LANGSUNG)
+        // ============================================================
+        // FASE 3: Cleanup WS MATI
+        //   - Catat kursi yang akan dihapus SEBELUM cleanup
+        //   - Broadcast removeKursi EKSPLISIT setelah semua cleanup
+        //   - Multi user (isMulti:true) TIDAK PERNAH dihapus
+        // ============================================================
+        const deadSeatsToRemove = []; // { room, seat, username }
+
         for (const ws of deadWebSockets) {
           try {
             // Isi field dari attachment supaya cleanup bisa resolve user/room
@@ -1676,12 +1700,84 @@ export class ChatServer {
               }
             } catch(e) {}
 
+            // Tangkap kursi yang akan dihapus SEBELUM cleanup
+            const uname = ws.username || ws._username;
+
+            // Skip multi user (jangan pernah hapus)
+            const isMulti = this.wsActiveMulti?.has(ws) || false;
+            if (!isMulti && uname) {
+              const roomsData = this._storageCache?.roomsData || {};
+              for (const [rName, rBucket] of Object.entries(roomsData)) {
+                if (!rBucket?.seat) continue;
+                for (const [seatStr, seatData] of Object.entries(rBucket.seat)) {
+                  if (seatData?.namauser === uname && seatData.isMulti !== true) {
+                    deadSeatsToRemove.push({
+                      room: rName,
+                      seat: parseInt(seatStr),
+                      username: uname
+                    });
+                  }
+                }
+              }
+            }
+
             await this._cleanupUserCompletely(ws);
             try { ws.serializeAttachment({}); } catch(e) {}
           } catch(e) {}
         }
 
+        // 🔥 Broadcast EKSPLISIT removeKursi untuk dead WS
+        // Pakai roomClients (sudah terisi dari FASE 2) + liveWsList (jaring pengaman)
+        for (const item of deadSeatsToRemove) {
+          const { room, seat } = item;
+          try {
+            const msg = JSON.stringify(["removeKursi", room, seat]);
+            const sentTo = new Set();
+
+            // (a) via roomClients
+            try {
+              const clients = this.roomClients?.get(room);
+              if (clients && clients.size > 0) {
+                for (const ws of clients) {
+                  try {
+                    if (!ws || ws.readyState !== 1) continue;
+                    const wsRoom = ws.room || ws.roomname || ws._room;
+                    if (wsRoom !== room) continue;
+                    ws.send(msg);
+                    sentTo.add(ws);
+                  } catch(e) {}
+                }
+              }
+            } catch(e) {}
+
+            // (b) jaring pengaman: kirim langsung ke liveWsList
+            try {
+              for (const ws of (liveWebSockets || [])) {
+                try {
+                  if (!ws || ws.readyState !== 1) continue;
+                  if (sentTo.has(ws)) continue;
+                  let wsRoom = ws.room || ws.roomname || ws._room;
+                  if (!wsRoom) {
+                    try {
+                      const att = ws.deserializeAttachment?.();
+                      wsRoom = att?.seatInfo?.room || att?.room;
+                    } catch(e) {}
+                  }
+                  if (wsRoom !== room) continue;
+                  ws.send(msg);
+                  sentTo.add(ws);
+                } catch(e) {}
+              }
+            } catch(e) {}
+
+            // Update count SETELAH broadcast
+            try { await this.updateRoomCount(room); } catch(e) {}
+          } catch(e) {}
+        }
+
+        // ============================================================
         // FASE 4: Verifikasi orphan D1 → broadcast LANGSUNG
+        // ============================================================
         try {
           await this._verifyAndCleanupOrphanSeats(liveWebSockets);
         } catch(e) {}
