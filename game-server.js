@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.9.6 - STABLE (ALL FIXES APPLIED)
+// VERSION: 16.9.8 - 100% BEBAS LOG
 // ✅ FIX #1: _restoreAllState — batch processing (10 WS paralel)
 // ✅ FIX #2: _restoreAllState — batasi 100 WS
 // ✅ FIX #3: _restoreAllState — hapus console.log di loop
@@ -9,7 +9,8 @@
 // ✅ FIX #6: broadcast — jangan scan semua WS saat room kosong
 // ✅ FIX #7: alarm() — scheduleAlarms hanya jika berubah
 // ✅ FIX #8: _isRestoring — reset di finally
-// ✅ FIX #9: Hapus console.log berlebihan
+// ✅ FIX #9: HAPUS SEMUA console.log & console.error (100% BEBAS LOG)
+// ✅ FIX #10: scheduleAlarms — fallback ke _scheduleNearestAlarm jika gagal
 // ✅ SEMUA LOGIKA GAME TIDAK DIUBAH
 // ============================================================
 
@@ -55,7 +56,6 @@ const CONSTANTS = {
   CACHE_LOAD_TIMEOUT: 5000,
   MAX_RESTORE_ATTEMPTS: 3,
   RESTORE_RETRY_DELAY_MS: 2000,
-  // 🔥 FIX #2: Batasi jumlah WS yang di-restore
   MAX_RESTORE_WS: 100,
   RESTORE_BATCH_SIZE: 10,
 };
@@ -264,7 +264,12 @@ class AlarmScheduler {
         if (dur > 0) await this._scheduleAlarm('dice_session_end', startDelay + dur);
       }
       return true;
-    } catch(e) { return false; }
+    } catch(e) {
+      try {
+        await this._scheduleNearestAlarm();
+      } catch(e2) {}
+      return false;
+    }
   }
 
   async _scheduleWeeklyResetUTC() {
@@ -487,7 +492,6 @@ export class GameServer {
       this._nextSessionNotifiedFor = null;
       this._roomEntryNotified = new Set();
 
-      // 🔥 FIX #7: Track jadwal terakhir untuk hindari scheduleAlarms berulang
       this._alarmsScheduledFor = null;
 
       this.db = env.DB;
@@ -531,7 +535,6 @@ export class GameServer {
   // RESTORE
   // ============================================================
 
-  // 🔥 FIX #8: _isRestoring reset di finally
   async _restoreWithRetry() {
     let attempts = 0;
     let lastError = null;
@@ -557,7 +560,6 @@ export class GameServer {
       this._initialized = true;
       throw lastError;
     } finally {
-      // 🔥 FIX #8: Reset _isRestoring di finally
       this._isRestoring = false;
     }
   }
@@ -571,7 +573,6 @@ export class GameServer {
       try {
         await this.alarmScheduler.restoreAlarms();
         await this.alarmScheduler.scheduleAlarms();
-        // 🔥 FIX #7: Catat jadwal terakhir
         this._alarmsScheduledFor = new Date().toISOString().slice(0, 10);
       } catch(e) {}
 
@@ -579,8 +580,6 @@ export class GameServer {
 
       try {
         const webSockets = this.ctx.getWebSockets();
-        // 🔥 FIX #3: Hapus console.log di dalam loop
-        // 🔥 FIX #2: Batasi jumlah WS yang di-restore
 
         this.wsSet.clear();
         this.roomClients.clear();
@@ -589,19 +588,16 @@ export class GameServer {
         let restoredCount = 0;
         let deadCount = 0;
 
-        // 🔥 FIX #2: Batasi WS yang diproses
         const maxRestore = Math.min(webSockets.length, CONSTANTS.MAX_RESTORE_WS);
         const toRestore = webSockets.slice(0, maxRestore);
         const toSkip = webSockets.slice(maxRestore);
 
-        // 🔥 FIX #2: Close WS yang di-skip
         for (const ws of toSkip) {
           try {
             if (ws && ws.readyState === 1) ws.close(1000, "Too many connections");
           } catch(e) {}
         }
 
-        // 🔥 FIX #1: Batch processing dengan Promise.allSettled
         const batchSize = CONSTANTS.RESTORE_BATCH_SIZE;
         for (let i = 0; i < toRestore.length; i += batchSize) {
           const batch = toRestore.slice(i, i + batchSize);
@@ -625,9 +621,7 @@ export class GameServer {
 
                 await this._restoreSingleWebSocket(ws);
                 restoredCount++;
-              } catch(e) {
-                // 🔥 FIX #3: Hapus console.error di dalam loop
-              }
+              } catch(e) {}
             })
           );
         }
@@ -712,20 +706,7 @@ export class GameServer {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
 
-      // 🔥 FIX #4: Skip safeSend diceRoll saat restore
-      // Client akan minta sendiri via getDiceSessionStatus
-      // if (room === CONSTANTS.DICE_ROOM) {
-      //   try {
-      //     const isDiceTime = this.alarmScheduler.isDiceTime();
-      //     const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
-      //     if (isDiceTime && isGameRunning) {
-      //       this.safeSend(ws, ["diceRoll", { ... }]);
-      //     }
-      //   } catch(e) {}
-      // }
-    } catch(e) {
-      // 🔥 FIX #3: Hapus console.error
-    }
+    } catch(e) {}
   }
 
   // ============================================================
@@ -788,7 +769,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // 🔥 FIX #5: Clear timer di finally
   async _processWithTimeout(ws, data, timeoutMs = 500) {
     let timer = null;
     try {
@@ -799,7 +779,6 @@ export class GameServer {
       await Promise.race([this.handleEvent(ws, data), timeoutPromise]);
     } catch(e) {
     } finally {
-      // 🔥 FIX #5: Clear timer di finally
       if (timer) {
         try { clearTimeout(timer); } catch(e) {}
         this._allTimers.delete(timer);
@@ -905,14 +884,12 @@ export class GameServer {
   // BROADCAST
   // ============================================================
 
-  // 🔥 FIX #6: Jangan scan semua WS saat room kosong
   broadcast(room, msg) {
     try {
       if (this.closing || this.isDestroyed || !room || !msg) return 0;
 
       let clients = this.roomClients?.get(room);
 
-      // 🔥 FIX #6: Jangan scan semua WS — cukup return 0
       if (!clients || clients.size === 0) {
         return 0;
       }
@@ -1774,7 +1751,6 @@ export class GameServer {
   // ALARM
   // ============================================================
 
-  // 🔥 FIX #7: scheduleAlarms hanya jika jadwal berubah
   async alarm() {
     if (this.closing || this.isDestroyed) return;
     try {
@@ -1788,7 +1764,6 @@ export class GameServer {
         } catch(e) {}
       }
 
-      // 🔥 FIX #7: Hanya scheduleAlarms jika tanggal berubah
       const today = new Date().toISOString().slice(0, 10);
       if (this._alarmsScheduledFor !== today) {
         await this.alarmScheduler.scheduleAlarms();
