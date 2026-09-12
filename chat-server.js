@@ -1,16 +1,19 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.9.3 - ALARM FIX FINAL (15 MENIT, RE-SCHEDULE PASTI, NO LOG)
-// ✅ _ensureAlarm: SELALU setAlarm (bukan cek existing)
-// ✅ alarm(): cek ctx.storage sebelum pakai
-// ✅ _saveCurrentNumber: baca dari this.currentNumber
-// ✅ _updateNumber: anti-stuck 30s
-// ✅ MULTI BEHAVIOR UNCHANGED
+// VERSION: 15.9.6 - USER INDEX FIX
+// ✅ #1 _ensureAlarm: guard — tidak timpa alarm tiap fetch
+// ✅ #2 _withLock: token pemilik
+// ✅ #3 _forceDeleteFromD1: 1-2 query bersih
+// ✅ #4 fetch(): overloaded/retryable → 503
+// ✅ #5 _verifyAndCleanupOrphanSeats: broadcast()
+// ✅ #6 _joinInternal: setTimeout + fallback pendingStateSend
+// ✅ #A _userIndex: Map username → {room, seat, isMulti} — O(1)
+// ✅ SEMUA LOGIKA UI & JOIN ROOM TIDAK DIUBAH
 
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
-  NUMBER_INTERVAL_MS: 1 * 60 * 1000,   // 15 menit × 60 detik × 1000 ms
+  NUMBER_INTERVAL_MS: 1 * 60 * 1000,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
   USER_JOIN_LOCK_TIMEOUT: 10000,
@@ -65,6 +68,9 @@ export class ChatServer {
       this.userConnections = new Map();
       this.roomClients = new Map();
       this.wsActiveMulti = new Map();
+
+      // ✅ PATCH #A: index username → { room, seat, isMulti }
+      this._userIndex = new Map();
 
       this._joinLocks = new Map();
       this._kursiLocks = new Map();
@@ -172,6 +178,7 @@ export class ChatServer {
       this.userConnections = new Map();
       this.roomClients = new Map();
       this.wsActiveMulti = new Map();
+      this._userIndex = new Map();
       this._pendingEvents = [];
       this._eventQueue = [];
       this.db = null;
@@ -185,18 +192,68 @@ export class ChatServer {
     }
   }
 
-  // 🔥 FIX: SELALU setAlarm, bukan cek existing
+  // ============================================================
+  // ✅ PATCH #A helper: rebuild _userIndex dari _storageCache
+  // ============================================================
+  _rebuildUserIndex() {
+    try {
+      this._userIndex = new Map();
+      const roomsData = this._storageCache?.roomsData || {};
+      for (const [roomName, roomBucket] of Object.entries(roomsData)) {
+        if (!roomBucket?.seat) continue;
+        for (const [seatStr, seatData] of Object.entries(roomBucket.seat)) {
+          if (seatData?.namauser) {
+            const seatNum = parseInt(seatStr);
+            if (!isNaN(seatNum)) {
+              this._userIndex.set(seatData.namauser, {
+                room: roomName,
+                seat: seatNum,
+                isMulti: seatData.isMulti === true
+              });
+            }
+          }
+        }
+      }
+    } catch(e) {
+      this._userIndex = new Map();
+    }
+  }
+
+  // ✅ PATCH #A helper: set/update entry index
+  _setUserIndex(username, room, seat, isMulti) {
+    if (!username) return;
+    try {
+      this._userIndex.set(username, { room, seat, isMulti: isMulti === true });
+    } catch(e) {}
+  }
+
+  // ✅ PATCH #A helper: hapus entry index
+  _removeUserIndex(username) {
+    if (!username) return;
+    try { this._userIndex.delete(username); } catch(e) {}
+  }
+
+  // ============================================================
+  // ✅ PATCH #1: _ensureAlarm
+  // ============================================================
   async _ensureAlarm() {
     if (this.closing || this.isDestroyed) return;
     try {
       if (!this.ctx || !this.ctx.storage) return;
       if (typeof this.ctx.storage.setAlarm !== 'function') return;
+
+      if (typeof this.ctx.storage.getAlarm === 'function') {
+        try {
+          const existing = await this.ctx.storage.getAlarm();
+          if (existing !== null && existing !== undefined) return;
+        } catch(e) {}
+      }
+
       const next = Date.now() + C.NUMBER_INTERVAL_MS;
       await this.ctx.storage.setAlarm(next);
     } catch(e) {}
   }
 
-  // 🔥 FIX: cek ctx.storage sebelum pakai
   async alarm() {
     try {
       if (this.closing || this.isDestroyed) return;
@@ -302,6 +359,7 @@ export class ChatServer {
         this._storageCache = { roomsData: {}, currentNumber: 1 };
         this._cacheInitialized = true;
         this.currentNumber = 1;
+        this._userIndex = new Map();
         return this._storageCache;
       }
 
@@ -390,6 +448,9 @@ export class ChatServer {
       this.currentNumber = currentNumber;
       this._cacheLoadAttempts = 0;
 
+      // ✅ PATCH #A: bangun index
+      this._rebuildUserIndex();
+
       return this._storageCache;
 
     } catch(e) {
@@ -462,73 +523,57 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // ✅ PATCH #3: _forceDeleteFromD1
+  // ============================================================
   async _forceDeleteFromD1(username) {
     if (!this.db) return true;
     if (!username) return true;
 
     const u = String(username);
 
-    let seatRows = [];
     try {
-      const rows = await this.db
-        .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND json_extract(value, '$.namauser') = ?`)
-        .bind(u)
-        .all();
-      seatRows = rows?.results || [];
+      await this.db.prepare(`
+        DELETE FROM ${TABLE_NAME}
+        WHERE key LIKE 'point_%'
+        AND key IN (
+          SELECT 'point_' || substr(key, 6) FROM ${TABLE_NAME}
+          WHERE key LIKE 'seat_%'
+          AND json_extract(value, '$.namauser') = ?
+          AND json_extract(value, '$.isMulti') IS NOT 1
+        )
+      `).bind(u).run();
     } catch(e) {
       try {
-        const rows = await this.db
-          .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND value LIKE ?`)
-          .bind(`%"namauser":"${u}"%`)
-          .all();
-        seatRows = rows?.results || [];
-      } catch(e2) {
-        try {
-          const rows = await this.db
-            .prepare(`SELECT key, value FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND value LIKE ?`)
-            .bind(`%"namauser": "${u}"%`)
-            .all();
-          seatRows = rows?.results || [];
-        } catch(e3) {}
-      }
-    }
-
-    for (const r of seatRows) {
-      let isMultiRow = false;
-      try {
-        const v = JSON.parse(r.value);
-        if (v?.isMulti === true) isMultiRow = true;
-      } catch(e) {}
-      if (isMultiRow) continue;
-
-      const p = r.key.split('_');
-      if (p.length >= 3) {
-        try {
-          await this.db.prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
-            .bind(`point_${p[1]}_${p[2]}`)
-            .run();
-        } catch(e) {}
-      }
+        await this.db.prepare(`
+          DELETE FROM ${TABLE_NAME}
+          WHERE key LIKE 'point_%'
+          AND key IN (
+            SELECT 'point_' || substr(key, 6) FROM ${TABLE_NAME}
+            WHERE key LIKE 'seat_%'
+            AND value LIKE ?
+            AND value NOT LIKE '%"isMulti":true%'
+          )
+        `).bind(`%"namauser":"${u}"%`).run();
+      } catch(e2) {}
     }
 
     try {
-      await this.db
-        .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND json_extract(value, '$.namauser') = ? AND json_extract(value, '$.isMulti') IS NOT 1`)
-        .bind(u)
-        .run();
-    } catch (e) {
+      await this.db.prepare(`
+        DELETE FROM ${TABLE_NAME}
+        WHERE key LIKE 'seat_%'
+        AND json_extract(value, '$.namauser') = ?
+        AND json_extract(value, '$.isMulti') IS NOT 1
+      `).bind(u).run();
+    } catch(e) {
       try {
-        await this.db
-          .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND value LIKE ? AND value NOT LIKE '%"isMulti":true%'`)
-          .bind(`%"namauser":"${u}"%`)
-          .run();
-      } catch (e2) {}
-      try {
-        await this.db
-          .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND value LIKE ? AND value NOT LIKE '%"isMulti":true%'`)
-          .bind(`%"namauser": "${u}"%`)
-          .run();
-      } catch (e2) {}
+        await this.db.prepare(`
+          DELETE FROM ${TABLE_NAME}
+          WHERE key LIKE 'seat_%'
+          AND value LIKE ?
+          AND value NOT LIKE '%"isMulti":true%'
+        `).bind(`%"namauser":"${u}"%`).run();
+      } catch(e2) {}
     }
 
     return true;
@@ -542,8 +587,12 @@ export class ChatServer {
       const seatData = roomBucket.seat?.[seatNumber];
       if (seatData?.isMulti === true) return false;
 
+      const removedUsername = seatData?.namauser;
       if (roomBucket.seat) delete roomBucket.seat[seatNumber];
       if (roomBucket.point) delete roomBucket.point[seatNumber];
+
+      // ✅ PATCH #A: hapus dari index
+      if (removedUsername) this._removeUserIndex(removedUsername);
 
       if (this.db) {
         try {
@@ -583,12 +632,16 @@ export class ChatServer {
       if (!roomBucket) return false;
 
       if (!seatData || !seatData.namauser || seatData.namauser.trim() === '') {
+        const oldUser = roomBucket.seat?.[seatNumber]?.namauser;
         if (roomBucket.seat) delete roomBucket.seat[seatNumber];
+        if (oldUser) this._removeUserIndex(oldUser);
         await this._saveSeat(roomName, seatNumber, null);
         return true;
       }
       if (!roomBucket.seat) roomBucket.seat = {};
       roomBucket.seat[seatNumber] = seatData;
+      // ✅ PATCH #A: update index
+      this._setUserIndex(seatData.namauser, roomName, seatNumber, seatData.isMulti);
       await this._saveSeat(roomName, seatNumber, seatData);
       return true;
     } catch(e) {
@@ -662,16 +715,42 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // ✅ PATCH #A: _findUserInAnyRoom — pakai _userIndex (O(1))
+  // ============================================================
   async _findUserInAnyRoom(username) {
     try {
       if (!username) return null;
+
+      // ✅ Fast path: cek index dulu (O(1))
+      const cached = this._userIndex?.get(username);
+      if (cached) {
+        // Verifikasi cache masih valid
+        await this._ensureCacheInitialized();
+        const roomBucket = this._storageCache?.roomsData?.[cached.room];
+        const seatData = roomBucket?.seat?.[cached.seat];
+        if (seatData?.namauser === username) {
+          return {
+            room: cached.room,
+            seat: cached.seat,
+            isMulti: seatData.isMulti === true
+          };
+        }
+        // Cache basi — hapus, lanjut scan manual
+        this._userIndex.delete(username);
+      }
+
+      // Fallback: scan manual (hanya jika index miss)
       await this._ensureCacheInitialized();
       const roomsData = this._storageCache?.roomsData || {};
       for (const [roomName, roomBucket] of Object.entries(roomsData)) {
         if (!roomBucket?.seat) continue;
         for (const [seat, data] of Object.entries(roomBucket.seat)) {
           if (data?.namauser === username) {
-            return { room: roomName, seat: parseInt(seat), isMulti: data.isMulti || false };
+            const seatNum = parseInt(seat);
+            // Update index
+            this._setUserIndex(username, roomName, seatNum, data.isMulti);
+            return { room: roomName, seat: seatNum, isMulti: data.isMulti || false };
           }
         }
       }
@@ -743,31 +822,31 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // ✅ PATCH #2: _withLock
+  // ============================================================
   async _withLock(lockMap, key, fn, timeout = C.LOCK_TIMEOUT) {
     try {
       if (!lockMap) return await fn();
 
+      const token = Symbol('lock_' + key);
       const start = Date.now();
-      let waited = 0;
 
-      while (lockMap.has(key) && waited < timeout) {
+      while (lockMap.has(key) && (Date.now() - start) < timeout) {
         await new Promise(resolve => setTimeout(resolve, 50));
-        waited += 50;
       }
 
       if (lockMap.has(key)) {
-        lockMap.delete(key);
+        return await fn();
       }
 
-      lockMap.set(key, Date.now());
+      lockMap.set(key, token);
       try {
-        const result = await fn();
-        return result;
+        return await fn();
       } finally {
-        lockMap.delete(key);
+        if (lockMap.get(key) === token) lockMap.delete(key);
       }
     } catch(e) {
-      if (lockMap && lockMap.has(key)) lockMap.delete(key);
       throw e;
     }
   }
@@ -878,6 +957,9 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // ✅ PATCH #6: _joinInternal
+  // ============================================================
   async _joinInternal(ws, roomName, username) {
     try {
       const existing = await this._findUserInAnyRoom(username);
@@ -971,11 +1053,24 @@ export class ChatServer {
 
       await this.updateRoomCount(roomName);
 
-      setTimeout(() => {
+      try {
+        const att = ws.deserializeAttachment?.() || {};
+        att.pendingStateSend = Date.now();
+        att.pendingStateRoom = roomName;
+        att.pendingStateUsername = username;
+        ws.serializeAttachment(att);
+      } catch(e) {}
+
+      setTimeout(async () => {
         try {
-          if (ws?.readyState === 1) {
-            this.sendAllStateTo(ws, roomName, true);
-          }
+          if (!ws || ws.readyState !== 1) return;
+          const att = ws.deserializeAttachment?.() || {};
+          if (!att.pendingStateSend) return;
+          att.pendingStateSend = null;
+          att.pendingStateRoom = null;
+          att.pendingStateUsername = null;
+          try { ws.serializeAttachment(att); } catch(e) {}
+          await this.sendAllStateTo(ws, roomName, true);
         } catch(e) {}
       }, 1000);
 
@@ -1148,6 +1243,9 @@ export class ChatServer {
               const seatNum = parseInt(seat);
               delete rBucket.seat[seat];
               if (rBucket.point) delete rBucket.point[seat];
+
+              // ✅ PATCH #A: hapus dari index
+              this._removeUserIndex(username);
 
               result.removedSeats.push({ room: rName, seat: seatNum, username: username });
 
@@ -1400,10 +1498,10 @@ export class ChatServer {
   broadcast(room, msg) {
     try {
       if (this.closing || this.isDestroyed || !room || !msg) return 0;
-      const msgStr = JSON.stringify(msg);
       const clients = this.roomClients?.get(room);
       if (!clients || clients.size === 0) return 0;
 
+      const msgStr = JSON.stringify(msg);
       const toRemove = new Set();
       let sentCount = 0;
 
@@ -1560,6 +1658,9 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ============================================================
+  // ✅ PATCH #5: _verifyAndCleanupOrphanSeats
+  // ============================================================
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
       await this._ensureCacheInitialized();
@@ -1606,11 +1707,14 @@ export class ChatServer {
       }
 
       for (const orphan of orphanSeats) {
-        const { room, seat } = orphan;
+        const { room, seat, username } = orphan;
         try {
           const roomBucket = this._storageCache?.roomsData?.[room];
           if (roomBucket?.seat) delete roomBucket.seat[seat];
           if (roomBucket?.point) delete roomBucket.point[seat];
+
+          // ✅ PATCH #A: hapus dari index
+          if (username) this._removeUserIndex(username);
 
           if (this.db) {
             try {
@@ -1626,41 +1730,8 @@ export class ChatServer {
             this._restoreRemovedSeats.push({ room, seat });
           }
 
-          const msg = JSON.stringify(["removeKursi", room, seat]);
-          const sentTo = new Set();
-
           try {
-            const clients = this.roomClients?.get(room);
-            if (clients && clients.size > 0) {
-              for (const ws of clients) {
-                try {
-                  if (!ws || ws.readyState !== 1) continue;
-                  const wsRoom = ws.room || ws.roomname || ws._room;
-                  if (wsRoom !== room) continue;
-                  ws.send(msg);
-                  sentTo.add(ws);
-                } catch(e) {}
-              }
-            }
-          } catch(e) {}
-
-          try {
-            for (const ws of (liveWsList || [])) {
-              try {
-                if (!ws || ws.readyState !== 1) continue;
-                if (sentTo.has(ws)) continue;
-                let wsRoom = ws.room || ws.roomname || ws._room;
-                if (!wsRoom) {
-                  try {
-                    const att = ws.deserializeAttachment?.();
-                    wsRoom = att?.seatInfo?.room || att?.room;
-                  } catch(e) {}
-                }
-                if (wsRoom !== room) continue;
-                ws.send(msg);
-                sentTo.add(ws);
-              } catch(e) {}
-            }
+            this.broadcast(room, ["removeKursi", room, seat]);
           } catch(e) {}
 
           try { await this.updateRoomCount(room); } catch(e) {}
@@ -1879,6 +1950,11 @@ export class ChatServer {
         try { this.wsSet?.add(ws); } catch(e) {}
       }
 
+      // ✅ PATCH #A: pastikan index terisi
+      if (finalRoom && finalSeat) {
+        this._setUserIndex(attachment.username, finalRoom, finalSeat, false);
+      }
+
       try {
         ws.serializeAttachment({
           username: attachment.username,
@@ -1943,6 +2019,20 @@ export class ChatServer {
       if (ws._cleaning || ws._closing) {
         return;
       }
+
+      try {
+        const att = ws.deserializeAttachment?.();
+        if (att?.pendingStateSend && (Date.now() - att.pendingStateSend) >= 1000) {
+          const pendingRoom = att.pendingStateRoom;
+          att.pendingStateSend = null;
+          att.pendingStateRoom = null;
+          att.pendingStateUsername = null;
+          try { ws.serializeAttachment(att); } catch(e) {}
+          if (pendingRoom) {
+            this.sendAllStateTo(ws, pendingRoom, true).catch(() => {});
+          }
+        }
+      } catch(e) {}
 
       if (!this._restored && this._restorePromise) {
         try {
@@ -2051,6 +2141,7 @@ export class ChatServer {
             if (roomName && seatNumber) {
               await this._removeUserFromRoom(targetUsername, roomName);
             }
+            this._removeUserIndex(targetUsername);
             const connections = this.userConnections?.get(targetUsername);
             if (connections) {
               const toRemove = Array.from(connections);
@@ -2488,6 +2579,11 @@ export class ChatServer {
             await this._ensureCacheInitialized();
             const roomBucket = this._storageCache?.roomsData?.[resetRoomName];
             if (roomBucket) {
+              // ✅ PATCH #A: hapus semua username di room ini dari index
+              for (const seatStr in roomBucket.seat) {
+                const uname = roomBucket.seat[seatStr]?.namauser;
+                if (uname) this._removeUserIndex(uname);
+              }
               roomBucket.seat = {};
               roomBucket.point = {};
               roomBucket.mute = false;
@@ -2526,6 +2622,9 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // ✅ PATCH #4: fetch()
+  // ============================================================
   async fetch(req) {
     try {
       if (!this._restored && !this._restorePromise) {
@@ -2591,9 +2690,6 @@ export class ChatServer {
 
       await this._ensureCacheInitialized();
 
-      // 🔥 Pastikan alarm selalu ter-set
-      this._ensureAlarm().catch(() => {});
-
       try {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
@@ -2635,10 +2731,22 @@ export class ChatServer {
 
         return new Response(null, { status: 101, webSocket: client });
       } catch(e) {
+        if (e?.overloaded || e?.retryable) {
+          return new Response("Overloaded", {
+            status: 503,
+            headers: { 'Retry-After': '2', 'Content-Type': 'text/plain' }
+          });
+        }
         this._handleError('fetch', e);
         return new Response("Internal Server Error", { status: 500 });
       }
     } catch(e) {
+      if (e?.overloaded || e?.retryable) {
+        return new Response("Overloaded", {
+          status: 503,
+          headers: { 'Retry-After': '2', 'Content-Type': 'text/plain' }
+        });
+      }
       this._handleError('fetch', e);
       return new Response("Internal Server Error", { status: 500 });
     }
@@ -2646,6 +2754,10 @@ export class ChatServer {
 
   _handleError(type, error) {
     try {
+      if (error?.overloaded || error?.retryable) {
+        return;
+      }
+
       const now = Date.now();
       if (now - this._lastErrorReset > C.ERROR_RESET_INTERVAL_MS) {
         this._errorCount = 0;
@@ -2724,6 +2836,7 @@ export class ChatServer {
     this._roomCountsCache = null;
     this._roomCountsCacheTime = 0;
     this._restoreRemovedSeats = [];
+    this._userIndex = new Map();
 
     this.isDestroyed = true;
   }
