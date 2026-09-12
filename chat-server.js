@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 16.0.0 - STABLE (ALL FIXES APPLIED)
+// VERSION: 16.0.1 - STABLE + BROADCAST currentNumber KE SEMUA ROOM
 // ✅ FIX #1: _verifyAndCleanupOrphanSeats — jalan saat restore
 // ✅ FIX #2: _deleteSeatInRoom — skip broadcast saat restore
 // ✅ FIX #3: _restoreRemovedSeats — reset di finally
@@ -8,6 +8,7 @@
 // ✅ FIX #6: _cleanupUserCompletely — skip broadcast saat restore
 // ✅ FIX #7: _hasBroadcastRemoveKursi — hindari duplikat saat retry
 // ✅ FIX #8: _restoreAllState — _restoreFailed hanya di catch
+// ✅ FIX #9: _updateNumber — broadcast currentNumber ke SEMUA room (tiap berubah)
 // ✅ SEMUA LOGIKA UI & JOIN ROOM TIDAK DIUBAH
 
 const C = {
@@ -276,6 +277,7 @@ export class ChatServer {
     }
   }
 
+  // 🔥 FIX #9: Broadcast currentNumber ke SEMUA room
   async _updateNumber() {
     try {
       if (this.closing || this.isDestroyed) return;
@@ -300,6 +302,15 @@ export class ChatServer {
 
         await this._saveCurrentNumber();
 
+        // 🔥 FIX #9: Broadcast currentNumber ke SEMUA room yang ada client
+        if (!this._isRestoring) {
+          for (const [room, clients] of (this.roomClients || new Map())) {
+            if (clients?.size > 0) {
+              this.broadcast(room, ["currentNumber", this.currentNumber]);
+            }
+          }
+        }
+
       } catch(e) {
         this._handleError('_updateNumber', e);
       } finally {
@@ -309,7 +320,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // 🔥 FIX #5: _isRestoring reset di finally
   async _restoreWithRetry() {
     let attempts = 0;
     let lastError = null;
@@ -342,7 +352,6 @@ export class ChatServer {
 
       throw lastError;
     } finally {
-      // 🔥 FIX #5: Reset _isRestoring di finally biar tidak bocor
       this._isRestoring = false;
     }
   }
@@ -594,7 +603,6 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      // 🔥 FIX #2: Skip broadcast removeKursi saat restore
       if (!this._isRestoring) {
         this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
       }
@@ -1655,7 +1663,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // 🔥 FIX #1: Hapus cek _isRestoring — fungsi ini dipanggil DI DALAM restore
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
       if (this._restoreFailed) {
@@ -1737,7 +1744,6 @@ export class ChatServer {
     }
   }
 
-  // 🔥 FIX #3, #4, #7, #8
   async _restoreAllState() {
     try {
       this._isRestoring = true;
@@ -1811,7 +1817,6 @@ export class ChatServer {
           if (conns.size === 0) this.userConnections.delete(user);
         }
 
-        // 🔥 FIX #7: Hindari duplikat removeKursi saat retry
         if (this._restoreRemovedSeats?.length) {
           const affectedRooms = new Set();
 
