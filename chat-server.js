@@ -1,12 +1,13 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.9.6 - USER INDEX FIX
-// ✅ #1 _ensureAlarm: guard — tidak timpa alarm tiap fetch
-// ✅ #2 _withLock: token pemilik
-// ✅ #3 _forceDeleteFromD1: 1-2 query bersih
-// ✅ #4 fetch(): overloaded/retryable → 503
-// ✅ #5 _verifyAndCleanupOrphanSeats: broadcast()
-// ✅ #6 _joinInternal: setTimeout + fallback pendingStateSend
-// ✅ #A _userIndex: Map username → {room, seat, isMulti} — O(1)
+// VERSION: 15.9.7 - FINAL (NO LOG, PRODUCTION READY)
+// ✅ _ensureAlarm: guard
+// ✅ _withLock: token pemilik
+// ✅ _forceDeleteFromD1: 2 query
+// ✅ fetch(): overloaded/retryable → 503
+// ✅ _verifyAndCleanupOrphanSeats: broadcast()
+// ✅ _joinInternal: setTimeout + fallback
+// ✅ _userIndex: O(1)
+// ✅ _lastRoomCounts: skip broadcast roomUserCount jika count sama
 // ✅ SEMUA LOGIKA UI & JOIN ROOM TIDAK DIUBAH
 
 const C = {
@@ -69,8 +70,8 @@ export class ChatServer {
       this.roomClients = new Map();
       this.wsActiveMulti = new Map();
 
-      // ✅ PATCH #A: index username → { room, seat, isMulti }
       this._userIndex = new Map();
+      this._lastRoomCounts = new Map();
 
       this._joinLocks = new Map();
       this._kursiLocks = new Map();
@@ -179,6 +180,7 @@ export class ChatServer {
       this.roomClients = new Map();
       this.wsActiveMulti = new Map();
       this._userIndex = new Map();
+      this._lastRoomCounts = new Map();
       this._pendingEvents = [];
       this._eventQueue = [];
       this.db = null;
@@ -192,9 +194,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ PATCH #A helper: rebuild _userIndex dari _storageCache
-  // ============================================================
   _rebuildUserIndex() {
     try {
       this._userIndex = new Map();
@@ -219,7 +218,6 @@ export class ChatServer {
     }
   }
 
-  // ✅ PATCH #A helper: set/update entry index
   _setUserIndex(username, room, seat, isMulti) {
     if (!username) return;
     try {
@@ -227,15 +225,11 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ✅ PATCH #A helper: hapus entry index
   _removeUserIndex(username) {
     if (!username) return;
     try { this._userIndex.delete(username); } catch(e) {}
   }
 
-  // ============================================================
-  // ✅ PATCH #1: _ensureAlarm
-  // ============================================================
   async _ensureAlarm() {
     if (this.closing || this.isDestroyed) return;
     try {
@@ -448,7 +442,6 @@ export class ChatServer {
       this.currentNumber = currentNumber;
       this._cacheLoadAttempts = 0;
 
-      // ✅ PATCH #A: bangun index
       this._rebuildUserIndex();
 
       return this._storageCache;
@@ -523,9 +516,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // ✅ PATCH #3: _forceDeleteFromD1
-  // ============================================================
   async _forceDeleteFromD1(username) {
     if (!this.db) return true;
     if (!username) return true;
@@ -591,7 +581,6 @@ export class ChatServer {
       if (roomBucket.seat) delete roomBucket.seat[seatNumber];
       if (roomBucket.point) delete roomBucket.point[seatNumber];
 
-      // ✅ PATCH #A: hapus dari index
       if (removedUsername) this._removeUserIndex(removedUsername);
 
       if (this.db) {
@@ -640,7 +629,6 @@ export class ChatServer {
       }
       if (!roomBucket.seat) roomBucket.seat = {};
       roomBucket.seat[seatNumber] = seatData;
-      // ✅ PATCH #A: update index
       this._setUserIndex(seatData.namauser, roomName, seatNumber, seatData.isMulti);
       await this._saveSeat(roomName, seatNumber, seatData);
       return true;
@@ -715,17 +703,12 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ PATCH #A: _findUserInAnyRoom — pakai _userIndex (O(1))
-  // ============================================================
   async _findUserInAnyRoom(username) {
     try {
       if (!username) return null;
 
-      // ✅ Fast path: cek index dulu (O(1))
       const cached = this._userIndex?.get(username);
       if (cached) {
-        // Verifikasi cache masih valid
         await this._ensureCacheInitialized();
         const roomBucket = this._storageCache?.roomsData?.[cached.room];
         const seatData = roomBucket?.seat?.[cached.seat];
@@ -736,11 +719,9 @@ export class ChatServer {
             isMulti: seatData.isMulti === true
           };
         }
-        // Cache basi — hapus, lanjut scan manual
         this._userIndex.delete(username);
       }
 
-      // Fallback: scan manual (hanya jika index miss)
       await this._ensureCacheInitialized();
       const roomsData = this._storageCache?.roomsData || {};
       for (const [roomName, roomBucket] of Object.entries(roomsData)) {
@@ -748,7 +729,6 @@ export class ChatServer {
         for (const [seat, data] of Object.entries(roomBucket.seat)) {
           if (data?.namauser === username) {
             const seatNum = parseInt(seat);
-            // Update index
             this._setUserIndex(username, roomName, seatNum, data.isMulti);
             return { room: roomName, seat: seatNum, isMulti: data.isMulti || false };
           }
@@ -822,9 +802,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ PATCH #2: _withLock
-  // ============================================================
   async _withLock(lockMap, key, fn, timeout = C.LOCK_TIMEOUT) {
     try {
       if (!lockMap) return await fn();
@@ -957,9 +934,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ PATCH #6: _joinInternal
-  // ============================================================
   async _joinInternal(ws, roomName, username) {
     try {
       const existing = await this._findUserInAnyRoom(username);
@@ -1244,7 +1218,6 @@ export class ChatServer {
               delete rBucket.seat[seat];
               if (rBucket.point) delete rBucket.point[seat];
 
-              // ✅ PATCH #A: hapus dari index
               this._removeUserIndex(username);
 
               result.removedSeats.push({ room: rName, seat: seatNum, username: username });
@@ -1588,6 +1561,14 @@ export class ChatServer {
       this._onlineUsersCacheTime = 0;
 
       const count = await this._getRoomCount(room);
+
+      if (!this._lastRoomCounts) this._lastRoomCounts = new Map();
+      const lastCount = this._lastRoomCounts.get(room);
+      if (lastCount === count) {
+        return count;
+      }
+      this._lastRoomCounts.set(room, count);
+
       this.broadcast(room, ["roomUserCount", room, count]);
       return count;
     } catch(e) {
@@ -1624,6 +1605,8 @@ export class ChatServer {
         }
 
         const count = Object.values(allSeats).filter(s => s?.namauser).length;
+        if (!this._lastRoomCounts) this._lastRoomCounts = new Map();
+        this._lastRoomCounts.set(room, count);
         this.safeSend(ws, ["roomUserCount", room, count]);
 
         if (allSeats && Object.keys(allSeats).length > 0) {
@@ -1658,9 +1641,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // ✅ PATCH #5: _verifyAndCleanupOrphanSeats
-  // ============================================================
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
       await this._ensureCacheInitialized();
@@ -1713,7 +1693,6 @@ export class ChatServer {
           if (roomBucket?.seat) delete roomBucket.seat[seat];
           if (roomBucket?.point) delete roomBucket.point[seat];
 
-          // ✅ PATCH #A: hapus dari index
           if (username) this._removeUserIndex(username);
 
           if (this.db) {
@@ -1828,9 +1807,8 @@ export class ChatServer {
         }
 
         for (const [room, clients] of this.roomClients) {
-          if (clients && clients.size > 0) {
-            try { await this.updateRoomCount(room); } catch(e) {}
-          }
+          if (!clients || clients.size === 0) continue;
+          try { await this.updateRoomCount(room); } catch(e) {}
         }
       } catch(e) {}
 
@@ -1950,7 +1928,6 @@ export class ChatServer {
         try { this.wsSet?.add(ws); } catch(e) {}
       }
 
-      // ✅ PATCH #A: pastikan index terisi
       if (finalRoom && finalSeat) {
         this._setUserIndex(attachment.username, finalRoom, finalSeat, false);
       }
@@ -2579,7 +2556,6 @@ export class ChatServer {
             await this._ensureCacheInitialized();
             const roomBucket = this._storageCache?.roomsData?.[resetRoomName];
             if (roomBucket) {
-              // ✅ PATCH #A: hapus semua username di room ini dari index
               for (const seatStr in roomBucket.seat) {
                 const uname = roomBucket.seat[seatStr]?.namauser;
                 if (uname) this._removeUserIndex(uname);
@@ -2622,9 +2598,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ PATCH #4: fetch()
-  // ============================================================
   async fetch(req) {
     try {
       if (!this._restored && !this._restorePromise) {
@@ -2837,6 +2810,7 @@ export class ChatServer {
     this._roomCountsCacheTime = 0;
     this._restoreRemovedSeats = [];
     this._userIndex = new Map();
+    this._lastRoomCounts = new Map();
 
     this.isDestroyed = true;
   }
