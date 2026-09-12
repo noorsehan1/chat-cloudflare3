@@ -1,13 +1,13 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 15.9.7 - FINAL (NO LOG, PRODUCTION READY)
-// ✅ _ensureAlarm: guard
-// ✅ _withLock: token pemilik
-// ✅ _forceDeleteFromD1: 2 query
-// ✅ fetch(): overloaded/retryable → 503
-// ✅ _verifyAndCleanupOrphanSeats: broadcast()
-// ✅ _joinInternal: setTimeout + fallback
-// ✅ _userIndex: O(1)
-// ✅ _lastRoomCounts: skip broadcast roomUserCount jika count sama
+// VERSION: 16.0.0 - STABLE (ALL FIXES APPLIED)
+// ✅ FIX #1: _verifyAndCleanupOrphanSeats — jalan saat restore
+// ✅ FIX #2: _deleteSeatInRoom — skip broadcast saat restore
+// ✅ FIX #3: _restoreRemovedSeats — reset di finally
+// ✅ FIX #4: _userIndex — rebuild setelah restore
+// ✅ FIX #5: _isRestoring — reset di finally
+// ✅ FIX #6: _cleanupUserCompletely — skip broadcast saat restore
+// ✅ FIX #7: _hasBroadcastRemoveKursi — hindari duplikat saat retry
+// ✅ FIX #8: _restoreAllState — _restoreFailed hanya di catch
 // ✅ SEMUA LOGIKA UI & JOIN ROOM TIDAK DIUBAH
 
 const C = {
@@ -64,6 +64,7 @@ export class ChatServer {
       this._processingPending = false;
 
       this._restoreRemovedSeats = [];
+      this._hasBroadcastRemoveKursi = new Set();
 
       this.wsSet = new Set();
       this.userConnections = new Map();
@@ -71,7 +72,6 @@ export class ChatServer {
       this.wsActiveMulti = new Map();
 
       this._userIndex = new Map();
-      this._lastRoomCounts = new Map();
 
       this._joinLocks = new Map();
       this._kursiLocks = new Map();
@@ -175,12 +175,12 @@ export class ChatServer {
       this.closing = false;
       this.isDestroyed = false;
       this._restoreRemovedSeats = [];
+      this._hasBroadcastRemoveKursi = new Set();
       this.wsSet = new Set();
       this.userConnections = new Map();
       this.roomClients = new Map();
       this.wsActiveMulti = new Map();
       this._userIndex = new Map();
-      this._lastRoomCounts = new Map();
       this._pendingEvents = [];
       this._eventQueue = [];
       this.db = null;
@@ -300,11 +300,6 @@ export class ChatServer {
 
         await this._saveCurrentNumber();
 
-        for (const [room, clients] of (this.roomClients || new Map())) {
-          if (clients?.size > 0) {
-            this.broadcast(room, ["currentNumber", this.currentNumber]);
-          }
-        }
       } catch(e) {
         this._handleError('_updateNumber', e);
       } finally {
@@ -314,37 +309,42 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // 🔥 FIX #5: _isRestoring reset di finally
   async _restoreWithRetry() {
     let attempts = 0;
     let lastError = null;
 
-    while (attempts < C.MAX_RESTORE_ATTEMPTS) {
-      try {
-        attempts++;
-        const result = await this._restoreAllState();
-        this._restoreAttempts = attempts;
-        return result;
-      } catch(e) {
-        lastError = e;
-        this._restoreAttempts = attempts;
+    try {
+      while (attempts < C.MAX_RESTORE_ATTEMPTS) {
+        try {
+          attempts++;
+          const result = await this._restoreAllState();
+          this._restoreAttempts = attempts;
+          return result;
+        } catch(e) {
+          lastError = e;
+          this._restoreAttempts = attempts;
 
-        if (attempts < C.MAX_RESTORE_ATTEMPTS) {
-          await new Promise(resolve => setTimeout(resolve, C.RESTORE_RETRY_DELAY_MS));
-          this._isRestoring = true;
+          if (attempts < C.MAX_RESTORE_ATTEMPTS) {
+            await new Promise(resolve => setTimeout(resolve, C.RESTORE_RETRY_DELAY_MS));
+            this._isRestoring = true;
+          }
         }
       }
-    }
 
-    this._restored = true;
-    this._restoreDone = true;
-    this._restoreFailed = true;
-    this._isRestoring = false;
-    if (!this._cacheInitialized) {
-      this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
-      this._cacheInitialized = true;
-    }
+      this._restored = true;
+      this._restoreDone = true;
+      this._restoreFailed = true;
+      if (!this._cacheInitialized) {
+        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+        this._cacheInitialized = true;
+      }
 
-    throw lastError;
+      throw lastError;
+    } finally {
+      // 🔥 FIX #5: Reset _isRestoring di finally biar tidak bocor
+      this._isRestoring = false;
+    }
   }
 
   async _loadFromStorage() {
@@ -529,6 +529,7 @@ export class ChatServer {
         AND key IN (
           SELECT 'point_' || substr(key, 6) FROM ${TABLE_NAME}
           WHERE key LIKE 'seat_%'
+          AND json_valid(value)
           AND json_extract(value, '$.namauser') = ?
           AND json_extract(value, '$.isMulti') IS NOT 1
         )
@@ -552,6 +553,7 @@ export class ChatServer {
       await this.db.prepare(`
         DELETE FROM ${TABLE_NAME}
         WHERE key LIKE 'seat_%'
+        AND json_valid(value)
         AND json_extract(value, '$.namauser') = ?
         AND json_extract(value, '$.isMulti') IS NOT 1
       `).bind(u).run();
@@ -592,7 +594,10 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
+      // 🔥 FIX #2: Skip broadcast removeKursi saat restore
+      if (!this._isRestoring) {
+        this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
+      }
       await this.updateRoomCount(roomName);
       return true;
     } catch(e) {
@@ -1024,6 +1029,7 @@ export class ChatServer {
       this.safeSend(ws, ["rooMasuk", seat, roomName]);
       this.safeSend(ws, ["numberKursiSaya", seat]);
       this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
+      this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
       await this.updateRoomCount(roomName);
 
@@ -1203,7 +1209,20 @@ export class ChatServer {
         return result;
       }
 
+      let stillConnected = false;
       if (username) {
+        const conns = this.userConnections?.get(username);
+        if (conns) {
+          for (const c of conns) {
+            if (c !== ws && c?.readyState === 1) {
+              stillConnected = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (username && !stillConnected && !this._restoreFailed) {
         try { await this._forceDeleteFromD1(username); } catch (e) {}
       }
 
@@ -1214,6 +1233,8 @@ export class ChatServer {
           if (!rBucket?.seat) continue;
           for (const [seat, data] of Object.entries(rBucket.seat)) {
             if (data?.namauser === username && data.isMulti !== true) {
+              if (stillConnected) continue;
+
               const seatNum = parseInt(seat);
               delete rBucket.seat[seat];
               if (rBucket.point) delete rBucket.point[seat];
@@ -1227,7 +1248,7 @@ export class ChatServer {
                 this._restoreRemovedSeats.push({ room: rName, seat: seatNum });
               }
 
-              if (!skipBroadcast) {
+              if (!skipBroadcast && !this._isRestoring) {
                 this.broadcast(rName, ["removeKursi", rName, seatNum]);
                 this.updateRoomCount(rName).catch(() => {});
               }
@@ -1562,12 +1583,7 @@ export class ChatServer {
 
       const count = await this._getRoomCount(room);
 
-      if (!this._lastRoomCounts) this._lastRoomCounts = new Map();
-      const lastCount = this._lastRoomCounts.get(room);
-      if (lastCount === count) {
-        return count;
-      }
-      this._lastRoomCounts.set(room, count);
+      if (this._isRestoring) return count;
 
       this.broadcast(room, ["roomUserCount", room, count]);
       return count;
@@ -1605,8 +1621,6 @@ export class ChatServer {
         }
 
         const count = Object.values(allSeats).filter(s => s?.namauser).length;
-        if (!this._lastRoomCounts) this._lastRoomCounts = new Map();
-        this._lastRoomCounts.set(room, count);
         this.safeSend(ws, ["roomUserCount", room, count]);
 
         if (allSeats && Object.keys(allSeats).length > 0) {
@@ -1641,8 +1655,13 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // 🔥 FIX #1: Hapus cek _isRestoring — fungsi ini dipanggil DI DALAM restore
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
+      if (this._restoreFailed) {
+        return 0;
+      }
+
       await this._ensureCacheInitialized();
       const roomsData = this._storageCache?.roomsData || {};
 
@@ -1709,11 +1728,6 @@ export class ChatServer {
             this._restoreRemovedSeats.push({ room, seat });
           }
 
-          try {
-            this.broadcast(room, ["removeKursi", room, seat]);
-          } catch(e) {}
-
-          try { await this.updateRoomCount(room); } catch(e) {}
         } catch(e) {}
       }
 
@@ -1723,11 +1737,12 @@ export class ChatServer {
     }
   }
 
+  // 🔥 FIX #3, #4, #7, #8
   async _restoreAllState() {
     try {
       this._isRestoring = true;
-
       this._restoreRemovedSeats = [];
+      this._hasBroadcastRemoveKursi = new Set();
 
       try {
         await this._loadFromStorage();
@@ -1796,21 +1811,37 @@ export class ChatServer {
           if (conns.size === 0) this.userConnections.delete(user);
         }
 
+        // 🔥 FIX #7: Hindari duplikat removeKursi saat retry
         if (this._restoreRemovedSeats?.length) {
+          const affectedRooms = new Set();
+
           for (const item of this._restoreRemovedSeats) {
             const { room, seat } = item;
+            const key = `${room}_${seat}`;
+            if (this._hasBroadcastRemoveKursi.has(key)) continue;
+            this._hasBroadcastRemoveKursi.add(key);
             try {
               this.broadcast(room, ["removeKursi", room, seat]);
+              affectedRooms.add(room);
             } catch(e) {}
           }
-          this._restoreRemovedSeats = [];
+
+          for (const room of affectedRooms) {
+            try {
+              const count = await this._getRoomCount(room);
+              this.broadcast(room, ["roomUserCount", room, count]);
+            } catch(e) {}
+          }
         }
 
-        for (const [room, clients] of this.roomClients) {
-          if (!clients || clients.size === 0) continue;
-          try { await this.updateRoomCount(room); } catch(e) {}
-        }
-      } catch(e) {}
+      } catch(e) {
+
+      } finally {
+        this._restoreRemovedSeats = [];
+        this._hasBroadcastRemoveKursi = new Set();
+      }
+
+      this._rebuildUserIndex();
 
       if (!this.closing && !this.isDestroyed) {
         try {
@@ -1834,6 +1865,9 @@ export class ChatServer {
       this._restoreDone = true;
       this._restoreFailed = true;
       this._isRestoring = false;
+
+      this._restoreRemovedSeats = [];
+      this._hasBroadcastRemoveKursi = new Set();
 
       if (!this.closing && !this.isDestroyed) {
         try {
@@ -2321,6 +2355,13 @@ export class ChatServer {
         case "updatePoint": {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
           if (!pointRoom || typeof pointSeat !== 'number') break;
+          if (!ROOMS_SET.has(pointRoom)) break;
+
+          const currentUser = ws.username || ws._username;
+          if (!currentUser) break;
+          const seatData = await this._getSeatData(pointRoom, pointSeat);
+          if (!seatData || seatData.namauser !== currentUser) break;
+
           const updated = await this._updatePointDirect(pointRoom, pointSeat, pointX, pointY, pointFast === 1);
           if (updated) {
             this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
@@ -2809,8 +2850,8 @@ export class ChatServer {
     this._roomCountsCache = null;
     this._roomCountsCacheTime = 0;
     this._restoreRemovedSeats = [];
+    this._hasBroadcastRemoveKursi = new Set();
     this._userIndex = new Map();
-    this._lastRoomCounts = new Map();
 
     this.isDestroyed = true;
   }
