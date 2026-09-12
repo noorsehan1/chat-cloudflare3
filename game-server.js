@@ -2041,7 +2041,7 @@ export class GameServer {
         try {
           const isRecording = await this.dataManager.getRecordingStatus(roomKey);
           const winners = await this.dataManager.getWinners(roomKey);
-          this.safeSend(ws, ["roomWinnersResponse", { winners: winners || {}, room: roomKey, recording: isRecording || false }]);
+          this.safeSend(ws, ["lowCardWinnerUpdate", { winners: winners || {}, room: roomKey, recording: isRecording || false }]);
         } catch(e) { this.safeSend(ws, ["recordingError", e.message]); }
         return;
       }
