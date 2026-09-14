@@ -1,18 +1,15 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.9.8 - 100% BEBAS LOG
-// ✅ FIX #1: _restoreAllState — batch processing (10 WS paralel)
-// ✅ FIX #2: _restoreAllState — batasi 100 WS
-// ✅ FIX #3: _restoreAllState — hapus console.log di loop
-// ✅ FIX #4: _restoreSingleWebSocket — skip diceRoll saat restore
-// ✅ FIX #5: _processWithTimeout — clear timer di finally
-// ✅ FIX #6: broadcast — jangan scan semua WS saat room kosong
-// ✅ FIX #7: alarm() — scheduleAlarms hanya jika berubah
-// ✅ FIX #8: _isRestoring — reset di finally
-// ✅ FIX #9: HAPUS SEMUA console.log & console.error (100% BEBAS LOG)
-// ✅ FIX #10: scheduleAlarms — fallback ke _scheduleNearestAlarm jika gagal
-// ✅ SEMUA LOGIKA GAME TIDAK DIUBAH
-// ✅ LOWCARD QUIZ 100% PAKAI EVENT LOWCARD ASLI
+// VERSION: 17.1.0 - LOWCARD QUIZ SESSION + SMART BOT
+// ✅ FITUR:
+//   - LOWCARD_QUIZ_ROOM: Room "LowCardQuiz" untuk quiz lowcard
+//   - LOWCARD_SCHEDULE: Sesi otomatis (16:00-17:00 & 18:00-19:00 WITA)
+//   - Auto-start game dengan BET 100 (100% sama dengan start manual user)
+//   - Auto-end game saat sesi berakhir
+//   - Record pemenang dengan nama + reset mingguan Senin UTC 00:00
+//   - Auto-restart ronde baru selama sesi masih aktif
+//   - SMART BOT: >4 user = NO BOT | <4 user = 4 BOT otomatis
+// ✅ SEMUA LOGIKA GAME LAMA TIDAK DIUBAH
 // ============================================================
 
 const CONSTANTS = {
@@ -46,6 +43,7 @@ const CONSTANTS = {
   WEEKLY_RESET_DAY: 1,
   WEEKLY_RESET_HOUR: 0,
   WEEKLY_RESET_ALARM: 'weekly_reset',
+  LOWCARD_WEEKLY_RESET_ALARM: 'lowcard_weekly_reset',
   MAX_LEADERBOARD_LIMIT: 30,
   MIN_LEADERBOARD_LIMIT: 1,
   DEFAULT_LEADERBOARD_LIMIT: 10,
@@ -59,8 +57,15 @@ const CONSTANTS = {
   RESTORE_RETRY_DELAY_MS: 2000,
   MAX_RESTORE_WS: 100,
   RESTORE_BATCH_SIZE: 10,
+  LOWCARD_QUIZ_BET: 100,
+  LOWCARD_AUTO_RESTART_DELAY_MS: 8000,
+  LOWCARD_MIN_HUMAN_FOR_NO_BOT: 4,
+  LOWCARD_MAX_BOTS: 4,
 };
 
+// ============================================================
+// JADWAL SESI QUIZ (DICE)
+// ============================================================
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: "01:00", end: "02:00" },
@@ -71,26 +76,23 @@ const QUIZ_SCHEDULE = {
 };
 
 // ============================================================
-// LOWCARD QUIZ CONFIG (TAMBAHAN BARU)
+// JADWAL SESI LOWCARD QUIZ (WITA)
+// 16:00-17:00 WITA (jam 4-5 siang)
+// 18:00-19:00 WITA (jam 6 sore - 7 malam)
 // ============================================================
-const LOWCARD_QUIZ_ROOM = "LowCard";
-const LOWCARD_QUIZ_BET = 100;
-
-const LOWCARD_QUIZ_SCHEDULE = {
+const LOWCARD_SCHEDULE = {
   SESSIONS: [
-    { start: "16:00", end: "17:00" }, // jam 4-5 sore WITA
-    { start: "20:00", end: "21:00" }  // jam 8-9 malam WITA
+    { start: "16:00", end: "17:00" },
+    { start: "18:00", end: "19:00" }
   ],
   TIMEZONE_OFFSET: 8,
 };
 
-const LOWCARD_QUIZ_ALARMS = {
-  SESSION_START: 'lowcard_quiz_session_start',
-  SESSION_END: 'lowcard_quiz_session_end',
-};
-// ============================================================
-
 const TABLE_NAME = 'game_data';
+const LOWCARD_WINNERS_KEY = 'lowcard_quiz_winners';
+const LOWCARD_LAST_WEEK_WINNER_KEY = 'lowcard_last_week_winner';
+const LOWCARD_LAST_RESET_WEEK_KEY = 'lowcard_last_reset_week';
+const LOWCARD_QUIZ_ROOM = "LowCardQuiz";
 const _wsCleanupState = new WeakMap();
 
 function parseTime(timeStr) {
@@ -211,6 +213,51 @@ class DataManager {
   async setAlarms(a) { await this._set('scheduled_alarms', a); return true; }
   async deleteAlarms() { await this._set('scheduled_alarms', {}); return true; }
 
+  // ============================================================
+  // LOWCARD QUIZ WINNERS DATA
+  // ============================================================
+
+  async getLowCardWinners() {
+    return await this._get(LOWCARD_WINNERS_KEY) || {};
+  }
+
+  async addLowCardWinner(username) {
+    if (!username) return false;
+    const winners = await this.getLowCardWinners();
+    let count = parseInt(String(winners[username] || "0").replace("x", "")) || 0;
+    winners[username] = (count + 1) + "x";
+    await this._set(LOWCARD_WINNERS_KEY, winners);
+    return true;
+  }
+
+  async resetLowCardWinners() {
+    await this._set(LOWCARD_WINNERS_KEY, {});
+    return true;
+  }
+
+  async getLowCardLastWeekWinner() {
+    return await this._get(LOWCARD_LAST_WEEK_WINNER_KEY);
+  }
+
+  async setLowCardLastWeekWinner(data) {
+    await this._set(LOWCARD_LAST_WEEK_WINNER_KEY, data);
+    return true;
+  }
+
+  async deleteLowCardLastWeekWinner() {
+    await this._set(LOWCARD_LAST_WEEK_WINNER_KEY, null);
+    return true;
+  }
+
+  async getLowCardLastResetWeek() {
+    return await this._get(LOWCARD_LAST_RESET_WEEK_KEY);
+  }
+
+  async setLowCardLastResetWeek(week) {
+    await this._set(LOWCARD_LAST_RESET_WEEK_KEY, week);
+    return true;
+  }
+
   async getAllData() {
     try {
       const result = await this.db.prepare(`SELECT key, value FROM ${TABLE_NAME}`).all();
@@ -230,51 +277,6 @@ class DataManager {
     const week = Math.ceil((diff / 86400000 + startOfYear.getUTCDay() + 1) / 7);
     return `${year}-W${String(week).padStart(2, '0')}`;
   }
-
-  // ============================================================
-  // LOWCARD QUIZ DATA (TAMBAHAN BARU)
-  // ============================================================
-  async getLowCardQuizWinners() {
-    return await this._get('lowcard_quiz_winners') || {};
-  }
-
-  async addLowCardQuizWinner(username) {
-    if (!username) return false;
-    const winners = await this.getLowCardQuizWinners();
-    let count = parseInt(String(winners[username] || "0").replace("x", "")) || 0;
-    winners[username] = (count + 1) + "x";
-    await this._set('lowcard_quiz_winners', winners);
-    return true;
-  }
-
-  async resetLowCardQuizWinners() {
-    await this._set('lowcard_quiz_winners', {});
-    return true;
-  }
-
-  async getLowCardQuizLastWeekWinner() {
-    return await this._get('lowcard_quiz_last_week_winner');
-  }
-
-  async setLowCardQuizLastWeekWinner(data) {
-    await this._set('lowcard_quiz_last_week_winner', data);
-    return true;
-  }
-
-  async deleteLowCardQuizLastWeekWinner() {
-    await this._set('lowcard_quiz_last_week_winner', null);
-    return true;
-  }
-
-  async getLowCardQuizLastResetWeek() {
-    return await this._get('lowcard_quiz_last_reset_week');
-  }
-
-  async setLowCardQuizLastResetWeek(week) {
-    await this._set('lowcard_quiz_last_reset_week', week);
-    return true;
-  }
-  // ============================================================
 }
 
 // ============================================================
@@ -296,8 +298,9 @@ class AlarmScheduler {
       const currentTotal = witaNow.getHours() * 60 + witaNow.getMinutes();
       await this._clearAllAlarms();
       await this._scheduleWeeklyResetUTC();
-      try { await this.scheduleLowCardQuizAlarms(); } catch(e) {}
+      await this._scheduleLowCardWeeklyResetUTC();
 
+      // ---------- DICE SESSIONS ----------
       let currentSession = null;
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
@@ -312,29 +315,58 @@ class AlarmScheduler {
         const endDelay = (currentSession.endTotal - currentTotal) * 60 * 1000;
         if (endDelay > 0) await this._scheduleAlarm('dice_session_end', endDelay);
         await this._scheduleAlarm('dice_session_start_immediate', 1000);
-        return true;
+      } else {
+        let nextSession = null, minDiff = Infinity;
+        for (const session of QUIZ_SCHEDULE.SESSIONS) {
+          const startTotal = parseTime(session.start);
+          let diff = startTotal - currentTotal;
+          if (diff < 0) diff += 24 * 60;
+          if (diff < minDiff) { minDiff = diff; nextSession = { ...session, startTotal, endTotal: parseTime(session.end) }; }
+        }
+        if (nextSession) {
+          let startDelay = minDiff * 60 * 1000;
+          if (startDelay < 0) startDelay = 0;
+          await this._scheduleAlarm('dice_session_start', startDelay);
+          const dur = (nextSession.endTotal - nextSession.startTotal) * 60 * 1000;
+          if (dur > 0) await this._scheduleAlarm('dice_session_end', startDelay + dur);
+        }
       }
 
-      let nextSession = null, minDiff = Infinity;
-      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+      // ---------- LOWCARD SESSIONS ----------
+      let currentLowCardSession = null;
+      for (const session of LOWCARD_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
-        let diff = startTotal - currentTotal;
-        if (diff < 0) diff += 24 * 60;
-        if (diff < minDiff) { minDiff = diff; nextSession = { ...session, startTotal, endTotal: parseTime(session.end) }; }
+        const endTotal = parseTime(session.end);
+        if (currentTotal >= startTotal && currentTotal < endTotal) {
+          currentLowCardSession = { ...session, startTotal, endTotal };
+          break;
+        }
       }
 
-      if (nextSession) {
-        let startDelay = minDiff * 60 * 1000;
-        if (startDelay < 0) startDelay = 0;
-        await this._scheduleAlarm('dice_session_start', startDelay);
-        const dur = (nextSession.endTotal - nextSession.startTotal) * 60 * 1000;
-        if (dur > 0) await this._scheduleAlarm('dice_session_end', startDelay + dur);
+      if (currentLowCardSession) {
+        const endDelay = (currentLowCardSession.endTotal - currentTotal) * 60 * 1000;
+        if (endDelay > 0) await this._scheduleAlarm('lowcard_session_end', endDelay);
+        await this._scheduleAlarm('lowcard_session_start_immediate', 1000);
+      } else {
+        let nextLowCardSession = null, minDiffLowCard = Infinity;
+        for (const session of LOWCARD_SCHEDULE.SESSIONS) {
+          const startTotal = parseTime(session.start);
+          let diff = startTotal - currentTotal;
+          if (diff < 0) diff += 24 * 60;
+          if (diff < minDiffLowCard) { minDiffLowCard = diff; nextLowCardSession = { ...session, startTotal, endTotal: parseTime(session.end) }; }
+        }
+        if (nextLowCardSession) {
+          let startDelay = minDiffLowCard * 60 * 1000;
+          if (startDelay < 0) startDelay = 0;
+          await this._scheduleAlarm('lowcard_session_start', startDelay);
+          const dur = (nextLowCardSession.endTotal - nextLowCardSession.startTotal) * 60 * 1000;
+          if (dur > 0) await this._scheduleAlarm('lowcard_session_end', startDelay + dur);
+        }
       }
+
       return true;
     } catch(e) {
-      try {
-        await this._scheduleNearestAlarm();
-      } catch(e2) {}
+      try { await this._scheduleNearestAlarm(); } catch(e2) {}
       return false;
     }
   }
@@ -352,6 +384,23 @@ class AlarmScheduler {
       const resetTime = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + daysUntilReset, 0, 0, 0, 0));
       const delayMs = resetTime.getTime() - now.getTime();
       if (delayMs > 0) await this._scheduleAlarm(CONSTANTS.WEEKLY_RESET_ALARM, delayMs);
+      return true;
+    } catch(e) { return false; }
+  }
+
+  async _scheduleLowCardWeeklyResetUTC() {
+    try {
+      const now = new Date();
+      const currentDay = now.getUTCDay();
+      const currentHour = now.getUTCHours();
+      const currentMinutes = now.getUTCMinutes();
+      const currentSeconds = now.getUTCSeconds();
+      let daysUntilReset = CONSTANTS.WEEKLY_RESET_DAY - currentDay;
+      if (daysUntilReset < 0) daysUntilReset += 7;
+      if (daysUntilReset === 0 && (currentHour > 0 || currentMinutes > 0 || currentSeconds > 0)) daysUntilReset = 7;
+      const resetTime = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + daysUntilReset, 0, 0, 0, 0));
+      const delayMs = resetTime.getTime() - now.getTime();
+      if (delayMs > 0) await this._scheduleAlarm(CONSTANTS.LOWCARD_WEEKLY_RESET_ALARM, delayMs);
       return true;
     } catch(e) { return false; }
   }
@@ -446,6 +495,15 @@ class AlarmScheduler {
     return false;
   }
 
+  isLowCardTime(date) {
+    const wita = this._toWITA(date || new Date());
+    const currentTotal = wita.getHours() * 60 + wita.getMinutes();
+    for (const session of LOWCARD_SCHEDULE.SESSIONS) {
+      if (currentTotal >= parseTime(session.start) && currentTotal < parseTime(session.end)) return true;
+    }
+    return false;
+  }
+
   _getTimeLeftUntilNextDice() {
     try {
       const witaTime = this._toWITA(new Date());
@@ -464,26 +522,12 @@ class AlarmScheduler {
     } catch(e) { return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null }; }
   }
 
-  async cleanup() { await this._clearAllAlarms(); }
-
-  // ============================================================
-  // LOWCARD QUIZ SCHEDULER (TAMBAHAN BARU)
-  // ============================================================
-  isLowCardQuizTime(date) {
-    const wita = this._toWITA(date || new Date());
-    const currentTotal = wita.getHours() * 60 + wita.getMinutes();
-    for (const session of LOWCARD_QUIZ_SCHEDULE.SESSIONS) {
-      if (currentTotal >= parseTime(session.start) && currentTotal < parseTime(session.end)) return true;
-    }
-    return false;
-  }
-
-  _getTimeLeftUntilNextLowCardQuiz() {
+  _getTimeLeftUntilNextLowCard() {
     try {
       const witaTime = this._toWITA(new Date());
       const currentTotal = witaTime.getHours() * 60 + witaTime.getMinutes();
       let minDiff = Infinity, nextSession = null;
-      for (const session of LOWCARD_QUIZ_SCHEDULE.SESSIONS) {
+      for (const session of LOWCARD_SCHEDULE.SESSIONS) {
         const startTotal = parseTime(session.start);
         let diff = startTotal - currentTotal;
         if (diff < 0) diff += 24 * 60;
@@ -492,52 +536,11 @@ class AlarmScheduler {
       if (minDiff === Infinity) return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null };
       const hours = Math.floor(minDiff / 60);
       const minutes = Math.floor(minDiff % 60);
-      return { hours, minutes, totalMs: minDiff * 60 * 1000, text: hours + "h " + minutes + "m", isRunning: this.isLowCardQuizTime(), nextSession };
+      return { hours, minutes, totalMs: minDiff * 60 * 1000, text: hours + "h " + minutes + "m", isRunning: this.isLowCardTime(), nextSession };
     } catch(e) { return { hours: 0, minutes: 0, totalMs: 0, text: '0h 0m', isRunning: false, nextSession: null }; }
   }
 
-  async scheduleLowCardQuizAlarms() {
-    try {
-      const now = new Date();
-      const witaNow = this._toWITA(now);
-      const currentTotal = witaNow.getHours() * 60 + witaNow.getMinutes();
-
-      let currentSession = null;
-      for (const session of LOWCARD_QUIZ_SCHEDULE.SESSIONS) {
-        const startTotal = parseTime(session.start);
-        const endTotal = parseTime(session.end);
-        if (currentTotal >= startTotal && currentTotal < endTotal) {
-          currentSession = { ...session, startTotal, endTotal };
-          break;
-        }
-      }
-
-      if (currentSession) {
-        const endDelay = (currentSession.endTotal - currentTotal) * 60 * 1000;
-        if (endDelay > 0) await this._scheduleAlarm(LOWCARD_QUIZ_ALARMS.SESSION_END, endDelay);
-        await this._scheduleAlarm(LOWCARD_QUIZ_ALARMS.SESSION_START, 1000);
-        return true;
-      }
-
-      let nextSession = null, minDiff = Infinity;
-      for (const session of LOWCARD_QUIZ_SCHEDULE.SESSIONS) {
-        const startTotal = parseTime(session.start);
-        let diff = startTotal - currentTotal;
-        if (diff < 0) diff += 24 * 60;
-        if (diff < minDiff) { minDiff = diff; nextSession = { ...session, startTotal, endTotal: parseTime(session.end) }; }
-      }
-
-      if (nextSession) {
-        let startDelay = minDiff * 60 * 1000;
-        if (startDelay < 0) startDelay = 0;
-        await this._scheduleAlarm(LOWCARD_QUIZ_ALARMS.SESSION_START, startDelay);
-        const dur = (nextSession.endTotal - nextSession.startTotal) * 60 * 1000;
-        if (dur > 0) await this._scheduleAlarm(LOWCARD_QUIZ_ALARMS.SESSION_END, startDelay + dur);
-      }
-      return true;
-    } catch(e) { return false; }
-  }
-  // ============================================================
+  async cleanup() { await this._clearAllAlarms(); }
 }
 
 // ============================================================
@@ -628,22 +631,20 @@ export class GameServer {
       this._diceLoopCounter = 0;
       this._maxDiceLoops = 10;
       this.DICE_ROOM = CONSTANTS.DICE_ROOM;
+      this.LOWCARD_QUIZ_ROOM = LOWCARD_QUIZ_ROOM;
 
       this._nextSessionNotifiedFor = null;
       this._roomEntryNotified = new Set();
 
-      this._alarmsScheduledFor = null;
+      // LowCard Quiz session state
+      this._lowCardSessionActive = false;
+      this._lowCardSessionEnded = true;
+      this._lowCardGameStarted = false;
+      this._lowCardAutoStartTimer = null;
+      this._nextLowCardSessionNotifiedFor = null;
+      this._lowCardRoomEntryNotified = new Set();
 
-      // ============ LOWCARD QUIZ STATE (TAMBAHAN BARU) ============
-      this._lowCardQuizActive = false;
-      this._lowCardQuizEnded = false;
-      this._lowCardQuizGameStarted = false;
-      this._lowCardQuizRound = 0;
-      this._lowCardQuizStartTime = null;
-      this._lowCardQuizLastWinner = null;
-      this._lowCardQuizNotifiedFor = null;
-      this._lowCardQuizSessionTimer = null;
-      // ============================================================
+      this._alarmsScheduledFor = null;
 
       this.db = env.DB;
       this.dataManager = new DataManager(this.db);
@@ -666,12 +667,8 @@ export class GameServer {
       }, CONSTANTS.CACHE_LOAD_TIMEOUT || 5000);
 
       this._restorePromise
-        .then(() => {
-          clearTimeout(restoreTimeout);
-        })
-        .catch(() => {
-          clearTimeout(restoreTimeout);
-        });
+        .then(() => { clearTimeout(restoreTimeout); })
+        .catch(() => { clearTimeout(restoreTimeout); });
 
     } catch(e) {
       this._restored = true;
@@ -728,6 +725,7 @@ export class GameServer {
       } catch(e) {}
 
       try { await this._checkAndForceResetIfMondayUTC(); } catch(e) {}
+      try { await this._checkAndForceLowCardResetIfMondayUTC(); } catch(e) {}
 
       try {
         const webSockets = this.ctx.getWebSockets();
@@ -769,7 +767,6 @@ export class GameServer {
                   try { this.wsSet.delete(ws); } catch(e) {}
                   return;
                 }
-
                 await this._restoreSingleWebSocket(ws);
                 restoredCount++;
               } catch(e) {}
@@ -785,6 +782,7 @@ export class GameServer {
       this._initialized = true;
 
       try {
+        // Restore dice session state
         const isDiceTime = this.alarmScheduler.isDiceTime();
         if (isDiceTime) {
           this._diceSessionActive = true;
@@ -797,22 +795,22 @@ export class GameServer {
           this._diceSessionEnded = true;
           this._diceGameStarted = false;
         }
-      } catch(e) {}
 
-      // ============ LOWCARD QUIZ RESTORE (TAMBAHAN BARU) ============
-      try {
-        await this._checkLowCardQuizAuto();
-        if (this._lowCardQuizActive && !this._lowCardQuizEnded) {
-          const clients = this.roomClients?.get(LOWCARD_QUIZ_ROOM);
-          const existingGame = this.activeGames.get(LOWCARD_QUIZ_ROOM);
-          const gameRunning = existingGame?._isActive && !existingGame._gameEnded;
-          if (clients && clients.size > 0 && !gameRunning) {
-            this._lowCardQuizGameStarted = false;
-            await this._startLowCardQuizGame();
+        // Restore LowCard Quiz session state
+        const isLowCardTime = this.alarmScheduler.isLowCardTime();
+        if (isLowCardTime) {
+          this._lowCardSessionActive = true;
+          this._lowCardSessionEnded = false;
+          this._lowCardGameStarted = false;
+          const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);
+          if (clients && clients.size > 0) {
+            this._startLowCardQuizGameIfNotStarted();
           }
+        } else {
+          this._lowCardSessionActive = false;
+          this._lowCardSessionEnded = true;
         }
       } catch(e) {}
-      // ============================================================
 
       await this._processPendingEvents();
       return true;
@@ -838,9 +836,7 @@ export class GameServer {
       const username = attachment?.username || ws.username || ws._username;
       const wsId = attachment?.wsId || ws._wsId || (++this._wsIdCounter);
 
-      if (!room) {
-        return;
-      }
+      if (!room) return;
 
       ws.username = username;
       ws._username = username;
@@ -871,7 +867,6 @@ export class GameServer {
       } else {
         _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false, cleanupStart: null });
       }
-
     } catch(e) {}
   }
 
@@ -1055,10 +1050,7 @@ export class GameServer {
       if (this.closing || this.isDestroyed || !room || !msg) return 0;
 
       let clients = this.roomClients?.get(room);
-
-      if (!clients || clients.size === 0) {
-        return 0;
-      }
+      if (!clients || clients.size === 0) return 0;
 
       const msgStr = JSON.stringify(msg);
       const toRemove = new Set();
@@ -1403,7 +1395,12 @@ export class GameServer {
 
       this.broadcast(room, ["gameLowCardError", `${username} left the game`]);
 
-      if (game._phase !== 'registration' && !game._botsAdded) {
+      // ============================================================
+      // SMART BOT — Re-evaluate bot saat pemain keluar
+      // ============================================================
+      if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
+        this._reevaluateBots(room, game);
+      } else if (game._phase !== 'registration' && !game._botsAdded) {
         const humanCount = this._countHumanPlayers(game);
         if (humanCount <= 1) {
           this._addBots(room, 4);
@@ -1433,7 +1430,290 @@ export class GameServer {
   }
 
   // ============================================================
-  // DICE ROOM
+  // LOWCARD QUIZ - SMART BOT HELPER
+  // ============================================================
+
+  /**
+   * Cek apakah perlu bot berdasarkan jumlah human
+   * Aturan: >4 user = NO BOT | <4 user = 4 BOT
+   */
+  _shouldUseBots(game) {
+    try {
+      const humanCount = this._countHumanPlayers(game);
+      return humanCount < CONSTANTS.LOWCARD_MIN_HUMAN_FOR_NO_BOT;
+    } catch(e) { return false; }
+  }
+
+  /**
+   * Re-evaluate bot di room LowCardQuiz:
+   *   - Kalau human >= 4 → hapus semua bot
+   *   - Kalau human < 4 → pastikan 4 bot
+   */
+  _reevaluateBots(room, game) {
+    try {
+      if (!game || !game._isActive || game._gameEnded) return;
+
+      const humanCount = this._countHumanPlayers(game);
+      const botIds = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
+      const existingBots = botIds.length;
+
+      if (humanCount >= CONSTANTS.LOWCARD_MIN_HUMAN_FOR_NO_BOT) {
+        // User banyak → hapus semua bot
+        if (existingBots > 0) {
+          for (const botId of botIds) {
+            game.players.delete(botId);
+            game.botPlayers?.delete(botId);
+            game.numbers?.delete(botId);
+            game.tanda?.delete(botId);
+            game.eliminated?.delete(botId);
+          }
+          if (!game.botPlayers) game.botPlayers = new Map();
+          if (game.botPlayers.size === 0) {
+            game.botPlayers = new Map();
+          }
+          game.useBots = false;
+        }
+      } else {
+        // User sedikit → pastikan 4 bot
+        const needed = CONSTANTS.LOWCARD_MAX_BOTS - existingBots;
+        if (needed > 0) {
+          this._addBots(room, needed, game);
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // LOWCARD QUIZ AUTO-START (BET 100)
+  // ============================================================
+
+  isLowCardQuizTime() {
+    try { return this.alarmScheduler.isLowCardTime(); } catch(e) { return false; }
+  }
+
+  async _startLowCardQuizGameIfNotStarted() {
+    try {
+      if (this._lowCardGameStarted) return;
+      if (!this.isLowCardQuizTime()) return;
+      if (this.isDestroyed || this.closing) return;
+
+      const room = this.LOWCARD_QUIZ_ROOM;
+
+      const existingGame = this.activeGames.get(room);
+      if (existingGame?._isActive && !existingGame._gameEnded) {
+        this._lowCardGameStarted = true;
+        return;
+      }
+
+      const clients = this.roomClients?.get(room);
+      if (!clients || clients.size === 0) {
+        this._lowCardGameStarted = false;
+        return;
+      }
+
+      // ============================================================
+      // HITUNG USER AKTIF DI ROOM (bukan bot, bukan duplikat)
+      // ============================================================
+      const activeUsers = new Set();
+      let hostWs = null;
+      let hostUsername = null;
+
+      for (const ws of clients) {
+        if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
+        const uname = ws.username || ws._username;
+        if (!uname) continue;
+        if (uname.startsWith('BOT_')) continue;
+        if (activeUsers.has(uname)) continue;
+
+        activeUsers.add(uname);
+
+        if (!hostWs) {
+          hostWs = ws;
+          hostUsername = uname;
+        }
+      }
+
+      if (!hostWs || !hostUsername) {
+        this._lowCardGameStarted = false;
+        return;
+      }
+
+      const lockKey = `game_start_${room}`;
+      if (this._gameLocks.has(lockKey)) return;
+      this._gameLocks.set(lockKey, Date.now());
+
+      try {
+        const betAmount = CONSTANTS.LOWCARD_QUIZ_BET;
+
+        if (!hostWs.room && !hostWs.roomname && !hostWs._room) {
+          hostWs.room = room;
+          hostWs.roomname = room;
+          hostWs._room = room;
+        }
+
+        const wsId = hostWs._wsId;
+        const game = {
+          room,
+          players: new Map(),
+          botPlayers: new Map(),
+          registrationOpen: true,
+          round: 1,
+          numbers: new Map(),
+          tanda: new Map(),
+          eliminated: new Set(),
+          betAmount,
+          hostId: hostUsername,
+          hostName: hostUsername,
+          useBots: false,
+          evaluationLocked: false,
+          drawTimeExpired: false,
+          _isActive: true,
+          _gameEnded: false,
+          _phase: 'registration',
+          _botTimeouts: new Set(),
+          _botsAdded: false,
+          _registrationTimer: null,
+          _drawTimer: null,
+          _evalTimer: null,
+          _safetyTimer: null,
+          _isEvaluating: false,
+          _createdAt: Date.now(),
+          _drawPhaseStart: null,
+          _endTime: null,
+          playerWsId: new Map(),
+          _startedByRecording: false,
+          _startedBy: 'auto_session',
+          _roundCompleted: 0,
+          _isAutoQuiz: true,
+          _userCountAtStart: activeUsers.size,
+        };
+
+        // Tambah semua user aktif sebagai pemain
+        for (const username of activeUsers) {
+          game.players.set(username, {
+            id: username,
+            name: username,
+            _left: false,
+            _leftAt: null
+          });
+        }
+
+        game.playerWsId.set(hostUsername, wsId);
+
+        // ============================================================
+        // ATURAN BOT: >4 USER = NO BOT | <4 USER = 4 BOT
+        // ============================================================
+        if (activeUsers.size < CONSTANTS.LOWCARD_MIN_HUMAN_FOR_NO_BOT) {
+          game._botsAdded = true;
+          game.useBots = true;
+          this._addBots(room, CONSTANTS.LOWCARD_MAX_BOTS, game);
+        } else {
+          game._botsAdded = true;
+          game.useBots = false;
+        }
+
+        this.activeGames.set(room, game);
+
+        this.broadcast(room, ["gameLowCardStart", betAmount]);
+        this.broadcast(room, ["gameLowCardStartSuccess", hostUsername, betAmount]);
+        this.broadcast(room, ["gameLowCardNotification",
+          `LowCard Quiz started! Bet: ${betAmount} | Players: ${activeUsers.size}${activeUsers.size < CONSTANTS.LOWCARD_MIN_HUMAN_FOR_NO_BOT ? ' + 4 Bots' : ''}`
+        ]);
+        this.broadcast(room, ["lowCardQuizGameStarted", {
+          host: hostUsername,
+          bet: betAmount,
+          room: room,
+          userCount: activeUsers.size,
+          botsAdded: activeUsers.size < CONSTANTS.LOWCARD_MIN_HUMAN_FOR_NO_BOT ? CONSTANTS.LOWCARD_MAX_BOTS : 0
+        }]);
+
+        this._lowCardGameStarted = true;
+        this._startRegistration(room, game);
+
+      } finally {
+        setTimeout(() => { this._gameLocks.delete(lockKey); }, 3000);
+      }
+
+    } catch(e) {
+      this._lowCardGameStarted = false;
+    }
+  }
+
+  async _endLowCardQuizSession() {
+    try {
+      const room = this.LOWCARD_QUIZ_ROOM;
+
+      this._lowCardSessionActive = false;
+      this._lowCardSessionEnded = true;
+      this._lowCardGameStarted = false;
+
+      if (this._lowCardAutoStartTimer) {
+        this._clearTimer(this._lowCardAutoStartTimer);
+        this._lowCardAutoStartTimer = null;
+      }
+
+      this.broadcast(room, ["gameLowCardNotification", "LowCard Quiz session ended"]);
+      this.broadcast(room, ["lowCardQuizSessionEnded", true]);
+
+      const game = this.activeGames.get(room);
+      if (game) {
+        game._gameEnded = true;
+        game._isActive = false;
+        this.broadcast(room, ["gameLowCardEnd", ["Session ended"]]);
+        await this._forceCleanupGame(room, game);
+      }
+
+    } catch(e) {}
+  }
+
+  _sendNextLowCardNotificationOnce(source, targetWs = null) {
+    try {
+      const timeInfo = this.alarmScheduler._getTimeLeftUntilNextLowCard();
+      if (!timeInfo || !timeInfo.text) return;
+
+      const now = new Date();
+      const dateKey = now.toISOString().slice(0, 10);
+      const sessionKey = timeInfo.nextSession?.start || 'none';
+      const key = `${sessionKey}_${dateKey}_${source}`;
+
+      if (this._nextLowCardSessionNotifiedFor === key) return;
+      this._nextLowCardSessionNotifiedFor = key;
+
+      const msg = ["lowCardQuizNotification", `Next LowCard session in: ${timeInfo.text}`];
+
+      if (targetWs) {
+        this.safeSend(targetWs, msg);
+      } else {
+        this.broadcast(this.LOWCARD_QUIZ_ROOM, msg);
+      }
+    } catch(e) {}
+  }
+
+  _sendLowCardRoomState(ws) {
+    try {
+      if (!ws || ws.readyState !== 1) return;
+      const isLowCardTime = this.isLowCardQuizTime();
+
+      if (isLowCardTime) {
+        if (!this._lowCardGameStarted) {
+          this._startLowCardQuizGameIfNotStarted();
+        }
+      }
+
+      const game = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
+      const isGameRunning = game?._isActive && !game._gameEnded;
+
+      this.safeSend(ws, ["lowCardQuizStatus", {
+        isSessionTime: isLowCardTime,
+        isGameRunning: !!isGameRunning,
+        bet: CONSTANTS.LOWCARD_QUIZ_BET,
+        room: this.LOWCARD_QUIZ_ROOM
+      }]);
+    } catch(e) {}
+  }
+
+  // ============================================================
+  // DICE ROOM (EXISTING)
   // ============================================================
 
   _sendNextDiceNotificationOnce(source, targetWs = null) {
@@ -1853,6 +2133,10 @@ export class GameServer {
     try { if (!room) return {}; return await this.dataManager.getWinners(room); } catch(e) { return {}; }
   }
 
+  // ============================================================
+  // WEEKLY RESET (DICE)
+  // ============================================================
+
   async _checkAndForceResetIfMondayUTC() {
     try {
       const now = new Date();
@@ -1914,6 +2198,86 @@ export class GameServer {
   }
 
   // ============================================================
+  // WEEKLY RESET (LOWCARD QUIZ)
+  // ============================================================
+
+  async _handleLowCardWeeklyReset() {
+    try {
+      const winners = await this.dataManager.getLowCardWinners();
+
+      let winner = null;
+      let highestCount = 0;
+      for (const [username, countStr] of Object.entries(winners)) {
+        if (!username || typeof username !== 'string') continue;
+        const numericCount = parseInt(String(countStr).replace("x", ""), 10) || 0;
+        if (numericCount > highestCount) {
+          highestCount = numericCount;
+          winner = username;
+        }
+      }
+
+      const currentWeek = this.dataManager.getCurrentWeek();
+
+      if (winner && highestCount > 0) {
+        await this.dataManager.setLowCardLastWeekWinner({
+          username: winner,
+          wins: highestCount,
+          week: currentWeek,
+          timestamp: Date.now()
+        });
+      } else {
+        await this.dataManager.deleteLowCardLastWeekWinner();
+      }
+
+      await this.dataManager.resetLowCardWinners();
+      await this.dataManager.setLowCardLastResetWeek(currentWeek);
+
+      return true;
+    } catch(e) {
+      const currentWeek = this.dataManager.getCurrentWeek();
+      await this.dataManager.setLowCardLastResetWeek(currentWeek);
+      return false;
+    }
+  }
+
+  async _checkAndForceLowCardResetIfMondayUTC() {
+    try {
+      const now = new Date();
+      const currentDay = now.getUTCDay();
+      const currentWeek = this.dataManager.getCurrentWeek();
+      let lastResetWeek = await this.dataManager.getLowCardLastResetWeek();
+
+      if (!lastResetWeek) {
+        await this.dataManager.setLowCardLastResetWeek(currentWeek);
+        return true;
+      }
+      if (lastResetWeek === currentWeek) return true;
+      if (currentDay === CONSTANTS.WEEKLY_RESET_DAY) {
+        await this._handleLowCardWeeklyReset();
+      }
+      return true;
+    } catch(e) {
+      const currentWeek = this.dataManager.getCurrentWeek();
+      await this.dataManager.setLowCardLastResetWeek(currentWeek);
+      return false;
+    }
+  }
+
+  async _forceLowCardResetIfNeededUTC() {
+    try {
+      const now = new Date();
+      const currentDay = now.getUTCDay();
+      const currentWeek = this.dataManager.getCurrentWeek();
+      const lastResetWeek = await this.dataManager.getLowCardLastResetWeek();
+      if (currentDay === CONSTANTS.WEEKLY_RESET_DAY && lastResetWeek !== currentWeek) {
+        await this._handleLowCardWeeklyReset();
+        return true;
+      }
+      return false;
+    } catch(e) { return false; }
+  }
+
+  // ============================================================
   // ALARM
   // ============================================================
 
@@ -1921,6 +2285,7 @@ export class GameServer {
     if (this.closing || this.isDestroyed) return;
     try {
       await this._forceResetIfNeededUTC();
+      await this._forceLowCardResetIfNeededUTC();
       await this.alarmScheduler.restoreAlarms();
       const pendingAlarms = await this.alarmScheduler.getPendingAlarms();
       for (const alarm of pendingAlarms) {
@@ -1935,19 +2300,6 @@ export class GameServer {
         await this.alarmScheduler.scheduleAlarms();
         this._alarmsScheduledFor = today;
       }
-
-      // ============ LOWCARD QUIZ AUTO CHECK (TAMBAHAN BARU) ============
-      await this._checkLowCardQuizAuto();
-      // Auto-start game jika sesi aktif & ada client & game belum jalan
-      if (this._lowCardQuizActive && !this._lowCardQuizEnded) {
-        const quizClients = this.roomClients?.get(LOWCARD_QUIZ_ROOM);
-        const existingGame = this.activeGames.get(LOWCARD_QUIZ_ROOM);
-        const gameRunning = existingGame?._isActive && !existingGame._gameEnded;
-        if (quizClients && quizClients.size > 0 && !gameRunning && !this._lowCardQuizGameStarted) {
-          await this._startLowCardQuizGame();
-        }
-      }
-      // ================================================================
     } catch(e) {}
   }
 
@@ -1955,14 +2307,51 @@ export class GameServer {
     switch(name) {
       case CONSTANTS.WEEKLY_RESET_ALARM:
         await this._handleWeeklyReset();
-        await this._handleLowCardQuizWeeklyReset();
         break;
-      case LOWCARD_QUIZ_ALARMS.SESSION_START:
-        await this._checkLowCardQuizAuto();
+
+      case CONSTANTS.LOWCARD_WEEKLY_RESET_ALARM:
+        await this._handleLowCardWeeklyReset();
         break;
-      case LOWCARD_QUIZ_ALARMS.SESSION_END:
+
+      // ============================================================
+      // LOWCARD QUIZ SESSION ALARMS
+      // ============================================================
+      case 'lowcard_session_start':
+      case 'lowcard_session_start_immediate':
+        if (this.isLowCardQuizTime()) {
+          this._lowCardSessionActive = true;
+          this._lowCardSessionEnded = false;
+          this._lowCardGameStarted = false;
+
+          this._nextLowCardSessionNotifiedFor = null;
+          this._lowCardRoomEntryNotified.clear();
+
+          this.broadcast(this.LOWCARD_QUIZ_ROOM, [
+            "gameLowCardNotification",
+            `LowCard Quiz session started! Bet: ${CONSTANTS.LOWCARD_QUIZ_BET}`
+          ]);
+          this.broadcast(this.LOWCARD_QUIZ_ROOM, ["lowCardQuizSessionStarted", true]);
+
+          const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);
+          if (clients && clients.size > 0) {
+            await this._startLowCardQuizGameIfNotStarted();
+          } else {
+            this.broadcast(this.LOWCARD_QUIZ_ROOM, [
+              "gameLowCardNotification",
+              "Waiting for players..."
+            ]);
+          }
+        }
+        break;
+
+      case 'lowcard_session_end':
         await this._endLowCardQuizSession();
+        this._sendNextLowCardNotificationOnce('session_end');
         break;
+
+      // ============================================================
+      // DICE SESSION ALARMS (EXISTING)
+      // ============================================================
       case 'dice_session_start':
       case 'dice_session_start_immediate':
         if (this.alarmScheduler.isDiceTime()) {
@@ -1988,6 +2377,7 @@ export class GameServer {
           }
         }
         break;
+
       case 'dice_session_end':
         this.diceAutoEnabled = false;
         this._diceSessionActive = false;
@@ -2065,195 +2455,6 @@ export class GameServer {
   }
 
   // ============================================================
-  // LOWCARD QUIZ AUTO SYSTEM (TAMBAHAN BARU)
-  // 100% PAKAI EVENT LOWCARD ASLI
-  // ============================================================
-
-  async _startLowCardQuizSession() {
-    try {
-      if (this._lowCardQuizActive && !this._lowCardQuizEnded) return;
-      this._lowCardQuizActive = true;
-      this._lowCardQuizEnded = false;
-      this._lowCardQuizGameStarted = false;
-      this._lowCardQuizRound = 0;
-      this._lowCardQuizStartTime = Date.now();
-      this._lowCardQuizLastWinner = null;
-      this._lowCardQuizNotifiedFor = null;
-
-      // Jika sudah ada client di room, langsung start game
-      // Event yang dipakai: gameLowCardStart, gameLowCardStartSuccess (dari _startLowCardQuizGame)
-      const clients = this.roomClients?.get(LOWCARD_QUIZ_ROOM);
-      if (clients && clients.size > 0) {
-        this._lowCardQuizGameStarted = false;
-        await this._startLowCardQuizGame();
-      }
-      // Jika tidak ada client, tunggu sampai ada yang masuk (auto-start via switchRoom/alarm)
-
-      const now = new Date();
-      const witaNow = this.alarmScheduler._toWITA(now);
-      const currentTotal = witaNow.getHours() * 60 + witaNow.getMinutes();
-      let sessionEndMinutes = 0;
-      for (const session of LOWCARD_QUIZ_SCHEDULE.SESSIONS) {
-        const startTotal = parseTime(session.start);
-        const endTotal = parseTime(session.end);
-        if (currentTotal >= startTotal && currentTotal < endTotal) {
-          sessionEndMinutes = endTotal - currentTotal;
-          break;
-        }
-      }
-      if (sessionEndMinutes > 0) {
-        this._clearTimer(this._lowCardQuizSessionTimer);
-        this._lowCardQuizSessionTimer = this._trackTimer(setTimeout(() => {
-          this._endLowCardQuizSession();
-        }, sessionEndMinutes * 60 * 1000));
-      }
-    } catch(e) {}
-  }
-
-  async _endLowCardQuizSession() {
-    try {
-      if (!this._lowCardQuizActive) return;
-      this._lowCardQuizActive = false;
-      this._lowCardQuizEnded = true;
-      this._lowCardQuizGameStarted = false;
-
-      const game = this.activeGames.get(LOWCARD_QUIZ_ROOM);
-      if (game) {
-        await this._forceCleanupGame(LOWCARD_QUIZ_ROOM, game);
-      }
-
-      // Pakai event LowCard asli untuk end session
-      this.broadcast(LOWCARD_QUIZ_ROOM, ["gameLowCardEnd", ["LowCard Quiz session ended"]]);
-
-      this._clearTimer(this._lowCardQuizSessionTimer);
-      this._lowCardQuizSessionTimer = null;
-    } catch(e) {}
-  }
-
-  async _startLowCardQuizGame() {
-    try {
-      if (!this._lowCardQuizActive || this._lowCardQuizEnded) return;
-      if (this._lowCardQuizGameStarted) return;
-
-      const existingGame = this.activeGames.get(LOWCARD_QUIZ_ROOM);
-      if (existingGame?._isActive && !existingGame._gameEnded) return;
-
-      const clients = this.roomClients?.get(LOWCARD_QUIZ_ROOM);
-      if (!clients || clients.size === 0) return;
-
-      this._lowCardQuizGameStarted = true;
-      this._lowCardQuizRound++;
-
-      const game = {
-        room: LOWCARD_QUIZ_ROOM,
-        players: new Map(),
-        botPlayers: new Map(),
-        registrationOpen: true,
-        round: 1,
-        numbers: new Map(),
-        tanda: new Map(),
-        eliminated: new Set(),
-        betAmount: LOWCARD_QUIZ_BET,
-        hostId: 'LowCardQuiz',
-        hostName: 'LowCardQuiz',
-        useBots: false,
-        evaluationLocked: false,
-        drawTimeExpired: false,
-        _isActive: true,
-        _gameEnded: false,
-        _phase: 'registration',
-        _botTimeouts: new Set(),
-        _botsAdded: false,
-        _registrationTimer: null,
-        _drawTimer: null,
-        _evalTimer: null,
-        _safetyTimer: null,
-        _isEvaluating: false,
-        _createdAt: Date.now(),
-        _drawPhaseStart: null,
-        _endTime: null,
-        playerWsId: new Map(),
-        _startedByRecording: true,
-        _startedBy: 'lowcard_quiz',
-        _roundCompleted: 0,
-        _isLowCardQuiz: true
-      };
-
-      // Tambahkan semua client di room sebagai player
-      for (const ws of clients) {
-        const username = ws.username || ws._username;
-        if (username) {
-          game.players.set(username, { id: username, name: username, _left: false, _leftAt: null });
-          game.playerWsId.set(username, ws._wsId);
-        }
-      }
-
-      // Kalau tidak ada human player sama sekali, tambah bot
-      if (game.players.size === 0) {
-        this._addBots(LOWCARD_QUIZ_ROOM, 4);
-        game._botsAdded = true;
-      }
-
-      this.activeGames.set(LOWCARD_QUIZ_ROOM, game);
-
-      // ===== PAKAI EVENT LOWCARD ASLI — SAMA PERSIS DENGAN startGame() =====
-      this.broadcast(LOWCARD_QUIZ_ROOM, ["gameLowCardStart", LOWCARD_QUIZ_BET]);
-      this.broadcast(LOWCARD_QUIZ_ROOM, ["gameLowCardStartSuccess", "LowCardQuiz", LOWCARD_QUIZ_BET]);
-
-      // _startRegistration() akan broadcast: gameLowCardTimeLeft (15s, 10s, 5s, TIME UP)
-      // _closeRegistration() → _startDrawPhase() → gameLowCardClosed, gameLowCardNextRound
-      // _startDrawCountdown() → gameLowCardTimeLeft
-      // _handleBotDraw() / submitNumber() → gameLowCardPlayerDraw
-      // _closeDrawPhase() → gameLowCardWait
-      // _evaluateRound() → gameLowCardRoundResult, gameLowCardWinner
-      // ====================================================================
-      this._startRegistration(LOWCARD_QUIZ_ROOM, game);
-    } catch(e) { this._lowCardQuizGameStarted = false; }
-  }
-
-  async _addLowCardQuizWinner(username) {
-    try {
-      if (!username) return false;
-      await this.dataManager.addLowCardQuizWinner(username);
-      const winners = await this.dataManager.getLowCardQuizWinners();
-      // Pakai event lowCardWinnerUpdate yang sama dengan LowCard asli
-      this.broadcast(LOWCARD_QUIZ_ROOM, ["lowCardWinnerUpdate", { winners, room: LOWCARD_QUIZ_ROOM, recording: true }]);
-      return true;
-    } catch(e) { return false; }
-  }
-
-  async _handleLowCardQuizWeeklyReset() {
-    try {
-      const winners = await this.dataManager.getLowCardQuizWinners();
-      let winner = null, highestScore = 0;
-      for (const [username, score] of Object.entries(winners)) {
-        const numericScore = parseInt(String(score).replace("x", "")) || 0;
-        if (numericScore > highestScore) { highestScore = numericScore; winner = username; }
-      }
-      const currentWeek = this.dataManager.getCurrentWeek();
-      if (winner && highestScore > 0) {
-        await this.dataManager.setLowCardQuizLastWeekWinner({ username: winner, score: highestScore, week: currentWeek, timestamp: Date.now() });
-      } else {
-        await this.dataManager.deleteLowCardQuizLastWeekWinner();
-      }
-      await this.dataManager.resetLowCardQuizWinners();
-      await this.dataManager.setLowCardQuizLastResetWeek(currentWeek);
-      return true;
-    } catch(e) { return false; }
-  }
-
-  async _checkLowCardQuizAuto() {
-    try {
-      const isQuizTime = this.alarmScheduler.isLowCardQuizTime();
-      if (isQuizTime && !this._lowCardQuizActive) {
-        await this._startLowCardQuizSession();
-      } else if (!isQuizTime && this._lowCardQuizActive) {
-        await this._endLowCardQuizSession();
-      }
-    } catch(e) {}
-  }
-
-  // ============================================================
   // EVENT DISPATCHER
   // ============================================================
 
@@ -2318,7 +2519,6 @@ export class GameServer {
         try {
           const isDiceTime = this.alarmScheduler.isDiceTime();
           const isGameRunning = this.currentDiceRoll && this._canSubmitDiceAnswer;
-
           if (isDiceTime && isGameRunning) {
             this.safeSend(ws, ["diceRoll", {
               value: this.currentDiceRoll.value,
@@ -2457,9 +2657,7 @@ export class GameServer {
         return;
       }
 
-      if (evt === "getDicePoints") {
-        return;
-      }
+      if (evt === "getDicePoints") { return; }
 
       if (evt === "getDiceStatus") {
         const isActive = !!this.currentDiceRoll && this._canSubmitDiceAnswer;
@@ -2471,7 +2669,6 @@ export class GameServer {
         try {
           const isActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
           let notification = "";
-
           if (isActive) {
             const elapsed = (Date.now() - this._diceStartTime) / 1000;
             const remaining = Math.max(0, 20 - elapsed);
@@ -2488,16 +2685,84 @@ export class GameServer {
 
       if (evt === "checkGameRunning") { await this.checkGameRunning(ws, data[1]); return; }
 
+      // ============================================================
+      // LOWCARD QUIZ EVENTS
+      // ============================================================
+
+      if (evt === "getLowCardQuizStatus") {
+        try {
+          const isSessionTime = this.isLowCardQuizTime();
+          const game = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
+          const isGameRunning = game?._isActive && !game._gameEnded;
+          const timeInfo = this.alarmScheduler._getTimeLeftUntilNextLowCard();
+
+          const humanCount = game ? this._countHumanPlayers(game) : 0;
+          const botCount = game ? Array.from(game.players?.keys() || []).filter(id => id.startsWith('BOT_')).length : 0;
+
+          this.safeSend(ws, ["lowCardQuizStatus", {
+            isSessionTime,
+            isGameRunning: !!isGameRunning,
+            bet: CONSTANTS.LOWCARD_QUIZ_BET,
+            room: this.LOWCARD_QUIZ_ROOM,
+            nextSessionText: timeInfo?.text || '0h 0m',
+            userCount: humanCount,
+            botCount: botCount
+          }]);
+        } catch(e) {}
+        return;
+      }
+
+      if (evt === "getLowCardWinners") {
+        try {
+          const winners = await this.dataManager.getLowCardWinners();
+          this.safeSend(ws, ["lowCardWinnersList", winners]);
+        } catch(e) { this.safeSend(ws, ["lowCardWinnersList", {}]); }
+        return;
+      }
+
+      if (evt === "getLowCardLastWeekWinner") {
+        try {
+          const wsId = ws._wsId;
+          const now = Date.now();
+          if (!this._lastWinnerRequestTime) this._lastWinnerRequestTime = new Map();
+          const lastReq = this._lastWinnerRequestTime.get(wsId) || 0;
+          if (now - lastReq < 5000) return;
+          this._lastWinnerRequestTime.set(wsId, now);
+
+          const winner = await this.dataManager.getLowCardLastWeekWinner();
+          if (winner && winner.username) {
+            this.safeSend(ws, [
+              "lowCardLastWeekWinner",
+              String(winner.username),
+              parseInt(winner.wins, 10) || 0,
+              String(winner.week || '')
+            ]);
+          } else {
+            this.safeSend(ws, ["lowCardLastWeekWinner", "", 0, ""]);
+          }
+        } catch(e) {
+          this.safeSend(ws, ["lowCardLastWeekWinner", "", 0, ""]);
+        }
+        return;
+      }
+
+      if (evt === "deleteLowCardLastWeekWinner") {
+        try {
+          await this.dataManager.deleteLowCardLastWeekWinner();
+          this.safeSend(ws, ["lowCardLastWeekWinnerDeleted", true, "Deleted"]);
+        } catch(e) {
+          this.safeSend(ws, ["lowCardLastWeekWinnerDeleted", false, e.message]);
+        }
+        return;
+      }
+
+      // ============================================================
+      // END LOWCARD QUIZ EVENTS
+      // ============================================================
+
       const room = ws.room || ws.roomname;
       if (!room) { this.safeSend(ws, ["gameLowCardError", "Please switch to a room first"]); return; }
       if (room === CONSTANTS.DICE_ROOM) { this.safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]); return; }
-
-      // ============ BLOCK MANUAL START DI LOWCARD QUIZ (TAMBAHAN BARU) ============
-      if (room === LOWCARD_QUIZ_ROOM && evt === "gameLowCardStart") {
-        this.safeSend(ws, ["gameLowCardError", "LowCard Quiz berjalan otomatis pada jam 16:00-17:00 & 20:00-21:00 WITA"]);
-        return;
-      }
-      // ==========================================================================
 
       switch (evt) {
         case "gameLowCardStart": await this.startGame(ws, data[1], data[2]); break;
@@ -2525,7 +2790,6 @@ export class GameServer {
       if (currentRoom === roomName) {
         if (roomName === CONSTANTS.DICE_ROOM) {
           this._sendDiceRoomState(ws);
-
           const userKey = `${wsId}_${roomName}`;
           if (!this._roomEntryNotified.has(userKey)) {
             this._roomEntryNotified.add(userKey);
@@ -2538,6 +2802,22 @@ export class GameServer {
             this._trackTimer(timer);
           }
         }
+
+        if (roomName === this.LOWCARD_QUIZ_ROOM) {
+          this._sendLowCardRoomState(ws);
+          const userKey = `${wsId}_${roomName}`;
+          if (!this._lowCardRoomEntryNotified.has(userKey)) {
+            this._lowCardRoomEntryNotified.add(userKey);
+            const timer = setTimeout(() => {
+              try {
+                if (!ws || ws.readyState !== 1 || ws._closing) return;
+                this._sendNextLowCardNotificationOnce('room_entry', ws);
+              } catch(e) {}
+            }, 1000);
+            this._trackTimer(timer);
+          }
+        }
+
         this.safeSend(ws, ["switchRoomSuccess", roomName]);
         return;
       }
@@ -2571,9 +2851,12 @@ export class GameServer {
       }
 
       this.safeSend(ws, ["switchRoomSuccess", roomName]);
+
+      // ============================================================
+      // DICE ROOM
+      // ============================================================
       if (roomName === CONSTANTS.DICE_ROOM) {
         this._sendDiceRoomState(ws);
-
         const userKey = `${wsId}_${roomName}`;
         if (!this._roomEntryNotified.has(userKey)) {
           this._roomEntryNotified.add(userKey);
@@ -2586,30 +2869,56 @@ export class GameServer {
           this._trackTimer(timer);
         }
 
-        if (this.alarmScheduler.isDiceTime() && !this._diceGameStarted && !this.currentDiceRoll) this._startDiceGameIfNotStarted();
+        if (this.alarmScheduler.isDiceTime() && !this._diceGameStarted && !this.currentDiceRoll) {
+          this._startDiceGameIfNotStarted();
+        }
       }
 
-      // ============ LOWCARD QUIZ AUTO-START (TAMBAHAN BARU) ============
-      // 100% pakai event LowCard asli
-      if (roomName === LOWCARD_QUIZ_ROOM) {
-        try {
-          // 1. Pastikan sesi aktif
-          await this._checkLowCardQuizAuto();
-          
-          // 2. Jika sesi aktif & game belum jalan, START GAME sekarang
-          if (this._lowCardQuizActive && !this._lowCardQuizEnded) {
-            const quizClients = this.roomClients?.get(LOWCARD_QUIZ_ROOM);
-            const existingGame = this.activeGames.get(LOWCARD_QUIZ_ROOM);
-            const gameRunning = existingGame?._isActive && !existingGame._gameEnded;
-            
-            if (quizClients && quizClients.size > 0 && !gameRunning) {
-              this._lowCardQuizGameStarted = false; // reset flag agar bisa start
-              await this._startLowCardQuizGame();
-            }
-          }
-        } catch(e) {}
+      // ============================================================
+      // LOWCARD QUIZ ROOM
+      // ============================================================
+      if (roomName === this.LOWCARD_QUIZ_ROOM) {
+        this._sendLowCardRoomState(ws);
+
+        const userKey = `${wsId}_${roomName}`;
+        if (!this._lowCardRoomEntryNotified.has(userKey)) {
+          this._lowCardRoomEntryNotified.add(userKey);
+          const timer = setTimeout(() => {
+            try {
+              if (!ws || ws.readyState !== 1 || ws._closing) return;
+              this._sendNextLowCardNotificationOnce('room_entry', ws);
+            } catch(e) {}
+          }, 1000);
+          this._trackTimer(timer);
+        }
+
+        // Auto-start game jika sesi aktif dan ada pemain
+        if (this.isLowCardQuizTime() && !this._lowCardGameStarted) {
+          const timer = setTimeout(() => {
+            try {
+              if (!this.isDestroyed && this.isLowCardQuizTime()) {
+                this._startLowCardQuizGameIfNotStarted();
+              }
+            } catch(e) {}
+          }, 500);
+          this._trackTimer(timer);
+        }
+
+        // Re-evaluate bots jika game sedang berjalan
+        const currentGame = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
+        if (currentGame?._isActive && !currentGame._gameEnded && currentGame._isAutoQuiz) {
+          const timer = setTimeout(() => {
+            try {
+              const g = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
+              if (g?._isActive && !g._gameEnded) {
+                this._reevaluateBots(this.LOWCARD_QUIZ_ROOM, g);
+              }
+            } catch(e) {}
+          }, 1000);
+          this._trackTimer(timer);
+        }
       }
-      // ================================================================
+
     } catch(e) { this.safeSend(ws, ["gameLowCardError", e.message || "Switch failed"]); }
   }
 
@@ -2637,13 +2946,6 @@ export class GameServer {
       if (!username?.trim()) { this.safeSend(ws, ["gameLowCardError", "Username required"]); return; }
       const usernameClean = username.trim();
       if (roomName === CONSTANTS.DICE_ROOM) { this.safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]); return; }
-
-      // ============ BLOCK LOWCARD QUIZ ROOM (TAMBAHAN BARU) ============
-      if (roomName === LOWCARD_QUIZ_ROOM) {
-        this.safeSend(ws, ["gameLowCardError", "LowCard Quiz berjalan otomatis, tidak bisa dimulai manual"]);
-        return;
-      }
-      // ================================================================
 
       const betAmount = parseInt(bet, 10) || 0;
       if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
@@ -2718,7 +3020,7 @@ export class GameServer {
   }
 
   // ============================================================
-  // LOW CARD GAME LOGIC (TIDAK DIUBAH)
+  // LOW CARD GAME LOGIC
   // ============================================================
 
   _isGameActuallyRunning(game) { return game?._isActive === true && !game?._gameEnded && game?.players?.size > 0; }
@@ -2856,11 +3158,19 @@ export class GameServer {
       game.registrationOpen = false;
       if (game._registrationTimer) { this._clearTimer(game._registrationTimer); game._registrationTimer = null; }
 
-      if (!game._botsAdded) {
-        const humanCount = this._countHumanPlayers(game);
-        if (humanCount <= 1) {
-          this._addBots(room, 4);
-          game._botsAdded = true;
+      // ============================================================
+      // ATURAN BOT KHUSUS LOWCARD QUIZ
+      // ============================================================
+      if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
+        this._reevaluateBots(room, game);
+        game._botsAdded = true;
+      } else {
+        if (!game._botsAdded) {
+          const humanCount = this._countHumanPlayers(game);
+          if (humanCount <= 1) {
+            this._addBots(room, 4);
+            game._botsAdded = true;
+          }
         }
       }
 
@@ -2875,15 +3185,17 @@ export class GameServer {
     } catch(e) {}
   }
 
-  _addBots(room, count) {
+  _addBots(room, count, targetGame = null) {
     try {
-      const game = this.activeGames.get(room);
+      const game = targetGame || this.activeGames.get(room);
       if (!this._isGameActuallyRunning(game)) return;
+
       const botNames = ["moz1", "moz2", "moz3", "moz4"];
       const existingBots = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
       const existingBotCount = existingBots.length;
       const maxBotsToAdd = Math.min(count, CONSTANTS.MAX_BOTS_PER_GAME - existingBotCount);
       if (maxBotsToAdd <= 0) return;
+
       for (let i = 0; i < maxBotsToAdd; i++) {
         const botId = `BOT_${room}_${existingBotCount + i}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
         const botName = botNames[(existingBotCount + i) % botNames.length];
@@ -2893,6 +3205,7 @@ export class GameServer {
           game.botPlayers.set(botId, botName);
         }
       }
+
       game._botsAdded = true;
       game.useBots = true;
     } catch(e) {}
@@ -2909,11 +3222,18 @@ export class GameServer {
       game.evaluationLocked = false;
       game.drawTimeExpired = false;
 
-      if (!game._botsAdded) {
-        const humanCount = this._countHumanPlayers(game);
-        if (humanCount <= 1) {
-          this._addBots(room, 4);
-          game._botsAdded = true;
+      // ============================================================
+      // ATURAN BOT SAAT DRAW PHASE
+      // ============================================================
+      if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
+        this._reevaluateBots(room, game);
+      } else {
+        if (!game._botsAdded) {
+          const humanCount = this._countHumanPlayers(game);
+          if (humanCount <= 1) {
+            this._addBots(room, 4);
+            game._botsAdded = true;
+          }
         }
       }
 
@@ -3063,10 +3383,16 @@ export class GameServer {
       if (entries.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-        if (!game._botsAdded) {
-          const humanCount = this._countHumanPlayers(game);
-          if (humanCount <= 1) { this._addBots(room, 4); game._botsAdded = true; }
+
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
+          this._reevaluateBots(room, game);
+        } else {
+          if (!game._botsAdded) {
+            const humanCount = this._countHumanPlayers(game);
+            if (humanCount <= 1) { this._addBots(room, 4); game._botsAdded = true; }
+          }
         }
+
         const remaining = Array.from(players.keys()).filter(id => !eliminated.has(id));
         if (remaining.length >= 2) {
           game.round++;
@@ -3124,47 +3450,79 @@ export class GameServer {
         const winnerId = remaining[0];
         const winnerName = players.get(winnerId)?.name || winnerId;
         const totalCoin = (game.betAmount || 0) * players.size;
+
+        // Recording mode (existing)
         if (game._startedByRecording) {
           await this._addLowCardWinner(room, winnerName);
           const winners = await this._getLowCardWinners(room);
           this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
         }
-        this.broadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
 
-        // ============ LOWCARD QUIZ WINNER RECORD (TAMBAHAN BARU) ============
-        if (game._isLowCardQuiz || room === LOWCARD_QUIZ_ROOM) {
+        // ============================================================
+        // RECORD LOWCARD QUIZ WINNER (auto session)
+        // ============================================================
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
           try {
-            await this._addLowCardQuizWinner(winnerName);
-            this._lowCardQuizLastWinner = winnerName;
+            await this.dataManager.addLowCardWinner(winnerName);
+            const quizWinners = await this.dataManager.getLowCardWinners();
+
+            this.broadcast(room, ["lowCardQuizWinnerUpdate", {
+              winners: quizWinners,
+              room: room,
+              latestWinner: winnerName,
+              bet: game.betAmount,
+              timestamp: Date.now()
+            }]);
+
+            this.broadcast(room, ["lowCardQuizWinner", {
+              username: winnerName,
+              bet: game.betAmount,
+              totalWins: quizWinners[winnerName] || "1x",
+              room: room
+            }]);
+
           } catch(e) {}
         }
-        // ====================================================================
+        // ============================================================
 
+        this.broadcast(room, ["gameLowCardWinner", winnerName, totalCoin]);
         game._gameEnded = true;
         game._isActive = false;
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
         this._scheduleGameCleanup(room, game);
 
-        // ============ LOWCARD QUIZ AUTO-RESTART (TAMBAHAN BARU) ============
-        if (game._isLowCardQuiz || room === LOWCARD_QUIZ_ROOM) {
-          this._lowCardQuizGameStarted = false;
-          const self = this;
-          this._trackTimer(setTimeout(() => {
-            if (self._lowCardQuizActive && !self._lowCardQuizEnded) {
-              self._startLowCardQuizGame();
-            }
-          }, 5000));
+        // Reset flag quiz agar bisa auto-start lagi
+        if (room === this.LOWCARD_QUIZ_ROOM) {
+          this._lowCardGameStarted = false;
+
+          if (this.isLowCardQuizTime() && this._lowCardSessionActive && !this._lowCardSessionEnded) {
+            const restartTimer = setTimeout(() => {
+              try {
+                if (this.isDestroyed || !this.isLowCardQuizTime()) return;
+                if (this._lowCardSessionActive && !this._lowCardSessionEnded && !this._lowCardGameStarted) {
+                  const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);
+                  if (clients && clients.size > 0) {
+                    this._startLowCardQuizGameIfNotStarted();
+                  }
+                }
+              } catch(e) {}
+            }, CONSTANTS.LOWCARD_AUTO_RESTART_DELAY_MS);
+            this._trackTimer(restartTimer);
+          }
         }
-        // ==================================================================
 
         return;
       }
 
       if (remaining.length === 0) {
-        if (!game._botsAdded) {
-          const humanCount = this._countHumanPlayers(game);
-          if (humanCount <= 1) { this._addBots(room, 4); game._botsAdded = true; }
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
+          this._reevaluateBots(room, game);
+        } else {
+          if (!game._botsAdded) {
+            const humanCount = this._countHumanPlayers(game);
+            if (humanCount <= 1) { this._addBots(room, 4); game._botsAdded = true; }
+          }
         }
         const newActive = Array.from(players.keys()).filter(id => !eliminated.has(id));
         if (newActive.length >= 2) {
@@ -3271,6 +3629,11 @@ export class GameServer {
             this.safeSend(ws, ["gameLowCardPlayerDraw", usernameClean, game.numbers.get(usernameClean), game.tanda.get(usernameClean) || ""]);
           }
 
+          // Re-evaluate bots setelah user rejoin
+          if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
+            this._reevaluateBots(room, game);
+          }
+
           return;
         }
 
@@ -3300,6 +3663,12 @@ export class GameServer {
 
         game.playerWsId.set(usernameClean, wsId);
         this.broadcast(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
+
+        // Re-evaluate bots setelah user join
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
+          this._reevaluateBots(room, game);
+        }
+
       } finally {
         setTimeout(() => { this._joinLocks.delete(lockKey); }, 2000);
       }
@@ -3370,12 +3739,33 @@ export class GameServer {
       if (!room || !game) return;
       if (this._cleanupTimers.has(room)) { this._clearTimer(this._cleanupTimers.get(room)); this._cleanupTimers.delete(room); }
       if (!game._gameEnded) return;
+
       const timer = this._trackTimer(setTimeout(() => {
         const currentGame = this.activeGames.get(room);
         if (currentGame?._isActive && !currentGame._gameEnded) { this._cleanupTimers.delete(room); return; }
         this._cleanupTimers.delete(room);
         const gameToDelete = this.activeGames.get(room);
         if (gameToDelete) this._deleteGame(room, gameToDelete);
+
+        // ============================================================
+        // AUTO-START RONDE BARU UNTUK LOWCARD QUIZ
+        // ============================================================
+        if (room === this.LOWCARD_QUIZ_ROOM && this.isLowCardQuizTime() &&
+            this._lowCardSessionActive && !this._lowCardSessionEnded) {
+          const restartTimer = setTimeout(() => {
+            try {
+              if (this.isDestroyed || !this.isLowCardQuizTime()) return;
+              if (!this._lowCardSessionActive || this._lowCardSessionEnded) return;
+              this._lowCardGameStarted = false;
+              const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);
+              if (clients && clients.size > 0) {
+                this._startLowCardQuizGameIfNotStarted();
+              }
+            } catch(e) {}
+          }, 3000);
+          this._trackTimer(restartTimer);
+        }
+
       }, CONSTANTS.GAME_CLEANUP_DELAY_MS || 5000));
       this._cleanupTimers.set(room, timer);
     } catch(e) {}
@@ -3444,6 +3834,12 @@ export class GameServer {
       if (this.isDestroyed) return;
       this.isDestroyed = true;
       this.closing = true;
+
+      if (this._lowCardAutoStartTimer) {
+        this._clearTimer(this._lowCardAutoStartTimer);
+        this._lowCardAutoStartTimer = null;
+      }
+
       for (const timer of this._allTimers) { try { clearTimeout(timer); } catch(e) {} }
       this._allTimers.clear();
       if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
@@ -3455,9 +3851,6 @@ export class GameServer {
       if (this._tieInterval) { clearInterval(this._tieInterval); this._tieInterval = null; }
       for (const t of this._tieNotificationTimeouts) { clearTimeout(t); }
       this._tieNotificationTimeouts = [];
-      // ============ LOWCARD QUIZ CLEANUP (TAMBAHAN BARU) ============
-      if (this._lowCardQuizSessionTimer) { clearTimeout(this._lowCardQuizSessionTimer); this._lowCardQuizSessionTimer = null; }
-      // ============================================================
       for (const [room, game] of this.activeGames) {
         if (game._isActive && !game._gameEnded) {
           game._gameEnded = true;
