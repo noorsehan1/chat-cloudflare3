@@ -72,12 +72,12 @@ const QUIZ_SCHEDULE = {
 // ============================================================
 // LOWCARD QUIZ CONFIG (TAMBAHAN BARU)
 // ============================================================
-const LOWCARD_QUIZ_ROOM = "LowCardQuiz";
+const LOWCARD_QUIZ_ROOM = "LowCard";
 
 const LOWCARD_QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: "16:00", end: "17:00" }, // jam 4-5 sore WITA
-    { start: "18:00", end: "19:00" }  // jam 6-7 sore WITA
+    { start: "20:00", end: "21:00" }  // jam 6-7 sore WITA
   ],
   TIMEZONE_OFFSET: 8,
 };
