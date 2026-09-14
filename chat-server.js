@@ -26,6 +26,7 @@ const ROOMS = [
 
 const ROOMS_SET = new Set(ROOMS);
 const TABLE_NAME = 'chat_data';
+const TABLE_AUTOCHAT = 'chatmulty'; // 🔥 AUTOCHAT
 
 const _wsCleanupState = new WeakMap();
 
@@ -83,6 +84,11 @@ export class ChatServer {
       this._onlineUsersCacheTime = 0;
       this._roomCountsCache = null;
       this._roomCountsCacheTime = 0;
+
+      // 🔥 AUTOCHAT
+      this._autochatNextAt = null;
+      this._autochatPlaying = false;
+      this._numberNextAt = null;
 
       if (!env || !env.DB) {
         this.db = null;
@@ -176,11 +182,210 @@ export class ChatServer {
       this._onlineUsersCacheTime = 0;
       this._roomCountsCache = null;
       this._roomCountsCacheTime = 0;
+      // 🔥 AUTOCHAT
+      this._autochatNextAt = null;
+      this._autochatPlaying = false;
+      this._numberNextAt = null;
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
       }
     }
   }
+
+  /* ============================================================
+     🔥 AUTOCHAT — cek tabel, baca, dan kirim ke event `chat`
+     ============================================================ */
+
+  async _ensureAutoChatTable() {
+    try {
+      if (!this.db) return false;
+
+      // 1) Cek apakah tabel ada
+      let exists = false;
+      try {
+        const check = await this.db
+          .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
+          .bind(TABLE_AUTOCHAT)
+          .first();
+        exists = !!check;
+      } catch(e) {
+        exists = false;
+      }
+
+      // 2) Kalau tidak ada, buat tabel
+      if (!exists) {
+        try {
+          await this.db.prepare(`
+            CREATE TABLE IF NOT EXISTS ${TABLE_AUTOCHAT} (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+          `).run();
+        } catch(e) {
+          this._handleError('_ensureAutoChatTable:create', e);
+          return false;
+        }
+      }
+
+      // 3) Cek apakah ada row autochat_index
+      let hasIndex = false;
+      try {
+        const idx = await this.db
+          .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
+          .bind('autochat_index')
+          .first();
+        hasIndex = !!idx?.value;
+      } catch(e) {
+        hasIndex = false;
+      }
+
+      // 4) Kalau belum ada index, buat default kosong
+      if (!hasIndex) {
+        try {
+          await this.db
+            .prepare(`INSERT OR REPLACE INTO ${TABLE_AUTOCHAT} (key, value) VALUES (?, ?)`)
+            .bind('autochat_index', JSON.stringify({ total: 0, nextId: 1 }))
+            .run();
+        } catch(e) {
+          this._handleError('_ensureAutoChatTable:index', e);
+        }
+      }
+
+      return true;
+    } catch(e) {
+      this._handleError('_ensureAutoChatTable', e);
+      return false;
+    }
+  }
+
+  _randomAutoChatInterval() {
+    const MIN = 5 * 60 * 1000;
+    const MAX = 15 * 60 * 1000;
+    return Math.floor(Math.random() * (MAX - MIN + 1)) + MIN;
+  }
+
+  async _loadAutoChatConv(id) {
+    try {
+      if (!this.db) return null;
+      const row = await this.db
+        .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
+        .bind(`autochat_conv_${id}`)
+        .first();
+      return row?.value ? JSON.parse(row.value) : null;
+    } catch(e) {
+      return null;
+    }
+  }
+
+  async _loadAutoChatIndex() {
+    try {
+      if (!this.db) return { total: 0, nextId: 1 };
+      const row = await this.db
+        .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
+        .bind('autochat_index')
+        .first();
+      return row?.value ? JSON.parse(row.value) : { total: 0, nextId: 1 };
+    } catch(e) {
+      return { total: 0, nextId: 1 };
+    }
+  }
+
+  async _saveAutoChatIndex(idx) {
+    try {
+      if (!this.db) return;
+      await this.db
+        .prepare(`INSERT OR REPLACE INTO ${TABLE_AUTOCHAT} (key, value) VALUES (?, ?)`)
+        .bind('autochat_index', JSON.stringify(idx))
+        .run();
+    } catch(e) {}
+  }
+
+  async _loadAutoChatUser(username) {
+    try {
+      if (!this.db || !username) return null;
+      const row = await this.db
+        .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
+        .bind(`autochat_user_${username}`)
+        .first();
+      return row?.value ? JSON.parse(row.value) : null;
+    } catch(e) {
+      return null;
+    }
+  }
+
+  async _playConversation(conv) {
+    try {
+      if (!conv?.lines?.length) return;
+      if (this._autochatPlaying) return;
+      this._autochatPlaying = true;
+
+      for (const line of conv.lines) {
+        if (this.closing || this.isDestroyed) break;
+
+        const speaker = line.from;
+        const text = line.text;
+        if (!speaker || !text) continue;
+
+        // Cari room: manual dulu, fallback ke seat aktif
+        let room = null;
+        const manual = await this._loadAutoChatUser(speaker);
+        if (manual?.room && ROOMS_SET.has(manual.room)) {
+          room = manual.room;
+        } else {
+          const found = await this._findUserInAnyRoom(speaker);
+          room = found?.room || null;
+        }
+        if (!room) continue;
+
+        // 🔥 Kirim langsung ke event "chat"
+        this.broadcast(room, [
+          "chat",
+          room,
+          "",        // noimageUrl
+          speaker,   // username
+          text,      // pesan
+          "",        // color
+          ""         // textColor
+        ]);
+
+        // Jeda antar baris 1–5 detik
+        await new Promise(r => setTimeout(r, 1000 + Math.floor(Math.random() * 4000)));
+      }
+    } catch(e) {
+      this._handleError('_playConversation', e);
+    } finally {
+      this._autochatPlaying = false;
+    }
+  }
+
+  async _processNextAutoChat() {
+    try {
+      if (this.closing || this.isDestroyed || !this.db) return;
+
+      const index = await this._loadAutoChatIndex();
+      if (!index.total) return;
+
+      const id = index.nextId || 1;
+      const conv = await this._loadAutoChatConv(id);
+      if (!conv) {
+        index.nextId = 1;
+        await this._saveAutoChatIndex(index);
+        return;
+      }
+
+      await this._playConversation(conv);
+
+      index.nextId = (id >= index.total) ? 1 : id + 1;
+      await this._saveAutoChatIndex(index);
+    } catch(e) {
+      this._handleError('_processNextAutoChat', e);
+    }
+  }
+
+  /* ============================================================
+     CORE
+     ============================================================ */
 
   _rebuildUserIndex() {
     try {
@@ -224,14 +429,20 @@ export class ChatServer {
       if (!this.ctx || !this.ctx.storage) return;
       if (typeof this.ctx.storage.setAlarm !== 'function') return;
 
+      const now = Date.now();
+      const numberNext = this._numberNextAt || (now + C.NUMBER_INTERVAL_MS);
+      const autoChatNext = this._autochatNextAt || (now + this._randomAutoChatInterval());
+
+      const next = Math.min(numberNext, autoChatNext);
+
       if (typeof this.ctx.storage.getAlarm === 'function') {
         try {
           const existing = await this.ctx.storage.getAlarm();
-          if (existing !== null && existing !== undefined) return;
+          if (existing !== null && existing !== undefined && existing <= next) return;
         } catch(e) {}
       }
 
-      const next = Date.now() + C.NUMBER_INTERVAL_MS;
+      this._numberNextAt = numberNext;
       await this.ctx.storage.setAlarm(next);
     } catch(e) {}
   }
@@ -249,17 +460,25 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      await this._updateNumber();
+      const now = Date.now();
+
+      // A) Number rotation
+      if (!this._numberNextAt || now >= this._numberNextAt) {
+        await this._updateNumber();
+        this._numberNextAt = Date.now() + C.NUMBER_INTERVAL_MS;
+      }
+
+      // B) AutoChat rotation
+      if (!this._autochatNextAt || now >= this._autochatNextAt) {
+        await this._processNextAutoChat();
+        this._autochatNextAt = Date.now() + this._randomAutoChatInterval();
+      }
+
     } catch(e) {
       this._handleError('alarm', e);
     } finally {
       if (!this.closing && !this.isDestroyed) {
-        try {
-          if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
-            const next = Date.now() + C.NUMBER_INTERVAL_MS;
-            await this.ctx.storage.setAlarm(next);
-          }
-        } catch(e) {}
+        try { await this._ensureAlarm(); } catch(e) {}
       }
     }
   }
@@ -565,7 +784,6 @@ export class ChatServer {
     return true;
   }
 
-  // 🔥 force=true agar seat multi ikut terhapus
   async _deleteSeatInRoom(roomName, seatNumber, force = false) {
     try {
       const roomBucket = await this._getRoomBucket(roomName);
@@ -614,7 +832,6 @@ export class ChatServer {
     }
   }
 
-  // 🔥 Guard: pertahankan isMulti=true jika seat lama multi
   async _updateSeatInRoom(roomName, seatNumber, seatData) {
     try {
       const roomBucket = await this._getRoomBucket(roomName);
@@ -859,7 +1076,6 @@ export class ChatServer {
         return { success: false, error: 'You do not own this seat' };
       }
 
-      // 🔥 Pertahankan isMulti=true jika seat lama multi
       const finalIsMulti = (data.isMulti === true || currentSeatData.isMulti === true);
 
       const updatedSeat = {
@@ -961,7 +1177,6 @@ export class ChatServer {
 
   async _joinInternal(ws, roomName, username) {
     try {
-      // 🔥 Simpan status multi SEBELUM seat lama dihapus
       const existing = await this._findUserInAnyRoom(username);
       const wasMulti = existing?.isMulti === true;
 
@@ -1017,7 +1232,7 @@ export class ChatServer {
           itematas: 0,
           vip: 0,
           viptanda: 0,
-          isMulti: wasMulti   // 🔥 pertahankan status multi
+          isMulti: wasMulti
         };
 
         await this._updateSeatInRoom(roomName, seat, newSeat);
@@ -1047,7 +1262,6 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      // Kalau bukan multi, hapus dari wsActiveMulti
       if (!wasMulti) {
         this.wsActiveMulti.delete(ws);
       }
@@ -1775,6 +1989,14 @@ export class ChatServer {
       try {
         await this._loadFromStorage();
         await this._ensureCacheInitialized();
+
+        // 🔥 AUTOCHAT: cek & buat tabel chatmulty kalau belum ada
+        await this._ensureAutoChatTable();
+
+        // 🔥 AUTOCHAT: init jadwal pertama
+        if (!this._autochatNextAt) {
+          this._autochatNextAt = Date.now() + this._randomAutoChatInterval();
+        }
       } catch(e) {}
 
       for (const room of ROOMS) {
@@ -1873,7 +2095,8 @@ export class ChatServer {
       if (!this.closing && !this.isDestroyed) {
         try {
           if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
-            await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+            this._numberNextAt = Date.now() + C.NUMBER_INTERVAL_MS;
+            await this._ensureAlarm();
           }
         } catch(e) {}
       }
@@ -1899,7 +2122,8 @@ export class ChatServer {
       if (!this.closing && !this.isDestroyed) {
         try {
           if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
-            await this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
+            this._numberNextAt = Date.now() + C.NUMBER_INTERVAL_MS;
+            await this._ensureAlarm();
           }
         } catch(e2) {}
       }
@@ -2169,7 +2393,6 @@ export class ChatServer {
           break;
         }
 
-        // 🔥 exitMulti: HANYA jalankan 1–5. Poin 6 (hapus ws) DILEWATI.
         case "exitMulti": {
           const targetUsername = args[0];
           if (!targetUsername) break;
@@ -2182,8 +2405,6 @@ export class ChatServer {
               await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
             this._removeUserIndex(targetUsername);
-
-            // ❌ 6 TIDAK dilakukan
           } catch(e) {}
           break;
         }
@@ -2599,6 +2820,45 @@ export class ChatServer {
           break;
         }
 
+        // 🔥 AUTOCHAT events (opsional)
+        case "playAutoChatNow": {
+          this._processNextAutoChat().catch(() => {});
+          break;
+        }
+
+        case "getAutoChatIndex": {
+          const idx = await this._loadAutoChatIndex();
+          this.safeSend(ws, ["autoChatIndex", idx]);
+          break;
+        }
+
+        case "getAutoChatConv": {
+          const cid = args[0];
+          const data = await this._loadAutoChatConv(cid);
+          this.safeSend(ws, ["autoChatConv", cid, data]);
+          break;
+        }
+
+        case "checkAutoChatTable": {
+          let exists = false;
+          try {
+            const check = await this.db
+              .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
+              .bind(TABLE_AUTOCHAT)
+              .first();
+            exists = !!check;
+          } catch(e) {}
+          let count = 0;
+          try {
+            const c = await this.db
+              .prepare(`SELECT COUNT(*) as c FROM ${TABLE_AUTOCHAT} WHERE key LIKE 'autochat_conv_%'`)
+              .first();
+            count = c?.c || 0;
+          } catch(e) {}
+          this.safeSend(ws, ["autoChatTableStatus", exists, count]);
+          break;
+        }
+
         default:
           break;
       }
@@ -2820,6 +3080,9 @@ export class ChatServer {
     this._restoreRemovedSeats = [];
     this._hasBroadcastRemoveKursi = new Set();
     this._userIndex = new Map();
+    // 🔥 AUTOCHAT
+    this._autochatNextAt = null;
+    this._autochatPlaying = false;
 
     this.isDestroyed = true;
   }
