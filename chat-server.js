@@ -264,7 +264,6 @@ export class ChatServer {
     }
   }
 
-  // 🔥 FIX #9: Broadcast currentNumber ke SEMUA room
   async _updateNumber() {
     try {
       if (this.closing || this.isDestroyed) return;
@@ -289,7 +288,6 @@ export class ChatServer {
 
         await this._saveCurrentNumber();
 
-        // 🔥 FIX #9: Broadcast currentNumber ke SEMUA room yang ada client
         if (!this._isRestoring) {
           for (const [room, clients] of (this.roomClients || new Map())) {
             if (clients?.size > 0) {
@@ -567,10 +565,7 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // 🔥 PERUBAHAN: tambah parameter `force` agar seat multi bisa dihapus
-  // saat user pindah room. Default tetap false = perilaku lama.
-  // ============================================================
+  // 🔥 force=true agar seat multi ikut terhapus
   async _deleteSeatInRoom(roomName, seatNumber, force = false) {
     try {
       const roomBucket = await this._getRoomBucket(roomName);
@@ -619,6 +614,7 @@ export class ChatServer {
     }
   }
 
+  // 🔥 Guard: pertahankan isMulti=true jika seat lama multi
   async _updateSeatInRoom(roomName, seatNumber, seatData) {
     try {
       const roomBucket = await this._getRoomBucket(roomName);
@@ -631,10 +627,17 @@ export class ChatServer {
         await this._saveSeat(roomName, seatNumber, null);
         return true;
       }
+
+      const oldSeat = roomBucket.seat?.[seatNumber];
+      const finalSeatData = { ...seatData };
+      if (oldSeat?.isMulti === true && finalSeatData.isMulti !== true) {
+        finalSeatData.isMulti = true;
+      }
+
       if (!roomBucket.seat) roomBucket.seat = {};
-      roomBucket.seat[seatNumber] = seatData;
-      this._setUserIndex(seatData.namauser, roomName, seatNumber, seatData.isMulti);
-      await this._saveSeat(roomName, seatNumber, seatData);
+      roomBucket.seat[seatNumber] = finalSeatData;
+      this._setUserIndex(finalSeatData.namauser, roomName, seatNumber, finalSeatData.isMulti);
+      await this._saveSeat(roomName, seatNumber, finalSeatData);
       return true;
     } catch(e) {
       return false;
@@ -856,6 +859,9 @@ export class ChatServer {
         return { success: false, error: 'You do not own this seat' };
       }
 
+      // 🔥 Pertahankan isMulti=true jika seat lama multi
+      const finalIsMulti = (data.isMulti === true || currentSeatData.isMulti === true);
+
       const updatedSeat = {
         noimageUrl: data.noimageUrl || currentSeatData.noimageUrl || "",
         namauser: data.namauser || currentSeatData.namauser || "",
@@ -864,7 +870,7 @@ export class ChatServer {
         itematas: typeof data.itematas === 'number' ? data.itematas : (parseInt(data.itematas) || 0),
         vip: typeof data.vip === 'number' ? data.vip : (parseInt(data.vip) || 0),
         viptanda: typeof data.viptanda === 'number' ? data.viptanda : (parseInt(data.viptanda) || 0),
-        isMulti: data.isMulti !== undefined ? data.isMulti : (currentSeatData.isMulti || false)
+        isMulti: finalIsMulti
       };
 
       await this._updateSeatInRoom(roomName, seat, updatedSeat);
@@ -892,7 +898,7 @@ export class ChatServer {
     }
   }
 
-  async _removeUserFromRoom(username, roomName) {
+  async _removeUserFromRoom(username, roomName, force = false) {
     try {
       if (!username || !roomName) return false;
       await this._ensureCacheInitialized();
@@ -907,17 +913,12 @@ export class ChatServer {
         }
       }
       if (!seat) return false;
-      await this._deleteSeatInRoom(roomName, seat);
-      return true;
+      return await this._deleteSeatInRoom(roomName, seat, force);
     } catch(e) {
       return false;
     }
   }
 
-  // ============================================================
-  // Helper: bersihkan wsActiveMulti + roomClients untuk username
-  // yang pindah room (menghindari sisa entry di memory).
-  // ============================================================
   _cleanupMultiTracking(username, oldRoom, keepWs = null) {
     try {
       if (!username) return;
@@ -960,14 +961,13 @@ export class ChatServer {
 
   async _joinInternal(ws, roomName, username) {
     try {
-      // 🔥 PERUBAHAN: hapus seat lama (normal) saat pindah room.
-      // Pakai _deleteSeatInRoom force=true agar point + D1 + broadcast + count
-      // semuanya ikut terhapus.
+      // 🔥 Simpan status multi SEBELUM seat lama dihapus
       const existing = await this._findUserInAnyRoom(username);
+      const wasMulti = existing?.isMulti === true;
+
       if (existing && existing.room !== roomName) {
         await this._deleteSeatInRoom(existing.room, existing.seat, true);
         this._removeUserIndex(username);
-        // Bersihkan sisa tracking multi lama (jika ada) di room lama
         this._cleanupMultiTracking(username, existing.room, ws);
       }
 
@@ -1017,7 +1017,7 @@ export class ChatServer {
           itematas: 0,
           vip: 0,
           viptanda: 0,
-          isMulti: false
+          isMulti: wasMulti   // 🔥 pertahankan status multi
         };
 
         await this._updateSeatInRoom(roomName, seat, newSeat);
@@ -1047,7 +1047,10 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      this.wsActiveMulti.delete(ws);
+      // Kalau bukan multi, hapus dari wsActiveMulti
+      if (!wasMulti) {
+        this.wsActiveMulti.delete(ws);
+      }
 
       const muteStatus = roomBucket.mute || false;
 
@@ -1090,13 +1093,10 @@ export class ChatServer {
       if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
       await this._ensureCacheInitialized();
 
-      // 🔥 PERUBAHAN: hapus seat lama (baik normal maupun multi) saat
-      // multi user pindah room. force=true agar multi seat ikut terhapus.
       const existing = await this._findUserInAnyRoom(multiUsername);
       if (existing && existing.room !== multiRoomname) {
         await this._deleteSeatInRoom(existing.room, existing.seat, true);
         this._removeUserIndex(multiUsername);
-        // Bersihkan sisa tracking multi lama di memory
         this._cleanupMultiTracking(multiUsername, existing.room, ws);
       }
 
@@ -2169,6 +2169,7 @@ export class ChatServer {
           break;
         }
 
+        // 🔥 exitMulti: HANYA jalankan 1–5. Poin 6 (hapus ws) DILEWATI.
         case "exitMulti": {
           const targetUsername = args[0];
           if (!targetUsername) break;
@@ -2176,73 +2177,13 @@ export class ChatServer {
             const found = await this._findUserInAnyRoom(targetUsername);
             const roomName = found?.room;
             const seatNumber = found?.seat;
+
             if (roomName && seatNumber) {
-              await this._removeUserFromRoom(targetUsername, roomName);
+              await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
             this._removeUserIndex(targetUsername);
-            const connections = this.userConnections?.get(targetUsername);
-            if (connections) {
-              const toRemove = Array.from(connections);
-              for (const conn of toRemove) {
-                if (conn.room) {
-                  const rc = this.roomClients?.get(conn.room);
-                  if (rc) try { rc.delete(conn); } catch(e) {}
-                }
-                if (roomName) {
-                  const rc = this.roomClients?.get(roomName);
-                  if (rc) try { rc.delete(conn); } catch(e) {}
-                }
-                try { this.wsActiveMulti?.delete(conn); } catch(e) {}
-                try {
-                  conn.serializeAttachment({});
-                  conn.username = null;
-                  conn.room = null;
-                  conn.roomname = null;
-                  conn.idtarget = null;
-                  conn._username = null;
-                  conn._room = null;
-                } catch(e) {}
-                try {
-                  if (conn.readyState === 1) {
-                    this.safeSend(conn, ["forceExit", "You have been exited"]);
-                  }
-                } catch(e) {}
-                try { this.wsSet?.delete(conn); } catch(e) {}
-              }
-              try { this.userConnections?.delete(targetUsername); } catch(e) {}
-            }
-            const toDelete = [];
-            for (const [wsKey, data] of (this.wsActiveMulti || new Map())) {
-              if (data?.username === targetUsername) {
-                toDelete.push(wsKey);
-                if (data.room) {
-                  const rc = this.roomClients?.get(data.room);
-                  if (rc) try { rc.delete(wsKey); } catch(e) {}
-                }
-                try {
-                  wsKey.serializeAttachment({});
-                  wsKey.username = null;
-                  wsKey.room = null;
-                  wsKey.roomname = null;
-                  wsKey.idtarget = null;
-                  wsKey._username = null;
-                  wsKey._room = null;
-                } catch(e) {}
-                try {
-                  if (wsKey.readyState === 1) {
-                    this.safeSend(wsKey, ["forceExit", "You have been exited"]);
-                  }
-                } catch(e) {}
-                try { this.wsSet?.delete(wsKey); } catch(e) {}
-              }
-            }
-            for (const wsKey of toDelete) {
-              try { this.wsActiveMulti?.delete(wsKey); } catch(e) {}
-            }
-            if (roomName) {
-              this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
-              await this.updateRoomCount(roomName);
-            }
+
+            // ❌ 6 TIDAK dilakukan
           } catch(e) {}
           break;
         }
@@ -2354,7 +2295,7 @@ export class ChatServer {
                   itematas: typeof kursiAtas === 'number' ? kursiAtas : (parseInt(kursiAtas) || 0),
                   vip: typeof kursiVip === 'number' ? kursiVip : (parseInt(kursiVip) || 0),
                   viptanda: typeof kursiVt === 'number' ? kursiVt : (parseInt(kursiVt) || 0),
-                  isMulti: seatData.isMulti || false
+                  isMulti: seatData.isMulti === true
                 };
                 const result = await this._updateKursi(kursiRoom, kursiSeat, updateData);
                 if (result.success) {
