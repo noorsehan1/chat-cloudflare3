@@ -70,7 +70,7 @@ const QUIZ_SCHEDULE = {
 const LOWCARD_QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: "16:00", end: "16:30" },
-    { start: "18:00", end: "18:30" }
+    { start: "18:00", end: "19:30" }
   ],
   TIMEZONE_OFFSET: 8,
 };
