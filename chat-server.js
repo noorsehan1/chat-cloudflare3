@@ -1,16 +1,3 @@
-// ==================== CHAT-SERVER.JS ====================
-// VERSION: 16.0.1 - STABLE + BROADCAST currentNumber KE SEMUA ROOM
-// ✅ FIX #1: _verifyAndCleanupOrphanSeats — jalan saat restore
-// ✅ FIX #2: _deleteSeatInRoom — skip broadcast saat restore
-// ✅ FIX #3: _restoreRemovedSeats — reset di finally
-// ✅ FIX #4: _userIndex — rebuild setelah restore
-// ✅ FIX #5: _isRestoring — reset di finally
-// ✅ FIX #6: _cleanupUserCompletely — skip broadcast saat restore
-// ✅ FIX #7: _hasBroadcastRemoveKursi — hindari duplikat saat retry
-// ✅ FIX #8: _restoreAllState — _restoreFailed hanya di catch
-// ✅ FIX #9: _updateNumber — broadcast currentNumber ke SEMUA room (tiap berubah)
-// ✅ SEMUA LOGIKA UI & JOIN ROOM TIDAK DIUBAH
-
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
@@ -580,13 +567,17 @@ export class ChatServer {
     return true;
   }
 
-  async _deleteSeatInRoom(roomName, seatNumber) {
+  // ============================================================
+  // 🔥 PERUBAHAN: tambah parameter `force` agar seat multi bisa dihapus
+  // saat user pindah room. Default tetap false = perilaku lama.
+  // ============================================================
+  async _deleteSeatInRoom(roomName, seatNumber, force = false) {
     try {
       const roomBucket = await this._getRoomBucket(roomName);
       if (!roomBucket) return false;
 
       const seatData = roomBucket.seat?.[seatNumber];
-      if (seatData?.isMulti === true) return false;
+      if (!force && seatData?.isMulti === true) return false;
 
       const removedUsername = seatData?.namauser;
       if (roomBucket.seat) delete roomBucket.seat[seatNumber];
@@ -923,6 +914,26 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // Helper: bersihkan wsActiveMulti + roomClients untuk username
+  // yang pindah room (menghindari sisa entry di memory).
+  // ============================================================
+  _cleanupMultiTracking(username, oldRoom, keepWs = null) {
+    try {
+      if (!username) return;
+      for (const [wsKey, data] of (this.wsActiveMulti || new Map())) {
+        if (data?.username === username && (!keepWs || wsKey !== keepWs)) {
+          try { this.wsActiveMulti.delete(wsKey); } catch(e) {}
+          const room = data.room || oldRoom;
+          if (room) {
+            const rc = this.roomClients?.get(room);
+            if (rc) try { rc.delete(wsKey); } catch(e) {}
+          }
+        }
+      }
+    } catch(e) {}
+  }
+
   async _handleJoin(ws, roomName) {
     try {
       if (!ws?.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -949,9 +960,15 @@ export class ChatServer {
 
   async _joinInternal(ws, roomName, username) {
     try {
+      // 🔥 PERUBAHAN: hapus seat lama (normal) saat pindah room.
+      // Pakai _deleteSeatInRoom force=true agar point + D1 + broadcast + count
+      // semuanya ikut terhapus.
       const existing = await this._findUserInAnyRoom(username);
       if (existing && existing.room !== roomName) {
-        await this._removeUserFromRoom(username, existing.room);
+        await this._deleteSeatInRoom(existing.room, existing.seat, true);
+        this._removeUserIndex(username);
+        // Bersihkan sisa tracking multi lama (jika ada) di room lama
+        this._cleanupMultiTracking(username, existing.room, ws);
       }
 
       await this._ensureCacheInitialized();
@@ -1073,9 +1090,14 @@ export class ChatServer {
       if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
       await this._ensureCacheInitialized();
 
+      // 🔥 PERUBAHAN: hapus seat lama (baik normal maupun multi) saat
+      // multi user pindah room. force=true agar multi seat ikut terhapus.
       const existing = await this._findUserInAnyRoom(multiUsername);
-      if (existing && !existing.isMulti) {
-        await this._removeUserFromRoom(multiUsername, existing.room);
+      if (existing && existing.room !== multiRoomname) {
+        await this._deleteSeatInRoom(existing.room, existing.seat, true);
+        this._removeUserIndex(multiUsername);
+        // Bersihkan sisa tracking multi lama di memory
+        this._cleanupMultiTracking(multiUsername, existing.room, ws);
       }
 
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
