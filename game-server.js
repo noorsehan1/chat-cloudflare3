@@ -92,7 +92,7 @@ const TABLE_NAME = 'game_data';
 const LOWCARD_WINNERS_KEY = 'lowcard_quiz_winners';
 const LOWCARD_LAST_WEEK_WINNER_KEY = 'lowcard_last_week_winner';
 const LOWCARD_LAST_RESET_WEEK_KEY = 'lowcard_last_reset_week';
-const LOWCARD_QUIZ_ROOM = "LowCardQuiz";
+const LOWCARD_QUIZ_ROOM = "LowCard";
 const _wsCleanupState = new WeakMap();
 
 function parseTime(timeStr) {
