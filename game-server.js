@@ -1,17 +1,17 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 17.3.0 - LOWCARD ROOM = "LowCard"
+// VERSION: 17.4.0 - LOWCARD ROOM = "LowCard" + AUTO-START BET 100
 // ✅ FITUR:
 //   - LOWCARD_QUIZ_ROOM: Room "LowCard" untuk quiz lowcard
 //   - LOWCARD_SCHEDULE: Sesi otomatis (16:00-17:00 & 21:00-22:00 WITA)
-//   - Auto-start game dengan BET 100 (100% sama dengan start manual user)
+//   - Auto-start game dengan BET 100 saat user masuk room pada jam sesi
+//   - Fallback username "Guest_xxx" kalau client tidak kirim username
 //   - Auto-end game saat sesi berakhir
-//   - Record pemenang dengan nama + reset mingguan Senin UTC 00:00
-//   - Auto-restart ronde baru selama sesi masih aktif (WAIT 16 DETIK)
+//   - Record pemenang + reset mingguan Senin UTC 00:00
+//   - Auto-restart ronde baru (WAIT 16 DETIK)
 //   - SMART BOT: >4 user = NO BOT | <4 user = 4 BOT otomatis
 //   - Logika masuk room SAMA PERSIS dengan Dice Quiz
 //   - Logika sesi berakhir SAMA PERSIS dengan Dice Quiz
-// ✅ SEMUA LOGIKA GAME LAMA TIDAK DIUBAH
 // ============================================================
 
 const CONSTANTS = {
@@ -98,7 +98,7 @@ const LOWCARD_LAST_WEEK_WINNER_KEY = 'lowcard_last_week_winner';
 const LOWCARD_LAST_RESET_WEEK_KEY = 'lowcard_last_reset_week';
 
 // ============================================================
-// ⚠️ NAMA ROOM LOWCARD — DIGANTI DARI "LowCardQuiz" MENJADI "LowCard"
+// ⚠️ NAMA ROOM LOWCARD = "LowCard"
 // ============================================================
 const LOWCARD_QUIZ_ROOM = "LowCard";
 
@@ -807,7 +807,7 @@ export class GameServer {
           this._lowCardSessionActive = true;
           this._lowCardSessionEnded = false;
           this._lowCardGameStarted = false;
-          const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);  // ← "LowCard"
+          const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);
           if (clients && clients.size > 0) {
             this._startLowCardQuizGameIfNotStarted();
           }
@@ -1510,6 +1510,7 @@ export class GameServer {
         if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
         let uname = ws.username || ws._username;
 
+        // Fallback 1: coba dari attachment
         if (!uname) {
           try {
             const att = ws.deserializeAttachment?.();
@@ -1530,6 +1531,20 @@ export class GameServer {
         if (!hostWs) {
           hostWs = ws;
           hostUsername = uname;
+        }
+      }
+
+      // Fallback 2: kalau tidak ada user dengan username, paksa pakai WS pertama
+      if (!hostWs || !hostUsername) {
+        for (const ws of clients) {
+          if (!ws || ws.readyState !== 1 || ws._closing || ws._cleaning) continue;
+          const fallbackName = ws.username || ws._username || `Guest_${ws._wsId || Date.now()}`;
+          ws.username = fallbackName;
+          ws._username = fallbackName;
+          hostWs = ws;
+          hostUsername = fallbackName;
+          activeUsers.add(fallbackName);
+          break;
         }
       }
 
@@ -1638,7 +1653,7 @@ export class GameServer {
 
   async _endLowCardQuizSession() {
     try {
-      const room = this.LOWCARD_QUIZ_ROOM;  // ← "LowCard"
+      const room = this.LOWCARD_QUIZ_ROOM;
 
       this._lowCardSessionActive = false;
       this._lowCardSessionEnded = true;
@@ -1688,7 +1703,7 @@ export class GameServer {
       if (targetWs) {
         this.safeSend(targetWs, msg);
       } else {
-        this.broadcast(this.LOWCARD_QUIZ_ROOM, msg);  // ← "LowCard"
+        this.broadcast(this.LOWCARD_QUIZ_ROOM, msg);
       }
     } catch(e) {}
   }
@@ -1699,7 +1714,7 @@ export class GameServer {
       const isLowCardTime = this.isLowCardQuizTime();
 
       if (isLowCardTime) {
-        const existingGame = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);  // ← "LowCard"
+        const existingGame = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
         const isGameRunning = existingGame?._isActive && !existingGame._gameEnded;
         const lockKey = `game_start_${this.LOWCARD_QUIZ_ROOM}`;
 
@@ -1708,7 +1723,7 @@ export class GameServer {
         }
       }
 
-      const game = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);  // ← "LowCard"
+      const game = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
       const isGameRunning = game?._isActive && !game._gameEnded;
       const isRegistrationOpen = game?.registrationOpen || false;
       const currentRound = game?.round || 0;
@@ -1723,7 +1738,7 @@ export class GameServer {
         isGameRunning: !!isGameRunning,
         isRegistrationOpen: !!isRegistrationOpen,
         bet: CONSTANTS.LOWCARD_QUIZ_BET,
-        room: this.LOWCARD_QUIZ_ROOM,  // ← "LowCard"
+        room: this.LOWCARD_QUIZ_ROOM,
         round: currentRound,
         phase: phase,
         isPlayerRegistered: !!isPlayerRegistered,
@@ -1732,7 +1747,7 @@ export class GameServer {
 
       if (isGameRunning && isRegistrationOpen && uname && !isPlayerRegistered) {
         this.safeSend(ws, ["lowCardQuizAutoJoinHint", {
-          room: this.LOWCARD_QUIZ_ROOM,  // ← "LowCard"
+          room: this.LOWCARD_QUIZ_ROOM,
           username: uname,
           bet: CONSTANTS.LOWCARD_QUIZ_BET
         }]);
@@ -2354,17 +2369,35 @@ export class GameServer {
           this._nextLowCardSessionNotifiedFor = null;
           this._lowCardRoomEntryNotified.clear();
 
-          this.broadcast(this.LOWCARD_QUIZ_ROOM, [  // ← "LowCard"
+          this.broadcast(this.LOWCARD_QUIZ_ROOM, [
             "gameLowCardNotification",
             `LowCard Quiz session started! Bet: ${CONSTANTS.LOWCARD_QUIZ_BET}`
           ]);
-          this.broadcast(this.LOWCARD_QUIZ_ROOM, ["lowCardQuizSessionStarted", true]);  // ← "LowCard"
+          this.broadcast(this.LOWCARD_QUIZ_ROOM, ["lowCardQuizSessionStarted", true]);
 
-          const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);  // ← "LowCard"
+          const clients = this.roomClients?.get(this.LOWCARD_QUIZ_ROOM);
           if (clients && clients.size > 0) {
+            // Paksa set username untuk setiap client yang belum punya
+            for (const ws of clients) {
+              if (!ws || ws.readyState !== 1) continue;
+              if (!ws.username && !ws._username) {
+                const fallback = `Guest_${ws._wsId || Date.now()}`;
+                ws.username = fallback;
+                ws._username = fallback;
+                try {
+                  ws.serializeAttachment({
+                    wsId: ws._wsId,
+                    username: fallback,
+                    room: this.LOWCARD_QUIZ_ROOM,
+                    roomname: this.LOWCARD_QUIZ_ROOM,
+                    createdAt: ws._createdAt || Date.now()
+                  });
+                } catch(e) {}
+              }
+            }
             await this._startLowCardQuizGameIfNotStarted();
           } else {
-            this.broadcast(this.LOWCARD_QUIZ_ROOM, [  // ← "LowCard"
+            this.broadcast(this.LOWCARD_QUIZ_ROOM, [
               "gameLowCardNotification",
               "Waiting for players..."
             ]);
@@ -2712,7 +2745,7 @@ export class GameServer {
       if (evt === "getLowCardQuizStatus") {
         try {
           const isSessionTime = this.isLowCardQuizTime();
-          const game = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);  // ← "LowCard"
+          const game = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
           const isGameRunning = game?._isActive && !game._gameEnded;
           const timeInfo = this.alarmScheduler._getTimeLeftUntilNextLowCard();
 
@@ -2723,7 +2756,7 @@ export class GameServer {
             isSessionTime,
             isGameRunning: !!isGameRunning,
             bet: CONSTANTS.LOWCARD_QUIZ_BET,
-            room: this.LOWCARD_QUIZ_ROOM,  // ← "LowCard"
+            room: this.LOWCARD_QUIZ_ROOM,
             nextSessionText: timeInfo?.text || '0h 0m',
             userCount: humanCount,
             botCount: botCount
@@ -2819,7 +2852,7 @@ export class GameServer {
           }
         }
 
-        if (roomName === this.LOWCARD_QUIZ_ROOM) {  // ← "LowCard"
+        if (roomName === this.LOWCARD_QUIZ_ROOM) {
           this._sendLowCardRoomState(ws);
           const userKey = `${wsId}_${roomName}`;
           if (!this._lowCardRoomEntryNotified.has(userKey)) {
@@ -2851,11 +2884,18 @@ export class GameServer {
       ws.roomname = roomName;
       ws._room = roomName;
       ws._wsId = wsId;
-      if (username) { ws.username = username; ws._username = username; }
 
-      ws.serializeAttachment({ wsId, username: username || ws.username || null, room: roomName, roomname: roomName, createdAt: ws._createdAt || Date.now() });
+      // ============================================================
+      // SET USERNAME (fallback dari yang sudah ada atau Guest_xxx)
+      // ============================================================
+      const finalUsername = username || ws.username || ws._username;
+      if (finalUsername) {
+        ws.username = finalUsername;
+        ws._username = finalUsername;
+      }
 
-      const finalUsername = username || ws.username;
+      ws.serializeAttachment({ wsId, username: finalUsername || null, room: roomName, roomname: roomName, createdAt: ws._createdAt || Date.now() });
+
       if (finalUsername) {
         let conns = this.userConnections.get(finalUsername);
         if (!conns) { conns = new Set(); this.userConnections.set(finalUsername, conns); }
@@ -2893,7 +2933,7 @@ export class GameServer {
       // ============================================================
       // LOWCARD QUIZ ROOM (nama room: "LowCard")
       // ============================================================
-      if (roomName === this.LOWCARD_QUIZ_ROOM) {  // ← "LowCard"
+      if (roomName === this.LOWCARD_QUIZ_ROOM) {
         this._sendLowCardRoomState(ws);
 
         const userKey = `${wsId}_${roomName}`;
@@ -2909,25 +2949,35 @@ export class GameServer {
         }
 
         // ============================================================
-        // AUTO-JOIN: Daftarkan user ke game yang sedang berjalan
+        // PASTIKAN USERNAME TER-SET SEBELUM AUTO-START
         // ============================================================
-        const autoJoinUsername = username || ws.username || ws._username;
-        if (autoJoinUsername) {
-          const currentGame = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
-          if (currentGame?._isActive && !currentGame._gameEnded) {
-            if (!currentGame.players.has(autoJoinUsername) && currentGame.registrationOpen) {
-              const joinTimer = setTimeout(() => {
-                try {
-                  if (!ws || ws.readyState !== 1 || ws._closing) return;
-                  this.joinGame(ws, autoJoinUsername);
-                } catch(e) {}
-              }, 200);
-              this._trackTimer(joinTimer);
-            }
+        const autoJoinUsername = username || ws.username || ws._username || `Guest_${wsId}`;
+        ws.username = autoJoinUsername;
+        ws._username = autoJoinUsername;
+
+        try {
+          ws.serializeAttachment({ wsId, username: autoJoinUsername, room: roomName, roomname: roomName, createdAt: ws._createdAt || Date.now() });
+        } catch(e) {}
+
+        let conns = this.userConnections.get(autoJoinUsername);
+        if (!conns) { conns = new Set(); this.userConnections.set(autoJoinUsername, conns); }
+        conns.add(ws);
+
+        // Auto-join ke game yang sedang berjalan
+        const currentGame = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
+        if (currentGame?._isActive && !currentGame._gameEnded) {
+          if (!currentGame.players.has(autoJoinUsername) && currentGame.registrationOpen) {
+            const joinTimer = setTimeout(() => {
+              try {
+                if (!ws || ws.readyState !== 1 || ws._closing) return;
+                this.joinGame(ws, autoJoinUsername);
+              } catch(e) {}
+            }, 200);
+            this._trackTimer(joinTimer);
           }
         }
 
-        // Auto-start game — SAMA seperti Dice (langsung, tanpa setTimeout)
+        // Auto-start game — SAMA seperti Dice
         if (this.isLowCardQuizTime() && !this._lowCardGameStarted) {
           const existingGame = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
           const isGameRunning = existingGame?._isActive && !existingGame._gameEnded;
@@ -2938,9 +2988,9 @@ export class GameServer {
           }
         }
 
-        const currentGame = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
-        if (currentGame?._isActive && !currentGame._gameEnded && currentGame._isAutoQuiz) {
-          this._reevaluateBots(this.LOWCARD_QUIZ_ROOM, currentGame);
+        const currentGame2 = this.activeGames.get(this.LOWCARD_QUIZ_ROOM);
+        if (currentGame2?._isActive && !currentGame2._gameEnded && currentGame2._isAutoQuiz) {
+          this._reevaluateBots(this.LOWCARD_QUIZ_ROOM, currentGame2);
         }
       }
 
@@ -3184,7 +3234,7 @@ export class GameServer {
       game.registrationOpen = false;
       if (game._registrationTimer) { this._clearTimer(game._registrationTimer); game._registrationTimer = null; }
 
-      if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {  // ← "LowCard"
+      if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
         this._reevaluateBots(room, game);
         game._botsAdded = true;
       } else {
@@ -3245,7 +3295,7 @@ export class GameServer {
       game.evaluationLocked = false;
       game.drawTimeExpired = false;
 
-      if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {  // ← "LowCard"
+      if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
         this._reevaluateBots(room, game);
       } else {
         if (!game._botsAdded) {
@@ -3404,7 +3454,7 @@ export class GameServer {
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
 
-        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {  // ← "LowCard"
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
           this._reevaluateBots(room, game);
         } else {
           if (!game._botsAdded) {
@@ -3477,7 +3527,7 @@ export class GameServer {
           this.broadcast(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
         }
 
-        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {  // ← "LowCard"
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
           try {
             await this.dataManager.addLowCardWinner(winnerName);
             const quizWinners = await this.dataManager.getLowCardWinners();
@@ -3510,7 +3560,7 @@ export class GameServer {
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
         this._scheduleGameCleanup(room, game);
 
-        if (room === this.LOWCARD_QUIZ_ROOM) {  // ← "LowCard"
+        if (room === this.LOWCARD_QUIZ_ROOM) {
           this._lowCardGameStarted = false;
 
           if (this.isLowCardQuizTime() && this._lowCardSessionActive && !this._lowCardSessionEnded) {
@@ -3537,7 +3587,7 @@ export class GameServer {
       }
 
       if (remaining.length === 0) {
-        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {  // ← "LowCard"
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
           this._reevaluateBots(room, game);
         } else {
           if (!game._botsAdded) {
@@ -3650,7 +3700,7 @@ export class GameServer {
             this.safeSend(ws, ["gameLowCardPlayerDraw", usernameClean, game.numbers.get(usernameClean), game.tanda.get(usernameClean) || ""]);
           }
 
-          if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {  // ← "LowCard"
+          if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
             this._reevaluateBots(room, game);
           }
 
@@ -3684,7 +3734,7 @@ export class GameServer {
         game.playerWsId.set(usernameClean, wsId);
         this.broadcast(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
 
-        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {  // ← "LowCard"
+        if (room === this.LOWCARD_QUIZ_ROOM && game._isAutoQuiz) {
           this._reevaluateBots(room, game);
         }
 
