@@ -89,7 +89,7 @@ const LOWCARD_QUIZ_SCHEDULE = {
 // LOWCARD QUIZ CONFIG (EXTRA)
 // ============================================================
 const LOWCARD_QUIZ_CONFIG = {
-  ROOM: "LowCardQuiz",
+  ROOM: "LowCard",
   REQUIRED_BET: 100,
   RESTART_DELAY_MS: 15000,
   RESET_DAY_UTC: 1,
