@@ -27,6 +27,7 @@ const ROOMS = [
 const ROOMS_SET = new Set(ROOMS);
 const TABLE_NAME = 'chat_data';
 const TABLE_AUTOCHAT = 'chatmulty'; // 🔥 AUTOCHAT
+const AUTOCHAT_KEY = 'autochat_all'; // 🔥 1 key untuk semua
 
 const _wsCleanupState = new WeakMap();
 
@@ -182,7 +183,6 @@ export class ChatServer {
       this._onlineUsersCacheTime = 0;
       this._roomCountsCache = null;
       this._roomCountsCacheTime = 0;
-      // 🔥 AUTOCHAT
       this._autochatNextAt = null;
       this._autochatPlaying = false;
       this._numberNextAt = null;
@@ -193,71 +193,8 @@ export class ChatServer {
   }
 
   /* ============================================================
-     🔥 AUTOCHAT — cek tabel, baca, dan kirim ke event `chat`
+     🔥 AUTOCHAT — baca 1 key `autochat_all` dari tabel `chatmulty`
      ============================================================ */
-
-  async _ensureAutoChatTable() {
-    try {
-      if (!this.db) return false;
-
-      // 1) Cek apakah tabel ada
-      let exists = false;
-      try {
-        const check = await this.db
-          .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
-          .bind(TABLE_AUTOCHAT)
-          .first();
-        exists = !!check;
-      } catch(e) {
-        exists = false;
-      }
-
-      // 2) Kalau tidak ada, buat tabel
-      if (!exists) {
-        try {
-          await this.db.prepare(`
-            CREATE TABLE IF NOT EXISTS ${TABLE_AUTOCHAT} (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-          `).run();
-        } catch(e) {
-          this._handleError('_ensureAutoChatTable:create', e);
-          return false;
-        }
-      }
-
-      // 3) Cek apakah ada row autochat_index
-      let hasIndex = false;
-      try {
-        const idx = await this.db
-          .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
-          .bind('autochat_index')
-          .first();
-        hasIndex = !!idx?.value;
-      } catch(e) {
-        hasIndex = false;
-      }
-
-      // 4) Kalau belum ada index, buat default kosong
-      if (!hasIndex) {
-        try {
-          await this.db
-            .prepare(`INSERT OR REPLACE INTO ${TABLE_AUTOCHAT} (key, value) VALUES (?, ?)`)
-            .bind('autochat_index', JSON.stringify({ total: 0, nextId: 1 }))
-            .run();
-        } catch(e) {
-          this._handleError('_ensureAutoChatTable:index', e);
-        }
-      }
-
-      return true;
-    } catch(e) {
-      this._handleError('_ensureAutoChatTable', e);
-      return false;
-    }
-  }
 
   _randomAutoChatInterval() {
     const MIN = 5 * 60 * 1000;
@@ -265,52 +202,30 @@ export class ChatServer {
     return Math.floor(Math.random() * (MAX - MIN + 1)) + MIN;
   }
 
-  async _loadAutoChatConv(id) {
+  async _loadAutoChatAll() {
     try {
       if (!this.db) return null;
       const row = await this.db
         .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
-        .bind(`autochat_conv_${id}`)
+        .bind(AUTOCHAT_KEY)
         .first();
-      return row?.value ? JSON.parse(row.value) : null;
+      if (!row?.value) return null;
+      return JSON.parse(row.value);
     } catch(e) {
       return null;
     }
   }
 
-  async _loadAutoChatIndex() {
+  async _saveAutoChatAll(data) {
     try {
-      if (!this.db) return { total: 0, nextId: 1 };
-      const row = await this.db
-        .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
-        .bind('autochat_index')
-        .first();
-      return row?.value ? JSON.parse(row.value) : { total: 0, nextId: 1 };
-    } catch(e) {
-      return { total: 0, nextId: 1 };
-    }
-  }
-
-  async _saveAutoChatIndex(idx) {
-    try {
-      if (!this.db) return;
+      if (!this.db || !data) return false;
       await this.db
         .prepare(`INSERT OR REPLACE INTO ${TABLE_AUTOCHAT} (key, value) VALUES (?, ?)`)
-        .bind('autochat_index', JSON.stringify(idx))
+        .bind(AUTOCHAT_KEY, JSON.stringify(data))
         .run();
-    } catch(e) {}
-  }
-
-  async _loadAutoChatUser(username) {
-    try {
-      if (!this.db || !username) return null;
-      const row = await this.db
-        .prepare(`SELECT value FROM ${TABLE_AUTOCHAT} WHERE key = ?`)
-        .bind(`autochat_user_${username}`)
-        .first();
-      return row?.value ? JSON.parse(row.value) : null;
+      return true;
     } catch(e) {
-      return null;
+      return false;
     }
   }
 
@@ -327,26 +242,20 @@ export class ChatServer {
         const text = line.text;
         if (!speaker || !text) continue;
 
-        // Cari room: manual dulu, fallback ke seat aktif
-        let room = null;
-        const manual = await this._loadAutoChatUser(speaker);
-        if (manual?.room && ROOMS_SET.has(manual.room)) {
-          room = manual.room;
-        } else {
-          const found = await this._findUserInAnyRoom(speaker);
-          room = found?.room || null;
-        }
+        // Cari room tempat user berada
+        const found = await this._findUserInAnyRoom(speaker);
+        const room = found?.room;
         if (!room) continue;
 
         // 🔥 Kirim langsung ke event "chat"
         this.broadcast(room, [
           "chat",
           room,
-          "",        // noimageUrl
-          speaker,   // username
-          text,      // pesan
-          "",        // color
-          ""         // textColor
+          "",
+          speaker,
+          text,
+          "",
+          ""
         ]);
 
         // Jeda antar baris 1–5 detik
@@ -363,21 +272,30 @@ export class ChatServer {
     try {
       if (this.closing || this.isDestroyed || !this.db) return;
 
-      const index = await this._loadAutoChatIndex();
-      if (!index.total) return;
+      const data = await this._loadAutoChatAll();
+      if (!data?.conversations?.length) return;
 
-      const id = index.nextId || 1;
-      const conv = await this._loadAutoChatConv(id);
+      const total = data.index?.total || data.conversations.length;
+      let id = data.index?.nextId || 1;
+      if (id < 1) id = 1;
+      if (id > total) id = 1;
+
+      const conv = data.conversations.find(c => c.id === id);
       if (!conv) {
-        index.nextId = 1;
-        await this._saveAutoChatIndex(index);
+        data.index = data.index || {};
+        data.index.total = total;
+        data.index.nextId = 1;
+        await this._saveAutoChatAll(data);
         return;
       }
 
       await this._playConversation(conv);
 
-      index.nextId = (id >= index.total) ? 1 : id + 1;
-      await this._saveAutoChatIndex(index);
+      data.index = data.index || {};
+      data.index.total = total;
+      data.index.nextId = (id >= total) ? 1 : id + 1;
+
+      await this._saveAutoChatAll(data);
     } catch(e) {
       this._handleError('_processNextAutoChat', e);
     }
@@ -1990,9 +1908,6 @@ export class ChatServer {
         await this._loadFromStorage();
         await this._ensureCacheInitialized();
 
-        // 🔥 AUTOCHAT: cek & buat tabel chatmulty kalau belum ada
-        await this._ensureAutoChatTable();
-
         // 🔥 AUTOCHAT: init jadwal pertama
         if (!this._autochatNextAt) {
           this._autochatNextAt = Date.now() + this._randomAutoChatInterval();
@@ -2827,35 +2742,8 @@ export class ChatServer {
         }
 
         case "getAutoChatIndex": {
-          const idx = await this._loadAutoChatIndex();
-          this.safeSend(ws, ["autoChatIndex", idx]);
-          break;
-        }
-
-        case "getAutoChatConv": {
-          const cid = args[0];
-          const data = await this._loadAutoChatConv(cid);
-          this.safeSend(ws, ["autoChatConv", cid, data]);
-          break;
-        }
-
-        case "checkAutoChatTable": {
-          let exists = false;
-          try {
-            const check = await this.db
-              .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
-              .bind(TABLE_AUTOCHAT)
-              .first();
-            exists = !!check;
-          } catch(e) {}
-          let count = 0;
-          try {
-            const c = await this.db
-              .prepare(`SELECT COUNT(*) as c FROM ${TABLE_AUTOCHAT} WHERE key LIKE 'autochat_conv_%'`)
-              .first();
-            count = c?.c || 0;
-          } catch(e) {}
-          this.safeSend(ws, ["autoChatTableStatus", exists, count]);
+          const data = await this._loadAutoChatAll();
+          this.safeSend(ws, ["autoChatIndex", data?.index || null]);
           break;
         }
 
@@ -3080,7 +2968,6 @@ export class ChatServer {
     this._restoreRemovedSeats = [];
     this._hasBroadcastRemoveKursi = new Set();
     this._userIndex = new Map();
-    // 🔥 AUTOCHAT
     this._autochatNextAt = null;
     this._autochatPlaying = false;
 
