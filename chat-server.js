@@ -5,7 +5,7 @@ const C = {
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,
   MULTY_MIN_MS: 10 * 1000,
   MULTY_MAX_MS: 30 * 1000,
-  MULTY_ALARM_INTERVAL_MS: 5 * 60 * 1000,
+  MULTY_ALARM_INTERVAL_MS: 2 * 60 * 1000,
   MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
@@ -879,7 +879,6 @@ export class ChatServer {
         arr = flat;
       }
 
-      // ✅ NORMALIZE: pastikan setiap chat punya field lengkap
       const normalized = [];
       for (const item of arr) {
         if (!item || typeof item !== 'object') continue;
@@ -1019,7 +1018,6 @@ export class ChatServer {
 
         const numberNext = this._multyNumberNext;
 
-        // ✅ BACA field sesuai format JSON baru
         const chatNoimg = chat.noimg ?? 1000;
         const username = chat.sender || "";
         const chatMsg = chat.text || "";
@@ -1663,7 +1661,6 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      // ✅ RESUME: restart loop kalau multy running di room ini
       if (this._multyRunning && this._multyRoom === roomName && !this._multyLoopTimer) {
         this._startMultyLoop();
       }
@@ -2833,6 +2830,7 @@ export class ChatServer {
           break;
         }
 
+        // ✅ REPLACE JSON — HAPUS dulu, baru MASUKKAN
         case "replaceMultyChat": {
           try {
             const newArr = args[0];
@@ -2841,7 +2839,7 @@ export class ChatServer {
               break;
             }
 
-            // ✅ NORMALIZE: pastikan field lengkap
+            // Normalize
             const valid = [];
             for (const item of newArr) {
               if (!item || typeof item !== 'object') continue;
@@ -2855,13 +2853,57 @@ export class ChatServer {
               });
             }
 
-            if (this.db) {
-              await this.db.prepare(`
-                INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
-                VALUES ('chat_multy', ?, CURRENT_TIMESTAMP)
-              `).bind(JSON.stringify(valid)).run();
+            if (valid.length === 0) {
+              this.safeSend(ws, ["error", "Tidak ada chat valid"]);
+              break;
             }
 
+            // ============================================
+            // STEP 1: HAPUS JSON LAMA dari D1
+            // ============================================
+            if (this.db) {
+              try {
+                await this.db.prepare(`
+                  DELETE FROM ${TABLE_MULTY} WHERE key = 'chat_multy'
+                `).run();
+              } catch(e) {
+                this.safeSend(ws, ["error", "Gagal hapus JSON lama"]);
+                break;
+              }
+
+              // ============================================
+              // STEP 2: MASUKKAN JSON BARU ke D1
+              // ============================================
+              try {
+                await this.db.prepare(`
+                  INSERT INTO ${TABLE_MULTY} (key, value, updated_at)
+                  VALUES ('chat_multy', ?, CURRENT_TIMESTAMP)
+                `).bind(JSON.stringify(valid)).run();
+              } catch(e) {
+                this.safeSend(ws, ["error", "Gagal simpan JSON baru"]);
+                break;
+              }
+
+              // ============================================
+              // STEP 3: VERIFIKASI
+              // ============================================
+              try {
+                const check = await this.db
+                  .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'chat_multy'`)
+                  .first();
+                if (check && check.value) {
+                  const savedArr = JSON.parse(check.value);
+                  if (!Array.isArray(savedArr) || savedArr.length !== valid.length) {
+                    this.safeSend(ws, ["error", `Verifikasi gagal: ${savedArr?.length || 0} != ${valid.length}`]);
+                    break;
+                  }
+                }
+              } catch(e) {}
+            }
+
+            // ============================================
+            // STEP 4: UPDATE MEMORY
+            // ============================================
             this._multyChatList = valid;
             this._multyChatLoaded = true;
 
