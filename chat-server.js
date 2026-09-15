@@ -81,6 +81,7 @@ export class ChatServer {
       this._multyRoom = null;
       this._multyNumberNext = 1;
       this._multyLoopTimer = null;
+      this._multyTickRunning = false;
       // ====================================================
 
       this._requestCount = 0;
@@ -195,6 +196,7 @@ export class ChatServer {
       this._multyRoom = null;
       this._multyNumberNext = 1;
       this._multyLoopTimer = null;
+      this._multyTickRunning = false;
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
       }
@@ -400,29 +402,46 @@ export class ChatServer {
 
   _startMultyLoop() {
     try {
-      if (this._multyLoopTimer) return;
+      // Wajib clear timer lama
+      if (this._multyLoopTimer) {
+        clearTimeout(this._multyLoopTimer);
+        this._multyLoopTimer = null;
+      }
+
       if (!this._multyRunning || this.closing || this.isDestroyed) return;
 
       const room = this._multyRoom || "Gacor";
       const delay = this._randMultyDelay();
 
       this._multyLoopTimer = setTimeout(async () => {
-        this._multyLoopTimer = null;
+        // Wajib clear setelah selesai
+        if (this._multyLoopTimer) {
+          clearTimeout(this._multyLoopTimer);
+          this._multyLoopTimer = null;
+        }
 
         if (!this._multyRunning || this.closing || this.isDestroyed) return;
 
-        const clients = this.roomClients?.get(room);
-        if (!clients || clients.size === 0) {
-          this._multyRunning = false;
-          this._multyRoom = null;
-          this._multyIndex = 0;
-          this._stopMultyLoop();
-          return;
-        }
+        // Guard: jangan double tick
+        if (this._multyTickRunning) return;
+        this._multyTickRunning = true;
 
         try {
-          await this._nextMultyChat(room);
-        } catch(e) {}
+          const clients = this.roomClients?.get(room);
+          if (!clients || clients.size === 0) {
+            this._multyRunning = false;
+            this._multyRoom = null;
+            this._multyIndex = 0;
+            this._stopMultyLoop();
+            return;
+          }
+
+          try {
+            await this._nextMultyChat(room);
+          } catch(e) {}
+        } finally {
+          this._multyTickRunning = false;
+        }
 
         if (this._multyRunning && !this.closing && !this.isDestroyed) {
           this._startMultyLoop();
@@ -437,6 +456,7 @@ export class ChatServer {
         clearTimeout(this._multyLoopTimer);
         this._multyLoopTimer = null;
       }
+      this._multyTickRunning = false;
     } catch(e) {}
   }
 
@@ -468,7 +488,7 @@ export class ChatServer {
         this.broadcast(room, ["chat", room, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
       }
 
-      // Simpan number ke D1 (tanpa blocking)
+      // Simpan number ke D1 tanpa blocking
       try {
         if (this.db) {
           const num = this._multyNumberNext;
@@ -3194,6 +3214,7 @@ export class ChatServer {
     this._multyRoom = null;
     this._multyNumberNext = 1;
     this._multyLoopTimer = null;
+    this._multyTickRunning = false;
 
     this.isDestroyed = true;
   }
