@@ -641,17 +641,6 @@ export class ChatServer {
     } catch(e) { return false; }
   }
 
-  async _saveMultyChat(chatArray) {
-    try {
-      if (!this.db) return false;
-      await this.db.prepare(`
-        INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
-        VALUES ('chat_multy', ?, CURRENT_TIMESTAMP)
-      `).bind(JSON.stringify(chatArray)).run();
-      return true;
-    } catch(e) { return false; }
-  }
-
   async _getMultyNumber() {
     try {
       if (!this.db) return 1;
@@ -678,6 +667,7 @@ export class ChatServer {
     } catch(e) { return []; }
   }
 
+  // ================= LOAD (TIDAK reset chat_multy) =================
   async _loadMultyChat(jsonArray, room) {
     try {
       if (!Array.isArray(jsonArray)) return false;
@@ -687,14 +677,15 @@ export class ChatServer {
       this._multyRoom = room || null;
       this._multyNumberNext = 1;
 
+      // 👇 hanya update number, TIDAK reset chat_multy
       await this._saveMultyNumber(1);
-      await this._saveMultyChat([]);
 
       await this._scheduleMultyAlarm();
       return true;
     } catch(e) { return false; }
   }
 
+  // ================= JALAN 1 LANGKAH (TIDAK push ke chat_multy) =================
   async _nextMultyChat(room) {
     try {
       if (!this._multyRunning) return false;
@@ -711,12 +702,8 @@ export class ChatServer {
       const chat = this._multyChatList[this._multyIndex];
       const numberNext = this._multyNumberNext;
 
+      // 👇 hanya update number
       await this._saveMultyNumber(numberNext);
-
-      let arr = await this._getMultyChat();
-      if (!Array.isArray(arr)) arr = [];
-      arr.push(chat);
-      await this._saveMultyChat(arr);
 
       if (room) {
         this.broadcast(room, ["chat", room, "", chat.sender, chat.text, "7", "1"]);
@@ -2621,11 +2608,6 @@ export class ChatServer {
           if (wsRoom !== chatRoom) break;
 
           this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
-
-          let arr = await this._getMultyChat();
-          if (!Array.isArray(arr)) arr = [];
-          arr.push({ sender: username, text: chatMsg });
-          await this._saveMultyChat(arr);
 
           break;
         }
