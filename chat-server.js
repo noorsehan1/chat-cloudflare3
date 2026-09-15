@@ -3,7 +3,9 @@ const C = {
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,
-  MULTY_INTERVAL_MS: 1 * 60 * 1000,
+  MULTY_MIN_MS: 30 * 1000,
+  MULTY_MAX_MS: 5 * 60 * 1000,
+  MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
   USER_JOIN_LOCK_TIMEOUT: 10000,
@@ -69,11 +71,14 @@ export class ChatServer {
       this._wsLock = null;
 
       this.currentNumber = 1;
-      this.currentMultyNumber = 1;
+      this._multyChatList = [];
+      this._multyIndex = 0;
+      this._multyRunning = false;
+      this._multyRoom = null;
+      this._multyAlarmActive = false;
+      this._multyNumberNext = 1;
       this._isNumberUpdating = false;
-      this._isMultyUpdating = false;
       this._numberUpdateStart = null;
-      this._multyUpdateStart = null;
 
       this._requestCount = 0;
       this._lastResetTime = Date.now();
@@ -91,7 +96,7 @@ export class ChatServer {
 
       if (!env || !env.DB) {
         this.db = null;
-        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1 };
         this._cacheInitialized = true;
         this._restored = true;
         this._restoreDone = true;
@@ -106,8 +111,7 @@ export class ChatServer {
 
       this._storageCache = {
         roomsData: {},
-        currentNumber: 1,
-        currentMultyNumber: 1
+        currentNumber: 1
       };
       this._cacheInitialized = false;
       this._cacheLoading = false;
@@ -127,7 +131,7 @@ export class ChatServer {
           this._restoreFailed = true;
           this._isRestoring = false;
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
             this._cacheInitialized = true;
           }
           if (!this.closing) {
@@ -152,7 +156,7 @@ export class ChatServer {
           this._restoreFailed = true;
           this._isRestoring = false;
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
             this._cacheInitialized = true;
           }
           this._ensureAlarm().catch(() => {});
@@ -162,10 +166,15 @@ export class ChatServer {
       this._restored = true;
       this._restoreDone = true;
       this._isRestoring = false;
-      this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+      this._storageCache = { roomsData: {}, currentNumber: 1 };
       this._cacheInitialized = false;
       this.currentNumber = 1;
-      this.currentMultyNumber = 1;
+      this._multyChatList = [];
+      this._multyIndex = 0;
+      this._multyRunning = false;
+      this._multyRoom = null;
+      this._multyAlarmActive = false;
+      this._multyNumberNext = 1;
       this._restoreFailed = true;
       this.closing = false;
       this.isDestroyed = false;
@@ -186,22 +195,6 @@ export class ChatServer {
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
       }
-    }
-  }
-
-  // ================= USERNAME DARI JSON =================
-  _getUsernameFromWs(ws, fallback) {
-    try {
-      if (!ws) return fallback || null;
-      if (ws.username) return ws.username;
-      if (ws._username) return ws._username;
-      try {
-        const att = ws.deserializeAttachment?.();
-        if (att?.username) return att.username;
-      } catch(e) {}
-      return fallback || null;
-    } catch(e) {
-      return fallback || null;
     }
   }
 
@@ -241,6 +234,21 @@ export class ChatServer {
     try { this._userIndex.delete(username); } catch(e) {}
   }
 
+  _getUsernameFromWs(ws, fallback) {
+    try {
+      if (!ws) return fallback || null;
+      if (ws.username) return ws.username;
+      if (ws._username) return ws._username;
+      try {
+        const att = ws.deserializeAttachment?.();
+        if (att?.username) return att.username;
+      } catch(e) {}
+      return fallback || null;
+    } catch(e) {
+      return fallback || null;
+    }
+  }
+
   async _ensureAlarm() {
     if (this.closing || this.isDestroyed) return;
     try {
@@ -272,16 +280,34 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      await this._updateNumber();
-      await this._updateMultyNumber();
+      let isMultyAlarm = false;
+      try {
+        const multyNext = await this.ctx?.storage?.get?.('multy_alarm_next');
+        if (multyNext && Date.now() >= multyNext - 1000) {
+          isMultyAlarm = true;
+        }
+      } catch(e) {}
+
+      if (isMultyAlarm) {
+        await this._multyAlarmTick();
+      } else {
+        await this._updateNumber();
+      }
+
     } catch(e) {
       this._handleError('alarm', e);
     } finally {
       if (!this.closing && !this.isDestroyed) {
         try {
           if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
-            const next = Date.now() + C.NUMBER_INTERVAL_MS;
-            await this.ctx.storage.setAlarm(next);
+            let nextDelay = C.NUMBER_INTERVAL_MS;
+            try {
+              const multyNext = await this.ctx?.storage?.get?.('multy_alarm_next');
+              if (multyNext && multyNext > Date.now()) {
+                nextDelay = Math.min(nextDelay, multyNext - Date.now());
+              }
+            } catch(e) {}
+            await this.ctx.storage.setAlarm(Date.now() + Math.max(nextDelay, 1000));
           }
         } catch(e) {}
       }
@@ -329,47 +355,63 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ================= UPDATE MULTY NUMBER =================
-  async _updateMultyNumber() {
+  _randMultyDelay() {
+    const min = C.MULTY_MIN_MS;
+    const max = C.MULTY_MAX_MS;
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  async _scheduleMultyAlarm() {
     try {
       if (this.closing || this.isDestroyed) return;
+      if (!this.ctx?.storage) return;
+      if (typeof this.ctx.storage.setAlarm !== 'function') return;
 
-      if (this._isMultyUpdating) {
-        if (this._multyUpdateStart && Date.now() - this._multyUpdateStart > 30000) {
-          this._isMultyUpdating = false;
-        } else {
-          return;
-        }
-      }
-
-      this._isMultyUpdating = true;
-      this._multyUpdateStart = Date.now();
+      const next = Date.now() + this._randMultyDelay();
 
       try {
-        this.currentMultyNumber = (this.currentMultyNumber < C.MAX_NUMBER)
-          ? (this.currentMultyNumber + 1)
-          : 1;
+        await this.ctx.storage.put('multy_alarm_next', next);
+      } catch(e) {}
 
-        if (this._storageCache) {
-          this._storageCache.currentMultyNumber = this.currentMultyNumber;
-        }
+      await this.ctx.storage.setAlarm(next);
+      this._multyAlarmActive = true;
+    } catch(e) {}
+  }
 
-        await this._saveCurrentMultyNumber();
+  async _multyAlarmTick() {
+    try {
+      if (this.closing || this.isDestroyed) return;
+      if (!this._multyRunning) {
+        this._multyAlarmActive = false;
+        try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+        return;
+      }
 
-        if (!this._isRestoring) {
-          for (const [room, clients] of (this.roomClients || new Map())) {
-            if (clients?.size > 0) {
-              this.broadcast(room, ["currentMultyNumber", this.currentMultyNumber]);
-            }
-          }
-        }
-      } catch(e) {
-        this._handleError('_updateMultyNumber', e);
-      } finally {
-        this._isMultyUpdating = false;
-        this._multyUpdateStart = null;
+      const room = this._multyRoom || this.roomClients?.keys?.().next()?.value;
+      if (room) {
+        await this._nextMultyChat(room);
+      }
+
+      if (this._multyRunning) {
+        await this._scheduleMultyAlarm();
+      } else {
+        this._multyAlarmActive = false;
+        try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
       }
     } catch(e) {}
+  }
+
+  async _stopMultyAlarm() {
+    try {
+      this._multyRunning = false;
+      this._multyIndex = 0;
+      this._multyAlarmActive = false;
+      try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+      if (this._multyRoom) {
+        this.broadcast(this._multyRoom, ["multyStop", this._multyRoom]);
+      }
+      return true;
+    } catch(e) { return false; }
   }
 
   async _restoreWithRetry() {
@@ -398,7 +440,7 @@ export class ChatServer {
       this._restoreDone = true;
       this._restoreFailed = true;
       if (!this._cacheInitialized) {
-        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
         this._cacheInitialized = true;
       }
 
@@ -411,10 +453,10 @@ export class ChatServer {
   async _loadFromStorage() {
     try {
       if (!this.db) {
-        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1 };
         this._cacheInitialized = true;
         this.currentNumber = 1;
-        this.currentMultyNumber = 1;
+        this._multyNumberNext = 1;
         this._userIndex = new Map();
         return this._storageCache;
       }
@@ -436,10 +478,10 @@ export class ChatServer {
         result = await this.db.prepare(`SELECT key, value FROM ${TABLE_NAME}`).all();
       } catch(e) {
         if (!this._cacheInitialized) {
-          this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+          this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
           this._cacheInitialized = true;
         }
-        return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        return this._storageCache || { roomsData: {}, currentNumber: 1 };
       }
 
       const roomsData = {};
@@ -448,7 +490,7 @@ export class ChatServer {
       }
 
       let currentNumber = 1;
-      let currentMultyNumber = 1;
+      let multyNumberNext = 1;
       const results = result?.results || [];
 
       for (const row of results) {
@@ -469,9 +511,9 @@ export class ChatServer {
             continue;
           }
 
-          if (key === 'current_multy_number') {
+          if (key === 'multy_number_next') {
             const n = parseInt(value);
-            if (!isNaN(n)) currentMultyNumber = n;
+            if (!isNaN(n)) multyNumberNext = n;
             continue;
           }
 
@@ -508,10 +550,10 @@ export class ChatServer {
         }
       }
 
-      this._storageCache = { roomsData, currentNumber, currentMultyNumber };
+      this._storageCache = { roomsData, currentNumber };
       this._cacheInitialized = true;
       this.currentNumber = currentNumber;
-      this.currentMultyNumber = currentMultyNumber;
+      this._multyNumberNext = multyNumberNext;
       this._cacheLoadAttempts = 0;
 
       this._rebuildUserIndex();
@@ -521,17 +563,16 @@ export class ChatServer {
     } catch(e) {
       this._cacheLoadAttempts = (this._cacheLoadAttempts || 0) + 1;
       if (this._cacheLoadAttempts > 3) {
-        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
         this._cacheInitialized = true;
         this.currentNumber = this.currentNumber || 1;
-        this.currentMultyNumber = this.currentMultyNumber || 1;
+        this._multyNumberNext = this._multyNumberNext || 1;
         this._restoreFailed = true;
       }
       throw e;
     }
   }
 
-  // ================= INIT TABLE chat_multy =================
   async _initTableMulty() {
     try {
       if (!this.db) return false;
@@ -548,13 +589,12 @@ export class ChatServer {
     } catch(e) { return false; }
   }
 
-  // ================= SIMPAN MULTY =================
-  async _saveMulty(numberNext, chatJson, data) {
+  async _saveMulty(numberNext, chatJson, value) {
     try {
       if (!this.db) return false;
       if (numberNext === null || numberNext === undefined || !chatJson) return false;
 
-      if (data === null || data === undefined) {
+      if (value === null || value === undefined) {
         await this.db
           .prepare(`DELETE FROM ${TABLE_MULTY} WHERE number_next = ? AND chat_json = ?`)
           .bind(numberNext, chatJson)
@@ -565,23 +605,104 @@ export class ChatServer {
       await this.db.prepare(`
         INSERT OR REPLACE INTO ${TABLE_MULTY} (number_next, chat_json, value, updated_at)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-      `).bind(numberNext, chatJson, JSON.stringify(data)).run();
+      `).bind(numberNext, chatJson, JSON.stringify(value)).run();
       return true;
     } catch(e) { return false; }
   }
 
-  // ================= SIMPAN currentMultyNumber =================
-  async _saveCurrentMultyNumber() {
+  async _getMulty(numberNext) {
+    try {
+      if (!this.db) return [];
+      const result = await this.db
+        .prepare(`SELECT chat_json, value FROM ${TABLE_MULTY} WHERE number_next = ? ORDER BY updated_at`)
+        .bind(numberNext)
+        .all();
+      return (result?.results || []).map(r => ({
+        chat_json: (() => { try { return JSON.parse(r.chat_json); } catch(e) { return null; } })(),
+        value: (() => { try { return JSON.parse(r.value); } catch(e) { return null; } })()
+      }));
+    } catch(e) { return []; }
+  }
+
+  async _saveMultyNumberNext() {
     try {
       if (!this.db) return;
-      const n = (typeof this.currentMultyNumber === 'number' && this.currentMultyNumber >= 1)
-        ? this.currentMultyNumber
+      const n = (typeof this._multyNumberNext === 'number' && this._multyNumberNext >= 1)
+        ? this._multyNumberNext
         : 1;
       await this.db
         .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
-        .bind('current_multy_number', String(n))
+        .bind('multy_number_next', String(n))
         .run();
     } catch(e) {}
+  }
+
+  async _loadMultyChat(jsonArray, room) {
+    try {
+      if (!Array.isArray(jsonArray)) return false;
+      this._multyChatList = jsonArray;
+      this._multyIndex = 0;
+      this._multyRunning = true;
+      this._multyRoom = room || null;
+      this._multyNumberNext = 1;
+      await this._saveMultyNumberNext();
+
+      await this._scheduleMultyAlarm();
+
+      return true;
+    } catch(e) { return false; }
+  }
+
+  async _nextMultyChat(room) {
+    try {
+      if (!this._multyRunning) return false;
+
+      if (this._multyIndex >= this._multyChatList.length) {
+        this._multyRunning = false;
+        this._multyIndex = 0;
+        this._multyAlarmActive = false;
+        try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+        if (room) this.broadcast(room, ["multyStop", room]);
+        return false;
+      }
+
+      const chat = this._multyChatList[this._multyIndex];
+      const numberNext = this._multyNumberNext;
+
+      const chatJson = JSON.stringify(chat);
+
+      await this._saveMulty(numberNext, chatJson, {
+        number: numberNext,
+        sender: chat.sender,
+        text: chat.text,
+        room: room || null,
+        time: Date.now()
+      });
+
+      if (room) {
+        this.broadcast(room, ["chat", room, "", chat.sender, chat.text, "7", "1"]);
+        this.broadcast(room, ["multyNumberNext", numberNext]);
+      }
+
+      this._multyNumberNext++;
+      if (this._multyNumberNext > C.MAX_MULTY_NUMBER) this._multyNumberNext = 1;
+      await this._saveMultyNumberNext();
+
+      this._multyIndex++;
+
+      if (this._multyIndex >= this._multyChatList.length) {
+        this._multyRunning = false;
+        this._multyIndex = 0;
+        this._multyAlarmActive = false;
+        try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+        if (room) this.broadcast(room, ["multyStop", room]);
+        return false;
+      }
+
+      return true;
+    } catch(e) {
+      return false;
+    }
   }
 
   async _saveSeat(roomName, seatNumber, seatData) {
@@ -734,7 +855,7 @@ export class ChatServer {
     try {
       await this._ensureCacheInitialized();
       if (!this._storageCache?.roomsData) {
-        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1 };
       }
       if (!this._storageCache.roomsData[roomName]) {
         this._storageCache.roomsData[roomName] = { seat: {}, point: {}, mute: false };
@@ -889,7 +1010,7 @@ export class ChatServer {
             await this._cacheLoadingPromise;
           } catch(e) {}
         }
-        return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        return this._storageCache || { roomsData: {}, currentNumber: 1 };
       }
 
       if (this._restorePromise && !this._restoreDone) {
@@ -902,12 +1023,12 @@ export class ChatServer {
           ]);
         } catch(e) {
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
             this._cacheInitialized = true;
             this._restoreFailed = true;
           }
         }
-        return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        return this._storageCache || { roomsData: {}, currentNumber: 1 };
       }
 
       this._cacheLoading = true;
@@ -919,7 +1040,7 @@ export class ChatServer {
         })
         .catch(e => {
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
             this._cacheInitialized = true;
           }
           return this._storageCache;
@@ -933,9 +1054,9 @@ export class ChatServer {
         await this._cacheLoadingPromise;
       } catch(e) {}
 
-      return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+      return this._storageCache || { roomsData: {}, currentNumber: 1 };
     } catch(e) {
-      return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+      return this._storageCache || { roomsData: {}, currentNumber: 1 };
     }
   }
 
@@ -1013,7 +1134,7 @@ export class ChatServer {
     try {
       await this._ensureCacheInitialized();
       if (!this._storageCache) {
-        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1 };
       }
       if (!this._storageCache.roomsData[roomName]) {
         this._storageCache.roomsData[roomName] = { seat: {}, point: {}, mute: false };
@@ -1104,7 +1225,7 @@ export class ChatServer {
       let roomBucket = this._storageCache?.roomsData?.[roomName];
       if (!roomBucket) {
         roomBucket = { seat: {}, point: {}, mute: false };
-        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1 };
         this._storageCache.roomsData[roomName] = roomBucket;
       }
       if (!roomBucket.seat) roomBucket.seat = {};
@@ -1185,7 +1306,8 @@ export class ChatServer {
       this.safeSend(ws, ["numberKursiSaya", seat]);
       this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
-      this.safeSend(ws, ["currentMultyNumber", this.currentMultyNumber]);
+      this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+      this.safeSend(ws, ["multyNumberNext", this._multyNumberNext]);
 
       await this.updateRoomCount(roomName);
 
@@ -1231,7 +1353,7 @@ export class ChatServer {
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
         roomBucket = { seat: {}, point: {}, mute: false };
-        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1 };
         this._storageCache.roomsData[multiRoomname] = roomBucket;
       }
       if (!roomBucket.seat) roomBucket.seat = {};
@@ -2255,7 +2377,8 @@ export class ChatServer {
       switch(evt) {
         case "getCurrentNumber":
           this.safeSend(ws, ["currentNumber", this.currentNumber]);
-          this.safeSend(ws, ["currentMultyNumber", this.currentMultyNumber]);
+          this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+          this.safeSend(ws, ["multyNumberNext", this._multyNumberNext]);
           break;
 
         case "setIdTarget2":
@@ -2450,23 +2573,15 @@ export class ChatServer {
           this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
 
           const chatJson = JSON.stringify({
-            room: chatRoom,
-            noimg: chatNoimg,
-            user: username,
-            msg: chatMsg,
-            color: chatColor,
-            textColor: chatTextColor
+            sender: username,
+            text: chatMsg
           });
 
           await this._saveMulty(this.currentNumber, chatJson, {
-            room: chatRoom,
-            noimg: chatNoimg,
-            user: username,
-            msg: chatMsg,
-            color: chatColor,
-            textColor: chatTextColor,
             number: this.currentNumber,
-            multy: this.currentMultyNumber,
+            sender: username,
+            text: chatMsg,
+            room: chatRoom,
             time: Date.now()
           });
 
@@ -2813,7 +2928,7 @@ export class ChatServer {
           ]);
         } catch(e) {
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
             this._cacheInitialized = true;
             this._restored = true;
             this._restoreDone = true;
@@ -2830,7 +2945,10 @@ export class ChatServer {
         if (upgrade !== "websocket") {
           return new Response(JSON.stringify({
             currentNumber: this.currentNumber,
-            currentMultyNumber: this.currentMultyNumber,
+            multyRunning: this._multyRunning,
+            multyIndex: this._multyIndex,
+            multyTotal: this._multyChatList.length,
+            multyNumberNext: this._multyNumberNext,
             alarmActive: !!(await this.ctx?.storage?.getAlarm().catch(() => null)),
             intervalMin: C.NUMBER_INTERVAL_MS / 60000
           }), {
@@ -2966,7 +3084,7 @@ export class ChatServer {
     }
     try { this.wsSet?.clear(); } catch (e) {}
     try { this.wsActiveMulti?.clear(); } catch (e) {}
-    this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
+    this._storageCache = { roomsData: {}, currentNumber: 1 };
     this._onlineUsersCache = null;
     this._onlineUsersCacheTime = 0;
     this._roomCountsCache = null;
@@ -2974,6 +3092,8 @@ export class ChatServer {
     this._restoreRemovedSeats = [];
     this._hasBroadcastRemoveKursi = new Set();
     this._userIndex = new Map();
+
+    try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
 
     this.isDestroyed = true;
   }
