@@ -254,6 +254,37 @@ export class ChatServer {
   }
 
   // =====================================================================
+  // ==================== STATE PERSISTENCE ==============================
+  // ==================== (untuk auto-resume)  ===========================
+  // =====================================================================
+
+  // Simpan state multy ke storage — dipanggil saat start, setiap tick, dan stop
+  async _saveMultyState() {
+    try {
+      if (!this.ctx?.storage) return;
+      if (!this._multyRunning) {
+        try { await this.ctx.storage.delete('multy_state'); } catch(e) {}
+        return;
+      }
+      await this.ctx.storage.put('multy_state', {
+        running: true,
+        room: this._multyRoom || "Gacor",
+        index: this._multyIndex,
+        numberNext: this._multyNumberNext,
+        savedAt: Date.now()
+      });
+    } catch(e) {}
+  }
+
+  // Hapus state multy saat stop
+  async _clearMultyState() {
+    try {
+      if (!this.ctx?.storage) return;
+      await this.ctx.storage.delete('multy_state');
+    } catch(e) {}
+  }
+
+  // =====================================================================
   // ==================== ALARM SYSTEM (TERPISAH) =========================
   // =====================================================================
 
@@ -502,6 +533,7 @@ export class ChatServer {
         this._multyAlarmActive = false;
         this._multyAlarmNext = 0;
         try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+        try { await this._clearMultyState(); } catch(e) {}
         return;
       }
 
@@ -530,6 +562,8 @@ export class ChatServer {
       this._multyAlarmNext = 0;
 
       try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+      // 👇 HAPUS STATE AUTO-RESUME
+      try { await this._clearMultyState(); } catch(e) {}
 
       if (this._multyRoom) {
         this.broadcast(this._multyRoom, ["multyStop", this._multyRoom]);
@@ -777,7 +811,6 @@ export class ChatServer {
     } catch(e) { return 1; }
   }
 
-  // 👇 GET MULTY CHAT — DENGAN FLATTEN (untuk jaga-jaga format nested)
   async _getMultyChat() {
     try {
       if (!this.db) return [];
@@ -789,7 +822,7 @@ export class ChatServer {
         let arr = JSON.parse(row.value);
         if (!Array.isArray(arr)) return [];
 
-        // 🔧 FLATTEN kalau nested [[{...}], [{...}]]
+        // Flatten kalau nested
         if (arr.length > 0 && Array.isArray(arr[0])) {
           const flat = [];
           for (const sub of arr) {
@@ -804,7 +837,6 @@ export class ChatServer {
           arr = flat;
         }
 
-        // Filter hanya item valid (punya sender & text)
         return arr.filter(x => x && typeof x === 'object' && x.sender && x.text);
       } catch(e) { return []; }
     } catch(e) { return []; }
@@ -839,6 +871,9 @@ export class ChatServer {
         await this._armNextAlarm();
       }
 
+      // 👇 SIMPAN STATE untuk auto-resume
+      await this._saveMultyState();
+
       return true;
     } catch(e) { return false; }
   }
@@ -853,13 +888,13 @@ export class ChatServer {
         this._multyAlarmActive = false;
         this._multyAlarmNext = 0;
         try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+        try { await this._clearMultyState(); } catch(e) {}
         if (room) this.broadcast(room, ["multyStop", room]);
         return false;
       }
 
       const chat = this._multyChatList[this._multyIndex];
       if (!chat || typeof chat !== 'object') {
-        // Skip item invalid, lanjut ke berikutnya
         this._multyIndex++;
         return this._multyRunning ? true : false;
       }
@@ -890,9 +925,13 @@ export class ChatServer {
         this._multyAlarmActive = false;
         this._multyAlarmNext = 0;
         try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
+        try { await this._clearMultyState(); } catch(e) {}
         if (room) this.broadcast(room, ["multyStop", room]);
         return false;
       }
+
+      // 👇 UPDATE STATE setelah tiap tick untuk auto-resume
+      await this._saveMultyState();
 
       return true;
     } catch(e) {
@@ -2325,20 +2364,68 @@ export class ChatServer {
         if (n) this._numberAlarmNext = n;
       } catch(e) {}
 
+      // ============================================================
+      // 👇 AUTO-RESUME MULTY CHAT
+      // ============================================================
       try {
-        const m = await this.ctx?.storage?.get?.('multy_alarm_next');
-        if (m && this._multyRunning) this._multyAlarmNext = m;
-      } catch(e) {}
+        await this._ensureMultyKeysExist();
+
+        // Baca state multy yang tersimpan
+        let savedState = null;
+        try {
+          savedState = await this.ctx?.storage?.get?.('multy_state');
+        } catch(e) { savedState = null; }
+
+        if (savedState && savedState.running === true) {
+          // Load daftar chat dari D1
+          const arr = await this._getMultyChat();
+
+          if (Array.isArray(arr) && arr.length > 0) {
+            // Restore state multy dari storage
+            this._multyChatList = arr;
+            this._multyIndex = Math.max(0, Math.min(
+              typeof savedState.index === 'number' ? savedState.index : 0,
+              arr.length
+            ));
+            this._multyRoom = savedState.room || "Gacor";
+            this._multyNumberNext = (typeof savedState.numberNext === 'number' && savedState.numberNext >= 1)
+              ? savedState.numberNext
+              : 1;
+            this._multyRunning = true;
+
+            // Kalau index sudah di akhir, mulai dari awal lagi (loop)
+            if (this._multyIndex >= arr.length) {
+              this._multyIndex = 0;
+            }
+
+            // Set alarm berikutnya
+            this._multyAlarmNext = Date.now() + this._randMultyDelay();
+            this._multyAlarmActive = true;
+            try {
+              await this.ctx.storage.put('multy_alarm_next', this._multyAlarmNext);
+            } catch(e) {}
+
+            console.log(`[AUTO-RESUME] Multy resumed: room=${this._multyRoom}, index=${this._multyIndex}/${arr.length}, numberNext=${this._multyNumberNext}`);
+          } else {
+            // Data chat kosong → hapus state
+            try { await this._clearMultyState(); } catch(e) {}
+          }
+        } else {
+          // Tidak ada state → multy stopped
+          this._multyRunning = false;
+        }
+      } catch(e) {
+        this._multyRunning = false;
+      }
+      // ============================================================
+      // 👆 END AUTO-RESUME
+      // ============================================================
 
       if (!this.closing && !this.isDestroyed) {
         await this._ensureAlarm();
       }
 
       await this._processPendingEvents();
-
-      try {
-        await this._ensureMultyKeysExist();
-      } catch(e) {}
 
       return true;
 
@@ -3206,7 +3293,8 @@ export class ChatServer {
             alarmActive: !!(await this.ctx?.storage?.getAlarm().catch(() => null)),
             intervalMin: C.NUMBER_INTERVAL_MS / 60000,
             multyMinSec: C.MULTY_MIN_MS / 1000,
-            multyMaxSec: C.MULTY_MAX_MS / 1000
+            multyMaxSec: C.MULTY_MAX_MS / 1000,
+            autoResume: true
           }), {
             status: 200,
             headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" }
@@ -3351,6 +3439,8 @@ export class ChatServer {
 
     try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
     try { await this.ctx?.storage?.delete?.('number_alarm_next'); } catch(e) {}
+    // 👇 JANGAN hapus multy_state saat destroy — biar bisa resume
+    // (biar kalau DO restart, multy tetap lanjut)
 
     this.isDestroyed = true;
   }
