@@ -490,7 +490,6 @@ export class ChatServer {
       }
 
       let currentNumber = 1;
-      let multyNumberNext = 1;
       const results = result?.results || [];
 
       for (const row of results) {
@@ -508,12 +507,6 @@ export class ChatServer {
           if (key === 'current_number') {
             const n = parseInt(value);
             if (!isNaN(n)) currentNumber = n;
-            continue;
-          }
-
-          if (key === 'multy_number_next') {
-            const n = parseInt(value);
-            if (!isNaN(n)) multyNumberNext = n;
             continue;
           }
 
@@ -553,10 +546,19 @@ export class ChatServer {
       this._storageCache = { roomsData, currentNumber };
       this._cacheInitialized = true;
       this.currentNumber = currentNumber;
-      this._multyNumberNext = multyNumberNext;
       this._cacheLoadAttempts = 0;
 
       this._rebuildUserIndex();
+
+      try {
+        const rowNum = await this.db
+          .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'number'`)
+          .first();
+        if (rowNum) {
+          const n = parseInt(rowNum.value);
+          if (!isNaN(n)) this._multyNumberNext = n;
+        }
+      } catch(e) {}
 
       return this._storageCache;
 
@@ -578,63 +580,58 @@ export class ChatServer {
       if (!this.db) return false;
       await this.db.prepare(`
         CREATE TABLE IF NOT EXISTS ${TABLE_MULTY} (
-          number_next INTEGER NOT NULL,
-          chat_json TEXT NOT NULL,
+          key TEXT PRIMARY KEY,
           value TEXT NOT NULL,
-          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          PRIMARY KEY (number_next, chat_json)
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `).run();
       return true;
     } catch(e) { return false; }
   }
 
-  async _saveMulty(numberNext, chatJson, value) {
+  async _saveMultyNumber(numberNext) {
     try {
       if (!this.db) return false;
-      if (numberNext === null || numberNext === undefined || !chatJson) return false;
-
-      if (value === null || value === undefined) {
-        await this.db
-          .prepare(`DELETE FROM ${TABLE_MULTY} WHERE number_next = ? AND chat_json = ?`)
-          .bind(numberNext, chatJson)
-          .run();
-        return true;
-      }
-
       await this.db.prepare(`
-        INSERT OR REPLACE INTO ${TABLE_MULTY} (number_next, chat_json, value, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-      `).bind(numberNext, chatJson, JSON.stringify(value)).run();
+        INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+        VALUES ('number', ?, CURRENT_TIMESTAMP)
+      `).bind(String(numberNext)).run();
       return true;
     } catch(e) { return false; }
   }
 
-  async _getMulty(numberNext) {
+  async _saveMultyChat(chatArray) {
     try {
-      if (!this.db) return [];
-      const result = await this.db
-        .prepare(`SELECT chat_json, value FROM ${TABLE_MULTY} WHERE number_next = ? ORDER BY updated_at`)
-        .bind(numberNext)
-        .all();
-      return (result?.results || []).map(r => ({
-        chat_json: (() => { try { return JSON.parse(r.chat_json); } catch(e) { return null; } })(),
-        value: (() => { try { return JSON.parse(r.value); } catch(e) { return null; } })()
-      }));
-    } catch(e) { return []; }
+      if (!this.db) return false;
+      await this.db.prepare(`
+        INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+        VALUES ('chat_multy', ?, CURRENT_TIMESTAMP)
+      `).bind(JSON.stringify(chatArray)).run();
+      return true;
+    } catch(e) { return false; }
   }
 
-  async _saveMultyNumberNext() {
+  async _getMultyNumber() {
     try {
-      if (!this.db) return;
-      const n = (typeof this._multyNumberNext === 'number' && this._multyNumberNext >= 1)
-        ? this._multyNumberNext
-        : 1;
-      await this.db
-        .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
-        .bind('multy_number_next', String(n))
-        .run();
-    } catch(e) {}
+      if (!this.db) return 1;
+      const row = await this.db
+        .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'number'`)
+        .first();
+      if (!row) return 1;
+      const n = parseInt(row.value);
+      return isNaN(n) ? 1 : n;
+    } catch(e) { return 1; }
+  }
+
+  async _getMultyChat() {
+    try {
+      if (!this.db) return [];
+      const row = await this.db
+        .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'chat_multy'`)
+        .first();
+      if (!row) return [];
+      try { return JSON.parse(row.value); } catch(e) { return []; }
+    } catch(e) { return []; }
   }
 
   async _loadMultyChat(jsonArray, room) {
@@ -645,10 +642,11 @@ export class ChatServer {
       this._multyRunning = true;
       this._multyRoom = room || null;
       this._multyNumberNext = 1;
-      await this._saveMultyNumberNext();
+
+      await this._saveMultyNumber(1);
+      await this._saveMultyChat([]);
 
       await this._scheduleMultyAlarm();
-
       return true;
     } catch(e) { return false; }
   }
@@ -669,24 +667,20 @@ export class ChatServer {
       const chat = this._multyChatList[this._multyIndex];
       const numberNext = this._multyNumberNext;
 
-      const chatJson = JSON.stringify(chat);
+      await this._saveMultyNumber(numberNext);
 
-      await this._saveMulty(numberNext, chatJson, {
-        number: numberNext,
-        sender: chat.sender,
-        text: chat.text,
-        room: room || null,
-        time: Date.now()
-      });
+      let arr = await this._getMultyChat();
+      if (!Array.isArray(arr)) arr = [];
+      arr.push(chat);
+      await this._saveMultyChat(arr);
 
       if (room) {
         this.broadcast(room, ["chat", room, "", chat.sender, chat.text, "7", "1"]);
-        this.broadcast(room, ["multyNumberNext", numberNext]);
+        this.broadcast(room, ["multyNumber", numberNext]);
       }
 
       this._multyNumberNext++;
       if (this._multyNumberNext > C.MAX_MULTY_NUMBER) this._multyNumberNext = 1;
-      await this._saveMultyNumberNext();
 
       this._multyIndex++;
 
@@ -1307,7 +1301,7 @@ export class ChatServer {
       this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
       this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
-      this.safeSend(ws, ["multyNumberNext", this._multyNumberNext]);
+      this.safeSend(ws, ["multyNumber", this._multyNumberNext]);
 
       await this.updateRoomCount(roomName);
 
@@ -2378,7 +2372,7 @@ export class ChatServer {
         case "getCurrentNumber":
           this.safeSend(ws, ["currentNumber", this.currentNumber]);
           this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
-          this.safeSend(ws, ["multyNumberNext", this._multyNumberNext]);
+          this.safeSend(ws, ["multyNumber", this._multyNumberNext]);
           break;
 
         case "setIdTarget2":
@@ -2572,18 +2566,10 @@ export class ChatServer {
 
           this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
 
-          const chatJson = JSON.stringify({
-            sender: username,
-            text: chatMsg
-          });
-
-          await this._saveMulty(this.currentNumber, chatJson, {
-            number: this.currentNumber,
-            sender: username,
-            text: chatMsg,
-            room: chatRoom,
-            time: Date.now()
-          });
+          let arr = await this._getMultyChat();
+          if (!Array.isArray(arr)) arr = [];
+          arr.push({ sender: username, text: chatMsg });
+          await this._saveMultyChat(arr);
 
           break;
         }
@@ -2948,7 +2934,7 @@ export class ChatServer {
             multyRunning: this._multyRunning,
             multyIndex: this._multyIndex,
             multyTotal: this._multyChatList.length,
-            multyNumberNext: this._multyNumberNext,
+            multyNumber: this._multyNumberNext,
             alarmActive: !!(await this.ctx?.storage?.getAlarm().catch(() => null)),
             intervalMin: C.NUMBER_INTERVAL_MS / 60000
           }), {
