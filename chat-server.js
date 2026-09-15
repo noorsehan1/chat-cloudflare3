@@ -237,10 +237,6 @@ export class ChatServer {
     try { this._userIndex.delete(username); } catch(e) {}
   }
 
-  // =====================================================================
-  // ==================== ALARM (HANYA UNTUK NUMBER) =====================
-  // =====================================================================
-
   async _ensureAlarm() {
     if (this.closing || this.isDestroyed) return;
     try {
@@ -415,7 +411,6 @@ export class ChatServer {
 
         if (!this._multyRunning || this.closing || this.isDestroyed) return;
 
-        // Kalau tidak ada WS di room, stop multy
         const clients = this.roomClients?.get(room);
         if (!clients || clients.size === 0) {
           this._multyRunning = false;
@@ -1963,6 +1958,7 @@ export class ChatServer {
             if (!this._restoreRemovedSeats) this._restoreRemovedSeats = [];
             this._restoreRemovedSeats.push({ room, seat });
           }
+
         } catch(e) {}
       }
 
