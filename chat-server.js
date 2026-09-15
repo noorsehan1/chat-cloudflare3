@@ -4,7 +4,7 @@ const C = {
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,           // 15 menit (number)
   MULTY_MIN_MS: 5 * 1000,                       // 30 detik (interval chat)
-  MULTY_MAX_MS: 60 * 1000,                       // 1 menit (interval chat)
+  MULTY_MAX_MS: 20 * 1000,                       // 1 menit (interval chat)
   MULTY_ALARM_INTERVAL_MS: 5 * 60 * 1000,        // ✅ 5 menit — alarm bangun DO
   MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
