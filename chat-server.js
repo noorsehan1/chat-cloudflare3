@@ -589,6 +589,47 @@ export class ChatServer {
     } catch(e) { return false; }
   }
 
+  // ================= CEK & ISI VALUE KOSONG =================
+  async _ensureMultyKeysExist() {
+    try {
+      if (!this.db) return false;
+
+      // cek key 'number'
+      let rowNum = null;
+      try {
+        rowNum = await this.db
+          .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'number'`)
+          .first();
+      } catch(e) {}
+
+      if (!rowNum || !rowNum.value || String(rowNum.value).trim() === '') {
+        await this.db.prepare(`
+          INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+          VALUES ('number', '1', CURRENT_TIMESTAMP)
+        `).run();
+      }
+
+      // cek key 'chat_multy'
+      let rowChat = null;
+      try {
+        rowChat = await this.db
+          .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'chat_multy'`)
+          .first();
+      } catch(e) {}
+
+      if (!rowChat || !rowChat.value || String(rowChat.value).trim() === '') {
+        await this.db.prepare(`
+          INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+          VALUES ('chat_multy', '[]', CURRENT_TIMESTAMP)
+        `).run();
+      }
+
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
   async _saveMultyNumber(numberNext) {
     try {
       if (!this.db) return false;
@@ -629,8 +670,11 @@ export class ChatServer {
       const row = await this.db
         .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'chat_multy'`)
         .first();
-      if (!row) return [];
-      try { return JSON.parse(row.value); } catch(e) { return []; }
+      if (!row || !row.value) return [];
+      try {
+        const arr = JSON.parse(row.value);
+        return Array.isArray(arr) ? arr : [];
+      } catch(e) { return []; }
     } catch(e) { return []; }
   }
 
@@ -2129,8 +2173,10 @@ export class ChatServer {
 
       await this._processPendingEvents();
 
-      // 👇 AUTO-START chat_multy di room "Gacor" saat deploy
+      // 👇 CEK & ISI VALUE KOSONG DULU, lalu AUTO-START di room "Gacor"
       try {
+        await this._ensureMultyKeysExist();
+
         if (!this._multyRunning && !this._multyAlarmActive) {
           const arr = await this._getMultyChat();
           if (Array.isArray(arr) && arr.length > 0) {
