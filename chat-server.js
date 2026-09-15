@@ -550,11 +550,12 @@ export class ChatServer {
 
       this._rebuildUserIndex();
 
+      // 👇 ambil number dari chat_multy, jangan reset
       try {
         const rowNum = await this.db
           .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'number'`)
           .first();
-        if (rowNum) {
+        if (rowNum && rowNum.value) {
           const n = parseInt(rowNum.value);
           if (!isNaN(n)) this._multyNumberNext = n;
         }
@@ -589,12 +590,12 @@ export class ChatServer {
     } catch(e) { return false; }
   }
 
-  // ================= CEK & ISI VALUE KOSONG =================
+  // ================= CEK KEY (JANGAN OVERWRITE) =================
   async _ensureMultyKeysExist() {
     try {
       if (!this.db) return false;
 
-      // cek key 'number'
+      // cek key 'number' — hanya isi kalau BENAR-BENAR tidak ada
       let rowNum = null;
       try {
         rowNum = await this.db
@@ -602,14 +603,14 @@ export class ChatServer {
           .first();
       } catch(e) {}
 
-      if (!rowNum || !rowNum.value || String(rowNum.value).trim() === '') {
+      if (!rowNum) {
         await this.db.prepare(`
           INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
           VALUES ('number', '1', CURRENT_TIMESTAMP)
         `).run();
       }
 
-      // cek key 'chat_multy'
+      // cek key 'chat_multy' — hanya isi kalau BENAR-BENAR tidak ada
       let rowChat = null;
       try {
         rowChat = await this.db
@@ -617,7 +618,7 @@ export class ChatServer {
           .first();
       } catch(e) {}
 
-      if (!rowChat || !rowChat.value || String(rowChat.value).trim() === '') {
+      if (!rowChat) {
         await this.db.prepare(`
           INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
           VALUES ('chat_multy', '[]', CURRENT_TIMESTAMP)
@@ -647,7 +648,7 @@ export class ChatServer {
       const row = await this.db
         .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'number'`)
         .first();
-      if (!row) return 1;
+      if (!row || !row.value) return 1;
       const n = parseInt(row.value);
       return isNaN(n) ? 1 : n;
     } catch(e) { return 1; }
@@ -667,25 +668,32 @@ export class ChatServer {
     } catch(e) { return []; }
   }
 
-  // ================= LOAD (TIDAK reset chat_multy) =================
+  // ================= LOAD (JANGAN RESET DATA) =================
   async _loadMultyChat(jsonArray, room) {
     try {
       if (!Array.isArray(jsonArray)) return false;
+
       this._multyChatList = jsonArray;
       this._multyIndex = 0;
       this._multyRunning = true;
       this._multyRoom = room || null;
-      this._multyNumberNext = 1;
 
-      // 👇 hanya update number, TIDAK reset chat_multy
-      await this._saveMultyNumber(1);
+      // 👇 ambil number dari D1, JANGAN reset
+      try {
+        const currentNum = await this._getMultyNumber();
+        this._multyNumberNext = (typeof currentNum === 'number' && currentNum >= 1)
+          ? currentNum
+          : 1;
+      } catch(e) {
+        this._multyNumberNext = 1;
+      }
 
       await this._scheduleMultyAlarm();
       return true;
     } catch(e) { return false; }
   }
 
-  // ================= JALAN 1 LANGKAH (TIDAK push ke chat_multy) =================
+  // ================= JALAN 1 LANGKAH (HANYA UPDATE NUMBER) =================
   async _nextMultyChat(room) {
     try {
       if (!this._multyRunning) return false;
@@ -2160,7 +2168,7 @@ export class ChatServer {
 
       await this._processPendingEvents();
 
-      // 👇 CEK & ISI VALUE KOSONG DULU, lalu AUTO-START di room "Gacor"
+      // 👇 CEK KEY (JANGAN OVERWRITE), lalu LANGSUNG LOAD dari D1
       try {
         await this._ensureMultyKeysExist();
 
