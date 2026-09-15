@@ -550,7 +550,6 @@ export class ChatServer {
 
       this._rebuildUserIndex();
 
-      // 👇 ambil number dari chat_multy, jangan reset
       try {
         const rowNum = await this.db
           .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'number'`)
@@ -590,12 +589,10 @@ export class ChatServer {
     } catch(e) { return false; }
   }
 
-  // ================= CEK KEY (JANGAN OVERWRITE) =================
   async _ensureMultyKeysExist() {
     try {
       if (!this.db) return false;
 
-      // cek key 'number' — hanya isi kalau BENAR-BENAR tidak ada
       let rowNum = null;
       try {
         rowNum = await this.db
@@ -610,7 +607,6 @@ export class ChatServer {
         `).run();
       }
 
-      // cek key 'chat_multy' — hanya isi kalau BENAR-BENAR tidak ada
       let rowChat = null;
       try {
         rowChat = await this.db
@@ -668,7 +664,6 @@ export class ChatServer {
     } catch(e) { return []; }
   }
 
-  // ================= LOAD (JANGAN RESET DATA) =================
   async _loadMultyChat(jsonArray, room) {
     try {
       if (!Array.isArray(jsonArray)) return false;
@@ -678,7 +673,6 @@ export class ChatServer {
       this._multyRunning = true;
       this._multyRoom = room || null;
 
-      // 👇 ambil number dari D1, JANGAN reset
       try {
         const currentNum = await this._getMultyNumber();
         this._multyNumberNext = (typeof currentNum === 'number' && currentNum >= 1)
@@ -693,7 +687,7 @@ export class ChatServer {
     } catch(e) { return false; }
   }
 
-  // ================= JALAN 1 LANGKAH (HANYA UPDATE NUMBER) =================
+  // ================= JALAN 1 LANGKAH =================
   async _nextMultyChat(room) {
     try {
       if (!this._multyRunning) return false;
@@ -710,11 +704,17 @@ export class ChatServer {
       const chat = this._multyChatList[this._multyIndex];
       const numberNext = this._multyNumberNext;
 
-      // 👇 hanya update number
+      // 👇 WAJIB format sama dengan chat manual
+      const chatNoimg = chat.noimg || "";
+      const username = chat.sender || "";
+      const chatMsg = chat.text || "";
+      const chatColor = chat.color || "7";
+      const chatTextColor = chat.textColor || "1";
+
       await this._saveMultyNumber(numberNext);
 
       if (room) {
-        this.broadcast(room, ["chat", room, "", chat.sender, chat.text, "7", "1"]);
+        this.broadcast(room, ["chat", room, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
         this.broadcast(room, ["multyNumber", numberNext]);
       }
 
@@ -2168,7 +2168,7 @@ export class ChatServer {
 
       await this._processPendingEvents();
 
-      // 👇 CEK KEY (JANGAN OVERWRITE), lalu LANGSUNG LOAD dari D1
+      // 👇 AUTO-START chat_multy di room "Gacor" — JANGAN hapus data D1
       try {
         await this._ensureMultyKeysExist();
 
