@@ -3,7 +3,7 @@ const C = {
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,        // 15 menit (number)
-  MULTY_MIN_MS: 30 * 1000,                    // 30 detik
+  MULTY_MIN_MS: 5 * 1000,                    // 30 detik
   MULTY_MAX_MS: 60 * 1000,                    // 1 menit
   MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
