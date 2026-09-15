@@ -1,4 +1,4 @@
- const C = {
+const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
@@ -2168,16 +2168,10 @@ export class ChatServer {
 
       await this._processPendingEvents();
 
-      // 👇 AUTO-START chat_multy di room "Gacor" — JANGAN hapus data D1
+      // 👇 MANUAL START/STOP — tidak auto-start multy chat
+      // Hanya pastikan keys di D1 ada, TIDAK menjalankan multy chat
       try {
         await this._ensureMultyKeysExist();
-
-        if (!this._multyRunning && !this._multyAlarmActive) {
-          const arr = await this._getMultyChat();
-          if (Array.isArray(arr) && arr.length > 0) {
-            await this._loadMultyChat(arr, "Gacor");
-          }
-        }
       } catch(e) {}
 
       return true;
@@ -2433,6 +2427,69 @@ export class ChatServer {
         case "joinRoom":
           await this._handleJoin(ws, args[0]);
           break;
+
+        // ================= MANUAL START MULTY =================
+        case "startMulty": {
+          try {
+            const startRoom = args[0] || "Gacor";
+            if (!ROOMS_SET.has(startRoom)) {
+              this.safeSend(ws, ["error", "Invalid room"]);
+              break;
+            }
+
+            if (this._multyRunning) {
+              this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+              break;
+            }
+
+            const arr = await this._getMultyChat();
+            if (!Array.isArray(arr) || arr.length === 0) {
+              this.safeSend(ws, ["error", "Multy chat kosong"]);
+              break;
+            }
+
+            await this._loadMultyChat(arr, startRoom);
+
+            // Broadcast status ke semua room
+            for (const [room, clients] of (this.roomClients || new Map())) {
+              if (clients?.size > 0) {
+                this.broadcast(room, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+              }
+            }
+
+            this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+            this.safeSend(ws, ["multyNumber", this._multyNumberNext]);
+          } catch(e) {
+            this._handleError('startMulty', e);
+          }
+          break;
+        }
+
+        // ================= MANUAL STOP MULTY =================
+        case "stopMulty": {
+          try {
+            await this._stopMultyAlarm();
+
+            for (const [room, clients] of (this.roomClients || new Map())) {
+              if (clients?.size > 0) {
+                this.broadcast(room, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+              }
+            }
+
+            this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+          } catch(e) {
+            this._handleError('stopMulty', e);
+          }
+          break;
+        }
+
+        // ================= CEK STATUS MULTY =================
+        case "getMultyStatus": {
+          this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
+          this.safeSend(ws, ["multyNumber", this._multyNumberNext]);
+          this.safeSend(ws, ["multyRoom", this._multyRoom]);
+          break;
+        }
 
         case "multiJoin": {
           const multiUsername = args[0];
