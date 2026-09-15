@@ -80,7 +80,7 @@ export class ChatServer {
       this._isNumberUpdating = false;
       this._numberUpdateStart = null;
 
-      // ✅ MEMORY CACHE FLAGS
+      // MEMORY CACHE FLAGS
       this._multyChatLoaded = false;
       this._multyNumberLoaded = false;
 
@@ -131,6 +131,7 @@ export class ChatServer {
         this.roomClients.set(room, new Set());
       }
 
+      // ✅ TIDAK panggil setAlarm di constructor — hanya mulai restore promise
       this._restorePromise = this._restoreWithRetry();
 
       const restoreTimeout = setTimeout(() => {
@@ -340,6 +341,7 @@ export class ChatServer {
     ]);
   }
 
+  // ✅ FIX: JANGAN reset alarm yang sudah lewat — biarkan alarm() yang handle
   async _rescheduleAlarms() {
     try {
       if (this.closing || this.isDestroyed) {
@@ -356,11 +358,15 @@ export class ChatServer {
       let numberNext = this._numberAlarmNext || 0;
       try {
         const n = await T(this.ctx.storage.get('number_alarm_next'), 'get-number');
-        if (n && n > now) numberNext = n;
+        if (n) numberNext = n;   // ✅ Pakai nilai dari storage walau sudah lewat
       } catch(e) {}
-      if (!numberNext || numberNext <= now) {
+
+      // ✅ Kalau belum ada sama sekali, set 15 menit ke depan
+      if (!numberNext || numberNext === 0) {
         numberNext = now + C.NUMBER_INTERVAL_MS;
       }
+      // ⚠️ JANGAN reset kalau numberNext <= now — biarkan alarm() yang handle
+
       this._numberAlarmNext = numberNext;
       try { await T(this.ctx.storage.put('number_alarm_next', numberNext), 'put-number'); } catch(e) {}
 
@@ -370,11 +376,14 @@ export class ChatServer {
         multyNext = this._multyAlarmNext || 0;
         try {
           const m = await T(this.ctx.storage.get('multy_alarm_next'), 'get-multy');
-          if (m && m > now) multyNext = m;
+          if (m) multyNext = m;   // ✅ Pakai nilai dari storage walau sudah lewat
         } catch(e) {}
-        if (!multyNext || multyNext <= now) {
+
+        // ✅ Kalau belum ada sama sekali, set random delay
+        if (!multyNext || multyNext === 0) {
           multyNext = now + this._randMultyDelay();
         }
+
         this._multyAlarmNext = multyNext;
         this._multyAlarmActive = true;
         try { await T(this.ctx.storage.put('multy_alarm_next', multyNext), 'put-multy'); } catch(e) {}
@@ -384,8 +393,11 @@ export class ChatServer {
         try { await T(this.ctx.storage.delete('multy_alarm_next'), 'del-multy'); } catch(e) {}
       }
 
+      // ✅ Set ke waktu terdekat
       const nextTime = multyNext > 0 ? Math.min(numberNext, multyNext) : numberNext;
-      const setTo = Math.max(nextTime, now + 1000);
+
+      // ✅ Kalau sudah lewat, set ke now + 1 detik (biar alarm segera dipanggil)
+      const setTo = nextTime <= now ? now + 1000 : nextTime;
 
       let setOk = false;
       for (let i = 0; i < 3; i++) {
@@ -864,7 +876,6 @@ export class ChatServer {
     }
   }
 
-  // ✅ METHOD BARU: Load chat_multy dari D1 ke memory SEKALI
   async _loadMultyChatToMemory() {
     try {
       if (this._multyChatLoaded && this._multyChatList.length > 0) {
@@ -924,7 +935,6 @@ export class ChatServer {
     }
   }
 
-  // ✅ FORCE RELOAD: dipanggil kalau admin update chat_multy di D1
   async _reloadMultyChatFromD1() {
     try {
       console.log('[RELOAD] Force reload chat_multy dari D1');
@@ -952,10 +962,8 @@ export class ChatServer {
     }
   }
 
-  // ✅ OPTIMASI: Pakai memory cache
   async _getMultyNumber() {
     try {
-      // Kalau sudah di memory, langsung return
       if (this._multyNumberLoaded && this._multyNumberNext >= 1) {
         return this._multyNumberNext;
       }
@@ -975,7 +983,6 @@ export class ChatServer {
     } catch(e) { return this._multyNumberNext || 1; }
   }
 
-  // ✅ OPTIMASI: Pakai memory cache, TIDAK query D1 setiap kali
   async _getMultyChat() {
     if (this._multyChatLoaded && this._multyChatList.length > 0) {
       return this._multyChatList;
@@ -2546,7 +2553,6 @@ export class ChatServer {
         console.log('[AUTO-RESUME] savedState=', JSON.stringify(savedState));
 
         if (savedState && savedState.running === true) {
-          // ✅ Pakai memory cache (tidak query D1 lagi)
           const arr = await this._getMultyChat();
 
           if (Array.isArray(arr) && arr.length > 0) {
@@ -2841,7 +2847,6 @@ export class ChatServer {
           await this._handleJoin(ws, args[0]);
           break;
 
-        // ✅ EVENT BARU: Force reload chat_multy dari D1
         case "reloadMultyChat": {
           try {
             console.log('[RELOAD] Admin reload chat_multy');
@@ -2866,7 +2871,6 @@ export class ChatServer {
               break;
             }
 
-            // ✅ Pakai memory cache (tidak query D1)
             const arr = await this._getMultyChat();
             if (!Array.isArray(arr) || arr.length === 0) {
               this.safeSend(ws, ["error", "Multy chat kosong"]);
