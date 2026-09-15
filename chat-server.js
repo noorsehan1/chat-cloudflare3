@@ -1,4 +1,4 @@
- const C = {
+const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
@@ -2129,6 +2129,16 @@ export class ChatServer {
 
       await this._processPendingEvents();
 
+      // 👇 AUTO-START chat_multy di room "Gacor" saat deploy
+      try {
+        if (!this._multyRunning && !this._multyAlarmActive) {
+          const arr = await this._getMultyChat();
+          if (Array.isArray(arr) && arr.length > 0) {
+            await this._loadMultyChat(arr, "Gacor");
+          }
+        }
+      } catch(e) {}
+
       return true;
 
     } catch(e) {
@@ -2934,6 +2944,7 @@ export class ChatServer {
             multyRunning: this._multyRunning,
             multyIndex: this._multyIndex,
             multyTotal: this._multyChatList.length,
+            multyRoom: this._multyRoom,
             multyNumber: this._multyNumberNext,
             alarmActive: !!(await this.ctx?.storage?.getAlarm().catch(() => null)),
             intervalMin: C.NUMBER_INTERVAL_MS / 60000
