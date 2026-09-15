@@ -2,10 +2,10 @@ const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
-  NUMBER_INTERVAL_MS: 15 * 60 * 1000,           // 15 menit (number)
-  MULTY_MIN_MS: 5 * 1000,                       // 30 detik (interval chat)
-  MULTY_MAX_MS: 20 * 1000,                       // 1 menit (interval chat)
-  MULTY_ALARM_INTERVAL_MS: 5 * 60 * 1000,        // ✅ 5 menit — alarm bangun DO
+  NUMBER_INTERVAL_MS: 15 * 60 * 1000,
+  MULTY_MIN_MS: 10 * 1000,
+  MULTY_MAX_MS: 60 * 1000,
+  MULTY_ALARM_INTERVAL_MS: 5 * 60 * 1000,
   MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
@@ -81,7 +81,6 @@ export class ChatServer {
       this._isNumberUpdating = false;
       this._numberUpdateStart = null;
 
-      // MEMORY CACHE FLAGS
       this._multyChatLoaded = false;
       this._multyNumberLoaded = false;
 
@@ -89,8 +88,6 @@ export class ChatServer {
       this._numberAlarmNext = 0;
       this._alarmRunning = false;
       this._lastAlarmRun = 0;
-
-      // ✅ LOOP TIMER untuk chat 30-60 detik
       this._multyLoopTimer = null;
 
       this._requestCount = 0;
@@ -135,7 +132,6 @@ export class ChatServer {
         this.roomClients.set(room, new Set());
       }
 
-      // ✅ TIDAK panggil setAlarm di constructor
       this._restorePromise = this._restoreWithRetry();
 
       const restoreTimeout = setTimeout(() => {
@@ -274,17 +270,11 @@ export class ChatServer {
 
   async _saveMultyState() {
     try {
-      if (!this.ctx?.storage) {
-        console.log('[SAVE-STATE] NO ctx.storage!');
-        return;
-      }
-
+      if (!this.ctx?.storage) return;
       if (!this._multyRunning) {
         try { await this.ctx.storage.delete('multy_state'); } catch(e) {}
-        console.log('[SAVE-STATE] cleared (not running)');
         return;
       }
-
       const state = {
         running: true,
         room: this._multyRoom || "Gacor",
@@ -292,7 +282,6 @@ export class ChatServer {
         numberNext: this._multyNumberNext,
         savedAt: Date.now()
       };
-
       let saved = false;
       for (let i = 0; i < 3; i++) {
         try {
@@ -300,24 +289,11 @@ export class ChatServer {
           saved = true;
           break;
         } catch(e) {
-          console.log(`[SAVE-STATE-RETRY ${i+1}/3]`, e?.message || e);
           await new Promise(r => setTimeout(r, 100));
         }
       }
-
-      if (saved) {
-        try {
-          const check = await this.ctx.storage.get('multy_state');
-          console.log(`[SAVE-STATE-OK] index=${check?.index}, running=${check?.running}`);
-        } catch(e) {
-          console.log('[SAVE-STATE-VERIFY-ERR]', e?.message || e);
-        }
-      } else {
-        console.log('[SAVE-STATE-FAIL] tidak bisa simpan!');
-      }
-    } catch(e) {
-      console.log('[SAVE-STATE-ERR]', e?.message || e);
-    }
+      if (!saved) return;
+    } catch(e) {}
   }
 
   async _clearMultyState() {
@@ -332,9 +308,7 @@ export class ChatServer {
   // =====================================================================
 
   _randMultyDelay() {
-    const min = C.MULTY_MIN_MS;
-    const max = C.MULTY_MAX_MS;
-    return Math.floor(Math.random() * (max - min + 1)) + min;
+    return Math.floor(Math.random() * (C.MULTY_MAX_MS - C.MULTY_MIN_MS + 1)) + C.MULTY_MIN_MS;
   }
 
   _withTimeout(promise, ms, label = '') {
@@ -346,7 +320,6 @@ export class ChatServer {
     ]);
   }
 
-  // ✅ LOOP INTERNAL: kirim chat setiap 30-60 detik (jalan saat DO aktif)
   _startMultyLoop() {
     try {
       if (this._multyLoopTimer) {
@@ -357,30 +330,21 @@ export class ChatServer {
       if (!this._multyRunning || this.closing || this.isDestroyed) return;
 
       const delay = this._randMultyDelay();
-      console.log(`[LOOP] Next chat in ${Math.round(delay / 1000)}s`);
 
       this._multyLoopTimer = setTimeout(async () => {
         this._multyLoopTimer = null;
 
-        if (!this._multyRunning || this.closing || this.isDestroyed) {
-          console.log('[LOOP] Stop (not running)');
-          return;
-        }
+        if (!this._multyRunning || this.closing || this.isDestroyed) return;
 
         try {
-          console.log('[LOOP] Tick now');
           await this._multyAlarmTick();
-        } catch(e) {
-          console.log('[LOOP-ERR]', e?.message || e);
-        }
+        } catch(e) {}
 
         if (this._multyRunning && !this.closing && !this.isDestroyed) {
           this._startMultyLoop();
         }
       }, delay);
-    } catch(e) {
-      console.log('[LOOP-START-ERR]', e?.message || e);
-    }
+    } catch(e) {}
   }
 
   _stopMultyLoop() {
@@ -388,24 +352,19 @@ export class ChatServer {
       if (this._multyLoopTimer) {
         clearTimeout(this._multyLoopTimer);
         this._multyLoopTimer = null;
-        console.log('[LOOP] Stopped');
       }
     } catch(e) {}
   }
 
   async _rescheduleAlarms() {
     try {
-      if (this.closing || this.isDestroyed) {
-        console.log('[RESCHEDULE] skip: closing/destroyed');
-        return;
-      }
+      if (this.closing || this.isDestroyed) return;
       if (!this.ctx?.storage) return;
       if (typeof this.ctx.storage.setAlarm !== 'function') return;
 
       const now = Date.now();
       const T = (p, l) => this._withTimeout(p, 1500, l);
 
-      // === NUMBER ===
       let numberNext = this._numberAlarmNext || 0;
       try {
         const n = await T(this.ctx.storage.get('number_alarm_next'), 'get-number');
@@ -417,7 +376,6 @@ export class ChatServer {
       this._numberAlarmNext = numberNext;
       try { await T(this.ctx.storage.put('number_alarm_next', numberNext), 'put-number'); } catch(e) {}
 
-      // === MULTY (5 MENIT) ===
       let multyNext = 0;
       if (this._multyRunning) {
         multyNext = this._multyAlarmNext || 0;
@@ -425,11 +383,9 @@ export class ChatServer {
           const m = await T(this.ctx.storage.get('multy_alarm_next'), 'get-multy');
           if (m) multyNext = m;
         } catch(e) {}
-
         if (!multyNext || multyNext === 0) {
           multyNext = now + C.MULTY_ALARM_INTERVAL_MS;
         }
-
         this._multyAlarmNext = multyNext;
         this._multyAlarmActive = true;
         try { await T(this.ctx.storage.put('multy_alarm_next', multyNext), 'put-multy'); } catch(e) {}
@@ -449,25 +405,10 @@ export class ChatServer {
           setOk = true;
           break;
         } catch(e) {
-          console.log(`[RESCHEDULE-RETRY ${i+1}/3]`, e?.message || e);
           await new Promise(r => setTimeout(r, 100));
         }
       }
-
-      let verify = null;
-      try { verify = await T(this.ctx.storage.getAlarm(), 'getAlarm'); } catch(e) {}
-
-      console.log(
-        `[RESCHEDULE${setOk ? '-OK' : '-FAIL'}] ` +
-        `set=${new Date(setTo).toISOString()}, ` +
-        `get=${verify ? new Date(verify).toISOString() : 'NULL'}, ` +
-        `in=${Math.round((setTo - now) / 1000)}s ` +
-        `(number in ${Math.round((numberNext - now) / 1000)}s, ` +
-        `multy ${multyNext > 0 ? 'in ' + Math.round((multyNext - now) / 1000) + 's' : 'off'})`
-      );
-    } catch(e) {
-      console.log('[RESCHEDULE-ERR]', e?.message || e);
-    }
+    } catch(e) {}
   }
 
   async _armNextAlarm() {
@@ -492,23 +433,13 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      console.log(`[ENSURE-ALARM] running=${this._multyRunning}, ` +
-        `numberNext=${this._numberAlarmNext}, multyNext=${this._multyAlarmNext}`);
-
       await this._rescheduleAlarms();
-    } catch(e) {
-      console.log('[ENSURE-ALARM-ERR]', e?.message || e);
-    }
+    } catch(e) {}
   }
 
   async alarm() {
     try {
-      console.log('[ALARM-ENTER] >>>>>> alarm() DIPANGGIL <<<<<<');
-
-      if (this.closing || this.isDestroyed) {
-        console.log('[ALARM] closing/destroyed → skip');
-        return;
-      }
+      if (this.closing || this.isDestroyed) return;
 
       const now = Date.now();
       const STUCK_THRESHOLD = 60000;
@@ -516,10 +447,8 @@ export class ChatServer {
       if (this._alarmRunning) {
         const stuckDuration = now - this._lastAlarmRun;
         if (stuckDuration > STUCK_THRESHOLD) {
-          console.log(`[ALARM] _alarmRunning nyangkut ${stuckDuration}ms → force reset`);
           this._alarmRunning = false;
         } else {
-          console.log(`[ALARM] _alarmRunning aktif (${stuckDuration}ms) → reschedule 1s`);
           setTimeout(() => this._rescheduleAlarms().catch(() => {}), 1000);
           return;
         }
@@ -554,23 +483,13 @@ export class ChatServer {
             const multyDue = this._multyRunning && multyNext > 0 && nowCheck >= multyNext;
             const numberDue = numberNext > 0 && nowCheck >= numberNext;
 
-            console.log(`[ALARM-STATE] running=${this._multyRunning}, ` +
-              `multyNext=${multyNext} (diff=${Math.round((multyNext-nowCheck)/1000)}s, due=${multyDue}), ` +
-              `numberNext=${numberNext} (diff=${Math.round((numberNext-nowCheck)/1000)}s, due=${numberDue})`);
-
-            // === MULTY: RESTART LOOP, SET ALARM 5 MENIT LAGI ===
             if (multyDue && this._multyRunning) {
-              console.log('[ALARM] Multy alarm DUE → restart loop + set alarm 5 menit');
-
-              // ✅ Restart loop kalau mati
-              if (!this._multyLoopTimer) {
-                console.log('[ALARM] Loop mati → start ulang');
-                this._startMultyLoop();
+              if (this._multyLoopTimer) {
+                this._stopMultyLoop();
               } else {
-                console.log('[ALARM] Loop masih hidup');
+                this._startMultyLoop();
               }
 
-              // ✅ Set alarm 5 menit lagi
               this._multyAlarmNext = Date.now() + C.MULTY_ALARM_INTERVAL_MS;
               this._multyAlarmActive = true;
               try {
@@ -578,12 +497,9 @@ export class ChatServer {
               } catch(e) {}
             }
 
-            // === NUMBER ===
             if (numberDue) {
-              console.log('[ALARM] Number DUE → update');
               try {
                 await this._updateNumber();
-                console.log('[ALARM] Number =', this.currentNumber);
               } catch(e) {
                 this._handleError('alarm:number', e);
               }
@@ -600,15 +516,12 @@ export class ChatServer {
           alarmTimeout
         ]);
       } catch(e) {
-        console.log('[ALARM] error/timeout:', e?.message || e);
         try { await this._rescheduleAlarms(); } catch(e2) {}
       } finally {
         this._alarmRunning = false;
-        console.log('[ALARM-EXIT]');
       }
 
     } catch(e) {
-      console.log('[ALARM-OUTER-ERR]', e?.message || e);
       this._alarmRunning = false;
     }
   }
@@ -652,14 +565,10 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ✅ TICK: kirim 1 chat (dipanggil dari loop)
   async _multyAlarmTick() {
     try {
-      console.log(`[TICK-ENTER] index=${this._multyIndex}/${this._multyChatList.length}, running=${this._multyRunning}`);
-
       if (this.closing || this.isDestroyed) return;
       if (!this._multyRunning) {
-        console.log('[TICK] not running → stop loop');
         this._stopMultyLoop();
         this._multyAlarmActive = false;
         this._multyAlarmNext = 0;
@@ -669,20 +578,15 @@ export class ChatServer {
       }
 
       const room = this._multyRoom || "Gacor";
-      console.log(`[TICK] Panggil _nextMultyChat(room=${room})`);
       await this._nextMultyChat(room);
-      console.log(`[TICK] _nextMultyChat selesai, index=${this._multyIndex}, running=${this._multyRunning}`);
 
       if (!this._multyRunning) {
-        console.log('[TICK] multy stopped setelah tick');
         this._stopMultyLoop();
         this._multyAlarmActive = false;
         this._multyAlarmNext = 0;
         try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
       }
-    } catch(e) {
-      console.log('[TICK-ERR]', e?.message || e, e?.stack);
-    }
+    } catch(e) {}
   }
 
   async _stopMultyAlarm() {
@@ -692,7 +596,6 @@ export class ChatServer {
       this._multyAlarmActive = false;
       this._multyAlarmNext = 0;
 
-      // ✅ Stop loop
       this._stopMultyLoop();
 
       try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
@@ -852,7 +755,6 @@ export class ChatServer {
           if (!isNaN(n)) {
             this._multyNumberNext = n;
             this._multyNumberLoaded = true;
-            console.log(`[LOAD-NUMBER] Cached numberNext=${n}`);
           }
         }
       } catch(e) {}
@@ -929,7 +831,6 @@ export class ChatServer {
   async _loadMultyChatToMemory() {
     try {
       if (this._multyChatLoaded && this._multyChatList.length > 0) {
-        console.log(`[MEMORY] Sudah ada ${this._multyChatList.length} chats di memory`);
         return this._multyChatList;
       }
 
@@ -939,7 +840,6 @@ export class ChatServer {
         return [];
       }
 
-      console.log('[MEMORY] Loading chat_multy dari D1...');
       const row = await this.db
         .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'chat_multy'`)
         .first();
@@ -947,7 +847,6 @@ export class ChatServer {
       if (!row || !row.value) {
         this._multyChatList = [];
         this._multyChatLoaded = true;
-        console.log('[MEMORY] chat_multy kosong');
         return [];
       }
 
@@ -975,10 +874,8 @@ export class ChatServer {
       this._multyChatList = arr.filter(x => x && typeof x === 'object' && x.sender && x.text);
       this._multyChatLoaded = true;
 
-      console.log(`[MEMORY] Loaded ${this._multyChatList.length} chats ke memory`);
       return this._multyChatList;
     } catch(e) {
-      console.log('[MEMORY-ERR]', e?.message || e);
       this._multyChatLoaded = true;
       this._multyChatList = [];
       return [];
@@ -987,12 +884,10 @@ export class ChatServer {
 
   async _reloadMultyChatFromD1() {
     try {
-      console.log('[RELOAD] Force reload chat_multy dari D1');
       this._multyChatLoaded = false;
       this._multyChatList = [];
       return await this._loadMultyChatToMemory();
     } catch(e) {
-      console.log('[RELOAD-ERR]', e?.message || e);
       return [];
     }
   }
@@ -1004,10 +899,8 @@ export class ChatServer {
         INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
         VALUES ('number', ?, CURRENT_TIMESTAMP)
       `).bind(String(numberNext)).run();
-      console.log(`[D1-SAVE] number=${numberNext}`);
       return true;
     } catch(e) {
-      console.log('[D1-SAVE-ERR]', e?.message || e);
       return false;
     }
   }
@@ -1058,21 +951,17 @@ export class ChatServer {
         this._multyNumberNext = 1;
       }
 
-      // Kirim chat pertama
       await this._nextMultyChat(this._multyRoom);
 
       if (this._multyRunning) {
-        // ✅ Set alarm 5 menit
         this._multyAlarmNext = Date.now() + C.MULTY_ALARM_INTERVAL_MS;
         this._multyAlarmActive = true;
         try {
           await this.ctx.storage.put('multy_alarm_next', this._multyAlarmNext);
         } catch(e) {}
 
-        // ✅ Start loop internal (30-60 detik)
         this._startMultyLoop();
 
-        // ✅ Reschedule alarm
         await this._rescheduleAlarms();
       }
 
@@ -1083,15 +972,11 @@ export class ChatServer {
 
   async _nextMultyChat(room) {
     try {
-      console.log(`[NEXT-ENTER] idx=${this._multyIndex}, total=${this._multyChatList.length}`);
-
       if (!this._multyRunning) {
-        console.log('[NEXT] not running');
         return false;
       }
 
       if (this._multyIndex >= this._multyChatList.length) {
-        console.log('[NEXT] index habis → stop');
         this._multyRunning = false;
         this._multyIndex = 0;
         this._multyAlarmActive = false;
@@ -1105,7 +990,6 @@ export class ChatServer {
 
       const chat = this._multyChatList[this._multyIndex];
       if (!chat || typeof chat !== 'object') {
-        console.log('[NEXT] chat invalid, skip');
         this._multyIndex++;
         return this._multyRunning ? true : false;
       }
@@ -1118,25 +1002,19 @@ export class ChatServer {
       const chatColor = chat.color || "7";
       const chatTextColor = chat.textColor || "1";
 
-      console.log(`[NEXT] Simpan numberNext=${numberNext} ke D1`);
       await this._saveMultyNumber(numberNext);
 
       if (room && chatMsg) {
-        console.log(`[NEXT] Broadcast ke room ${room}: ${username}: ${chatMsg.substring(0, 40)}`);
         this.broadcast(room, ["chat", room, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
         this.broadcast(room, ["multyNumber", numberNext]);
-      } else {
-        console.log(`[NEXT] TIDAK broadcast: room=${room}, chatMsg=${chatMsg}`);
       }
 
       this._multyNumberNext++;
       if (this._multyNumberNext > C.MAX_MULTY_NUMBER) this._multyNumberNext = 1;
 
       this._multyIndex++;
-      console.log(`[NEXT-OK] index=${this._multyIndex}, numberNext=${this._multyNumberNext}`);
 
       if (this._multyIndex >= this._multyChatList.length) {
-        console.log('[NEXT] Habis semua, stop');
         this._multyRunning = false;
         this._multyIndex = 0;
         this._multyAlarmActive = false;
@@ -1151,7 +1029,6 @@ export class ChatServer {
       await this._saveMultyState();
       return true;
     } catch(e) {
-      console.log('[NEXT-ERR]', e?.message || e);
       return false;
     }
   }
@@ -2048,19 +1925,12 @@ export class ChatServer {
 
       if (!ws || ws._closing || this.closing || this.isDestroyed || ws._cleaning) return;
 
-      // ✅ SAFETY NET: cek alarm + loop
       if (this._multyRunning && this._restored && !this.isDestroyed && this.ctx?.storage) {
         try {
           const currentAlarm = await this.ctx.storage.getAlarm();
           const now = Date.now();
           if (!currentAlarm || currentAlarm < now - 3000) {
-            console.log('[WS-SAFETY] Alarm hilang/stale → reschedule');
             await this._rescheduleAlarms();
-          }
-
-          if (!this._multyLoopTimer) {
-            console.log('[WS-SAFETY] Loop mati → start ulang');
-            this._startMultyLoop();
           }
         } catch(e) {}
       }
@@ -2603,7 +2473,6 @@ export class ChatServer {
         if (m) this._multyAlarmNext = m;
       } catch(e) {}
 
-      // AUTO-RESUME MULTY
       try {
         await this._ensureMultyKeysExist();
 
@@ -2611,8 +2480,6 @@ export class ChatServer {
         try {
           savedState = await this.ctx?.storage?.get?.('multy_state');
         } catch(e) { savedState = null; }
-
-        console.log('[AUTO-RESUME] savedState=', JSON.stringify(savedState));
 
         if (savedState && savedState.running === true) {
           const arr = await this._getMultyChat();
@@ -2633,7 +2500,6 @@ export class ChatServer {
               this._multyIndex = 0;
             }
 
-            // ✅ Cek dulu apakah multy_alarm_next sudah ada
             let existingAlarm = 0;
             try {
               existingAlarm = await this.ctx.storage.get('multy_alarm_next') || 0;
@@ -2641,20 +2507,13 @@ export class ChatServer {
 
             if (existingAlarm && existingAlarm > 0) {
               this._multyAlarmNext = existingAlarm;
-              console.log(`[AUTO-RESUME] Pakai alarm existing: ${existingAlarm}`);
             } else {
               this._multyAlarmNext = Date.now() + C.MULTY_ALARM_INTERVAL_MS;
               try {
                 await this.ctx.storage.put('multy_alarm_next', this._multyAlarmNext);
               } catch(e) {}
-              console.log(`[AUTO-RESUME] Set alarm baru: ${this._multyAlarmNext}`);
             }
             this._multyAlarmActive = true;
-
-            // ✅ Start loop internal
-            this._startMultyLoop();
-
-            console.log(`[AUTO-RESUME] OK: room=${this._multyRoom}, index=${this._multyIndex}/${arr.length}, numberNext=${this._multyNumberNext}`);
           } else {
             try { await this._clearMultyState(); } catch(e) {}
           }
@@ -2662,7 +2521,6 @@ export class ChatServer {
           this._multyRunning = false;
         }
       } catch(e) {
-        console.log('[AUTO-RESUME-ERR]', e?.message || e);
         this._multyRunning = false;
       }
 
@@ -2926,7 +2784,6 @@ export class ChatServer {
 
         case "reloadMultyChat": {
           try {
-            console.log('[RELOAD] Admin reload chat_multy');
             await this._reloadMultyChatFromD1();
             this.safeSend(ws, ["multyChatReloaded", this._multyChatList.length]);
           } catch(e) {
@@ -2954,7 +2811,6 @@ export class ChatServer {
               break;
             }
 
-            console.log(`[START-MULTY] arr length=${arr.length}, room=${startRoom}`);
             await this._loadMultyChat(arr, startRoom);
 
             for (const [room, clients] of (this.roomClients || new Map())) {
@@ -2968,7 +2824,6 @@ export class ChatServer {
             this.safeSend(ws, ["multyRoom", this._multyRoom]);
           } catch(e) {
             this._handleError('startMulty', e);
-            console.log('[START-MULTY-ERR]', e?.message || e);
           }
           break;
         }
@@ -3535,19 +3390,12 @@ export class ChatServer {
 
       await this._ensureCacheInitialized();
 
-      // ✅ SAFETY NET di fetch
       if (this._multyRunning && this._restored && !this.isDestroyed && this.ctx?.storage) {
         try {
           const currentAlarm = await this.ctx.storage.getAlarm();
           const nowCheck = Date.now();
           if (!currentAlarm || currentAlarm < nowCheck - 3000) {
-            console.log('[FETCH-SAFETY] Alarm hilang/stale → reschedule');
             await this._rescheduleAlarms();
-          }
-
-          if (!this._multyLoopTimer) {
-            console.log('[FETCH-SAFETY] Loop mati → start ulang');
-            this._startMultyLoop();
           }
         } catch(e) {}
       }
@@ -3655,7 +3503,6 @@ export class ChatServer {
     if (this.isDestroyed) return;
     this.closing = true;
 
-    // ✅ Stop loop
     this._stopMultyLoop();
 
     const normalUsers = new Set();
@@ -3724,7 +3571,6 @@ export class ChatServer {
 
     try { await this.ctx?.storage?.delete?.('multy_alarm_next'); } catch(e) {}
     try { await this.ctx?.storage?.delete?.('number_alarm_next'); } catch(e) {}
-    // 👇 JANGAN hapus multy_state saat destroy — biar bisa resume
 
     this.isDestroyed = true;
   }
