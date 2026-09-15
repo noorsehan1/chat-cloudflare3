@@ -1,7 +1,7 @@
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
-  MAX_MESSAGE_SIZE: 5000,
+  // MAX_MESSAGE_SIZE dihapus — tidak ada batasan
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,
   MULTY_MIN_MS: 10 * 1000,
   MULTY_MAX_MS: 30 * 1000,
@@ -2772,7 +2772,7 @@ export class ChatServer {
 
       try {
         let str = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-        if (str.length > C.MAX_MESSAGE_SIZE) return;
+        // ✅ TANPA cek MAX_MESSAGE_SIZE
         let data;
         try { data = JSON.parse(str); } catch(e) { return; }
         if (!Array.isArray(data) || !data.length) return;
@@ -2839,7 +2839,6 @@ export class ChatServer {
               break;
             }
 
-            // Normalize
             const valid = [];
             for (const item of newArr) {
               if (!item || typeof item !== 'object') continue;
@@ -2858,10 +2857,8 @@ export class ChatServer {
               break;
             }
 
-            // ============================================
-            // STEP 1: HAPUS JSON LAMA dari D1
-            // ============================================
             if (this.db) {
+              // STEP 1: HAPUS
               try {
                 await this.db.prepare(`
                   DELETE FROM ${TABLE_MULTY} WHERE key = 'chat_multy'
@@ -2871,22 +2868,18 @@ export class ChatServer {
                 break;
               }
 
-              // ============================================
-              // STEP 2: MASUKKAN JSON BARU ke D1
-              // ============================================
+              // STEP 2: INSERT
               try {
                 await this.db.prepare(`
                   INSERT INTO ${TABLE_MULTY} (key, value, updated_at)
                   VALUES ('chat_multy', ?, CURRENT_TIMESTAMP)
                 `).bind(JSON.stringify(valid)).run();
               } catch(e) {
-                this.safeSend(ws, ["error", "Gagal simpan JSON baru"]);
+                this.safeSend(ws, ["error", "Gagal simpan JSON baru: " + e.message]);
                 break;
               }
 
-              // ============================================
               // STEP 3: VERIFIKASI
-              // ============================================
               try {
                 const check = await this.db
                   .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = 'chat_multy'`)
@@ -2901,9 +2894,7 @@ export class ChatServer {
               } catch(e) {}
             }
 
-            // ============================================
-            // STEP 4: UPDATE MEMORY
-            // ============================================
+            // STEP 4: MEMORY
             this._multyChatList = valid;
             this._multyChatLoaded = true;
 
