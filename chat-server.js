@@ -3,8 +3,8 @@ const C = {
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,
-  MULTY_MIN_MS: 30 * 1000,
-  MULTY_MAX_MS: 60 * 1000,
+  MULTY_MIN_MS: 10 * 1000,
+  MULTY_MAX_MS: 30 * 1000,
   MULTY_ALARM_INTERVAL_MS: 5 * 60 * 1000,
   MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
@@ -322,7 +322,6 @@ export class ChatServer {
     ]);
   }
 
-  // ✅ Cek apakah ada WS di room
   _hasWsInRoom(room) {
     try {
       const clients = this.roomClients?.get(room);
@@ -332,18 +331,13 @@ export class ChatServer {
     }
   }
 
-  // ✅ RESUME: Loop hanya jalan kalau ada WS
   _startMultyLoop() {
     try {
       if (this._multyLoopTimer) return;
       if (!this._multyRunning || this.closing || this.isDestroyed) return;
 
       const room = this._multyRoom || "Gacor";
-
-      // ✅ Cek ada WS di room
-      if (!this._hasWsInRoom(room)) {
-        return;
-      }
+      if (!this._hasWsInRoom(room)) return;
 
       const delay = this._randMultyDelay();
 
@@ -351,11 +345,7 @@ export class ChatServer {
         this._multyLoopTimer = null;
 
         if (!this._multyRunning || this.closing || this.isDestroyed) return;
-
-        // ✅ Cek lagi — mungkin WS sudah keluar semua
-        if (!this._hasWsInRoom(room)) {
-          return;
-        }
+        if (!this._hasWsInRoom(room)) return;
 
         try {
           await this._multyAlarmTick();
@@ -499,7 +489,6 @@ export class ChatServer {
           if (this._multyLoopTimer) {
             this._stopMultyLoop();
           } else {
-            // ✅ _startMultyLoop cek WS di dalam
             this._startMultyLoop();
           }
 
@@ -890,7 +879,21 @@ export class ChatServer {
         arr = flat;
       }
 
-      this._multyChatList = arr.filter(x => x && typeof x === 'object' && x.sender && x.text);
+      // ✅ NORMALIZE: pastikan setiap chat punya field lengkap
+      const normalized = [];
+      for (const item of arr) {
+        if (!item || typeof item !== 'object') continue;
+        if (!item.sender || !item.text) continue;
+        normalized.push({
+          noimg: item.noimg ?? 1000,
+          sender: String(item.sender),
+          text: String(item.text),
+          color: item.color ? String(item.color) : "7",
+          textColor: item.textColor ? String(item.textColor) : "1"
+        });
+      }
+
+      this._multyChatList = normalized;
       this._multyChatLoaded = true;
 
       return this._multyChatList;
@@ -979,9 +982,7 @@ export class ChatServer {
           await this.ctx.storage.put('multy_alarm_next', this._multyAlarmNext);
         } catch(e) {}
 
-        // ✅ _startMultyLoop cek WS di dalam
         this._startMultyLoop();
-
         await this._rescheduleAlarms();
       }
 
@@ -1018,7 +1019,8 @@ export class ChatServer {
 
         const numberNext = this._multyNumberNext;
 
-        const chatNoimg = chat.noimg || "";
+        // ✅ BACA field sesuai format JSON baru
+        const chatNoimg = chat.noimg ?? 1000;
         const username = chat.sender || "";
         const chatMsg = chat.text || "";
         const chatColor = chat.color || "7";
@@ -1661,7 +1663,7 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      // ✅ RESUME: Kalau multy running di room ini, restart loop
+      // ✅ RESUME: restart loop kalau multy running di room ini
       if (this._multyRunning && this._multyRoom === roomName && !this._multyLoopTimer) {
         this._startMultyLoop();
       }
@@ -2185,9 +2187,7 @@ export class ChatServer {
           } catch(e) {}
         }
 
-        if (!wsRoom) {
-          continue;
-        }
+        if (!wsRoom) continue;
         if (wsRoom !== room) {
           try { toRemove.add(ws); } catch(e) {}
           continue;
@@ -2317,9 +2317,7 @@ export class ChatServer {
 
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
-      if (this._restoreFailed) {
-        return 0;
-      }
+      if (this._restoreFailed) return 0;
 
       await this._ensureCacheInitialized();
       const roomsData = this._storageCache?.roomsData || {};
@@ -2386,7 +2384,6 @@ export class ChatServer {
             if (!this._restoreRemovedSeats) this._restoreRemovedSeats = [];
             this._restoreRemovedSeats.push({ room, seat });
           }
-
         } catch(e) {}
       }
 
@@ -2456,7 +2453,6 @@ export class ChatServer {
             } catch(e) {}
 
             await this._cleanupUserCompletely(ws, { skipBroadcast: true });
-
             try { ws.serializeAttachment({}); } catch(e) {}
           } catch(e) {}
         }
@@ -2557,7 +2553,6 @@ export class ChatServer {
             }
             this._multyAlarmActive = true;
 
-            // ✅ Coba restart loop — akan cek WS di dalam
             this._startMultyLoop();
           } else {
             try { await this._clearMultyState(); } catch(e) {}
@@ -2664,7 +2659,6 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      // ✅ RESUME: Kalau multy running di room ini, restart loop
       if (this._multyRunning && this._multyRoom === finalRoom && !this._multyLoopTimer) {
         this._startMultyLoop();
       }
@@ -2743,13 +2737,9 @@ export class ChatServer {
       if (!ws) return;
 
       const state = _wsCleanupState.get(ws);
-      if (state && state.cleanupDone) {
-        return;
-      }
+      if (state && state.cleanupDone) return;
 
-      if (ws._cleaning || ws._closing) {
-        return;
-      }
+      if (ws._cleaning || ws._closing) return;
 
       try {
         const att = ws.deserializeAttachment?.();
@@ -2774,9 +2764,7 @@ export class ChatServer {
         } catch(e) {
           return;
         }
-        if (!this._restored) {
-          return;
-        }
+        if (!this._restored) return;
       }
 
       try {
@@ -2832,7 +2820,7 @@ export class ChatServer {
           await this._handleJoin(ws, args[0]);
           break;
 
-        // ============ EVENT REPLACE JSON & NUMBER ============
+        // ============ REPLACE JSON & NUMBER ============
 
         case "getMultyChatData": {
           try {
@@ -2853,7 +2841,19 @@ export class ChatServer {
               break;
             }
 
-            const valid = newArr.filter(x => x && typeof x === 'object' && x.sender && x.text);
+            // ✅ NORMALIZE: pastikan field lengkap
+            const valid = [];
+            for (const item of newArr) {
+              if (!item || typeof item !== 'object') continue;
+              if (!item.sender || !item.text) continue;
+              valid.push({
+                noimg: item.noimg ?? 1000,
+                sender: String(item.sender),
+                text: String(item.text),
+                color: item.color ? String(item.color) : "7",
+                textColor: item.textColor ? String(item.textColor) : "1"
+              });
+            }
 
             if (this.db) {
               await this.db.prepare(`
@@ -2896,7 +2896,6 @@ export class ChatServer {
             }
 
             await this._saveMultyNumber(newNum);
-
             this._multyNumberNext = newNum;
             this._multyNumberLoaded = true;
 
@@ -2911,7 +2910,7 @@ export class ChatServer {
           break;
         }
 
-        // ============ EVENT MULTY ============
+        // ============ MULTY ============
 
         case "startMulty": {
           try {
@@ -3011,7 +3010,6 @@ export class ChatServer {
           const roomClients = this.roomClients?.get(room);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
 
-          // ✅ RESUME: Restart loop kalau multy running di room ini
           if (this._multyRunning && this._multyRoom === room && !this._multyLoopTimer) {
             this._startMultyLoop();
           }
@@ -3089,7 +3087,6 @@ export class ChatServer {
           const roomClients = this.roomClients?.get(roomName);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
 
-          // ✅ RESUME: Restart loop kalau multy running di room ini
           if (this._multyRunning && this._multyRoom === roomName && !this._multyLoopTimer) {
             this._startMultyLoop();
           }
@@ -3121,9 +3118,7 @@ export class ChatServer {
 
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
-          if (!kursiRoom || typeof kursiSeat !== 'number' || kursiSeat < 1 || kursiSeat > C.MAX_SEATS) {
-            break;
-          }
+          if (!kursiRoom || typeof kursiSeat !== 'number' || kursiSeat < 1 || kursiSeat > C.MAX_SEATS) break;
           if (!ROOMS_SET.has(kursiRoom)) break;
           if (!kursiName || typeof kursiName !== 'string' || kursiName.trim().length === 0) break;
 
@@ -3132,10 +3127,7 @@ export class ChatServer {
 
           const seatData = await this._getSeatData(kursiRoom, kursiSeat);
           if (!seatData || seatData.namauser !== kursiName) break;
-
-          if (seatData.namauser !== currentUser) {
-            break;
-          }
+          if (seatData.namauser !== currentUser) break;
 
           try {
             await this._withLock(
@@ -3177,7 +3169,6 @@ export class ChatServer {
           if (wsRoom !== chatRoom) break;
 
           this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
-
           break;
         }
 
@@ -3412,9 +3403,7 @@ export class ChatServer {
           const currentUser = this._getUsernameFromWs(ws, null);
           if (currentUser) {
             const found = await this._findUserInAnyRoom(currentUser);
-            if (found) {
-              isInRoom = true;
-            }
+            if (found) isInRoom = true;
           }
           this.safeSend(ws, ["inRoomStatus", isInRoom]);
           break;
@@ -3626,9 +3615,7 @@ export class ChatServer {
 
   _handleError(type, error) {
     try {
-      if (error?.overloaded || error?.retryable) {
-        return;
-      }
+      if (error?.overloaded || error?.retryable) return;
 
       const now = Date.now();
       if (now - this._lastErrorReset > C.ERROR_RESET_INTERVAL_MS) {
