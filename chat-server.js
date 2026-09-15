@@ -1,4 +1,4 @@
- const C = {
+const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
@@ -354,7 +354,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ✅ SAMA dengan number — pakai nilai storage apa adanya, TANPA +1000/+5000
   async _rescheduleAlarms() {
     try {
       if (this.closing || this.isDestroyed) return;
@@ -396,7 +395,6 @@ export class ChatServer {
         try { await T(this.ctx.storage.delete('multy_alarm_next'), 'del-multy'); } catch(e) {}
       }
 
-      // === SET ALARM = waktu terdekat, APA ADANYA ===
       const nextTime = multyNext > 0 ? Math.min(numberNext, multyNext) : numberNext;
 
       let setOk = false;
@@ -2800,15 +2798,88 @@ export class ChatServer {
           await this._handleJoin(ws, args[0]);
           break;
 
-        case "reloadMultyChat": {
+        // ============ EVENT BARU: REPLACE JSON CHAT MULTY ============
+
+        case "getMultyChatData": {
           try {
-            await this._reloadMultyChatFromD1();
-            this.safeSend(ws, ["multyChatReloaded", this._multyChatList.length]);
+            const arr = await this._getMultyChat();
+            const jsonStr = JSON.stringify(arr, null, 2);
+            this.safeSend(ws, ["multyChatData", jsonStr, arr.length]);
           } catch(e) {
-            this.safeSend(ws, ["error", "Reload gagal"]);
+            this.safeSend(ws, ["error", "Gagal load JSON"]);
           }
           break;
         }
+
+        case "replaceMultyChat": {
+          try {
+            const newArr = args[0];
+            if (!Array.isArray(newArr)) {
+              this.safeSend(ws, ["error", "Data bukan array"]);
+              break;
+            }
+
+            const valid = newArr.filter(x => x && typeof x === 'object' && x.sender && x.text);
+
+            if (this.db) {
+              await this.db.prepare(`
+                INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+                VALUES ('chat_multy', ?, CURRENT_TIMESTAMP)
+              `).bind(JSON.stringify(valid)).run();
+            }
+
+            this._multyChatList = valid;
+            this._multyChatLoaded = true;
+
+            if (this._multyRunning) {
+              this._multyIndex = 0;
+              await this._saveMultyState();
+            }
+
+            this.safeSend(ws, ["multyChatReloaded", valid.length]);
+          } catch(e) {
+            this.safeSend(ws, ["error", "Gagal simpan JSON"]);
+          }
+          break;
+        }
+
+        // ============ EVENT BARU: REPLACE NUMBER MULTY ============
+
+        case "getMultyNumberData": {
+          try {
+            const num = await this._getMultyNumber();
+            this.safeSend(ws, ["multyNumberData", num]);
+          } catch(e) {
+            this.safeSend(ws, ["error", "Gagal load number"]);
+          }
+          break;
+        }
+
+        case "replaceMultyNumber": {
+          try {
+            const newNum = parseInt(args[0]);
+            if (isNaN(newNum) || newNum < 1 || newNum > C.MAX_MULTY_NUMBER) {
+              this.safeSend(ws, ["error", "Number invalid"]);
+              break;
+            }
+
+            await this._saveMultyNumber(newNum);
+
+            this._multyNumberNext = newNum;
+            this._multyNumberLoaded = true;
+
+            if (this._multyRunning) {
+              await this._saveMultyState();
+            }
+
+            this.safeSend(ws, ["multyNumberSaved", newNum]);
+          } catch(e) {
+            this.safeSend(ws, ["error", "Gagal simpan number"]);
+          }
+          break;
+        }
+
+        // ============ EVENT MULTY ============
 
         case "startMulty": {
           try {
@@ -2867,6 +2938,16 @@ export class ChatServer {
           this.safeSend(ws, ["multyStatus", this._multyRunning, this._multyIndex, this._multyChatList.length]);
           this.safeSend(ws, ["multyNumber", this._multyNumberNext]);
           this.safeSend(ws, ["multyRoom", this._multyRoom]);
+          break;
+        }
+
+        case "reloadMultyChat": {
+          try {
+            await this._reloadMultyChatFromD1();
+            this.safeSend(ws, ["multyChatReloaded", this._multyChatList.length]);
+          } catch(e) {
+            this.safeSend(ws, ["error", "Reload gagal"]);
+          }
           break;
         }
 
