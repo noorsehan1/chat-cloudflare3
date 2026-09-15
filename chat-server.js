@@ -2,9 +2,9 @@ const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
-  NUMBER_INTERVAL_MS: 15 * 60 * 1000,        // 15 menit
-  MULTY_MIN_MS: 30 * 1000,                    // 30 detik
-  MULTY_MAX_MS: 5 * 60 * 1000,                // 5 menit
+  NUMBER_INTERVAL_MS: 15 * 60 * 1000,        // 15 menit (number, TIDAK diubah)
+  MULTY_MIN_MS: 30 * 1000,                    // ✅ 30 detik
+  MULTY_MAX_MS: 60 * 1000,                    // ✅ 1 menit (dari 5 menit)
   MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
