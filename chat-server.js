@@ -3,9 +3,9 @@ const C = {
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,
-  MULTY_MIN_MS: 5 * 1000,
-  MULTY_MAX_MS: 29 * 1000,
-  MULTY_ALARM_INTERVAL_MS: 2* 60 * 1000,
+  MULTY_MIN_MS: 30 * 1000,
+  MULTY_MAX_MS: 60 * 1000,
+  MULTY_ALARM_INTERVAL_MS: 5 * 60 * 1000,
   MAX_MULTY_NUMBER: 9999,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
@@ -322,10 +322,28 @@ export class ChatServer {
     ]);
   }
 
+  // ✅ Cek apakah ada WS di room
+  _hasWsInRoom(room) {
+    try {
+      const clients = this.roomClients?.get(room);
+      return !!(clients && clients.size > 0);
+    } catch(e) {
+      return false;
+    }
+  }
+
+  // ✅ RESUME: Loop hanya jalan kalau ada WS
   _startMultyLoop() {
     try {
       if (this._multyLoopTimer) return;
       if (!this._multyRunning || this.closing || this.isDestroyed) return;
+
+      const room = this._multyRoom || "Gacor";
+
+      // ✅ Cek ada WS di room
+      if (!this._hasWsInRoom(room)) {
+        return;
+      }
 
       const delay = this._randMultyDelay();
 
@@ -333,6 +351,11 @@ export class ChatServer {
         this._multyLoopTimer = null;
 
         if (!this._multyRunning || this.closing || this.isDestroyed) return;
+
+        // ✅ Cek lagi — mungkin WS sudah keluar semua
+        if (!this._hasWsInRoom(room)) {
+          return;
+        }
 
         try {
           await this._multyAlarmTick();
@@ -363,7 +386,6 @@ export class ChatServer {
       const now = Date.now();
       const T = (p, l) => this._withTimeout(p, 1500, l);
 
-      // === NUMBER ===
       let numberNext = this._numberAlarmNext || 0;
       try {
         const n = await T(this.ctx.storage.get('number_alarm_next'), 'get-number');
@@ -375,7 +397,6 @@ export class ChatServer {
       this._numberAlarmNext = numberNext;
       try { await T(this.ctx.storage.put('number_alarm_next', numberNext), 'put-number'); } catch(e) {}
 
-      // === MULTY ===
       let multyNext = 0;
       if (this._multyRunning) {
         multyNext = this._multyAlarmNext || 0;
@@ -474,11 +495,11 @@ export class ChatServer {
         const multyDue = this._multyRunning && multyNext > 0 && nowCheck >= multyNext;
         const numberDue = numberNext > 0 && nowCheck >= numberNext;
 
-        // === MULTY: toggle loop, set alarm 5 menit lagi ===
         if (multyDue && this._multyRunning) {
           if (this._multyLoopTimer) {
             this._stopMultyLoop();
           } else {
+            // ✅ _startMultyLoop cek WS di dalam
             this._startMultyLoop();
           }
 
@@ -489,7 +510,6 @@ export class ChatServer {
           } catch(e) {}
         }
 
-        // === NUMBER ===
         if (numberDue) {
           try {
             await this._updateNumber();
@@ -959,6 +979,7 @@ export class ChatServer {
           await this.ctx.storage.put('multy_alarm_next', this._multyAlarmNext);
         } catch(e) {}
 
+        // ✅ _startMultyLoop cek WS di dalam
         this._startMultyLoop();
 
         await this._rescheduleAlarms();
@@ -1638,6 +1659,11 @@ export class ChatServer {
       const roomClients = this.roomClients.get(roomName);
       if (roomClients && !roomClients.has(ws)) {
         try { roomClients.add(ws); } catch(e) {}
+      }
+
+      // ✅ RESUME: Kalau multy running di room ini, restart loop
+      if (this._multyRunning && this._multyRoom === roomName && !this._multyLoopTimer) {
+        this._startMultyLoop();
       }
 
       if (!wasMulti) {
@@ -2530,6 +2556,9 @@ export class ChatServer {
               } catch(e) {}
             }
             this._multyAlarmActive = true;
+
+            // ✅ Coba restart loop — akan cek WS di dalam
+            this._startMultyLoop();
           } else {
             try { await this._clearMultyState(); } catch(e) {}
           }
@@ -2633,6 +2662,11 @@ export class ChatServer {
       const roomClients = this.roomClients?.get(finalRoom);
       if (roomClients && !roomClients.has(ws)) {
         try { roomClients.add(ws); } catch(e) {}
+      }
+
+      // ✅ RESUME: Kalau multy running di room ini, restart loop
+      if (this._multyRunning && this._multyRoom === finalRoom && !this._multyLoopTimer) {
+        this._startMultyLoop();
       }
 
       let conns = this.userConnections?.get(attachment.username);
@@ -2798,7 +2832,7 @@ export class ChatServer {
           await this._handleJoin(ws, args[0]);
           break;
 
-        // ============ EVENT BARU: REPLACE JSON CHAT MULTY ============
+        // ============ EVENT REPLACE JSON & NUMBER ============
 
         case "getMultyChatData": {
           try {
@@ -2842,8 +2876,6 @@ export class ChatServer {
           }
           break;
         }
-
-        // ============ EVENT BARU: REPLACE NUMBER MULTY ============
 
         case "getMultyNumberData": {
           try {
@@ -2978,6 +3010,12 @@ export class ChatServer {
           }
           const roomClients = this.roomClients?.get(room);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
+
+          // ✅ RESUME: Restart loop kalau multy running di room ini
+          if (this._multyRunning && this._multyRoom === room && !this._multyLoopTimer) {
+            this._startMultyLoop();
+          }
+
           this.safeSend(ws, ["rooMasukMulti", seat, room]);
           await this.updateRoomCount(room);
           break;
@@ -3050,6 +3088,12 @@ export class ChatServer {
           }
           const roomClients = this.roomClients?.get(roomName);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
+
+          // ✅ RESUME: Restart loop kalau multy running di room ini
+          if (this._multyRunning && this._multyRoom === roomName && !this._multyLoopTimer) {
+            this._startMultyLoop();
+          }
+
           ws.username = targetUsername;
           ws.idtarget = targetUsername;
           ws.room = roomName;
@@ -3512,6 +3556,7 @@ export class ChatServer {
             multyChatLoaded: this._multyChatLoaded,
             multyNumberLoaded: this._multyNumberLoaded,
             multyLoopActive: !!this._multyLoopTimer,
+            multyHasWsInRoom: this._multyRunning ? this._hasWsInRoom(this._multyRoom || "Gacor") : false,
             numberAlarmNext: this._numberAlarmNext,
             multyAlarmNext: this._multyAlarmNext,
             numberIn: Math.round((this._numberAlarmNext - Date.now()) / 1000),
