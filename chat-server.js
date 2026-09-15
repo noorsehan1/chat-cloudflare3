@@ -3,6 +3,7 @@ const C = {
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,
+  MULTY_INTERVAL_MS: 1 * 60 * 1000,
   MAX_NUMBER: 6,
   LOCK_TIMEOUT: 5000,
   USER_JOIN_LOCK_TIMEOUT: 10000,
@@ -26,6 +27,7 @@ const ROOMS = [
 
 const ROOMS_SET = new Set(ROOMS);
 const TABLE_NAME = 'chat_data';
+const TABLE_MULTY = 'chat_multy';
 
 const _wsCleanupState = new WeakMap();
 
@@ -67,8 +69,11 @@ export class ChatServer {
       this._wsLock = null;
 
       this.currentNumber = 1;
+      this.currentMultyNumber = 1;
       this._isNumberUpdating = false;
+      this._isMultyUpdating = false;
       this._numberUpdateStart = null;
+      this._multyUpdateStart = null;
 
       this._requestCount = 0;
       this._lastResetTime = Date.now();
@@ -86,7 +91,7 @@ export class ChatServer {
 
       if (!env || !env.DB) {
         this.db = null;
-        this._storageCache = { roomsData: {}, currentNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
         this._cacheInitialized = true;
         this._restored = true;
         this._restoreDone = true;
@@ -101,7 +106,8 @@ export class ChatServer {
 
       this._storageCache = {
         roomsData: {},
-        currentNumber: 1
+        currentNumber: 1,
+        currentMultyNumber: 1
       };
       this._cacheInitialized = false;
       this._cacheLoading = false;
@@ -121,7 +127,7 @@ export class ChatServer {
           this._restoreFailed = true;
           this._isRestoring = false;
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
             this._cacheInitialized = true;
           }
           if (!this.closing) {
@@ -146,7 +152,7 @@ export class ChatServer {
           this._restoreFailed = true;
           this._isRestoring = false;
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
             this._cacheInitialized = true;
           }
           this._ensureAlarm().catch(() => {});
@@ -156,9 +162,10 @@ export class ChatServer {
       this._restored = true;
       this._restoreDone = true;
       this._isRestoring = false;
-      this._storageCache = { roomsData: {}, currentNumber: 1 };
+      this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
       this._cacheInitialized = false;
       this.currentNumber = 1;
+      this.currentMultyNumber = 1;
       this._restoreFailed = true;
       this.closing = false;
       this.isDestroyed = false;
@@ -179,6 +186,22 @@ export class ChatServer {
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
       }
+    }
+  }
+
+  // ================= USERNAME DARI JSON =================
+  _getUsernameFromWs(ws, fallback) {
+    try {
+      if (!ws) return fallback || null;
+      if (ws.username) return ws.username;
+      if (ws._username) return ws._username;
+      try {
+        const att = ws.deserializeAttachment?.();
+        if (att?.username) return att.username;
+      } catch(e) {}
+      return fallback || null;
+    } catch(e) {
+      return fallback || null;
     }
   }
 
@@ -250,6 +273,7 @@ export class ChatServer {
       }
 
       await this._updateNumber();
+      await this._updateMultyNumber();
     } catch(e) {
       this._handleError('alarm', e);
     } finally {
@@ -305,6 +329,49 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ================= UPDATE MULTY NUMBER =================
+  async _updateMultyNumber() {
+    try {
+      if (this.closing || this.isDestroyed) return;
+
+      if (this._isMultyUpdating) {
+        if (this._multyUpdateStart && Date.now() - this._multyUpdateStart > 30000) {
+          this._isMultyUpdating = false;
+        } else {
+          return;
+        }
+      }
+
+      this._isMultyUpdating = true;
+      this._multyUpdateStart = Date.now();
+
+      try {
+        this.currentMultyNumber = (this.currentMultyNumber < C.MAX_NUMBER)
+          ? (this.currentMultyNumber + 1)
+          : 1;
+
+        if (this._storageCache) {
+          this._storageCache.currentMultyNumber = this.currentMultyNumber;
+        }
+
+        await this._saveCurrentMultyNumber();
+
+        if (!this._isRestoring) {
+          for (const [room, clients] of (this.roomClients || new Map())) {
+            if (clients?.size > 0) {
+              this.broadcast(room, ["currentMultyNumber", this.currentMultyNumber]);
+            }
+          }
+        }
+      } catch(e) {
+        this._handleError('_updateMultyNumber', e);
+      } finally {
+        this._isMultyUpdating = false;
+        this._multyUpdateStart = null;
+      }
+    } catch(e) {}
+  }
+
   async _restoreWithRetry() {
     let attempts = 0;
     let lastError = null;
@@ -331,7 +398,7 @@ export class ChatServer {
       this._restoreDone = true;
       this._restoreFailed = true;
       if (!this._cacheInitialized) {
-        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
         this._cacheInitialized = true;
       }
 
@@ -344,9 +411,10 @@ export class ChatServer {
   async _loadFromStorage() {
     try {
       if (!this.db) {
-        this._storageCache = { roomsData: {}, currentNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
         this._cacheInitialized = true;
         this.currentNumber = 1;
+        this.currentMultyNumber = 1;
         this._userIndex = new Map();
         return this._storageCache;
       }
@@ -361,15 +429,17 @@ export class ChatServer {
         `).run();
       } catch(e) {}
 
+      try { await this._initTableMulty(); } catch(e) {}
+
       let result;
       try {
         result = await this.db.prepare(`SELECT key, value FROM ${TABLE_NAME}`).all();
       } catch(e) {
         if (!this._cacheInitialized) {
-          this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+          this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
           this._cacheInitialized = true;
         }
-        return this._storageCache || { roomsData: {}, currentNumber: 1 };
+        return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
       }
 
       const roomsData = {};
@@ -378,6 +448,7 @@ export class ChatServer {
       }
 
       let currentNumber = 1;
+      let currentMultyNumber = 1;
       const results = result?.results || [];
 
       for (const row of results) {
@@ -395,6 +466,12 @@ export class ChatServer {
           if (key === 'current_number') {
             const n = parseInt(value);
             if (!isNaN(n)) currentNumber = n;
+            continue;
+          }
+
+          if (key === 'current_multy_number') {
+            const n = parseInt(value);
+            if (!isNaN(n)) currentMultyNumber = n;
             continue;
           }
 
@@ -431,9 +508,10 @@ export class ChatServer {
         }
       }
 
-      this._storageCache = { roomsData, currentNumber };
+      this._storageCache = { roomsData, currentNumber, currentMultyNumber };
       this._cacheInitialized = true;
       this.currentNumber = currentNumber;
+      this.currentMultyNumber = currentMultyNumber;
       this._cacheLoadAttempts = 0;
 
       this._rebuildUserIndex();
@@ -443,13 +521,67 @@ export class ChatServer {
     } catch(e) {
       this._cacheLoadAttempts = (this._cacheLoadAttempts || 0) + 1;
       if (this._cacheLoadAttempts > 3) {
-        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+        this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
         this._cacheInitialized = true;
         this.currentNumber = this.currentNumber || 1;
+        this.currentMultyNumber = this.currentMultyNumber || 1;
         this._restoreFailed = true;
       }
       throw e;
     }
+  }
+
+  // ================= INIT TABLE chat_multy =================
+  async _initTableMulty() {
+    try {
+      if (!this.db) return false;
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS ${TABLE_MULTY} (
+          number_next INTEGER NOT NULL,
+          chat_json TEXT NOT NULL,
+          value TEXT NOT NULL,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (number_next, chat_json)
+        )
+      `).run();
+      return true;
+    } catch(e) { return false; }
+  }
+
+  // ================= SIMPAN MULTY =================
+  async _saveMulty(numberNext, chatJson, data) {
+    try {
+      if (!this.db) return false;
+      if (numberNext === null || numberNext === undefined || !chatJson) return false;
+
+      if (data === null || data === undefined) {
+        await this.db
+          .prepare(`DELETE FROM ${TABLE_MULTY} WHERE number_next = ? AND chat_json = ?`)
+          .bind(numberNext, chatJson)
+          .run();
+        return true;
+      }
+
+      await this.db.prepare(`
+        INSERT OR REPLACE INTO ${TABLE_MULTY} (number_next, chat_json, value, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      `).bind(numberNext, chatJson, JSON.stringify(data)).run();
+      return true;
+    } catch(e) { return false; }
+  }
+
+  // ================= SIMPAN currentMultyNumber =================
+  async _saveCurrentMultyNumber() {
+    try {
+      if (!this.db) return;
+      const n = (typeof this.currentMultyNumber === 'number' && this.currentMultyNumber >= 1)
+        ? this.currentMultyNumber
+        : 1;
+      await this.db
+        .prepare(`INSERT OR REPLACE INTO ${TABLE_NAME} (key, value) VALUES (?, ?)`)
+        .bind('current_multy_number', String(n))
+        .run();
+    } catch(e) {}
   }
 
   async _saveSeat(roomName, seatNumber, seatData) {
@@ -565,7 +697,6 @@ export class ChatServer {
     return true;
   }
 
-  // 🔥 force=true agar seat multi ikut terhapus
   async _deleteSeatInRoom(roomName, seatNumber, force = false) {
     try {
       const roomBucket = await this._getRoomBucket(roomName);
@@ -603,7 +734,7 @@ export class ChatServer {
     try {
       await this._ensureCacheInitialized();
       if (!this._storageCache?.roomsData) {
-        this._storageCache = { roomsData: {}, currentNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
       }
       if (!this._storageCache.roomsData[roomName]) {
         this._storageCache.roomsData[roomName] = { seat: {}, point: {}, mute: false };
@@ -614,7 +745,6 @@ export class ChatServer {
     }
   }
 
-  // 🔥 Guard: pertahankan isMulti=true jika seat lama multi
   async _updateSeatInRoom(roomName, seatNumber, seatData) {
     try {
       const roomBucket = await this._getRoomBucket(roomName);
@@ -759,7 +889,7 @@ export class ChatServer {
             await this._cacheLoadingPromise;
           } catch(e) {}
         }
-        return this._storageCache || { roomsData: {}, currentNumber: 1 };
+        return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
       }
 
       if (this._restorePromise && !this._restoreDone) {
@@ -772,12 +902,12 @@ export class ChatServer {
           ]);
         } catch(e) {
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
             this._cacheInitialized = true;
             this._restoreFailed = true;
           }
         }
-        return this._storageCache || { roomsData: {}, currentNumber: 1 };
+        return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
       }
 
       this._cacheLoading = true;
@@ -789,7 +919,7 @@ export class ChatServer {
         })
         .catch(e => {
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
             this._cacheInitialized = true;
           }
           return this._storageCache;
@@ -803,9 +933,9 @@ export class ChatServer {
         await this._cacheLoadingPromise;
       } catch(e) {}
 
-      return this._storageCache || { roomsData: {}, currentNumber: 1 };
+      return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
     } catch(e) {
-      return this._storageCache || { roomsData: {}, currentNumber: 1 };
+      return this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
     }
   }
 
@@ -859,7 +989,6 @@ export class ChatServer {
         return { success: false, error: 'You do not own this seat' };
       }
 
-      // 🔥 Pertahankan isMulti=true jika seat lama multi
       const finalIsMulti = (data.isMulti === true || currentSeatData.isMulti === true);
 
       const updatedSeat = {
@@ -884,7 +1013,7 @@ export class ChatServer {
     try {
       await this._ensureCacheInitialized();
       if (!this._storageCache) {
-        this._storageCache = { roomsData: {}, currentNumber: 1 };
+        this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
       }
       if (!this._storageCache.roomsData[roomName]) {
         this._storageCache.roomsData[roomName] = { seat: {}, point: {}, mute: false };
@@ -961,7 +1090,6 @@ export class ChatServer {
 
   async _joinInternal(ws, roomName, username) {
     try {
-      // 🔥 Simpan status multi SEBELUM seat lama dihapus
       const existing = await this._findUserInAnyRoom(username);
       const wasMulti = existing?.isMulti === true;
 
@@ -976,7 +1104,7 @@ export class ChatServer {
       let roomBucket = this._storageCache?.roomsData?.[roomName];
       if (!roomBucket) {
         roomBucket = { seat: {}, point: {}, mute: false };
-        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1 };
+        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
         this._storageCache.roomsData[roomName] = roomBucket;
       }
       if (!roomBucket.seat) roomBucket.seat = {};
@@ -1017,7 +1145,7 @@ export class ChatServer {
           itematas: 0,
           vip: 0,
           viptanda: 0,
-          isMulti: wasMulti   // 🔥 pertahankan status multi
+          isMulti: wasMulti
         };
 
         await this._updateSeatInRoom(roomName, seat, newSeat);
@@ -1047,7 +1175,6 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      // Kalau bukan multi, hapus dari wsActiveMulti
       if (!wasMulti) {
         this.wsActiveMulti.delete(ws);
       }
@@ -1058,6 +1185,7 @@ export class ChatServer {
       this.safeSend(ws, ["numberKursiSaya", seat]);
       this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
+      this.safeSend(ws, ["currentMultyNumber", this.currentMultyNumber]);
 
       await this.updateRoomCount(roomName);
 
@@ -1103,7 +1231,7 @@ export class ChatServer {
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
         roomBucket = { seat: {}, point: {}, mute: false };
-        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1 };
+        if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
         this._storageCache.roomsData[multiRoomname] = roomBucket;
       }
       if (!roomBucket.seat) roomBucket.seat = {};
@@ -2127,6 +2255,7 @@ export class ChatServer {
       switch(evt) {
         case "getCurrentNumber":
           this.safeSend(ws, ["currentNumber", this.currentNumber]);
+          this.safeSend(ws, ["currentMultyNumber", this.currentMultyNumber]);
           break;
 
         case "setIdTarget2":
@@ -2169,7 +2298,6 @@ export class ChatServer {
           break;
         }
 
-        // 🔥 exitMulti: HANYA jalankan 1–5. Poin 6 (hapus ws) DILEWATI.
         case "exitMulti": {
           const targetUsername = args[0];
           if (!targetUsername) break;
@@ -2182,8 +2310,6 @@ export class ChatServer {
               await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
             this._removeUserIndex(targetUsername);
-
-            // ❌ 6 TIDAK dilakukan
           } catch(e) {}
           break;
         }
@@ -2272,7 +2398,7 @@ export class ChatServer {
           if (!ROOMS_SET.has(kursiRoom)) break;
           if (!kursiName || typeof kursiName !== 'string' || kursiName.trim().length === 0) break;
 
-          const currentUser = ws.username || ws._username;
+          const currentUser = this._getUsernameFromWs(ws, null);
           if (!currentUser) break;
 
           const seatData = await this._getSeatData(kursiRoom, kursiSeat);
@@ -2312,11 +2438,38 @@ export class ChatServer {
         case "chat": {
           const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
           if (!chatMsg || !ROOMS_SET.has(chatRoom)) break;
-          const found = await this._findUserInAnyRoom(chatUser);
+
+          const username = this._getUsernameFromWs(ws, chatUser);
+          if (!username) break;
+
+          const found = await this._findUserInAnyRoom(username);
           if (!found || found.room !== chatRoom) break;
           const wsRoom = ws.room || ws.roomname;
           if (wsRoom !== chatRoom) break;
-          this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor]);
+
+          this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
+
+          const chatJson = JSON.stringify({
+            room: chatRoom,
+            noimg: chatNoimg,
+            user: username,
+            msg: chatMsg,
+            color: chatColor,
+            textColor: chatTextColor
+          });
+
+          await this._saveMulty(this.currentNumber, chatJson, {
+            room: chatRoom,
+            noimg: chatNoimg,
+            user: username,
+            msg: chatMsg,
+            color: chatColor,
+            textColor: chatTextColor,
+            number: this.currentNumber,
+            multy: this.currentMultyNumber,
+            time: Date.now()
+          });
+
           break;
         }
 
@@ -2325,7 +2478,7 @@ export class ChatServer {
           if (!pointRoom || typeof pointSeat !== 'number') break;
           if (!ROOMS_SET.has(pointRoom)) break;
 
-          const currentUser = ws.username || ws._username;
+          const currentUser = this._getUsernameFromWs(ws, null);
           if (!currentUser) break;
           const seatData = await this._getSeatData(pointRoom, pointSeat);
           if (!seatData || seatData.namauser !== currentUser) break;
@@ -2368,7 +2521,7 @@ export class ChatServer {
 
         case "removeKursiAndPoint": {
           const [removeRoom, removeSeat] = args;
-          const currentUser = ws.username || ws._username;
+          const currentUser = this._getUsernameFromWs(ws, null);
           if (!currentUser) break;
           const found = await this._findUserInAnyRoom(currentUser);
           if (!found || found.room !== removeRoom) break;
@@ -2386,7 +2539,7 @@ export class ChatServer {
         case "setMuteType": {
           const [muteVal, muteRoom] = args;
           if (!muteRoom || !ROOMS_SET.has(muteRoom)) break;
-          const currentUser = ws.username || ws._username;
+          const currentUser = this._getUsernameFromWs(ws, null);
           if (!currentUser) break;
           const found = await this._findUserInAnyRoom(currentUser);
           if (!found || found.room !== muteRoom) break;
@@ -2548,7 +2701,7 @@ export class ChatServer {
 
         case "isInRoom": {
           let isInRoom = false;
-          const currentUser = ws.username || ws._username;
+          const currentUser = this._getUsernameFromWs(ws, null);
           if (currentUser) {
             const found = await this._findUserInAnyRoom(currentUser);
             if (found) {
@@ -2590,7 +2743,7 @@ export class ChatServer {
         case "modwarning": {
           const modRoom = args[0];
           if (modRoom && ROOMS_SET.has(modRoom)) {
-            const currentUser = ws.username || ws._username;
+            const currentUser = this._getUsernameFromWs(ws, null);
             if (!currentUser) break;
             const found = await this._findUserInAnyRoom(currentUser);
             if (!found || found.room !== modRoom) break;
@@ -2660,7 +2813,7 @@ export class ChatServer {
           ]);
         } catch(e) {
           if (!this._cacheInitialized) {
-            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1 };
+            this._storageCache = this._storageCache || { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
             this._cacheInitialized = true;
             this._restored = true;
             this._restoreDone = true;
@@ -2677,6 +2830,7 @@ export class ChatServer {
         if (upgrade !== "websocket") {
           return new Response(JSON.stringify({
             currentNumber: this.currentNumber,
+            currentMultyNumber: this.currentMultyNumber,
             alarmActive: !!(await this.ctx?.storage?.getAlarm().catch(() => null)),
             intervalMin: C.NUMBER_INTERVAL_MS / 60000
           }), {
@@ -2812,7 +2966,7 @@ export class ChatServer {
     }
     try { this.wsSet?.clear(); } catch (e) {}
     try { this.wsActiveMulti?.clear(); } catch (e) {}
-    this._storageCache = { roomsData: {}, currentNumber: 1 };
+    this._storageCache = { roomsData: {}, currentNumber: 1, currentMultyNumber: 1 };
     this._onlineUsersCache = null;
     this._onlineUsersCacheTime = 0;
     this._roomCountsCache = null;
