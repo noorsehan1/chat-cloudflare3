@@ -21,6 +21,7 @@ const C = {
   MAX_MULTY_NUMBER: 9999,
   MAX_HISTORY_LIMIT: 200,
   DEFAULT_HISTORY_LIMIT: 50,
+  HISTORY_MAX_AGE_MS: 3 * 60 * 60 * 1000, // 3 jam
 };
 
 const ROOMS = [
@@ -536,6 +537,41 @@ export class ChatServer {
       return result?.total || 0;
     } catch(e) {
       return 0;
+    }
+  }
+
+  // ✅ CEK + HAPUS TABEL kalau selisih timestamp chat pertama vs sekarang > 3 jam
+  // Dipanggil HANYA saat getChatHistory
+  async _checkAndResetHistory(room) {
+    try {
+      if (!this.db) return false;
+      const tableName = K_HISTORY_TABLE(room);
+
+      // 1. Timestamp chat PERTAMA (paling lama)
+      const row = await this.db.prepare(`
+        SELECT MIN(timestamp) AS first_ts FROM ${tableName}
+      `).first();
+
+      if (!row || !row.first_ts) return false;
+
+      // 2. Timestamp SEKARANG (saat getChatHistory dipanggil)
+      const nowTs = Date.now();
+      const age = nowTs - row.first_ts;
+
+      // 3. Kalau > 3 jam → DROP TABLE
+      if (age > C.HISTORY_MAX_AGE_MS) {
+        await this.db.prepare(`DROP TABLE IF EXISTS ${tableName}`).run();
+        this._historyTableReady.delete(tableName);
+        console.log(
+          `[HISTORY-RESET ${room}] age=${Math.floor(age/1000/60)}min → DROP TABLE`
+        );
+        return true;
+      }
+
+      return false;
+    } catch(e) {
+      console.log('[CHECK-HISTORY-ERR]', e?.message || e);
+      return false;
     }
   }
 
@@ -2709,6 +2745,15 @@ export class ChatServer {
 
             if (!room || !ROOMS_SET.has(room)) {
               this.safeSend(ws, ["error", "Invalid room"]);
+              break;
+            }
+
+            // ✅ CEK: timestamp chat pertama vs SEKARANG → kalau > 3 jam DROP TABLE
+            const reset = await this._checkAndResetHistory(room);
+
+            if (reset) {
+              this.safeSend(ws, ["chatHistory", room, [], "{}"]);
+              this.safeSend(ws, ["chatHistoryReset", room]);
               break;
             }
 
