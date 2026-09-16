@@ -200,10 +200,6 @@ export class ChatServer {
     }
   }
 
-  // =====================================================================
-  // ==================== MULTY STATE HELPERS ============================
-  // =====================================================================
-
   _getMultyState(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     let st = this._multyState.get(r);
@@ -359,10 +355,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // =====================================================================
-  // ==================== HISTORY CHAT PER ROOM ==========================
-  // =====================================================================
-
   async _ensureHistoryTable(room) {
     try {
       if (!this.db) return false;
@@ -497,10 +489,6 @@ export class ChatServer {
       return false;
     }
   }
-
-  // =====================================================================
-  // ==================== MULTY CHAT (PER ROOM) ==========================
-  // =====================================================================
 
   _randMultyDelay() {
     return Math.floor(Math.random() * (C.MULTY_MAX_MS - C.MULTY_MIN_MS + 1)) + C.MULTY_MIN_MS;
@@ -762,10 +750,6 @@ export class ChatServer {
       return false;
     }
   }
-
-  // =====================================================================
-  // ==================== STATE PERSISTENCE ==============================
-  // =====================================================================
 
   async _restoreWithRetry() {
     let attempts = 0;
@@ -1574,7 +1558,6 @@ export class ChatServer {
     }
   }
 
-  // ==================== _handleMultiJoin (DIUBAH) ====================
   async _handleMultiJoin(ws, multiUsername, multiRoomname) {
     try {
       if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
@@ -1628,21 +1611,21 @@ export class ChatServer {
         await this._updateSeatInRoom(multiRoomname, seat, newSeat);
       }
 
-      const muteStatus = roomBucket.mute || false;
-
-      this.safeSend(ws, ["rooMasuk", seat, multiRoomname]);
-      this.safeSend(ws, ["numberKursiSaya", seat]);
-      this.safeSend(ws, ["muteTypeResponse", muteStatus, multiRoomname]);
-      this.safeSend(ws, ["currentNumber", this.currentNumber]);
-
-      await this.updateRoomCount(multiRoomname);
+      try {
+        const st = this._getMultyState(multiRoomname);
+        if (!st.running && st.chatList.length > 0 && st.numberNext < st.chatList.length) {
+          st.running = true;
+          this._startMultyLoop(multiRoomname);
+          this.broadcast(multiRoomname, ["multyStatus", true, st.index, st.chatList.length, multiRoomname]);
+          this.broadcast(multiRoomname, ["multyNumber", st.numberNext, multiRoomname]);
+        }
+      } catch(e) {}
 
       return { room: multiRoomname, seat: seat };
     } catch(e) {
       return false;
     }
   }
-  // =====================================================================
 
   async _cleanupUserCompletely(ws, options = {}) {
     const result = { removedSeats: [] };
@@ -3130,19 +3113,24 @@ export class ChatServer {
           break;
         }
 
+        // ✅ UPDATE POINT — HANYA PAKAI INPUTAN USER, TANPA CEK SEAT
         case "updatePoint": {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
+
           if (!pointRoom || typeof pointSeat !== 'number') break;
           if (!ROOMS_SET.has(pointRoom)) break;
 
           const currentUser = ws.username || ws._username;
           if (!currentUser) break;
-          const seatData = await this._getSeatData(pointRoom, pointSeat);
-          if (!seatData || seatData.namauser !== currentUser) break;
 
-          const updated = await this._updatePointDirect(pointRoom, pointSeat, pointX, pointY, pointFast === 1);
+          const updated = await this._updatePointDirect(
+            pointRoom, pointSeat, pointX, pointY, pointFast === 1
+          );
+
           if (updated) {
-            this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
+            this.broadcast(pointRoom, [
+              "pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast
+            ]);
           }
           break;
         }
