@@ -368,7 +368,7 @@ export class ChatServer {
   // =====================================================================
   // ==================== HISTORY CHAT PER ROOM ==========================
   // KEY = TIMESTAMP SERVER
-  // VALUE = ARRAY BROADCAST ["chat", room, noimg, user, msg, color, textColor]
+  // VALUE = FORMAT JAVA [noimg, color, username, message, textColor, 0]
   // =====================================================================
 
   async _ensureHistoryTable(room) {
@@ -401,10 +401,26 @@ export class ChatServer {
 
       await this._ensureHistoryTable(room);
 
+      // ✅ KONVERSI KE FORMAT JAVA: [noimg, color, username, message, textColor, 0]
+      // Input dari client: ["chat", room, noimg, user, msg, color, textColor]
+      const noimg     = chatDataArray[2] ?? 1000;
+      const username  = chatDataArray[3] ?? "";
+      const message   = chatDataArray[4] ?? "";
+      const color     = chatDataArray[5] ?? "1";
+      const textColor = chatDataArray[6] ?? "1";
+
+      const javaFormat = [
+        Number(noimg) || 1000,       // index 0 = noimg
+        parseInt(color) || 1,         // index 1 = color
+        String(username),             // index 2 = username
+        String(message),              // index 3 = message
+        parseInt(textColor) || 1,     // index 4 = textColor
+        0                             // index 5 = 0 (minimal 6 elemen)
+      ];
+
       // ✅ KEY = TIMESTAMP SERVER
       let timestamp = Date.now();
 
-      // Anti-bentrok: kalau ada 2 chat di ms yang sama, tambah 1
       try {
         const tableName = K_HISTORY_TABLE(room);
         const existing = await this.db.prepare(
@@ -415,14 +431,14 @@ export class ChatServer {
 
       const tableName = K_HISTORY_TABLE(room);
 
-      // ✅ VALUE = ARRAY BROADCAST (JSON string)
+      // ✅ SIMPAN FORMAT JAVA
       await this.db.prepare(`
         INSERT OR REPLACE INTO ${tableName}
         (timestamp, chat_data)
         VALUES (?, ?)
       `).bind(
         timestamp,
-        JSON.stringify(chatDataArray)
+        JSON.stringify(javaFormat)
       ).run();
 
       return timestamp;
@@ -463,41 +479,15 @@ export class ChatServer {
       const result = await this.db.prepare(query).bind(...bindings).all();
       const rows = result?.results || [];
 
-      // Balik urutan: lama → baru
+      // ✅ Balik urutan: lama → baru
+      // ✅ chat_data SUDAH FORMAT JAVA: [noimg, color, username, message, textColor, 0]
       return rows.reverse().map(r => {
         let arr = null;
         try { arr = JSON.parse(r.chat_data); } catch(e) {}
 
-        // arr = ["chat", room, noimg, user, msg, color, textColor]
-        let noimg = 1000;
-        let username = "";
-        let message = "";
-        let color = 1;
-        let textColor = 1;
-
-        if (Array.isArray(arr)) {
-          noimg     = arr[2] ?? 1000;
-          username  = arr[3] ?? "";
-          message   = arr[4] ?? "";
-          color     = arr[5] ?? "1";
-          textColor = arr[6] ?? "1";
-        }
-
-        // ✅ FORMAT JAVA untuk parseChatRoomJson
-        // [noimg, color, username, message, textColor, 0]
-        const javaFormat = [
-          Number(noimg) || 1000,
-          parseInt(color) || 1,
-          String(username),
-          String(message),
-          parseInt(textColor) || 1,
-          0
-        ];
-
         return {
           timestamp: r.timestamp,
-          data: arr,              // ⬅️ format broadcast asli
-          java: javaFormat        // ⬅️ format Java (untuk parseChatRoomJson)
+          java: Array.isArray(arr) ? arr : [1000, 1, "", "", 1, 0]
         };
       });
     } catch(e) {
@@ -811,7 +801,7 @@ export class ChatServer {
         this.broadcast(r, chatData);
         this.broadcast(r, ["multyNumber", st.numberNext, r]);
 
-        // 💾 LANGSUNG SIMPAN ke history (tanpa cek sentCount)
+        // 💾 Simpan ke history (konversi ke format Java di dalam _saveHistoryChat)
         this._saveHistoryChat(r, chatData).catch(() => {});
       }
 
@@ -2766,8 +2756,8 @@ export class ChatServer {
             // ✅ CUKUP KIRIM: roomname + javaFormatJson
             this.safeSend(ws, [
               "chatHistory",
-              room,                          // ⬅️ roomname
-              JSON.stringify(javaJsonObject) // ⬅️ javaFormatJson
+              room,
+              JSON.stringify(javaJsonObject)
             ]);
           } catch(e) {
             this.safeSend(ws, ["error", "Gagal load history"]);
@@ -3250,13 +3240,13 @@ export class ChatServer {
           const wsRoom = ws.room || ws.roomname;
           if (wsRoom !== chatRoom) break;
 
-          // ✅ Array yang di-broadcast
+          // ✅ Array yang di-broadcast (inputan user)
           const chatData = ["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor];
 
           // Broadcast ke room
           this.broadcast(chatRoom, chatData);
 
-          // 💾 LANGSUNG SIMPAN ke history (tanpa cek sentCount)
+          // 💾 LANGSUNG SIMPAN ke history (konversi ke format Java di dalam _saveHistoryChat)
           this._saveHistoryChat(chatRoom, chatData).catch(() => {});
 
           break;
