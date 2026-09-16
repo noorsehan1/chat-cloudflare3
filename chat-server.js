@@ -17,11 +17,10 @@ const C = {
   MAX_RESTORE_ATTEMPTS: 2,
   RESTORE_RETRY_DELAY_MS: 1500,
   MULTY_MIN_MS: 10 * 1000,
-  MULTY_MAX_MS: 100 * 1000,
+  MULTY_MAX_MS: 30 * 1000,
   MAX_MULTY_NUMBER: 9999,
   MAX_HISTORY_LIMIT: 200,
   DEFAULT_HISTORY_LIMIT: 50,
-  HISTORY_RETENTION_MS: 30 * 24 * 60 * 60 * 1000, // 30 hari
 };
 
 const ROOMS = [
@@ -310,11 +309,6 @@ export class ChatServer {
       }
 
       await this._updateNumber();
-
-      // ✅ Cleanup history lama (> 30 hari)
-      try {
-        await this._cleanupOldHistory();
-      } catch(e) {}
     } catch(e) {
       this._handleError('alarm', e);
     } finally {
@@ -327,18 +321,6 @@ export class ChatServer {
         } catch(e) {}
       }
     }
-  }
-
-  async _cleanupOldHistory() {
-    try {
-      if (!this.db) return;
-      const cutoff = Date.now() - C.HISTORY_RETENTION_MS;
-      for (const room of ROOMS) {
-        try {
-          await this._clearHistoryChat(room, cutoff);
-        } catch(e) {}
-      }
-    } catch(e) {}
   }
 
   async _updateNumber() {
@@ -484,9 +466,37 @@ export class ChatServer {
       return rows.reverse().map(r => {
         let arr = null;
         try { arr = JSON.parse(r.chat_data); } catch(e) {}
+
+        // arr = ["chat", room, noimg, user, msg, color, textColor]
+        let noimg = 1000;
+        let username = "";
+        let message = "";
+        let color = 1;
+        let textColor = 1;
+
+        if (Array.isArray(arr)) {
+          noimg     = arr[2] ?? 1000;
+          username  = arr[3] ?? "";
+          message   = arr[4] ?? "";
+          color     = arr[5] ?? "1";
+          textColor = arr[6] ?? "1";
+        }
+
+        // ✅ FORMAT JAVA untuk parseChatRoomJson
+        // [noimg, color, username, message, textColor, 0]
+        const javaFormat = [
+          Number(noimg) || 1000,
+          parseInt(color) || 1,
+          String(username),
+          String(message),
+          parseInt(textColor) || 1,
+          0
+        ];
+
         return {
           timestamp: r.timestamp,
-          data: arr   // ⬅️ array broadcast asli
+          data: arr,              // ⬅️ format broadcast asli
+          java: javaFormat        // ⬅️ format Java (untuk parseChatRoomJson)
         };
       });
     } catch(e) {
@@ -2703,7 +2713,19 @@ export class ChatServer {
             }
 
             const history = await this._loadHistoryChat(room, limit, beforeTs);
-            this.safeSend(ws, ["chatHistory", room, history]);
+
+            // ✅ Bangun object JSON untuk Java (parseChatRoomJson)
+            const javaJsonObject = {};
+            for (const item of history) {
+              javaJsonObject[String(item.timestamp)] = item.java;
+            }
+
+            this.safeSend(ws, [
+              "chatHistory",
+              room,
+              history,                        // ⬅️ format broadcast
+              JSON.stringify(javaJsonObject)  // ⬅️ format Java
+            ]);
           } catch(e) {
             this.safeSend(ws, ["error", "Gagal load history"]);
           }
