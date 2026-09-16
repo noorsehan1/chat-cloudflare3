@@ -482,40 +482,6 @@ export class ChatServer {
     }
   }
 
-  async _clearHistoryChat(room, beforeTimestamp = null) {
-    try {
-      if (!this.db) return 0;
-      await this._ensureHistoryTable(room);
-      const tableName = K_HISTORY_TABLE(room);
-
-      let result;
-      if (beforeTimestamp) {
-        result = await this.db.prepare(`
-          DELETE FROM ${tableName} WHERE timestamp < ?
-        `).bind(beforeTimestamp).run();
-      } else {
-        result = await this.db.prepare(`DELETE FROM ${tableName}`).run();
-      }
-      return result?.meta?.changes || 0;
-    } catch(e) {
-      return 0;
-    }
-  }
-
-  async _countHistoryChat(room) {
-    try {
-      if (!this.db) return 0;
-      await this._ensureHistoryTable(room);
-      const tableName = K_HISTORY_TABLE(room);
-      const result = await this.db.prepare(
-        `SELECT COUNT(*) as total FROM ${tableName}`
-      ).first();
-      return result?.total || 0;
-    } catch(e) {
-      return 0;
-    }
-  }
-
   // ✅ CEK + HAPUS TABEL kalau selisih timestamp chat pertama vs sekarang > 3 jam
   // Dipanggil HANYA saat getChatHistory
   async _checkAndResetHistory(room) {
@@ -2724,7 +2690,8 @@ export class ChatServer {
             const reset = await this._checkAndResetHistory(room);
 
             if (reset) {
-              this.safeSend(ws, ["chatHistory", room, "{}"]);
+              // ✅ Reset (kosong) → isEmpty = true
+              this.safeSend(ws, ["chatHistory", room, "{}", true]);
               this.safeSend(ws, ["chatHistoryReset", room]);
               break;
             }
@@ -2738,53 +2705,18 @@ export class ChatServer {
               javaJsonObject[String(item.timestamp)] = item.java;
             }
 
-            // ✅ CUKUP KIRIM: roomname + javaFormatJson
+            // ✅ isEmpty = true kalau kosong
+            const isEmpty = history.length === 0;
+
+            // ✅ Kirim: roomname + javaFormatJson + isEmpty
             this.safeSend(ws, [
               "chatHistory",
               room,
-              JSON.stringify(javaJsonObject)
+              JSON.stringify(javaJsonObject),
+              isEmpty
             ]);
           } catch(e) {
             this.safeSend(ws, ["error", "Gagal load history"]);
-          }
-          break;
-        }
-
-        case "clearChatHistory": {
-          try {
-            const room = args[0];
-            const beforeTs = args[1] ? parseInt(args[1]) : null;
-
-            if (!room || !ROOMS_SET.has(room)) {
-              this.safeSend(ws, ["error", "Invalid room"]);
-              break;
-            }
-
-            const currentUser = ws.username || ws._username;
-            if (!currentUser) break;
-
-            const found = await this._findUserInAnyRoom(currentUser);
-            if (!found || found.room !== room) break;
-
-            const deleted = await this._clearHistoryChat(room, beforeTs);
-            this.safeSend(ws, ["chatHistoryCleared", room, deleted, beforeTs]);
-          } catch(e) {
-            this.safeSend(ws, ["error", "Gagal clear history"]);
-          }
-          break;
-        }
-
-        case "getChatHistoryCount": {
-          try {
-            const room = args[0];
-            if (!room || !ROOMS_SET.has(room)) {
-              this.safeSend(ws, ["error", "Invalid room"]);
-              break;
-            }
-            const total = await this._countHistoryChat(room);
-            this.safeSend(ws, ["chatHistoryCount", room, total]);
-          } catch(e) {
-            this.safeSend(ws, ["error", "Gagal hitung history"]);
           }
           break;
         }
