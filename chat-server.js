@@ -200,6 +200,10 @@ export class ChatServer {
     }
   }
 
+  // =====================================================================
+  // ==================== MULTY STATE HELPERS ============================
+  // =====================================================================
+
   _getMultyState(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     let st = this._multyState.get(r);
@@ -355,6 +359,10 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // =====================================================================
+  // ==================== HISTORY CHAT PER ROOM ==========================
+  // =====================================================================
+
   async _ensureHistoryTable(room) {
     try {
       if (!this.db) return false;
@@ -489,6 +497,10 @@ export class ChatServer {
       return false;
     }
   }
+
+  // =====================================================================
+  // ==================== MULTY CHAT (PER ROOM) ==========================
+  // =====================================================================
 
   _randMultyDelay() {
     return Math.floor(Math.random() * (C.MULTY_MAX_MS - C.MULTY_MIN_MS + 1)) + C.MULTY_MIN_MS;
@@ -750,6 +762,10 @@ export class ChatServer {
       return false;
     }
   }
+
+  // =====================================================================
+  // ==================== STATE PERSISTENCE ==============================
+  // =====================================================================
 
   async _restoreWithRetry() {
     let attempts = 0;
@@ -1412,9 +1428,6 @@ export class ChatServer {
     }
   }
 
-  // =====================================================================
-  // ==================== _joinInternal (USER NORMAL) ====================
-  // =====================================================================
   async _joinInternal(ws, roomName, username) {
     try {
       const existing = await this._findUserInAnyRoom(username);
@@ -1513,35 +1526,72 @@ export class ChatServer {
       this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
+      const st = this._getMultyState(roomName);
+
+      if (st.running) {
+        this.safeSend(ws, ["multyStatus", true, st.index, st.chatList.length, roomName]);
+        this.safeSend(ws, ["multyNumber", st.numberNext, roomName]);
+        this.safeSend(ws, ["multyRoom", roomName]);
+      }
+      else if (st.chatList.length > 0 && st.numberNext < st.chatList.length) {
+        st.running = true;
+        this._startMultyLoop(roomName);
+        this.broadcast(roomName, ["multyStatus", true, st.index, st.chatList.length, roomName]);
+        this.broadcast(roomName, ["multyNumber", st.numberNext, roomName]);
+        this.safeSend(ws, ["multyRoom", roomName]);
+      }
+      else if (st.chatList.length > 0) {
+        this.safeSend(ws, ["multyStatus", false, 0, st.chatList.length, roomName]);
+        this.safeSend(ws, ["multyNumber", st.numberNext, roomName]);
+      }
+
       await this.updateRoomCount(roomName);
+
+      try {
+        const att = ws.deserializeAttachment?.() || {};
+        att.pendingStateSend = Date.now();
+        att.pendingStateRoom = roomName;
+        att.pendingStateUsername = username;
+        ws.serializeAttachment(att);
+      } catch(e) {}
+
+      setTimeout(async () => {
+        try {
+          if (!ws || ws.readyState !== 1) return;
+          const att = ws.deserializeAttachment?.() || {};
+          if (!att.pendingStateSend) return;
+          att.pendingStateSend = null;
+          att.pendingStateRoom = null;
+          att.pendingStateUsername = null;
+          try { ws.serializeAttachment(att); } catch(e) {}
+          await this.sendAllStateTo(ws, roomName, true);
+        } catch(e) {}
+      }, 1000);
 
       return true;
     } catch(e) {
       return false;
     }
   }
-  // =====================================================================
 
-  // =====================================================================
-  // ==================== _handleMultiJoin (MULTI) =======================
-  // =====================================================================
-  async _handleMultiJoin(ws, multiUsername, roomName) {
+  // ==================== _handleMultiJoin (DIUBAH) ====================
+  async _handleMultiJoin(ws, multiUsername, multiRoomname) {
     try {
-      if (!multiUsername || !roomName || !ROOMS_SET.has(roomName)) return false;
+      if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
       await this._ensureCacheInitialized();
 
       const existing = await this._findUserInAnyRoom(multiUsername);
-      if (existing && existing.room !== roomName) {
+      if (existing && existing.room !== multiRoomname) {
         await this._deleteSeatInRoom(existing.room, existing.seat, true);
         this._removeUserIndex(multiUsername);
         this._cleanupMultiTracking(multiUsername, existing.room, ws);
       }
 
-      let roomBucket = this._storageCache?.roomsData?.[roomName];
+      let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
         roomBucket = { seat: {}, point: {}, mute: false };
         if (!this._storageCache) this._storageCache = { roomsData: {}, currentNumber: 1 };
-        this._storageCache.roomsData[roomName] = roomBucket;
+        this._storageCache.roomsData[multiRoomname] = roomBucket;
       }
       if (!roomBucket.seat) roomBucket.seat = {};
 
@@ -1575,19 +1625,19 @@ export class ChatServer {
           viptanda: 0,
           isMulti: true
         };
-        await this._updateSeatInRoom(roomName, seat, newSeat);
+        await this._updateSeatInRoom(multiRoomname, seat, newSeat);
       }
 
       const muteStatus = roomBucket.mute || false;
 
-      this.safeSend(ws, ["rooMasuk", seat, roomName]);
+      this.safeSend(ws, ["rooMasuk", seat, multiRoomname]);
       this.safeSend(ws, ["numberKursiSaya", seat]);
-      this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
+      this.safeSend(ws, ["muteTypeResponse", muteStatus, multiRoomname]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
-      await this.updateRoomCount(roomName);
+      await this.updateRoomCount(multiRoomname);
 
-      return { room: roomName, seat: seat };
+      return { room: multiRoomname, seat: seat };
     } catch(e) {
       return false;
     }
