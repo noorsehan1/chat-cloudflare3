@@ -37,6 +37,7 @@ const DEFAULT_MULTY_ROOM = "Gacor";
 
 const K_CHAT   = (room) => `chat_multy_${room}`;
 const K_NUMBER = (room) => `number_${room}`;
+const K_INDEX  = (room) => `index_${room}`;
 const K_HISTORY_TABLE = (room) => `chat_history_${String(room).replace(/[^a-zA-Z0-9_]/g, '_')}`;
 
 const _wsCleanupState = new WeakMap();
@@ -83,6 +84,7 @@ export class ChatServer {
       this._numberUpdateStart = null;
 
       this._multyState = new Map();
+      this._multyRestored = false;
 
       this._historyTableReady = new Set();
 
@@ -193,6 +195,7 @@ export class ChatServer {
       this._roomCountsCache = null;
       this._roomCountsCacheTime = 0;
       this._multyState = new Map();
+      this._multyRestored = false;
       this._historyTableReady = new Set();
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
@@ -494,13 +497,146 @@ export class ChatServer {
     return Math.floor(Math.random() * (C.MULTY_MAX_MS - C.MULTY_MIN_MS + 1)) + C.MULTY_MIN_MS;
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // MULTY PARSER & LOADER
+  // ═══════════════════════════════════════════════════════════
+
+  _parseMultyRow(chatRaw, numberRaw, indexRaw) {
+    let chatList = [];
+
+    if (chatRaw) {
+      try {
+        let arr = JSON.parse(chatRaw);
+
+        if (Array.isArray(arr) && arr.length > 0 && Array.isArray(arr[0])) {
+          const flat = [];
+          for (const sub of arr) {
+            if (Array.isArray(sub)) {
+              for (const item of sub) {
+                if (item && typeof item === 'object') flat.push(item);
+              }
+            } else if (sub && typeof sub === 'object') {
+              flat.push(sub);
+            }
+          }
+          arr = flat;
+        }
+
+        if (Array.isArray(arr)) {
+          for (const item of arr) {
+            if (!item || typeof item !== 'object') continue;
+            if (!item.sender || !item.text) continue;
+            chatList.push({
+              noimg: item.noimg ?? 1000,
+              sender: String(item.sender),
+              text: String(item.text),
+              color: item.color ? String(item.color) : "7",
+              textColor: item.textColor ? String(item.textColor) : "1"
+            });
+          }
+        }
+      } catch(e) {}
+    }
+
+    let numberNext = 1;
+    if (numberRaw) {
+      const n = parseInt(numberRaw);
+      if (!isNaN(n) && n >= 1) numberNext = n;
+    }
+
+    let index = 0;
+    if (indexRaw) {
+      const i = parseInt(indexRaw);
+      if (!isNaN(i) && i >= 0) index = i;
+    }
+
+    return { chatList, numberNext, index };
+  }
+
+  async _loadAllMultyFromTable() {
+    try {
+      if (!this.db) return new Map();
+
+      const result = await this.db
+        .prepare(`SELECT key, value FROM ${TABLE_MULTY}`)
+        .all();
+
+      const rows = result?.results || [];
+
+      const bucket = new Map();
+      for (const room of ROOMS) {
+        bucket.set(room, { chatRaw: null, numberRaw: null, indexRaw: null });
+      }
+
+      let legacyChatRaw = null;
+      let legacyNumberRaw = null;
+
+      for (const row of rows) {
+        const key = row?.key;
+        const value = row?.value;
+        if (!key || value === undefined || value === null) continue;
+
+        if (key === 'chat_multy') { legacyChatRaw = value; continue; }
+        if (key === 'number') { legacyNumberRaw = value; continue; }
+
+        if (key.startsWith('chat_multy_')) {
+          const room = key.slice('chat_multy_'.length);
+          if (bucket.has(room)) bucket.get(room).chatRaw = value;
+          continue;
+        }
+
+        if (key.startsWith('number_')) {
+          const room = key.slice('number_'.length);
+          if (bucket.has(room)) bucket.get(room).numberRaw = value;
+          continue;
+        }
+
+        if (key.startsWith('index_')) {
+          const room = key.slice('index_'.length);
+          if (bucket.has(room)) bucket.get(room).indexRaw = value;
+          continue;
+        }
+      }
+
+      const defBucket = bucket.get(DEFAULT_MULTY_ROOM);
+      if (defBucket) {
+        if (!defBucket.chatRaw && legacyChatRaw) {
+          defBucket.chatRaw = legacyChatRaw;
+          this.db.prepare(`
+            INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+          `).bind(K_CHAT(DEFAULT_MULTY_ROOM), legacyChatRaw).run().catch(() => {});
+        }
+        if (!defBucket.numberRaw && legacyNumberRaw) {
+          defBucket.numberRaw = legacyNumberRaw;
+          this.db.prepare(`
+            INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+          `).bind(K_NUMBER(DEFAULT_MULTY_ROOM), legacyNumberRaw).run().catch(() => {});
+        }
+      }
+
+      const out = new Map();
+      for (const [room, raw] of bucket) {
+        const parsed = this._parseMultyRow(raw.chatRaw, raw.numberRaw, raw.indexRaw);
+        if (parsed.chatList.length > 0) out.set(room, parsed);
+      }
+
+      return out;
+    } catch(e) {
+      console.log('[LOAD-ALL-MULTY-ERR]', e?.message || e);
+      return new Map();
+    }
+  }
+
   async _loadMultyFromTable(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     try {
-      if (!this.db) return { chatList: [], numberNext: 1 };
+      if (!this.db) return { chatList: [], numberNext: 1, index: 0 };
 
       let rowChat = null;
       let rowNum = null;
+      let rowIdx = null;
 
       try {
         rowChat = await this.db
@@ -513,6 +649,13 @@ export class ChatServer {
         rowNum = await this.db
           .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = ?`)
           .bind(K_NUMBER(r))
+          .first();
+      } catch(e) {}
+
+      try {
+        rowIdx = await this.db
+          .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = ?`)
+          .bind(K_INDEX(r))
           .first();
       } catch(e) {}
 
@@ -546,50 +689,13 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      let chatList = [];
-      if (rowChat && rowChat.value) {
-        try {
-          let arr = JSON.parse(rowChat.value);
-
-          if (Array.isArray(arr) && arr.length > 0 && Array.isArray(arr[0])) {
-            const flat = [];
-            for (const sub of arr) {
-              if (Array.isArray(sub)) {
-                for (const item of sub) {
-                  if (item && typeof item === 'object') flat.push(item);
-                }
-              } else if (sub && typeof sub === 'object') {
-                flat.push(sub);
-              }
-            }
-            arr = flat;
-          }
-
-          if (Array.isArray(arr)) {
-            for (const item of arr) {
-              if (!item || typeof item !== 'object') continue;
-              if (!item.sender || !item.text) continue;
-              chatList.push({
-                noimg: item.noimg ?? 1000,
-                sender: String(item.sender),
-                text: String(item.text),
-                color: item.color ? String(item.color) : "7",
-                textColor: item.textColor ? String(item.textColor) : "1"
-              });
-            }
-          }
-        } catch(e) {}
-      }
-
-      let numberNext = 1;
-      if (rowNum && rowNum.value) {
-        const n = parseInt(rowNum.value);
-        if (!isNaN(n) && n >= 1) numberNext = n;
-      }
-
-      return { chatList, numberNext };
+      return this._parseMultyRow(
+        rowChat?.value ?? null,
+        rowNum?.value ?? null,
+        rowIdx?.value ?? null
+      );
     } catch(e) {
-      return { chatList: [], numberNext: 1 };
+      return { chatList: [], numberNext: 1, index: 0 };
     }
   }
 
@@ -622,6 +728,25 @@ export class ChatServer {
       return false;
     }
   }
+
+  async _saveMultyIndexToTable(room, indexNext) {
+    const r = room || DEFAULT_MULTY_ROOM;
+    try {
+      if (!this.db) return false;
+      await this.db.prepare(`
+        INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+      `).bind(K_INDEX(r), String(indexNext)).run();
+      return true;
+    } catch(e) {
+      console.log('[SAVE-INDEX-ERR]', e?.message || e);
+      return false;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // MULTY LOOP
+  // ═══════════════════════════════════════════════════════════
 
   _startMultyLoop(room) {
     const r = room || DEFAULT_MULTY_ROOM;
@@ -698,12 +823,14 @@ export class ChatServer {
         st.index = 0;
         this._stopMultyLoop(r);
         this.broadcast(r, ["multyStop", r]);
+        this._saveMultyIndexToTable(r, 0).catch(() => {});
         return false;
       }
 
       const chat = st.chatList[st.index];
       if (!chat || typeof chat !== 'object') {
         st.index++;
+        this._saveMultyIndexToTable(r, st.index).catch(() => {});
         return st.running;
       }
 
@@ -725,23 +852,28 @@ export class ChatServer {
       try {
         if (this.db) {
           const num = st.numberNext;
-          this.db.prepare(`
+          await this.db.prepare(`
             INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
-          `).bind(K_NUMBER(r), String(num)).run().catch(() => {});
+          `).bind(K_NUMBER(r), String(num)).run();
         }
       } catch(e) {}
 
       st.numberNext++;
       if (st.numberNext > C.MAX_MULTY_NUMBER) st.numberNext = 1;
 
+      this._saveMultyNumberToTable(r, st.numberNext).catch(() => {});
+
       st.index++;
+
+      this._saveMultyIndexToTable(r, st.index).catch(() => {});
 
       if (st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
         this._stopMultyLoop(r);
         this.broadcast(r, ["multyStop", r]);
+        this._saveMultyIndexToTable(r, 0).catch(() => {});
         return false;
       }
 
@@ -750,6 +882,10 @@ export class ChatServer {
       return false;
     }
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // RESTORE
+  // ═══════════════════════════════════════════════════════════
 
   async _restoreWithRetry() {
     let attempts = 0;
@@ -1517,7 +1653,7 @@ export class ChatServer {
         this.safeSend(ws, ["multyNumber", st.numberNext, roomName]);
         this.safeSend(ws, ["multyRoom", roomName]);
       }
-      else if (st.chatList.length > 0 && st.numberNext < st.chatList.length) {
+      else if (st.chatList.length > 0 && st.index < st.chatList.length) {
         st.running = true;
         this._startMultyLoop(roomName);
         this.broadcast(roomName, ["multyStatus", true, st.index, st.chatList.length, roomName]);
@@ -1613,7 +1749,7 @@ export class ChatServer {
 
       try {
         const st = this._getMultyState(multiRoomname);
-        if (!st.running && st.chatList.length > 0 && st.numberNext < st.chatList.length) {
+        if (!st.running && st.chatList.length > 0 && st.index < st.chatList.length) {
           st.running = true;
           this._startMultyLoop(multiRoomname);
           this.broadcast(multiRoomname, ["multyStatus", true, st.index, st.chatList.length, multiRoomname]);
@@ -2247,12 +2383,48 @@ export class ChatServer {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // RESTORE ALL STATE — MULTY DULUAN (STEP 1)
+  // ═══════════════════════════════════════════════════════════
+
   async _restoreAllState() {
     try {
       this._isRestoring = true;
       this._restoreRemovedSeats = [];
       this._hasBroadcastRemoveKursi = new Set();
 
+      // ═══════════════════════════════════════════════════════
+      // STEP 1: LOAD chat_multy DULUAN (1 query)
+      // ═══════════════════════════════════════════════════════
+      try {
+        const allMulty = await this._loadAllMultyFromTable();
+
+        for (const room of ROOMS) {
+          const data = allMulty.get(room);
+          if (!data) continue;
+
+          const { chatList, numberNext, index } = data;
+          const st = this._getMultyState(room);
+
+          st.chatList = chatList;
+          st.numberNext = numberNext;
+          st.index = (typeof index === 'number' && index >= 0 && index < chatList.length)
+                      ? index
+                      : 0;
+          st.running = false;
+
+          console.log(`[MULTY-RESTORE ${room}] ${chatList.length} chats, number=${numberNext}, index=${st.index}`);
+        }
+
+        this._multyRestored = true;
+      } catch(e) {
+        console.log('[MULTY-RESTORE-ERR]', e?.message || e);
+        this._multyRestored = false;
+      }
+
+      // ═══════════════════════════════════════════════════════
+      // STEP 2: Load state utama (seat/point/mute)
+      // ═══════════════════════════════════════════════════════
       try {
         await this._loadFromStorage();
         await this._ensureCacheInitialized();
@@ -2264,6 +2436,9 @@ export class ChatServer {
         }
       }
 
+      // ═══════════════════════════════════════════════════════
+      // STEP 3: Restore WebSocket
+      // ═══════════════════════════════════════════════════════
       try {
         const webSockets = this.ctx?.getWebSockets?.() || [];
 
@@ -2351,22 +2526,9 @@ export class ChatServer {
 
       this._rebuildUserIndex();
 
-      try {
-        for (const room of ROOMS) {
-          try {
-            const { chatList, numberNext } = await this._loadMultyFromTable(room);
-            const st = this._getMultyState(room);
-            if (Array.isArray(chatList) && chatList.length > 0) {
-              st.chatList = chatList;
-              st.numberNext = numberNext;
-              st.index = 0;
-              st.running = false;
-              console.log(`[AUTO-LOAD ${room}] ${chatList.length} chats, number=${numberNext}`);
-            }
-          } catch(e) {}
-        }
-      } catch(e) {}
-
+      // ═══════════════════════════════════════════════════════
+      // STEP 4: Ensure alarm
+      // ═══════════════════════════════════════════════════════
       if (!this.closing && !this.isDestroyed) {
         try {
           if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
@@ -2694,7 +2856,7 @@ export class ChatServer {
               break;
             }
 
-            const { chatList, numberNext } = await this._loadMultyFromTable(startRoom);
+            const { chatList, numberNext, index } = await this._loadMultyFromTable(startRoom);
             if (!Array.isArray(chatList) || chatList.length === 0) {
               this.safeSend(ws, ["error", `Multy chat kosong untuk room ${startRoom}`]);
               break;
@@ -2702,10 +2864,12 @@ export class ChatServer {
 
             st.chatList = chatList;
             st.numberNext = numberNext;
-            st.index = 0;
+            st.index = (typeof index === 'number' && index >= 0 && index < chatList.length)
+                        ? index
+                        : 0;
             st.running = true;
 
-            this.safeSend(ws, ["multyStatus", true, 0, chatList.length, startRoom]);
+            this.safeSend(ws, ["multyStatus", true, st.index, chatList.length, startRoom]);
             this.safeSend(ws, ["multyNumber", st.numberNext, startRoom]);
             this.safeSend(ws, ["multyRoom", startRoom]);
 
@@ -2728,6 +2892,7 @@ export class ChatServer {
             st.running = false;
             st.index = 0;
             this._stopMultyLoop(stopRoom);
+            this._saveMultyIndexToTable(stopRoom, 0).catch(() => {});
 
             this.broadcast(stopRoom, ["multyStop", stopRoom]);
             this.safeSend(ws, ["multyStatus", false, 0, st.chatList.length, stopRoom]);
@@ -2817,7 +2982,9 @@ export class ChatServer {
 
             const st = this._getMultyState(room);
             st.chatList = valid;
+            st.index = 0;
             if (st.running) st.index = 0;
+            this._saveMultyIndexToTable(room, 0).catch(() => {});
 
             this.safeSend(ws, ["multyChatReloaded", valid.length, room]);
             this.broadcast(room, ["multyDataUpdated", room, valid.length, st.numberNext]);
@@ -2904,7 +3071,8 @@ export class ChatServer {
                 if (ok) {
                   const st = this._getMultyState(room);
                   st.chatList = valid;
-                  if (st.running) st.index = 0;
+                  st.index = 0;
+                  this._saveMultyIndexToTable(room, 0).catch(() => {});
                   results.chat = valid.length;
                 }
               }
@@ -3113,7 +3281,6 @@ export class ChatServer {
           break;
         }
 
-        // ✅ UPDATE POINT — HANYA PAKAI INPUTAN USER, TANPA CEK SEAT
         case "updatePoint": {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
 
@@ -3494,6 +3661,7 @@ export class ChatServer {
             intervalMin: C.NUMBER_INTERVAL_MS / 60000,
             multyRooms: multyStatus,
             runningRooms: runningRooms,
+            multyRestored: this._multyRestored,
             historyTables: Array.from(this._historyTableReady),
           }), {
             status: 200,
@@ -3640,6 +3808,7 @@ export class ChatServer {
     this._userIndex = new Map();
 
     this._multyState = new Map();
+    this._multyRestored = false;
     this._historyTableReady = new Set();
 
     this.isDestroyed = true;
