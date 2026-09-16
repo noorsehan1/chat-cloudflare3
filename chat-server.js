@@ -522,7 +522,7 @@ export class ChatServer {
           const clients = this.roomClients?.get(r);
           if (!clients || clients.size === 0) {
             st.running = false;
-            st.index = 0;
+            // ❌ JANGAN reset index — biar bisa resume
             this._stopMultyLoop(r);
             return;
           }
@@ -1382,11 +1382,29 @@ export class ChatServer {
       this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
       this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
+      // ==================== MULTY STATUS SAAT JOIN (PER ROOM) ====================
       const st = this._getMultyState(roomName);
-      if (st.running || st.chatList.length > 0) {
-        this.safeSend(ws, ["multyStatus", st.running, st.index, st.chatList.length, roomName]);
+
+      if (st.running) {
+        // Room ini sudah running → JANGAN resume lagi
+        this.safeSend(ws, ["multyStatus", true, st.index, st.chatList.length, roomName]);
+        this.safeSend(ws, ["multyNumber", st.numberNext, roomName]);
+        this.safeSend(ws, ["multyRoom", roomName]);
+      }
+      else if (st.chatList.length > 0 && st.numberNext < st.chatList.length) {
+        // Room ini belum habis → lanjutkan dari numberNext
+        st.running = true;
+        this._startMultyLoop(roomName);
+        this.broadcast(roomName, ["multyStatus", true, st.index, st.chatList.length, roomName]);
+        this.broadcast(roomName, ["multyNumber", st.numberNext, roomName]);
+        this.safeSend(ws, ["multyRoom", roomName]);
+      }
+      else if (st.chatList.length > 0) {
+        // Room ini sudah habis → JANGAN sambung
+        this.safeSend(ws, ["multyStatus", false, 0, st.chatList.length, roomName]);
         this.safeSend(ws, ["multyNumber", st.numberNext, roomName]);
       }
+      // ===========================================================================
 
       await this.updateRoomCount(roomName);
 
@@ -1469,6 +1487,18 @@ export class ChatServer {
         };
         await this._updateSeatInRoom(multiRoomname, seat, newSeat);
       }
+
+      // Auto-resume multy kalau perlu (per room)
+      try {
+        const st = this._getMultyState(multiRoomname);
+        if (!st.running && st.chatList.length > 0 && st.numberNext < st.chatList.length) {
+          st.running = true;
+          this._startMultyLoop(multiRoomname);
+          this.broadcast(multiRoomname, ["multyStatus", true, st.index, st.chatList.length, multiRoomname]);
+          this.broadcast(multiRoomname, ["multyNumber", st.numberNext, multiRoomname]);
+        }
+      } catch(e) {}
+
       return { room: multiRoomname, seat: seat };
     } catch(e) {
       return false;
@@ -2208,6 +2238,8 @@ export class ChatServer {
             if (Array.isArray(chatList) && chatList.length > 0) {
               st.chatList = chatList;
               st.numberNext = numberNext;
+              st.index = 0;
+              st.running = false;
               console.log(`[AUTO-LOAD ${room}] ${chatList.length} chats, number=${numberNext}`);
             }
           } catch(e) {}
