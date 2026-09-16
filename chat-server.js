@@ -19,6 +19,9 @@ const C = {
   MULTY_MIN_MS: 10 * 1000,
   MULTY_MAX_MS: 30 * 1000,
   MAX_MULTY_NUMBER: 9999,
+  MAX_HISTORY_LIMIT: 200,
+  DEFAULT_HISTORY_LIMIT: 50,
+  HISTORY_RETENTION_MS: 30 * 24 * 60 * 60 * 1000, // 30 hari
 };
 
 const ROOMS = [
@@ -36,6 +39,7 @@ const DEFAULT_MULTY_ROOM = "Gacor";
 // ✅ Key helper per room
 const K_CHAT   = (room) => `chat_multy_${room}`;
 const K_NUMBER = (room) => `number_${room}`;
+const K_HISTORY_TABLE = (room) => `chat_history_${String(room).replace(/[^a-zA-Z0-9_]/g, '_')}`;
 
 const _wsCleanupState = new WeakMap();
 
@@ -82,6 +86,10 @@ export class ChatServer {
 
       // ==================== MULTY STATE PER ROOM ====================
       this._multyState = new Map();
+      // ==============================================================
+
+      // ==================== HISTORY TABLE CACHE =====================
+      this._historyTableReady = new Set();
       // ==============================================================
 
       this._requestCount = 0;
@@ -191,6 +199,7 @@ export class ChatServer {
       this._roomCountsCache = null;
       this._roomCountsCacheTime = 0;
       this._multyState = new Map();
+      this._historyTableReady = new Set();
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
       }
@@ -301,6 +310,11 @@ export class ChatServer {
       }
 
       await this._updateNumber();
+
+      // ✅ Cleanup history lama (> 30 hari)
+      try {
+        await this._cleanupOldHistory();
+      } catch(e) {}
     } catch(e) {
       this._handleError('alarm', e);
     } finally {
@@ -313,6 +327,18 @@ export class ChatServer {
         } catch(e) {}
       }
     }
+  }
+
+  async _cleanupOldHistory() {
+    try {
+      if (!this.db) return;
+      const cutoff = Date.now() - C.HISTORY_RETENTION_MS;
+      for (const room of ROOMS) {
+        try {
+          await this._clearHistoryChat(room, cutoff);
+        } catch(e) {}
+      }
+    } catch(e) {}
   }
 
   async _updateNumber() {
@@ -354,6 +380,153 @@ export class ChatServer {
         this._numberUpdateStart = null;
       }
     } catch(e) {}
+  }
+
+  // =====================================================================
+  // ==================== HISTORY CHAT PER ROOM ==========================
+  // KEY = TIMESTAMP SERVER
+  // VALUE = ARRAY BROADCAST ["chat", room, noimg, user, msg, color, textColor]
+  // =====================================================================
+
+  async _ensureHistoryTable(room) {
+    try {
+      if (!this.db) return false;
+      const tableName = K_HISTORY_TABLE(room);
+
+      if (this._historyTableReady.has(tableName)) return true;
+
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS ${tableName} (
+          timestamp INTEGER PRIMARY KEY,
+          chat_data TEXT NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+
+      this._historyTableReady.add(tableName);
+      return true;
+    } catch(e) {
+      console.log('[ENSURE-HISTORY-ERR]', e?.message || e);
+      return false;
+    }
+  }
+
+  async _saveHistoryChat(room, chatDataArray) {
+    try {
+      if (!this.db) return false;
+      if (!room || !Array.isArray(chatDataArray)) return false;
+
+      await this._ensureHistoryTable(room);
+
+      // ✅ KEY = TIMESTAMP SERVER
+      let timestamp = Date.now();
+
+      // Anti-bentrok: kalau ada 2 chat di ms yang sama, tambah 1
+      try {
+        const tableName = K_HISTORY_TABLE(room);
+        const existing = await this.db.prepare(
+          `SELECT timestamp FROM ${tableName} WHERE timestamp = ? LIMIT 1`
+        ).bind(timestamp).first();
+        if (existing) timestamp = timestamp + 1;
+      } catch(e) {}
+
+      const tableName = K_HISTORY_TABLE(room);
+
+      // ✅ VALUE = ARRAY BROADCAST (JSON string)
+      await this.db.prepare(`
+        INSERT OR REPLACE INTO ${tableName}
+        (timestamp, chat_data)
+        VALUES (?, ?)
+      `).bind(
+        timestamp,
+        JSON.stringify(chatDataArray)
+      ).run();
+
+      return timestamp;
+    } catch(e) {
+      console.log('[SAVE-HISTORY-ERR]', e?.message || e);
+      return false;
+    }
+  }
+
+  async _loadHistoryChat(room, limit = C.DEFAULT_HISTORY_LIMIT, beforeTimestamp = null) {
+    try {
+      if (!this.db) return [];
+      await this._ensureHistoryTable(room);
+
+      const safeLimit = Math.min(Math.max(parseInt(limit) || C.DEFAULT_HISTORY_LIMIT, 1), C.MAX_HISTORY_LIMIT);
+      const tableName = K_HISTORY_TABLE(room);
+
+      let query, bindings;
+      if (beforeTimestamp) {
+        query = `
+          SELECT timestamp, chat_data
+          FROM ${tableName}
+          WHERE timestamp < ?
+          ORDER BY timestamp DESC
+          LIMIT ?
+        `;
+        bindings = [beforeTimestamp, safeLimit];
+      } else {
+        query = `
+          SELECT timestamp, chat_data
+          FROM ${tableName}
+          ORDER BY timestamp DESC
+          LIMIT ?
+        `;
+        bindings = [safeLimit];
+      }
+
+      const result = await this.db.prepare(query).bind(...bindings).all();
+      const rows = result?.results || [];
+
+      // Balik urutan: lama → baru
+      return rows.reverse().map(r => {
+        let arr = null;
+        try { arr = JSON.parse(r.chat_data); } catch(e) {}
+        return {
+          timestamp: r.timestamp,
+          data: arr   // ⬅️ array broadcast asli
+        };
+      });
+    } catch(e) {
+      console.log('[LOAD-HISTORY-ERR]', e?.message || e);
+      return [];
+    }
+  }
+
+  async _clearHistoryChat(room, beforeTimestamp = null) {
+    try {
+      if (!this.db) return 0;
+      await this._ensureHistoryTable(room);
+      const tableName = K_HISTORY_TABLE(room);
+
+      let result;
+      if (beforeTimestamp) {
+        result = await this.db.prepare(`
+          DELETE FROM ${tableName} WHERE timestamp < ?
+        `).bind(beforeTimestamp).run();
+      } else {
+        result = await this.db.prepare(`DELETE FROM ${tableName}`).run();
+      }
+      return result?.meta?.changes || 0;
+    } catch(e) {
+      return 0;
+    }
+  }
+
+  async _countHistoryChat(room) {
+    try {
+      if (!this.db) return 0;
+      await this._ensureHistoryTable(room);
+      const tableName = K_HISTORY_TABLE(room);
+      const result = await this.db.prepare(
+        `SELECT COUNT(*) as total FROM ${tableName}`
+      ).first();
+      return result?.total || 0;
+    } catch(e) {
+      return 0;
+    }
   }
 
   // =====================================================================
@@ -586,8 +759,16 @@ export class ChatServer {
       const chatTextColor = chat.textColor || "1";
 
       if (chatMsg) {
-        this.broadcast(r, ["chat", r, chatNoimg, username, chatMsg, chatColor, chatTextColor]);
+        // ✅ Array yang di-broadcast
+        const chatData = ["chat", r, chatNoimg, username, chatMsg, chatColor, chatTextColor];
+
+        const sentCount = this.broadcast(r, chatData);
         this.broadcast(r, ["multyNumber", st.numberNext, r]);
+
+        // 💾 Simpan array broadcast ke history (kalau terkirim)
+        if (sentCount > 0) {
+          this._saveHistoryChat(r, chatData).catch(() => {});
+        }
       }
 
       try {
@@ -1386,13 +1567,11 @@ export class ChatServer {
       const st = this._getMultyState(roomName);
 
       if (st.running) {
-        // Room ini sudah running → JANGAN resume lagi
         this.safeSend(ws, ["multyStatus", true, st.index, st.chatList.length, roomName]);
         this.safeSend(ws, ["multyNumber", st.numberNext, roomName]);
         this.safeSend(ws, ["multyRoom", roomName]);
       }
       else if (st.chatList.length > 0 && st.numberNext < st.chatList.length) {
-        // Room ini belum habis → lanjutkan dari numberNext
         st.running = true;
         this._startMultyLoop(roomName);
         this.broadcast(roomName, ["multyStatus", true, st.index, st.chatList.length, roomName]);
@@ -1400,7 +1579,6 @@ export class ChatServer {
         this.safeSend(ws, ["multyRoom", roomName]);
       }
       else if (st.chatList.length > 0) {
-        // Room ini sudah habis → JANGAN sambung
         this.safeSend(ws, ["multyStatus", false, 0, st.chatList.length, roomName]);
         this.safeSend(ws, ["multyNumber", st.numberNext, roomName]);
       }
@@ -2512,6 +2690,66 @@ export class ChatServer {
           }
           break;
 
+        // ==================== HISTORY CHAT EVENTS ====================
+        case "getChatHistory": {
+          try {
+            const room = args[0];
+            const limit = args[1];
+            const beforeTs = args[2] ? parseInt(args[2]) : null;
+
+            if (!room || !ROOMS_SET.has(room)) {
+              this.safeSend(ws, ["error", "Invalid room"]);
+              break;
+            }
+
+            const history = await this._loadHistoryChat(room, limit, beforeTs);
+            this.safeSend(ws, ["chatHistory", room, history]);
+          } catch(e) {
+            this.safeSend(ws, ["error", "Gagal load history"]);
+          }
+          break;
+        }
+
+        case "clearChatHistory": {
+          try {
+            const room = args[0];
+            const beforeTs = args[1] ? parseInt(args[1]) : null;
+
+            if (!room || !ROOMS_SET.has(room)) {
+              this.safeSend(ws, ["error", "Invalid room"]);
+              break;
+            }
+
+            const currentUser = ws.username || ws._username;
+            if (!currentUser) break;
+
+            const found = await this._findUserInAnyRoom(currentUser);
+            if (!found || found.room !== room) break;
+
+            const deleted = await this._clearHistoryChat(room, beforeTs);
+            this.safeSend(ws, ["chatHistoryCleared", room, deleted, beforeTs]);
+          } catch(e) {
+            this.safeSend(ws, ["error", "Gagal clear history"]);
+          }
+          break;
+        }
+
+        case "getChatHistoryCount": {
+          try {
+            const room = args[0];
+            if (!room || !ROOMS_SET.has(room)) {
+              this.safeSend(ws, ["error", "Invalid room"]);
+              break;
+            }
+            const total = await this._countHistoryChat(room);
+            this.safeSend(ws, ["chatHistoryCount", room, total]);
+          } catch(e) {
+            this.safeSend(ws, ["error", "Gagal hitung history"]);
+          }
+          break;
+        }
+        // ==============================================================
+
         case "setIdTarget2":
           await this._handleSetId(ws, args[0], args[1]);
           break;
@@ -2946,7 +3184,18 @@ export class ChatServer {
           if (!found || found.room !== chatRoom) break;
           const wsRoom = ws.room || ws.roomname;
           if (wsRoom !== chatRoom) break;
-          this.broadcast(chatRoom, ["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor]);
+
+          // ✅ Array yang di-broadcast
+          const chatData = ["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor];
+
+          // Broadcast ke room
+          const sentCount = this.broadcast(chatRoom, chatData);
+
+          // 💾 Simpan array broadcast ke history (kalau terkirim)
+          if (sentCount > 0) {
+            this._saveHistoryChat(chatRoom, chatData).catch(() => {});
+          }
+
           break;
         }
 
@@ -3326,6 +3575,7 @@ export class ChatServer {
             intervalMin: C.NUMBER_INTERVAL_MS / 60000,
             multyRooms: multyStatus,
             runningRooms: runningRooms,
+            historyTables: Array.from(this._historyTableReady),
           }), {
             status: 200,
             headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" }
@@ -3471,6 +3721,7 @@ export class ChatServer {
     this._userIndex = new Map();
 
     this._multyState = new Map();
+    this._historyTableReady = new Set();
 
     this.isDestroyed = true;
   }
