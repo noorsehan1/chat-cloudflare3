@@ -808,13 +808,11 @@ export class ChatServer {
         // ✅ Array yang di-broadcast
         const chatData = ["chat", r, chatNoimg, username, chatMsg, chatColor, chatTextColor];
 
-        const sentCount = this.broadcast(r, chatData);
+        this.broadcast(r, chatData);
         this.broadcast(r, ["multyNumber", st.numberNext, r]);
 
-        // 💾 Simpan array broadcast ke history (kalau terkirim)
-        if (sentCount > 0) {
-          this._saveHistoryChat(r, chatData).catch(() => {});
-        }
+        // 💾 LANGSUNG SIMPAN ke history (tanpa cek sentCount)
+        this._saveHistoryChat(r, chatData).catch(() => {});
       }
 
       try {
@@ -2752,7 +2750,7 @@ export class ChatServer {
             const reset = await this._checkAndResetHistory(room);
 
             if (reset) {
-              this.safeSend(ws, ["chatHistory", room, [], "{}"]);
+              this.safeSend(ws, ["chatHistory", room, "{}"]);
               this.safeSend(ws, ["chatHistoryReset", room]);
               break;
             }
@@ -2765,11 +2763,11 @@ export class ChatServer {
               javaJsonObject[String(item.timestamp)] = item.java;
             }
 
+            // ✅ CUKUP KIRIM: roomname + javaFormatJson
             this.safeSend(ws, [
               "chatHistory",
-              room,
-              history,                        // ⬅️ format broadcast
-              JSON.stringify(javaJsonObject)  // ⬅️ format Java
+              room,                          // ⬅️ roomname
+              JSON.stringify(javaJsonObject) // ⬅️ javaFormatJson
             ]);
           } catch(e) {
             this.safeSend(ws, ["error", "Gagal load history"]);
@@ -3256,12 +3254,10 @@ export class ChatServer {
           const chatData = ["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor];
 
           // Broadcast ke room
-          const sentCount = this.broadcast(chatRoom, chatData);
+          this.broadcast(chatRoom, chatData);
 
-          // 💾 Simpan array broadcast ke history (kalau terkirim)
-          if (sentCount > 0) {
-            this._saveHistoryChat(chatRoom, chatData).catch(() => {});
-          }
+          // 💾 LANGSUNG SIMPAN ke history (tanpa cek sentCount)
+          this._saveHistoryChat(chatRoom, chatData).catch(() => {});
 
           break;
         }
