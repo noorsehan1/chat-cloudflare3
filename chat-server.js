@@ -19,8 +19,7 @@ const C = {
   MULTY_MIN_MS: 10 * 1000,
   MULTY_MAX_MS: 30 * 1000,
   MAX_MULTY_NUMBER: 9999,
-  MAX_HISTORY_LIMIT: 200,
-  DEFAULT_HISTORY_LIMIT: 50,
+  HISTORY_LIMIT: 100,             // ✅ fixed limit 100
   HISTORY_MAX_AGE_MS: 3 * 60 * 60 * 1000, // 3 jam
 };
 
@@ -448,39 +447,26 @@ export class ChatServer {
     }
   }
 
-  async _loadHistoryChat(room, limit = C.DEFAULT_HISTORY_LIMIT, beforeTimestamp = null) {
+  // ✅ AMBIL 100 DARI YANG TERAKHIR (fixed)
+  async _loadHistoryChat(room) {
     try {
       if (!this.db) return [];
       await this._ensureHistoryTable(room);
 
-      const safeLimit = Math.min(Math.max(parseInt(limit) || C.DEFAULT_HISTORY_LIMIT, 1), C.MAX_HISTORY_LIMIT);
       const tableName = K_HISTORY_TABLE(room);
 
-      let query, bindings;
-      if (beforeTimestamp) {
-        query = `
-          SELECT timestamp, chat_data
-          FROM ${tableName}
-          WHERE timestamp < ?
-          ORDER BY timestamp DESC
-          LIMIT ?
-        `;
-        bindings = [beforeTimestamp, safeLimit];
-      } else {
-        query = `
-          SELECT timestamp, chat_data
-          FROM ${tableName}
-          ORDER BY timestamp DESC
-          LIMIT ?
-        `;
-        bindings = [safeLimit];
-      }
+      // ✅ 100 dari yang terakhir
+      const query = `
+        SELECT timestamp, chat_data
+        FROM ${tableName}
+        ORDER BY timestamp DESC
+        LIMIT ${C.HISTORY_LIMIT}
+      `;
 
-      const result = await this.db.prepare(query).bind(...bindings).all();
+      const result = await this.db.prepare(query).all();
       const rows = result?.results || [];
 
       // ✅ Balik urutan: lama → baru
-      // ✅ chat_data SUDAH FORMAT JAVA: [noimg, color, username, message, textColor, 0]
       return rows.reverse().map(r => {
         let arr = null;
         try { arr = JSON.parse(r.chat_data); } catch(e) {}
@@ -2728,8 +2714,6 @@ export class ChatServer {
         case "getChatHistory": {
           try {
             const room = args[0];
-            const limit = args[1];
-            const beforeTs = args[2] ? parseInt(args[2]) : null;
 
             if (!room || !ROOMS_SET.has(room)) {
               this.safeSend(ws, ["error", "Invalid room"]);
@@ -2745,7 +2729,8 @@ export class ChatServer {
               break;
             }
 
-            const history = await this._loadHistoryChat(room, limit, beforeTs);
+            // ✅ Ambil 100 dari yang terakhir (limit fixed di _loadHistoryChat)
+            const history = await this._loadHistoryChat(room);
 
             // ✅ Bangun object JSON untuk Java (parseChatRoomJson)
             const javaJsonObject = {};
@@ -3240,7 +3225,7 @@ export class ChatServer {
           const wsRoom = ws.room || ws.roomname;
           if (wsRoom !== chatRoom) break;
 
-          // ✅ Array yang di-broadcast (inputan user)
+          // ✅ Array yang di-broadcast
           const chatData = ["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor];
 
           // Broadcast ke room
