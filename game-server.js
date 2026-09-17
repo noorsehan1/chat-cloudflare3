@@ -2130,7 +2130,7 @@ export class GameServer {
               if (existingGame?._isActive && !existingGame._gameEnded && existingGame.players?.has(joinUsername)) {
                 if (!existingGame.eliminated?.has(joinUsername)) {
                   // User sudah join & belum eliminated — tolak dengan "already join"
-                  this.safeSend(ws, ["gameLowCardError", "You are already joined in this LowCard game"]);
+                  this.safeSend(ws, ["gameLowCardError", "You are already joined"]);
                   // Sinkronkan state agar UI client tetap konsisten
                   this.safeSend(ws, ["gameLowCardJoinSuccess", joinUsername, existingGame.betAmount]);
                   if (existingGame.numbers?.has(joinUsername)) {
@@ -2822,7 +2822,7 @@ export class GameServer {
           }
 
           // Sudah join — kirim error "already join" + sinkronkan state
-          this.safeSend(ws, ["gameLowCardError", "You are already joined in this LowCard game"]);
+          this.safeSend(ws, ["gameLowCardError", "You are already joined"]);
           this.safeSend(ws, ["gameLowCardJoinSuccess", usernameClean, game.betAmount]);
 
           const player = game.players.get(usernameClean);
