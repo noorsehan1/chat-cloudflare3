@@ -21,7 +21,7 @@ const C = {
   MAX_MULTY_NUMBER: 9999,
   HISTORY_LIMIT: 100,
   HISTORY_MAX_AGE_MS: 3 * 60 * 60 * 1000,
-  WS_GRACE_MS: 3000,
+  WS_GRACE_MS: 1000,
 };
 
 const ROOMS = [
