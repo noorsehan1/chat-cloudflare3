@@ -21,7 +21,7 @@ const C = {
   MAX_MULTY_NUMBER: 9999,
   HISTORY_LIMIT: 100,
   HISTORY_MAX_AGE_MS: 3 * 60 * 60 * 1000,
-  WS_GRACE_MS: 10000,
+  WS_GRACE_MS: 3000,
 };
 
 const ROOMS = [
@@ -277,7 +277,7 @@ export class ChatServer {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // GRACE PERIOD + REPLACE WS + CLEANUP ALL
+  // GRACE PERIOD
   // ═══════════════════════════════════════════════════════════
 
   _detachWs(ws) {
@@ -460,28 +460,57 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // _scheduleCleanup — WAJIB CATAT USER + TIMER 3 DETIK
+  // ═══════════════════════════════════════════════════════════
+
   async _scheduleCleanup(ws, reason) {
     try {
       if (!ws) return;
 
+      // 1. DAPATKAN USERNAME — dari WS
       let username = ws.username || ws._username;
-      let roomName = ws.room || ws.roomname || ws._room;
 
+      // Fallback: dari attachment
       if (!username) {
         try {
           const att = ws.deserializeAttachment?.();
           if (att?.username) username = att.username;
-          if (!roomName) roomName = att?.seatInfo?.room || att?.room;
         } catch(e) {}
       }
 
+      // Fallback: scan userConnections
+      if (!username) {
+        for (const [user, conns] of (this.userConnections || new Map())) {
+          if (conns?.has?.(ws)) {
+            username = user;
+            break;
+          }
+        }
+      }
+
+      // Fallback: scan roomClients
+      if (!username) {
+        for (const [, clients] of (this.roomClients || new Map())) {
+          if (clients?.has?.(ws)) {
+            try {
+              const att = ws.deserializeAttachment?.();
+              if (att?.username) username = att.username;
+            } catch(e) {}
+            if (username) break;
+          }
+        }
+      }
+
+      // Kalau tidak ada username → langsung cleanup
       if (!username) {
         await this._cleanupUserCompletely(ws);
         return;
       }
 
-      const existingConns = this.userConnections?.get(username);
+      // 2. Cek apakah masih ada WS live lain
       let hasLiveWs = false;
+      const existingConns = this.userConnections?.get(username);
       if (existingConns) {
         for (const c of existingConns) {
           if (c !== ws && c?.readyState === 1) {
@@ -496,20 +525,24 @@ export class ChatServer {
         return;
       }
 
+      // 3. Clear timer lama (kalau ada)
       const existing = this._pendingCleanups?.get(username);
       if (existing?.timer) {
         clearTimeout(existing.timer);
         this._pendingCleanups.delete(username);
       }
 
+      // 4. Detach WS lama
       this._detachWs(ws);
 
+      // 5. CATAT USER + SET TIMER 3 DETIK
       const GRACE_MS = C.WS_GRACE_MS || 3000;
 
       const timer = setTimeout(async () => {
         try {
           this._pendingCleanups?.delete(username);
 
+          // Cek ulang: user sudah reconnect?
           const conns = this.userConnections?.get(username);
           if (conns && conns.size > 0) {
             let live = false;
@@ -526,16 +559,18 @@ export class ChatServer {
             }
           }
 
+          // Cek user masih punya seat
           const found = await this._findUserInAnyRoom(username);
           if (!found) return;
           if (found.isMulti === true) return;
 
+          // Grace habis → cleanup semua
           await this._cleanupAllUserData(username);
         } catch(e) {}
       }, GRACE_MS);
 
       if (!this._pendingCleanups) this._pendingCleanups = new Map();
-      this._pendingCleanups.set(username, { timer, room: roomName, ws });
+      this._pendingCleanups.set(username, { timer, room: ws.room || ws.roomname, ws });
     } catch(e) {
       try { await this._cleanupUserCompletely(ws); } catch(e2) {}
     }
@@ -2023,7 +2058,7 @@ export class ChatServer {
           try { ws.serializeAttachment(att); } catch(e) {}
           await this.sendAllStateTo(ws, roomName, true);
         } catch(e) {}
-      }, 1000);
+      }, 1500);
 
       return true;
     } catch(e) {
