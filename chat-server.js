@@ -1429,13 +1429,13 @@ export class ChatServer {
       this._setUserIndex(finalSeatData.namauser, roomName, seatNumber, finalSeatData.isMulti);
 
       // ═══════════════════════════════════════════════════════
-      // HANYA multy user yang masuk cache noimg
+      // ← HANYA MULTY USER yang masuk cache
+      // User normal: TIDAK sentuh cache — data disimpan apa adanya
       // ═══════════════════════════════════════════════════════
       if (finalSeatData.isMulti === true) {
         const noimg = parseInt(finalSeatData.noimageUrl);
         await this._setUserNoimgCache(finalSeatData.namauser, noimg);
       }
-      // User biasa: TIDAK sentuh cache
 
       await this._saveSeat(roomName, seatNumber, finalSeatData);
       return true;
@@ -3503,8 +3503,11 @@ export class ChatServer {
               this._kursiLocks,
               `kursi_${kursiRoom}_${kursiSeat}`,
               async () => {
+                // ═══════════════════════════════════════════════════════
+                // ← INPUTAN USER APA ADANYA (semua user sama)
+                // ═══════════════════════════════════════════════════════
                 const updateData = {
-                  noimageUrl: String(kursiNoimg || ""),      // ← dari inputan (sama untuk semua user)
+                  noimageUrl: String(kursiNoimg || ""),
                   namauser: seatData.namauser,               // ← dari seat
                   color: String(kursiColor || ""),
                   itembawah: typeof kursiBawah === 'number' ? kursiBawah : (parseInt(kursiBawah) || 0),
