@@ -507,7 +507,6 @@ export class ChatServer {
     try {
       if (this.closing || this.isDestroyed) return;
 
-      // Sweep dead connections tiap alarm (15 menit)
       this._sweepDeadConnections();
 
       if (this._isNumberUpdating) {
@@ -2930,6 +2929,98 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // RESTORE ROOM TO WS — tanpa hapus seat (untuk reconnect)
+  // ═══════════════════════════════════════════════════════════
+
+  async _restoreRoomToWs(ws, username, found) {
+    try {
+      if (!ws || !username || !found?.room) return;
+
+      const roomName = found.room;
+      const seat = found.seat;
+
+      ws.username = username;
+      ws.idtarget = username;
+      ws.room = roomName;
+      ws.roomname = roomName;
+      ws._closing = false;
+      ws._cleaning = false;
+      ws._username = username;
+      ws._room = roomName;
+
+      let connections = this.userConnections?.get(username);
+      if (!connections) {
+        connections = new Set();
+        try { this.userConnections?.set(username, connections); } catch(e) {}
+      }
+      if (!connections.has(ws)) try { connections.add(ws); } catch(e) {}
+      if (!this.wsSet?.has(ws)) try { this.wsSet?.add(ws); } catch(e) {}
+
+      for (const [otherRoom, clients] of (this.roomClients || new Map())) {
+        if (otherRoom !== roomName && clients) {
+          try { clients.delete(ws); } catch(e) {}
+        }
+      }
+      const roomClients = this.roomClients?.get(roomName);
+      if (roomClients && !roomClients.has(ws)) {
+        try { roomClients.add(ws); } catch(e) {}
+      }
+
+      try { this.wsActiveMulti?.delete(ws); } catch(e) {}
+
+      const stCleanup = _wsCleanupState.get(ws);
+      if (stCleanup) {
+        stCleanup.cleanupDone = false;
+        stCleanup.cleaning = false;
+      } else {
+        try { _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false }); } catch(e) {}
+      }
+
+      try {
+        ws.serializeAttachment({
+          username: username,
+          seatInfo: { room: roomName, seat: seat }
+        });
+      } catch(e) {}
+
+      await this._ensureCacheInitialized();
+      const roomBucket = this._storageCache?.roomsData?.[roomName];
+      const muteStatus = roomBucket?.mute || false;
+
+      this.safeSend(ws, ["rooMasuk", seat, roomName]);
+      this.safeSend(ws, ["numberKursiSaya", seat]);
+      this.safeSend(ws, ["muteTypeResponse", muteStatus, roomName]);
+      this.safeSend(ws, ["currentNumber", this.currentNumber]);
+
+      const mst = this._getMultyState(roomName);
+      if (mst.running) {
+        if (!mst.loopTimer) {
+          this._startMultyLoop(roomName);
+        }
+        this.safeSend(ws, ["multyStatus", true, mst.index, mst.chatList.length, roomName]);
+        this.safeSend(ws, ["multyNumber", mst.numberNext, roomName]);
+        this.safeSend(ws, ["multyRoom", roomName]);
+      } else if (mst.chatList.length > 0) {
+        this.safeSend(ws, ["multyStatus", false, mst.index, mst.chatList.length, roomName]);
+        this.safeSend(ws, ["multyNumber", mst.numberNext, roomName]);
+      }
+
+      await this.updateRoomCount(roomName);
+
+      setTimeout(async () => {
+        try {
+          if (!ws || ws.readyState !== 1) return;
+          await this.sendAllStateTo(ws, roomName, true);
+        } catch(e) {}
+      }, 500);
+
+      console.log(`[RECONNECT-RESTORE] ${username} → ${roomName} seat ${seat}`);
+    } catch(e) {
+      console.log('[RECONNECT-RESTORE-ERR]', e?.message || e);
+    }
+  }
+
   async _handleSetId(ws, username, isNewUser) {
     try {
       if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
@@ -2942,14 +3033,19 @@ export class ChatServer {
       const found = await this._findUserInAnyRoom(username);
       const isMultiUser = found ? found.isMulti : false;
 
-      if (isMultiUser && isNewUser === false) {
+      if (isMultiUser) {
+        if (isNewUser === false) {
+          await this._restoreRoomToWs(ws, username, found);
+          return;
+        }
+        if (isNewUser === true) {
+          await this._removeUserFromRoom(username, found.room);
+        }
+      }
+
+      if (found && !isMultiUser) {
+        await this._restoreRoomToWs(ws, username, found);
         return;
-      }
-      if (isMultiUser && isNewUser === true) {
-        await this._removeUserFromRoom(username, found.room);
-      }
-      if (!isMultiUser && found) {
-        await this._removeUserFromRoom(username, found.room);
       }
 
       ws.username = username;
