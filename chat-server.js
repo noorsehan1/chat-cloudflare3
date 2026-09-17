@@ -39,6 +39,7 @@ const K_CHAT   = (room) => `chat_multy_${room}`;
 const K_NUMBER = (room) => `number_${room}`;
 const K_INDEX  = (room) => `index_${room}`;
 const K_RUNNING = (room) => `multy_running_${room}`;
+const K_MULTY_NOIMG_CACHE = 'multy_noimg_cache';   // ← NOIMG CACHE
 const K_HISTORY_TABLE = (room) => `chat_history_${String(room).replace(/[^a-zA-Z0-9_]/g, '_')}`;
 
 const _wsCleanupState = new WeakMap();
@@ -74,6 +75,9 @@ export class ChatServer {
       this.wsActiveMulti = new Map();
 
       this._userIndex = new Map();
+
+      // ← NOIMG CACHE: { namauser: noimg } khusus multy user
+      this._userNoimgCache = new Map();
 
       this._joinLocks = new Map();
       this._kursiLocks = new Map();
@@ -188,6 +192,7 @@ export class ChatServer {
       this.roomClients = new Map();
       this.wsActiveMulti = new Map();
       this._userIndex = new Map();
+      this._userNoimgCache = new Map();   // ← NOIMG CACHE
       this._pendingEvents = [];
       this._eventQueue = [];
       this.db = null;
@@ -271,6 +276,80 @@ export class ChatServer {
     if (!username) return;
     try { this._userIndex.delete(username); } catch(e) {}
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // ← NOIMG CACHE METHODS
+  // ═══════════════════════════════════════════════════════════
+
+  async _saveUserNoimgCache() {
+    try {
+      if (!this.db) return false;
+      const obj = {};
+      for (const [username, noimg] of this._userNoimgCache) {
+        obj[username] = noimg;
+      }
+      await this.db.prepare(`
+        INSERT OR REPLACE INTO ${TABLE_MULTY} (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+      `).bind(K_MULTY_NOIMG_CACHE, JSON.stringify(obj)).run();
+      return true;
+    } catch(e) {
+      console.log('[SAVE-NOIMG-CACHE-ERR]', e?.message || e);
+      return false;
+    }
+  }
+
+  async _loadUserNoimgCache() {
+    try {
+      if (!this.db) return false;
+      const row = await this.db
+        .prepare(`SELECT value FROM ${TABLE_MULTY} WHERE key = ?`)
+        .bind(K_MULTY_NOIMG_CACHE)
+        .first();
+
+      if (!row?.value) return false;
+
+      let obj = null;
+      try { obj = JSON.parse(row.value); } catch(e) {}
+      if (!obj || typeof obj !== 'object') return false;
+
+      this._userNoimgCache = new Map();
+      for (const [username, noimg] of Object.entries(obj)) {
+        const n = parseInt(noimg);
+        if (!isNaN(n) && n > 0) {
+          this._userNoimgCache.set(username, n);
+        }
+      }
+      return true;
+    } catch(e) {
+      console.log('[LOAD-NOIMG-CACHE-ERR]', e?.message || e);
+      return false;
+    }
+  }
+
+  async _setUserNoimgCache(username, noimg) {
+    if (!username) return;
+    try {
+      const n = parseInt(noimg);
+      if (!isNaN(n) && n > 0) {
+        this._userNoimgCache.set(username, n);
+      } else {
+        this._userNoimgCache.delete(username);
+      }
+      this._saveUserNoimgCache().catch(() => {});
+    } catch(e) {}
+  }
+
+  async _deleteUserNoimgCache(username) {
+    if (!username) return;
+    try {
+      if (this._userNoimgCache.delete(username)) {
+        this._saveUserNoimgCache().catch(() => {});
+      }
+    } catch(e) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════
 
   async _ensureAlarm() {
     if (this.closing || this.isDestroyed) return;
@@ -389,14 +468,14 @@ export class ChatServer {
 
       await this._ensureHistoryTable(room);
 
-      const noimg     = chatDataArray[2] ?? 1000;
+      const noimg     = chatDataArray[2] ?? 10000;   // ← NOIMG CACHE: default 10000
       const username  = chatDataArray[3] ?? "";
       const message   = chatDataArray[4] ?? "";
       const color     = chatDataArray[5] ?? "1";
       const textColor = chatDataArray[6] ?? "1";
 
       const javaFormat = [
-        Number(noimg) || 1000,
+        Number(noimg) || 10000,   // ← NOIMG CACHE: default 10000
         parseInt(color) || 1,
         String(username),
         String(message),
@@ -455,7 +534,7 @@ export class ChatServer {
 
         return {
           timestamp: r.timestamp,
-          java: Array.isArray(arr) ? arr : [1000, 1, "", "", 1, 0]
+          java: Array.isArray(arr) ? arr : [10000, 1, "", "", 1, 0]   // ← NOIMG CACHE: default 10000
         };
       });
     } catch(e) {
@@ -528,7 +607,7 @@ export class ChatServer {
             if (!item || typeof item !== 'object') continue;
             if (!item.sender || !item.text) continue;
             chatList.push({
-              noimg: item.noimg ?? 1000,
+              noimg: item.noimg ?? 10000,   // ← NOIMG CACHE: default 10000
               sender: String(item.sender),
               text: String(item.text),
               color: item.color ? String(item.color) : "7",
@@ -906,11 +985,21 @@ export class ChatServer {
         return st.running;
       }
 
-      const chatNoimg = chat.noimg ?? 1000;
       const username = chat.sender || "";
       const chatMsg = chat.text || "";
       const chatColor = chat.color || "7";
       const chatTextColor = chat.textColor || "1";
+
+      // ═══════════════════════════════════════════════════════
+      // ← NOIMG CACHE: ambil noimg dari cache berdasarkan username
+      // ═══════════════════════════════════════════════════════
+      let chatNoimg = 10000;
+      try {
+        const cached = this._userNoimgCache?.get(username);
+        if (cached && cached > 0) {
+          chatNoimg = cached;
+        }
+      } catch(e) {}
 
       if (chatMsg) {
         const chatData = ["chat", r, chatNoimg, username, chatMsg, chatColor, chatTextColor];
@@ -1265,10 +1354,18 @@ export class ChatServer {
       if (!force && seatData?.isMulti === true) return false;
 
       const removedUsername = seatData?.namauser;
+      const removedIsMulti = seatData?.isMulti === true;   // ← NOIMG CACHE
+
       if (roomBucket.seat) delete roomBucket.seat[seatNumber];
       if (roomBucket.point) delete roomBucket.point[seatNumber];
 
-      if (removedUsername) this._removeUserIndex(removedUsername);
+      if (removedUsername) {
+        this._removeUserIndex(removedUsername);
+        // ← NOIMG CACHE: hapus cache kalau multy
+        if (removedIsMulti) {
+          await this._deleteUserNoimgCache(removedUsername);
+        }
+      }
 
       if (this.db) {
         try {
@@ -1310,9 +1407,18 @@ export class ChatServer {
       if (!roomBucket) return false;
 
       if (!seatData || !seatData.namauser || seatData.namauser.trim() === '') {
-        const oldUser = roomBucket.seat?.[seatNumber]?.namauser;
+        const oldSeat = roomBucket.seat?.[seatNumber];
+        const oldUser = oldSeat?.namauser;
+        const oldIsMulti = oldSeat?.isMulti === true;
+
         if (roomBucket.seat) delete roomBucket.seat[seatNumber];
-        if (oldUser) this._removeUserIndex(oldUser);
+        if (oldUser) {
+          this._removeUserIndex(oldUser);
+          // ← NOIMG CACHE: hapus cache kalau multy
+          if (oldIsMulti) {
+            this._deleteUserNoimgCache(oldUser);
+          }
+        }
         await this._saveSeat(roomName, seatNumber, null);
         return true;
       }
@@ -1326,6 +1432,16 @@ export class ChatServer {
       if (!roomBucket.seat) roomBucket.seat = {};
       roomBucket.seat[seatNumber] = finalSeatData;
       this._setUserIndex(finalSeatData.namauser, roomName, seatNumber, finalSeatData.isMulti);
+
+      // ═══════════════════════════════════════════════════════
+      // ← NOIMG CACHE: simpan noimg ke cache BERDASARKAN USERNAME
+      // Hanya untuk multy user (isMulti === true)
+      // ═══════════════════════════════════════════════════════
+      if (finalSeatData.isMulti === true) {
+        const noimg = parseInt(finalSeatData.noimageUrl);
+        await this._setUserNoimgCache(finalSeatData.namauser, noimg);
+      }
+
       await this._saveSeat(roomName, seatNumber, finalSeatData);
       return true;
     } catch(e) {
@@ -1842,6 +1958,23 @@ export class ChatServer {
         await this._updateSeatInRoom(multiRoomname, seat, newSeat);
       }
 
+      // ═══════════════════════════════════════════════════════
+      // ← NOIMG CACHE: ambil noimg dari seat saat join
+      // (kalau seat sudah punya noimageUrl, simpan ke cache)
+      // ═══════════════════════════════════════════════════════
+      try {
+        const currentSeat = roomBucket.seat?.[seat];
+        if (currentSeat?.namauser === multiUsername) {
+          const noimg = parseInt(currentSeat.noimageUrl);
+          if (!isNaN(noimg) && noimg > 0) {
+            await this._setUserNoimgCache(multiUsername, noimg);
+            console.log(`[NOIMG-CACHE SET] ${multiUsername} → ${noimg} (seat ${seat})`);
+          }
+        }
+      } catch(e) {
+        console.log('[NOIMG-CACHE SET-ERR]', e?.message || e);
+      }
+
       try {
         const st = this._getMultyState(multiRoomname);
         if (st.running) {
@@ -1948,6 +2081,10 @@ export class ChatServer {
         }
         try { this.wsSet?.delete(ws); } catch (e) {}
         try { this.wsActiveMulti?.delete(ws); } catch (e) {}
+
+        // ← NOIMG CACHE: JANGAN hapus cache saat WS multy putus
+        // Cache dihapus hanya saat seat benar-benar dihapus
+
         state.cleanupDone = true;
         return result;
       }
@@ -2528,6 +2665,37 @@ export class ChatServer {
         this._multyRestored = false;
       }
 
+      // ← NOIMG CACHE: load dari D1
+      try {
+        const loaded = await this._loadUserNoimgCache();
+        if (loaded) {
+          console.log(`[NOIMG-CACHE] loaded ${this._userNoimgCache.size} entries from D1`);
+        } else {
+          // Fallback: rebuild dari seat
+          await this._ensureCacheInitialized();
+          const roomsData = this._storageCache?.roomsData || {};
+          let rebuilt = 0;
+          for (const roomBucket of Object.values(roomsData)) {
+            if (!roomBucket?.seat) continue;
+            for (const seatData of Object.values(roomBucket.seat)) {
+              if (seatData?.namauser && seatData.isMulti === true) {
+                const noimg = parseInt(seatData.noimageUrl);
+                if (!isNaN(noimg) && noimg > 0) {
+                  this._userNoimgCache.set(seatData.namauser, noimg);
+                  rebuilt++;
+                }
+              }
+            }
+          }
+          if (rebuilt > 0) {
+            console.log(`[NOIMG-CACHE] rebuilt ${rebuilt} entries from seats`);
+            this._saveUserNoimgCache().catch(() => {});
+          }
+        }
+      } catch(e) {
+        console.log('[NOIMG-CACHE-ERR]', e?.message || e);
+      }
+
       for (const room of ROOMS) {
         if (!this.roomClients.has(room)) {
           this.roomClients.set(room, new Set());
@@ -2965,7 +3133,6 @@ export class ChatServer {
 
             st.chatList = chatList;
             st.numberNext = numberNext;
-            // ← RESUME: pakai index dari D1 (bukan reset 0)
             st.index = (typeof index === 'number' && index >= 0 && index < chatList.length)
                         ? index
                         : 0;
@@ -2986,9 +3153,6 @@ export class ChatServer {
           break;
         }
 
-        // ═══════════════════════════════════════════════════════
-        // ← STOP FIX: jangan reset index, cukup running=false
-        // ═══════════════════════════════════════════════════════
         case "stopMulty": {
           try {
             const stopRoom = args[0] || DEFAULT_MULTY_ROOM;
@@ -3002,15 +3166,11 @@ export class ChatServer {
             // ← index TIDAK direset — biar bisa resume dari posisi terakhir
             this._stopMultyLoop(stopRoom);
 
-            // Persist running=false saja
             this._saveMultyRunningToTable(stopRoom, false)
               .then(ok => console.log('[RUNNING-SAVE]', stopRoom, '= false', ok))
               .catch(e => console.log('[RUNNING-SAVE-ERR]', e?.message || e));
 
-            // index TIDAK disimpan ulang — biarkan nilai lama di D1
-
             this.broadcast(stopRoom, ["multyStop", stopRoom]);
-            // Kirim status dengan index saat ini (bukan 0)
             this.safeSend(ws, ["multyStatus", false, st.index, st.chatList.length, stopRoom]);
           } catch(e) {
             this._handleError('stopMulty', e);
@@ -3075,7 +3235,7 @@ export class ChatServer {
               if (!item || typeof item !== 'object') continue;
               if (!item.sender || !item.text) continue;
               valid.push({
-                noimg: item.noimg ?? 1000,
+                noimg: item.noimg ?? 10000,
                 sender: String(item.sender),
                 text: String(item.text),
                 color: item.color ? String(item.color) : "7",
@@ -3172,7 +3332,7 @@ export class ChatServer {
                 if (!item || typeof item !== 'object') continue;
                 if (!item.sender || !item.text) continue;
                 valid.push({
-                  noimg: item.noimg ?? 1000,
+                  noimg: item.noimg ?? 10000,
                   sender: String(item.sender),
                   text: String(item.text),
                   color: item.color ? String(item.color) : "7",
@@ -3334,22 +3494,19 @@ export class ChatServer {
         }
 
         case "updateKursi": {
-          const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
+          // ← Format: [room, seat, noimg, color, bawah, atas, vip, vt]  (tanpa nama)
+          const [kursiRoom, kursiSeat, kursiNoimg, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
+
           if (!kursiRoom || typeof kursiSeat !== 'number' || kursiSeat < 1 || kursiSeat > C.MAX_SEATS) {
             break;
           }
           if (!ROOMS_SET.has(kursiRoom)) break;
-          if (!kursiName || typeof kursiName !== 'string' || kursiName.trim().length === 0) break;
 
           const currentUser = ws.username || ws._username;
           if (!currentUser) break;
 
           const seatData = await this._getSeatData(kursiRoom, kursiSeat);
-          if (!seatData || seatData.namauser !== kursiName) break;
-
-          if (seatData.namauser !== currentUser) {
-            break;
-          }
+          if (!seatData || seatData.namauser !== currentUser) break;
 
           try {
             await this._withLock(
@@ -3358,7 +3515,7 @@ export class ChatServer {
               async () => {
                 const updateData = {
                   noimageUrl: String(kursiNoimg || ""),
-                  namauser: String(kursiName || ""),
+                  namauser: seatData.namauser,   // ← dari seat, bukan arg
                   color: String(kursiColor || ""),
                   itembawah: typeof kursiBawah === 'number' ? kursiBawah : (parseInt(kursiBawah) || 0),
                   itematas: typeof kursiAtas === 'number' ? kursiAtas : (parseInt(kursiAtas) || 0),
@@ -3644,13 +3801,28 @@ export class ChatServer {
             await this._ensureCacheInitialized();
             const roomBucket = this._storageCache?.roomsData?.[resetRoomName];
             if (roomBucket) {
+              const removedMultiUsernames = [];   // ← NOIMG CACHE
               for (const seatStr in roomBucket.seat) {
-                const uname = roomBucket.seat[seatStr]?.namauser;
-                if (uname) this._removeUserIndex(uname);
+                const seatData = roomBucket.seat[seatStr];
+                const uname = seatData?.namauser;
+                const isMulti = seatData?.isMulti === true;
+                if (uname) {
+                  this._removeUserIndex(uname);
+                  if (isMulti) removedMultiUsernames.push(uname);
+                }
               }
               roomBucket.seat = {};
               roomBucket.point = {};
               roomBucket.mute = false;
+
+              // ← NOIMG CACHE: hapus cache multy user di room ini
+              if (removedMultiUsernames.length > 0) {
+                for (const u of removedMultiUsernames) {
+                  this._userNoimgCache.delete(u);
+                }
+                this._saveUserNoimgCache().catch(() => {});
+              }
+
               if (this.db) {
                 try {
                   await this.db
@@ -3774,6 +3946,7 @@ export class ChatServer {
             multyRooms: multyStatus,
             runningRooms: runningRooms,
             multyRestored: this._multyRestored,
+            noimgCacheSize: this._userNoimgCache?.size || 0,   // ← NOIMG CACHE
             historyTables: Array.from(this._historyTableReady),
           }), {
             status: 200,
@@ -3918,6 +4091,7 @@ export class ChatServer {
     this._restoreRemovedSeats = [];
     this._hasBroadcastRemoveKursi = new Set();
     this._userIndex = new Map();
+    this._userNoimgCache = new Map();   // ← NOIMG CACHE
 
     this._multyState = new Map();
     this._multyRestored = false;
