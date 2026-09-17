@@ -631,9 +631,8 @@ export class ChatServer {
       const out = new Map();
       for (const [room, raw] of bucket) {
         const parsed = this._parseMultyRow(raw.chatRaw, raw.numberRaw, raw.indexRaw);
-        parsed.running = raw.runningRaw === "1";   // null → false
+        parsed.running = raw.runningRaw === "1";
 
-        // ← UBAH: masukkan kalau ada chat ATAU running ATAU ada number/index
         const hasAny = parsed.chatList.length > 0
                     || parsed.running
                     || raw.numberRaw !== null
@@ -889,6 +888,7 @@ export class ChatServer {
         return false;
       }
 
+      // ← CHAT HABIS: reset index (putaran selesai)
       if (st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
@@ -940,6 +940,7 @@ export class ChatServer {
 
       this._saveMultyIndexToTable(r, st.index).catch(() => {});
 
+      // ← CHAT HABIS: reset index (putaran selesai)
       if (st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
@@ -1006,7 +1007,6 @@ export class ChatServer {
         return this._storageCache;
       }
 
-      // ═══ CREATE TABLE chat_data ═══
       try {
         await this.db.prepare(`
           CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
@@ -1017,7 +1017,6 @@ export class ChatServer {
         `).run();
       } catch(e) {}
 
-      // ═══ CREATE TABLE chat_multy ═══
       try {
         await this.db.prepare(`
           CREATE TABLE IF NOT EXISTS ${TABLE_MULTY} (
@@ -1029,7 +1028,6 @@ export class ChatServer {
       } catch(e) {}
 
       // ═══ SEED default multy_running_<room> = "0" ═══
-      // ← TAMBAH: pastikan setiap room punya row running default
       try {
         const existingRows = await this.db
           .prepare(`SELECT key FROM ${TABLE_MULTY} WHERE key LIKE 'multy_running_%'`)
@@ -2491,10 +2489,7 @@ export class ChatServer {
       this._restoreRemovedSeats = [];
       this._hasBroadcastRemoveKursi = new Set();
 
-      // ═══════════════════════════════════════════════════════
-      // STEP 0: CREATE TABLE + SEED multy_running DULUAN
-      // ← INI YANG DIPINDAH KE PALING AWAL
-      // ═══════════════════════════════════════════════════════
+      // STEP 0: CREATE TABLE + SEED multy_running
       try {
         await this._loadFromStorage();
         await this._ensureCacheInitialized();
@@ -2502,16 +2497,13 @@ export class ChatServer {
         console.log('[RESTORE-STEP0-ERR]', e?.message || e);
       }
 
-      // ═══════════════════════════════════════════════════════
-      // STEP 1: LOAD chat_multy (sekarang tabel sudah ada)
-      // ═══════════════════════════════════════════════════════
+      // STEP 1: LOAD chat_multy
       try {
         const allMulty = await this._loadAllMultyFromTable();
 
         for (const room of ROOMS) {
           const data = allMulty.get(room);
           if (!data) {
-            // Tidak ada di out → running default false
             const st = this._getMultyState(room);
             st.running = false;
             continue;
@@ -2542,9 +2534,7 @@ export class ChatServer {
         }
       }
 
-      // ═══════════════════════════════════════════════════════
       // STEP 2: Restore WebSocket
-      // ═══════════════════════════════════════════════════════
       try {
         const webSockets = this.ctx?.getWebSockets?.() || [];
 
@@ -2632,9 +2622,7 @@ export class ChatServer {
 
       this._rebuildUserIndex();
 
-      // ═══════════════════════════════════════════════════════
       // STEP 3: Ensure alarm
-      // ═══════════════════════════════════════════════════════
       if (!this.closing && !this.isDestroyed) {
         try {
           if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
@@ -2977,14 +2965,14 @@ export class ChatServer {
 
             st.chatList = chatList;
             st.numberNext = numberNext;
+            // ← RESUME: pakai index dari D1 (bukan reset 0)
             st.index = (typeof index === 'number' && index >= 0 && index < chatList.length)
                         ? index
                         : 0;
             st.running = true;
 
-            // ← Persist running=true ke D1
             this._saveMultyRunningToTable(startRoom, true)
-              .then(ok => console.log('[RUNNING-SAVE]', startRoom, '=', true, ok))
+              .then(ok => console.log('[RUNNING-SAVE]', startRoom, '= true', ok))
               .catch(e => console.log('[RUNNING-SAVE-ERR]', e?.message || e));
 
             this.safeSend(ws, ["multyStatus", true, st.index, chatList.length, startRoom]);
@@ -2998,6 +2986,9 @@ export class ChatServer {
           break;
         }
 
+        // ═══════════════════════════════════════════════════════
+        // ← STOP FIX: jangan reset index, cukup running=false
+        // ═══════════════════════════════════════════════════════
         case "stopMulty": {
           try {
             const stopRoom = args[0] || DEFAULT_MULTY_ROOM;
@@ -3008,18 +2999,19 @@ export class ChatServer {
 
             const st = this._getMultyState(stopRoom);
             st.running = false;
-            st.index = 0;
+            // ← index TIDAK direset — biar bisa resume dari posisi terakhir
             this._stopMultyLoop(stopRoom);
 
-            // ← Persist running=false ke D1
+            // Persist running=false saja
             this._saveMultyRunningToTable(stopRoom, false)
-              .then(ok => console.log('[RUNNING-SAVE]', stopRoom, '=', false, ok))
+              .then(ok => console.log('[RUNNING-SAVE]', stopRoom, '= false', ok))
               .catch(e => console.log('[RUNNING-SAVE-ERR]', e?.message || e));
 
-            this._saveMultyIndexToTable(stopRoom, 0).catch(() => {});
+            // index TIDAK disimpan ulang — biarkan nilai lama di D1
 
             this.broadcast(stopRoom, ["multyStop", stopRoom]);
-            this.safeSend(ws, ["multyStatus", false, 0, st.chatList.length, stopRoom]);
+            // Kirim status dengan index saat ini (bukan 0)
+            this.safeSend(ws, ["multyStatus", false, st.index, st.chatList.length, stopRoom]);
           } catch(e) {
             this._handleError('stopMulty', e);
           }
