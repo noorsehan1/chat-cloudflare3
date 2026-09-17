@@ -988,7 +988,7 @@ export class ChatServer {
       const chatColor = chat.color || "7";
       const chatTextColor = chat.textColor || "1";
 
-      // ← NOIMG: ambil dari cache berdasarkan username
+      // NOIMG: ambil dari cache berdasarkan username
       let chatNoimg = 10000;
       try {
         const cached = this._userNoimgCache?.get(username);
@@ -1357,7 +1357,6 @@ export class ChatServer {
 
       if (removedUsername) {
         this._removeUserIndex(removedUsername);
-        // Hapus cache hanya kalau multy
         if (removedIsMulti) {
           await this._deleteUserNoimgCache(removedUsername);
         }
@@ -1428,14 +1427,12 @@ export class ChatServer {
       roomBucket.seat[seatNumber] = finalSeatData;
       this._setUserIndex(finalSeatData.namauser, roomName, seatNumber, finalSeatData.isMulti);
 
-      // ═══════════════════════════════════════════════════════
-      // ← HANYA MULTY USER yang masuk cache
-      // User normal: TIDAK sentuh cache — data disimpan apa adanya
-      // ═══════════════════════════════════════════════════════
+      // HANYA multy user yang masuk cache noimg
       if (finalSeatData.isMulti === true) {
         const noimg = parseInt(finalSeatData.noimageUrl);
         await this._setUserNoimgCache(finalSeatData.namauser, noimg);
       }
+      // User biasa: TIDAK sentuh cache
 
       await this._saveSeat(roomName, seatNumber, finalSeatData);
       return true;
@@ -3483,9 +3480,12 @@ export class ChatServer {
           break;
         }
 
+        // ═══════════════════════════════════════════════════════════
+        // ← UPDATE KURSI: 9 argumen (dengan namauser) sesuai Java client
+        // Format: [room, seat, noimg, namauser, color, bawah, atas, vip, vt]
+        // ═══════════════════════════════════════════════════════════
         case "updateKursi": {
-          // Format: [room, seat, noimg, color, bawah, atas, vip, vt]
-          const [kursiRoom, kursiSeat, kursiNoimg, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
+          const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
 
           if (!kursiRoom || typeof kursiSeat !== 'number' || kursiSeat < 1 || kursiSeat > C.MAX_SEATS) {
             break;
@@ -3503,18 +3503,15 @@ export class ChatServer {
               this._kursiLocks,
               `kursi_${kursiRoom}_${kursiSeat}`,
               async () => {
-                // ═══════════════════════════════════════════════════════
-                // ← INPUTAN USER APA ADANYA (semua user sama)
-                // ═══════════════════════════════════════════════════════
                 const updateData = {
-                  noimageUrl: String(kursiNoimg || ""),
-                  namauser: seatData.namauser,               // ← dari seat
-                  color: String(kursiColor || ""),
-                  itembawah: typeof kursiBawah === 'number' ? kursiBawah : (parseInt(kursiBawah) || 0),
-                  itematas: typeof kursiAtas === 'number' ? kursiAtas : (parseInt(kursiAtas) || 0),
-                  vip: typeof kursiVip === 'number' ? kursiVip : (parseInt(kursiVip) || 0),
-                  viptanda: typeof kursiVt === 'number' ? kursiVt : (parseInt(kursiVt) || 0),
-                  isMulti: seatData.isMulti === true         // ← preserve dari seat
+                  noimageUrl: String(kursiNoimg || ""),      // ← index 2
+                  namauser: seatData.namauser,               // ← dari seat (bukan index 3)
+                  color: String(kursiColor || ""),           // ← index 4
+                  itembawah: typeof kursiBawah === 'number' ? kursiBawah : (parseInt(kursiBawah) || 0),   // ← index 5
+                  itematas: typeof kursiAtas === 'number' ? kursiAtas : (parseInt(kursiAtas) || 0),       // ← index 6
+                  vip: typeof kursiVip === 'number' ? kursiVip : (parseInt(kursiVip) || 0),               // ← index 7
+                  viptanda: typeof kursiVt === 'number' ? kursiVt : (parseInt(kursiVt) || 0),             // ← index 8
+                  isMulti: seatData.isMulti === true
                 };
                 const result = await this._updateKursi(kursiRoom, kursiSeat, updateData);
                 if (result.success) {
