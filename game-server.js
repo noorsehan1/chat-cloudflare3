@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.9.9 - 100% BEBAS LOG
+// VERSION: 16.9.10 - 100% BEBAS LOG + diceEliminated
 // ✅ FIX #1: _restoreAllState — batch processing (10 WS paralel)
 // ✅ FIX #2: _restoreAllState — batasi 100 WS
 // ✅ FIX #3: _restoreAllState — hapus console.log di loop
@@ -12,6 +12,7 @@
 // ✅ FIX #9: HAPUS SEMUA console.log & console.error (100% BEBAS LOG)
 // ✅ FIX #10: scheduleAlarms — fallback ke _scheduleNearestAlarm jika gagal
 // ✅ FIX #11: gameLowCardJoin — guard "already join" (error + sinkron state)
+// ✅ FIX #12: broadcast "diceEliminated" ke room Quiz saat tie breaker / round selesai
 // ✅ SEMUA LOGIKA GAME TIDAK DIUBAH
 // ============================================================
 
@@ -1389,6 +1390,11 @@ export class GameServer {
         } catch(e) {
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue, round: roundNumber }]);
         }
+        // ✅ TAMBAHAN: broadcast diceEliminated — semua yang menjawab salah
+        const eliminated = Array.from(this.diceAnswered).filter(p => p !== winner);
+        if (eliminated.length > 0) {
+          this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminated]);
+        }
       } else if (correctPlayers.length > 1 && !this._tieActive) {
         this.currentDiceRoll = null; this._diceLock = false; this._isShowingDice = false;
         await this._startTieBreaker(CONSTANTS.DICE_ROOM, correctPlayers);
@@ -1489,6 +1495,8 @@ export class GameServer {
     }
     if (answeredCount === 0) {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `No one answered in Round ${this._tieRound} - Tie breaker ended`]);
+      // ✅ TAMBAHAN: broadcast diceEliminated — semua player dianggap eliminated
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", players]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
@@ -1503,6 +1511,8 @@ export class GameServer {
       } catch(e) {
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: answer, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       }
+      // ✅ TAMBAHAN: broadcast diceEliminated — selain winner
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", players.filter(p => p !== winner)]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
@@ -1532,6 +1542,8 @@ export class GameServer {
       } catch(e) {
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: highest, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       }
+      // ✅ TAMBAHAN: broadcast diceEliminated — selain winner
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", players.filter(p => p !== winner)]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
@@ -1561,6 +1573,11 @@ export class GameServer {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: points[winner] || 0, diceValue: 'auto', round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
     } catch(e) {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: 'auto', round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
+    }
+    // ✅ TAMBAHAN: broadcast diceEliminated — player yang kalah di tie breaker
+    const eliminated = this._tiePlayers.filter(p => p !== winner);
+    if (eliminated.length > 0) {
+      this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminated]);
     }
     this._resetTieBreakerState(id);
     this._startCooldownAfterTieBreaker();
