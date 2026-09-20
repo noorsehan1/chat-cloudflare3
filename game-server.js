@@ -1,6 +1,6 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.9.10 - 100% BEBAS LOG + diceEliminated
+// VERSION: 16.9.9 - 100% BEBAS LOG
 // ✅ FIX #1: _restoreAllState — batch processing (10 WS paralel)
 // ✅ FIX #2: _restoreAllState — batasi 100 WS
 // ✅ FIX #3: _restoreAllState — hapus console.log di loop
@@ -12,7 +12,7 @@
 // ✅ FIX #9: HAPUS SEMUA console.log & console.error (100% BEBAS LOG)
 // ✅ FIX #10: scheduleAlarms — fallback ke _scheduleNearestAlarm jika gagal
 // ✅ FIX #11: gameLowCardJoin — guard "already join" (error + sinkron state)
-// ✅ FIX #12: broadcast "diceEliminated" ke room Quiz saat tie breaker / round selesai
+// ✅ TAMBAHAN: broadcast "diceEliminated" ke room Quiz
 // ✅ SEMUA LOGIKA GAME TIDAK DIUBAH
 // ============================================================
 
