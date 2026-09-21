@@ -1,19 +1,14 @@
 // ============================================================
 // GAME-SERVER.JS
-// VERSION: 16.9.9 - 100% BEBAS LOG
-// ✅ FIX #1: _restoreAllState — batch processing (10 WS paralel)
-// ✅ FIX #2: _restoreAllState — batasi 100 WS
-// ✅ FIX #3: _restoreAllState — hapus console.log di loop
-// ✅ FIX #4: _restoreSingleWebSocket — skip diceRoll saat restore
-// ✅ FIX #5: _processWithTimeout — clear timer di finally
-// ✅ FIX #6: broadcast — jangan scan semua WS saat room kosong
-// ✅ FIX #7: alarm() — scheduleAlarms hanya jika berubah
-// ✅ FIX #8: _isRestoring — reset di finally
-// ✅ FIX #9: HAPUS SEMUA console.log & console.error (100% BEBAS LOG)
-// ✅ FIX #10: scheduleAlarms — fallback ke _scheduleNearestAlarm jika gagal
-// ✅ FIX #11: gameLowCardJoin — guard "already join" (error + sinkron state)
-// ✅ TAMBAHAN: broadcast "diceEliminated" ke room Quiz
-// ✅ SEMUA LOGIKA GAME TIDAK DIUBAH
+// VERSION: 17.0.0 - FINAL (BEBAS LOG, RACE-CONDITION FREE)
+// ✅ FIX #1: Bot hanya muncul jika human <= 1 di round 1
+// ✅ FIX #2: Tidak ada draw sesama user → game berakhir
+// ✅ FIX #3: Semua tereliminasi → game berakhir
+// ✅ FIX #4: Pemain keluar di tengah game → tidak tambah bot
+// ✅ FIX #5: Timer dice dibersihkan sebelum round baru
+// ✅ FIX #6: Timer tie breaker dibersihkan sebelum round baru
+// ✅ FIX #7: Timer lowcard dibersihkan sebelum round baru
+// ✅ FIX #8: 100% BEBAS LOG
 // ============================================================
 
 const CONSTANTS = {
@@ -1239,13 +1234,8 @@ export class GameServer {
 
       this.broadcast(room, ["gameLowCardError", `${username} left the game`]);
 
-      if (game._phase !== 'registration' && !game._botsAdded) {
-        const humanCount = this._countHumanPlayers(game);
-        if (humanCount <= 1) {
-          this._addBots(room, 4);
-          game._botsAdded = true;
-        }
-      }
+      // ✅ FIX: JANGAN tambah bot saat pemain keluar di tengah game.
+      //    Biarkan game berlanjut sampai evaluasi; jika human <= 1, game akan berakhir.
 
       if (game._phase === 'draw' && !game.evaluationLocked && !game.drawTimeExpired) {
         const activeIds = this._getActivePlayerIds(game);
@@ -1342,6 +1332,12 @@ export class GameServer {
       if (!this._diceSessionActive || this._diceSessionEnded) { this._diceLock = false; this._isShowingDice = false; this._diceGameStarted = false; return; }
       if (this._diceLock || this.currentDiceRoll || this._isShowingDice) return;
       if (this._diceTimeUpCooldown) return;
+
+      // ✅ FIX: bersihkan timer round sebelumnya sebelum mulai round baru
+      if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
+      for (const t of this._diceNotificationTimeouts) clearTimeout(t);
+      this._diceNotificationTimeouts = [];
+
       this._diceLoopCounter = (this._diceLoopCounter || 0) + 1;
       if (this._diceLoopCounter > this._maxDiceLoops) { this._diceLoopCounter = 0; this._diceLock = false; this._isShowingDice = false; return; }
       this._diceLock = true;
@@ -1359,8 +1355,6 @@ export class GameServer {
       this.diceWinner = null;
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceRoll", { value, timestamp: Date.now(), answerTime: 20, canAnswerNow: true, round: this._diceRound }]);
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "clik draw"]);
-      for (const t of this._diceNotificationTimeouts) clearTimeout(t);
-      this._diceNotificationTimeouts = [];
       this._diceNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "15s remaining"]); }, 5000));
       this._diceNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "10s remaining"]); }, 10000));
       this._diceNotificationTimeouts.push(setTimeout(() => { this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", "5s remaining"]); }, 15000));
@@ -1390,7 +1384,6 @@ export class GameServer {
         } catch(e) {
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue, round: roundNumber }]);
         }
-        // ✅ TAMBAHAN: broadcast diceEliminated — semua yang menjawab salah
         const eliminated = Array.from(this.diceAnswered).filter(p => p !== winner);
         if (eliminated.length > 0) {
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminated]);
@@ -1440,10 +1433,13 @@ export class GameServer {
   async _runTieRound(room, id, players) {
     const data = this._tieBreakers.get(id);
     if (!data) return;
-    this._clearTimer(this._tieTimer);
-    this._clearTimer(this._tieInterval);
+
+    // ✅ FIX: bersihkan timer tie sebelumnya sebelum round tie baru
+    if (this._tieTimer) { this._clearTimer(this._tieTimer); this._tieTimer = null; }
+    if (this._tieInterval) { this._clearTimer(this._tieInterval); this._tieInterval = null; }
     for (const t of this._tieNotificationTimeouts) clearTimeout(t);
     this._tieNotificationTimeouts = [];
+
     this._tieRound++;
     data.round = this._tieRound;
     data.status = 'running';
@@ -1495,7 +1491,6 @@ export class GameServer {
     }
     if (answeredCount === 0) {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `No one answered in Round ${this._tieRound} - Tie breaker ended`]);
-      // ✅ TAMBAHAN: broadcast diceEliminated — semua player dianggap eliminated
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", players]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
@@ -1511,7 +1506,6 @@ export class GameServer {
       } catch(e) {
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: answer, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       }
-      // ✅ TAMBAHAN: broadcast diceEliminated — selain winner
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", players.filter(p => p !== winner)]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
@@ -1542,7 +1536,6 @@ export class GameServer {
       } catch(e) {
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: highest, round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
       }
-      // ✅ TAMBAHAN: broadcast diceEliminated — selain winner
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", players.filter(p => p !== winner)]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
@@ -1574,7 +1567,6 @@ export class GameServer {
     } catch(e) {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: 'auto', round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
     }
-    // ✅ TAMBAHAN: broadcast diceEliminated — player yang kalah di tie breaker
     const eliminated = this._tiePlayers.filter(p => p !== winner);
     if (eliminated.length > 0) {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminated]);
@@ -2138,7 +2130,6 @@ export class GameServer {
       switch (evt) {
         case "gameLowCardStart": await this.startGame(ws, data[1], data[2]); break;
         case "gameLowCardJoin": {
-          // ✅ FIX #11: Guard "already join" — cek dulu sebelum masuk joinGame
           const joinUsername = typeof data[1] === 'string' ? data[1].trim() : '';
           if (joinUsername) {
             const joinRoom = ws.room || ws.roomname || ws._room;
@@ -2146,9 +2137,7 @@ export class GameServer {
               const existingGame = this.activeGames.get(joinRoom);
               if (existingGame?._isActive && !existingGame._gameEnded && existingGame.players?.has(joinUsername)) {
                 if (!existingGame.eliminated?.has(joinUsername)) {
-                  // User sudah join & belum eliminated — tolak dengan "already join"
                   this.safeSend(ws, ["gameLowCardError", "You are already joined"]);
-                  // Sinkronkan state agar UI client tetap konsisten
                   this.safeSend(ws, ["gameLowCardJoinSuccess", joinUsername, existingGame.betAmount]);
                   if (existingGame.numbers?.has(joinUsername)) {
                     this.safeSend(ws, ["gameLowCardPlayerDraw", joinUsername, existingGame.numbers.get(joinUsername), existingGame.tanda.get(joinUsername) || ""]);
@@ -2486,6 +2475,7 @@ export class GameServer {
       game.registrationOpen = false;
       if (game._registrationTimer) { this._clearTimer(game._registrationTimer); game._registrationTimer = null; }
 
+      // ✅ FIX: Bot hanya ditambahkan jika human <= 1 (host saja)
       if (!game._botsAdded) {
         const humanCount = this._countHumanPlayers(game);
         if (humanCount <= 1) {
@@ -2531,6 +2521,8 @@ export class GameServer {
   async _startDrawPhase(room, game) {
     try {
       if (!this._isGameActuallyRunning(game)) return;
+
+      // ✅ FIX: bersihkan SEMUA timer round sebelumnya sebelum mulai round baru
       if (game._drawTimer) { this._clearTimer(game._drawTimer); game._drawTimer = null; }
       if (game._evalTimer) { this._clearTimer(game._evalTimer); game._evalTimer = null; }
       if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
@@ -2539,7 +2531,9 @@ export class GameServer {
       game.evaluationLocked = false;
       game.drawTimeExpired = false;
 
-      if (!game._botsAdded) {
+      // ✅ FIX: Bot hanya ditambahkan di round 1 jika human <= 1.
+      //    Jika game sudah berjalan (round > 1), JANGAN tambah bot.
+      if (!game._botsAdded && game.round === 1) {
         const humanCount = this._countHumanPlayers(game);
         if (humanCount <= 1) {
           this._addBots(room, 4);
@@ -2691,28 +2685,13 @@ export class GameServer {
       }
 
       if (entries.length === 0) {
+        // ✅ FIX: tidak ada yang draw → game berakhir, JANGAN tambah bot
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-        if (!game._botsAdded) {
-          const humanCount = this._countHumanPlayers(game);
-          if (humanCount <= 1) { this._addBots(room, 4); game._botsAdded = true; }
-        }
-        const remaining = Array.from(players.keys()).filter(id => !eliminated.has(id));
-        if (remaining.length >= 2) {
-          game.round++;
-          game.numbers = new Map();
-          game.tanda = new Map();
-          game.evaluationLocked = false;
-          game.drawTimeExpired = false;
-          game._phase = 'draw';
-          game._botTimeouts = new Set();
-          if (this._isGameActuallyRunning(game)) this._startDrawPhase(room, game);
-        } else {
-          game._gameEnded = true;
-          game._isActive = false;
-          this.broadcast(room, ["gameLowCardError", "No numbers drawn"]);
-          this._scheduleGameCleanup(room, game);
-        }
+        game._gameEnded = true;
+        game._isActive = false;
+        this.broadcast(room, ["gameLowCardError", "No numbers drawn - game ended"]);
+        this._scheduleGameCleanup(room, game);
         return;
       }
 
@@ -2769,30 +2748,12 @@ export class GameServer {
       }
 
       if (remaining.length === 0) {
-        if (!game._botsAdded) {
-          const humanCount = this._countHumanPlayers(game);
-          if (humanCount <= 1) { this._addBots(room, 4); game._botsAdded = true; }
-        }
-        const newActive = Array.from(players.keys()).filter(id => !eliminated.has(id));
-        if (newActive.length >= 2) {
-          game._isEvaluating = false;
-          if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
-          game.round++;
-          game.numbers = new Map();
-          game.tanda = new Map();
-          game.evaluationLocked = false;
-          game.drawTimeExpired = false;
-          game._phase = 'draw';
-          game._botTimeouts = new Set();
-          if (this._isGameActuallyRunning(game)) this._startDrawPhase(room, game);
-          return;
-        }
-
+        // ✅ FIX: semua tereliminasi → game berakhir, JANGAN tambah bot
         game._isEvaluating = false;
         if (game._safetyTimer) { this._clearTimer(game._safetyTimer); game._safetyTimer = null; }
         game._gameEnded = true;
         game._isActive = false;
-        this.broadcast(room, ["gameLowCardError", "All players eliminated"]);
+        this.broadcast(room, ["gameLowCardError", "All players eliminated - game ended"]);
         this._scheduleGameCleanup(room, game);
         return;
       }
@@ -2831,14 +2792,12 @@ export class GameServer {
         const game = this.activeGames.get(room);
         if (!game?._isActive || game._gameEnded || !game.players) { this.safeSend(ws, ["gameLowCardError", "No active game in this room"]); return; }
 
-        // ✅ FIX #11 (guard kedua): Jika sudah join & belum eliminated, tolak dengan "already join"
         if (game.players.has(usernameClean)) {
           if (game.eliminated?.has(usernameClean)) {
             this.safeSend(ws, ["gameLowCardError", "You have been eliminated"]);
             return;
           }
 
-          // Sudah join — kirim error "already join" + sinkronkan state
           this.safeSend(ws, ["gameLowCardError", "You are already joined"]);
           this.safeSend(ws, ["gameLowCardJoinSuccess", usernameClean, game.betAmount]);
 
