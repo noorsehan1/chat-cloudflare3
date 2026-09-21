@@ -9,8 +9,8 @@
 // ✅ FIX #6: Timer tie breaker dibersihkan sebelum round baru
 // ✅ FIX #7: Timer lowcard dibersihkan sebelum round baru
 // ✅ FIX #8: 100% BEBAS LOG
-// ✅ FIX #9: diceEliminated HANYA di tie breaker (bukan round normal)
-//            Yang lolos hanya nilai TERBESAR, sisanya di-eliminate
+// ✅ FIX #9: diceEliminated di round normal (jawaban != dice value)
+// ✅ FIX #10: diceEliminated di tie breaker (nilai TERBESAR lolos, sisanya eliminate)
 // ============================================================
 
 const CONSTANTS = {
@@ -61,9 +61,9 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: "00:00", end: "02:00" },
+    { start: "01:00", end: "02:00" },
     { start: "13:00", end: "14:00" },
-    { start: "22:00", end: "23:00" }
+    { start: "22:00", end: "24:00" }
   ],
   TIMEZONE_OFFSET: 8,
 };
@@ -1361,6 +1361,9 @@ export class GameServer {
     } catch(e) { this._diceLock = false; this._isShowingDice = false; this._diceGameStarted = false; }
   }
 
+  // ============================================================
+  // ✅ END DICE ROUND — broadcast diceEliminated untuk yang jawab SALAH
+  // ============================================================
   async _endDiceRound() {
     try {
       if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
@@ -1382,13 +1385,20 @@ export class GameServer {
         } catch(e) {
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue, round: roundNumber }]);
         }
-        // ✅ diceEliminated DIHAPUS — round normal bukan tie breaker
       } else if (correctPlayers.length > 1 && !this._tieActive) {
         this.currentDiceRoll = null; this._diceLock = false; this._isShowingDice = false;
         await this._startTieBreaker(CONSTANTS.DICE_ROOM, correctPlayers);
         this._diceGameStarted = false;
         return;
       }
+
+      // ✅ TAMBAHAN: eliminate yang jawabannya TIDAK sama dengan dice value
+      //    (yang jawab benar = tidak di-eliminate)
+      const eliminated = Array.from(this.diceAnswered).filter(p => this._playerAnswers.get(p) !== diceValue);
+      if (eliminated.length > 0) {
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminated]);
+      }
+
       this.currentDiceRoll = null;
       this._diceLock = false;
       this._diceGameStarted = false;
@@ -1579,7 +1589,6 @@ export class GameServer {
     } catch(e) {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue: 'auto', round: this._diceRound || 1, isTieBreaker: true, tieBreakerRound: this._tieRound, finalWinner: true, totalTieRounds: this._tieRound }]);
     }
-    // ❌ Tidak eliminate di sini — sudah final
     this._resetTieBreakerState(id);
     this._startCooldownAfterTieBreaker();
   }
