@@ -59,7 +59,7 @@ const CONSTANTS = {
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: "01:00", end: "03:00" },
+    { start: "01:00", end: "02:00" },
     { start: "13:00", end: "15:00" },
     { start: "22:00", end: "23:00" }
   ],
@@ -1359,6 +1359,10 @@ export class GameServer {
     } catch(e) { this._diceLock = false; this._isShowingDice = false; this._diceGameStarted = false; }
   }
 
+  // ============================================================
+  // ✅ END DICE ROUND — eliminate yang jawaban != dice value
+  //    (juga saat tie, sebelum masuk tie breaker)
+  // ============================================================
   async _endDiceRound() {
     try {
       if (this._diceTimeout) { clearTimeout(this._diceTimeout); this._diceTimeout = null; }
@@ -1370,6 +1374,7 @@ export class GameServer {
       const roundNumber = this._diceRound || 1;
       const correctPlayers = [];
       for (const p of this.diceAnswered) { if (this._playerAnswers.get(p) === diceValue) correctPlayers.push(p); }
+
       if (correctPlayers.length === 0) {
         this.broadcast(CONSTANTS.DICE_ROOM, ["diceNoWinner", { message: "No winner", value: diceValue, round: roundNumber }]);
       } else if (correctPlayers.length === 1) {
@@ -1380,16 +1385,24 @@ export class GameServer {
         } catch(e) {
           this.broadcast(CONSTANTS.DICE_ROOM, ["diceWinner", { username: winner, totalPoints: 0, diceValue, round: roundNumber }]);
         }
-        const eliminated = Array.from(this.diceAnswered).filter(p => p !== winner);
-        if (eliminated.length > 0) {
-          this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminated]);
-        }
       } else if (correctPlayers.length > 1 && !this._tieActive) {
+        // ✅ Eliminate yang jawab salah SEBELUM masuk tie breaker
+        const eliminatedBeforeTie = Array.from(this.diceAnswered).filter(p => this._playerAnswers.get(p) !== diceValue);
+        if (eliminatedBeforeTie.length > 0) {
+          this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminatedBeforeTie]);
+        }
         this.currentDiceRoll = null; this._diceLock = false; this._isShowingDice = false;
         await this._startTieBreaker(CONSTANTS.DICE_ROOM, correctPlayers);
         this._diceGameStarted = false;
         return;
       }
+
+      // ✅ SELALU eliminate yang jawabannya TIDAK sama dengan dice value
+      const eliminated = Array.from(this.diceAnswered).filter(p => this._playerAnswers.get(p) !== diceValue);
+      if (eliminated.length > 0) {
+        this.broadcast(CONSTANTS.DICE_ROOM, ["diceEliminated", eliminated]);
+      }
+
       this.currentDiceRoll = null;
       this._diceLock = false;
       this._diceGameStarted = false;
@@ -1473,7 +1486,6 @@ export class GameServer {
   // ============================================================
   // ✅ TIE RESULTS — HANYA NILAI TERBESAR YANG LOLOS
   //    Yang lain di-eliminate di round ini
-  //    (HANYA FUNGSI INI YANG DIUBAH)
   // ============================================================
   async _processTieResults(room, id, players) {
     const data = this._tieBreakers.get(id);
@@ -1513,7 +1525,7 @@ export class GameServer {
       return;
     }
 
-    // ✅ Semua nilai sama → tidak ada yang terbesar unik → lanjut round tanpa eliminate
+    // Semua nilai sama → tidak ada yang terbesar unik → lanjut round tanpa eliminate
     if (highestPlayers.length === players.length) {
       this.broadcast(CONSTANTS.DICE_ROOM, ["diceNotification", `All answered same value: ${highest} - Tie again!`]);
       this._tiePlayers = [...players];
