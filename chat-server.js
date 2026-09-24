@@ -633,6 +633,7 @@ export class ChatServer {
     try {
       if (!this.db) return new Map();
 
+      // ✅ 1x ambil SEMUA baris dari chat_multy
       const result = await this.db
         .prepare(`SELECT key, value FROM ${TABLE_MULTY}`)
         .all();
@@ -651,6 +652,7 @@ export class ChatServer {
 
       let legacyChatRaw = null;
       let legacyNumberRaw = null;
+      let noimgCacheRaw = null;
 
       for (const row of rows) {
         const key = row?.key;
@@ -659,6 +661,7 @@ export class ChatServer {
 
         if (key === 'chat_multy') { legacyChatRaw = value; continue; }
         if (key === 'number') { legacyNumberRaw = value; continue; }
+        if (key === K_MULTY_NOIMG_CACHE) { noimgCacheRaw = value; continue; }
 
         if (key.startsWith('chat_multy_')) {
           const room = key.slice('chat_multy_'.length);
@@ -701,6 +704,22 @@ export class ChatServer {
             VALUES (?, ?, CURRENT_TIMESTAMP)
           `).bind(K_NUMBER(DEFAULT_MULTY_ROOM), legacyNumberRaw).run().catch(() => {});
         }
+      }
+
+      // ✅ Parse noimg cache dari baris yang sama (bukan query baru)
+      if (noimgCacheRaw) {
+        try {
+          const obj = JSON.parse(noimgCacheRaw);
+          if (obj && typeof obj === 'object') {
+            this._userNoimgCache = new Map();
+            for (const [username, noimg] of Object.entries(obj)) {
+              const n = parseInt(noimg);
+              if (!isNaN(n) && n > 0) {
+                this._userNoimgCache.set(username, n);
+              }
+            }
+          }
+        } catch(e) {}
       }
 
       const out = new Map();
@@ -2775,8 +2794,7 @@ export class ChatServer {
       }
 
       try {
-        const loaded = await this._loadUserNoimgCache();
-        if (!loaded) {
+        if (this._userNoimgCache.size === 0) {
           await this._ensureCacheInitialized();
           const roomsData = this._storageCache?.roomsData || {};
           let rebuilt = 0;
