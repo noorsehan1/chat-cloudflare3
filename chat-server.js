@@ -3113,8 +3113,7 @@ export class ChatServer {
         this._userJoinLock,
         `join_user_${username}`,
         async () => {
-          const found = await this._findUserInAnyRoom(username);
-          const isMultiUser = found ? found.isMulti : false;
+          const isMultiUser = this._userNoimgCache?.has(username) === true;
 
           if (!isNewUser && isMultiUser) {
             ws.username = username;
