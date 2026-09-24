@@ -3117,6 +3117,10 @@ export class ChatServer {
           const isMultiUser = found ? found.isMulti : false;
 
           if (!isNewUser && isMultiUser) {
+            ws.username = username;
+            ws.idtarget = username;
+            ws._username = username;
+            try { ws.serializeAttachment({ username: username }); } catch(e) {}
             return { skip: true };
           }
 
