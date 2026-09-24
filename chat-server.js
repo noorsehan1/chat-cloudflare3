@@ -1849,16 +1849,11 @@ export class ChatServer {
   async _joinInternal(ws, roomName, username) {
     try {
       const existing = await this._findUserInAnyRoom(username);
-
-      // ✅ PERBAIKAN: user yang masuk lewat setIdTarget2 (isNewUser = true)
-      // tidak boleh mewarisi isMulti dari seat lamanya.
-      // Kalau ws ini TIDAK ditandai aktif multi, paksa wasMulti = false.
-      const wsIsMulti = this.wsActiveMulti?.has(ws) === true;
-      const wasMulti = wsIsMulti && existing?.isMulti === true;
+      const wasMulti = existing?.isMulti === true;
 
       await this._removeAllSeatsForUser(username);
 
-      if (existing && wasMulti) {
+      if (existing) {
         this._cleanupMultiTracking(username, existing.room, ws);
       }
 
@@ -3107,11 +3102,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // ✅ PERBAIKAN UTAMA: _handleSetId
-  //    Kalau isNewUser === true → user WAJIB jadi normal,
-  //    walaupun sebelumnya terdaftar sebagai multi.
-  // ============================================================
   async _handleSetId(ws, username, isNewUser) {
     try {
       if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
@@ -3126,12 +3116,7 @@ export class ChatServer {
           const found = await this._findUserInAnyRoom(username);
           const isMultiUser = found ? found.isMulti : false;
 
-          // ✅ PERBAIKAN:
-          // Kalau isNewUser === true → user wajib jadi normal.
-          // JANGAN skip walaupun dia terdeteksi multi.
-          // Kita harus hapus SEMUA seat lama (termasuk yang multi),
-          // dan bersihkan tracking multi milik user ini.
-          if (isMultiUser && isNewUser !== true) {
+          if (!isNewUser && isMultiUser) {
             return { skip: true };
           }
 
@@ -3139,16 +3124,9 @@ export class ChatServer {
             return { skip: true };
           }
 
-          // Hapus semua seat lama (normal + multi) untuk user ini
           await this._removeAllSeatsForUser(username);
 
-          // ✅ Bersihkan sisa tracking multi milik user ini
-          if (isMultiUser) {
-            this._cleanupMultiTracking(username, found?.room || null, ws);
-            await this._deleteUserNoimgCache(username);
-          }
-
-          return { skip: false, wasMulti: isMultiUser };
+          return { skip: false };
         },
         C.USER_JOIN_LOCK_TIMEOUT
       );
@@ -3168,9 +3146,6 @@ export class ChatServer {
       ws._username = username;
       ws._room = null;
 
-      // ✅ Pastikan ws ini tidak dianggap multi lagi
-      try { this.wsActiveMulti?.delete(ws); } catch(e) {}
-
       try { ws.serializeAttachment({ username: username }); } catch(e) {}
 
       let connections = this.userConnections?.get(username);
@@ -3180,6 +3155,7 @@ export class ChatServer {
       }
       if (!connections.has(ws)) try { connections.add(ws); } catch(e) {}
       if (!this.wsSet?.has(ws)) try { this.wsSet?.add(ws); } catch(e) {}
+      try { this.wsActiveMulti?.delete(ws); } catch(e) {}
 
       if (isNewUser) {
         this.safeSend(ws, ["joinroomawal"]);
