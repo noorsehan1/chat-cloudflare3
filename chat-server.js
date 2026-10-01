@@ -996,9 +996,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ NEXT MULTY CHAT — HAPUS DATA DI D1 & CACHE KALAU HABIS
-  // ============================================================
   async _nextMultyChat(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     const st = this._getMultyState(r);
@@ -1010,14 +1007,12 @@ export class ChatServer {
         return false;
       }
 
-      // === CHAT HABIS / KOSONG → HAPUS DATA DI D1 & CACHE ===
       if (!Array.isArray(st.chatList) || st.chatList.length === 0 || st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
 
         this._stopMultyLoop(r);
 
-        // === HAPUS DATA CHAT DI D1 ===
         try {
           if (this.db) {
             await this.db.prepare(`
@@ -1030,7 +1025,6 @@ export class ChatServer {
           }
         } catch(e) {}
 
-        // === HAPUS DATA CHAT DI CACHE ===
         try {
           st.chatList = [];
           st.index = 0;
@@ -1038,10 +1032,8 @@ export class ChatServer {
           st.numberNext = 1;
         } catch(e) {}
 
-        // === HAPUS DARI _multyState ===
         try { this._multyState.delete(r); } catch(e) {}
 
-        // === BROADCAST KE ROOM ===
         this.broadcast(r, ["multyStop", r]);
 
         return false;
@@ -1095,14 +1087,12 @@ export class ChatServer {
 
       this._saveMultyIndexToTable(r, st.index).catch(() => {});
 
-      // === CHAT HABIS SETELAH INCREMENT → HAPUS DATA DI D1 & CACHE ===
       if (st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
 
         this._stopMultyLoop(r);
 
-        // === HAPUS DATA CHAT DI D1 ===
         try {
           if (this.db) {
             await this.db.prepare(`
@@ -1115,7 +1105,6 @@ export class ChatServer {
           }
         } catch(e) {}
 
-        // === HAPUS DATA CHAT DI CACHE ===
         try {
           st.chatList = [];
           st.index = 0;
@@ -1123,10 +1112,8 @@ export class ChatServer {
           st.numberNext = 1;
         } catch(e) {}
 
-        // === HAPUS DARI _multyState ===
         try { this._multyState.delete(r); } catch(e) {}
 
-        // === BROADCAST KE ROOM ===
         this.broadcast(r, ["multyStop", r]);
 
         return false;
@@ -3743,9 +3730,6 @@ export class ChatServer {
           break;
         }
 
-        // ============================================================
-        // ✅ multiJoin2 — JOIN + AUTO SET ACTIVE MULTI2
-        // ============================================================
         case "multiJoin2": {
           const multiUsername2 = args[0];
           const multiRoomname2 = args[1];
@@ -3756,10 +3740,8 @@ export class ChatServer {
 
           const { room, seat } = result2;
 
-          // === AUTO SET ACTIVE MULTI2 ===
           try { this.wsActiveMulti?.set(ws, { username: multiUsername2, room: room }); } catch(e) {}
 
-          // === Set identity WS ===
           ws.username = multiUsername2;
           ws.idtarget = multiUsername2;
           ws.room = room;
@@ -3767,13 +3749,11 @@ export class ChatServer {
           ws._username = multiUsername2;
           ws._room = room;
 
-          // === userConnections ===
           let connections = this.userConnections?.get(multiUsername2);
           if (!connections) connections = new Set();
           if (!connections.has(ws)) try { connections.add(ws); } catch(e) {}
           try { this.userConnections?.set(multiUsername2, connections); } catch(e) {}
 
-          // === serializeAttachment ===
           try {
             ws.serializeAttachment({
               username: multiUsername2,
@@ -3781,7 +3761,6 @@ export class ChatServer {
             });
           } catch(e) {}
 
-          // === Pindah roomClients ===
           for (const [otherRoom, clients] of (this.roomClients || new Map())) {
             if (otherRoom !== room && clients) {
               try { clients.delete(ws); } catch(e) {}
@@ -3790,10 +3769,8 @@ export class ChatServer {
           const roomClients = this.roomClients?.get(room);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
 
-          // === Pastikan wsSet ===
           if (!this.wsSet?.has(ws)) try { this.wsSet?.add(ws); } catch(e) {}
 
-          // === Kirim balasan ===
           this.safeSend(ws, ["rooMasukMulti2", seat, room]);
           await this.updateRoomCount(room);
           break;
@@ -3811,6 +3788,33 @@ export class ChatServer {
               await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
             this._removeUserIndex(targetUsername);
+          } catch(e) {}
+          break;
+        }
+
+        // ============================================================
+        // ✅ exitMulti2 — HAPUS SEMUA SEAT USER (di semua room)
+        // ============================================================
+        case "exitMulti2": {
+          const targetUsername2 = args[0];
+          if (!targetUsername2) break;
+          try {
+            await this._removeAllSeatsForUser(targetUsername2);
+
+            try {
+              const active = this.wsActiveMulti?.get(ws);
+              if (active && active.username === targetUsername2) {
+                this.wsActiveMulti.delete(ws);
+              }
+            } catch(e) {}
+
+            this._removeUserIndex(targetUsername2);
+
+            try {
+              await this._deleteUserNoimgCache(targetUsername2);
+            } catch(e) {}
+
+            this.safeSend(ws, ["exitMulti2Success", targetUsername2]);
           } catch(e) {}
           break;
         }
