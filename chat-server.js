@@ -1435,7 +1435,7 @@ export class ChatServer {
     }
   }
 
-  // ✅ FIND SEAT USER DI ROOM TERTENTU (untuk multiJoin2 / exitMulti2)
+  // ✅ FIND SEAT USER DI ROOM TERTENTU (untuk multiJoin2)
   async _findAllSeatsForUserInRoom(username, roomName) {
     try {
       if (!username || !roomName) return null;
@@ -2256,8 +2256,6 @@ export class ChatServer {
   async _handleMultiJoin2Internal(ws, multiUsername, multiRoomname) {
     try {
       await this._ensureCacheInitialized();
-
-      // ❌ TIDAK ada _removeAllSeatsForUser — seat lama tetap aman
 
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
@@ -3892,24 +3890,27 @@ export class ChatServer {
         }
 
         // ============================================================
-        // ✅ exitMulti2 — KELUAR MULTI DARI 1 ROOM SAJA
+        // ✅ exitMulti2 — TANPA roomname (cukup username)
         // ============================================================
         case "exitMulti2": {
           const targetUsername2 = args[0];
-          const targetRoom2 = args[1];
-          if (!targetUsername2 || !targetRoom2) break;
+          if (!targetUsername2) break;
 
           try {
-            const found2 = await this._findAllSeatsForUserInRoom(targetUsername2, targetRoom2);
-            if (found2 && found2.seat) {
+            const found2 = await this._findUserInAnyRoom(targetUsername2);
+
+            if (found2 && found2.room && found2.seat) {
               await this._deleteSeatInRoom(found2.room, found2.seat, true);
             }
+
             try {
               const active = this.wsActiveMulti?.get(ws);
-              if (active && active.username === targetUsername2 && active.room === targetRoom2) {
+              if (active && active.username === targetUsername2) {
                 this.wsActiveMulti.delete(ws);
               }
             } catch (e) {}
+
+            this._removeUserIndex(targetUsername2);
           } catch (e) {}
           break;
         }
