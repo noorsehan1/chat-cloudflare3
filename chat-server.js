@@ -1402,23 +1402,6 @@ export class ChatServer {
     }
   }
 
-  async _findAllSeatsForUserInRoom(username, roomName) {
-    try {
-      if (!username || !roomName) return null;
-      await this._ensureCacheInitialized();
-      const roomBucket = this._storageCache?.roomsData?.[roomName];
-      if (!roomBucket?.seat) return null;
-      for (const [s, data] of Object.entries(roomBucket.seat)) {
-        if (data?.namauser === username) {
-          return { room: roomName, seat: parseInt(s), isMulti: data.isMulti === true };
-        }
-      }
-      return null;
-    } catch (e) {
-      return null;
-    }
-  }
-
   async _deleteSeatInRoom(roomName, seatNumber, force = false) {
     return await this._withLock(
       this._roomWriteLocks,
@@ -1523,6 +1506,9 @@ export class ChatServer {
     );
   }
 
+  // ============================================================
+  // UPDATE SEAT — dengan updateRoomCount setelah seat berubah
+  // ============================================================
   async _updateSeatInRoom(roomName, seatNumber, seatData) {
     return await this._withLock(
       this._roomWriteLocks,
@@ -1532,6 +1518,7 @@ export class ChatServer {
           const roomBucket = await this._getRoomBucket(roomName);
           if (!roomBucket) return false;
 
+          // === KOSONGKAN SEAT ===
           if (!seatData || !seatData.namauser || seatData.namauser.trim() === '') {
             const oldSeat = roomBucket.seat?.[seatNumber];
             const oldUser = oldSeat?.namauser;
@@ -1548,11 +1535,18 @@ export class ChatServer {
                 this._deleteUserNoimgCache(oldUser).catch(() => {});
               }
             }
+
+            // ✅ UPDATE ROOM COUNT setelah kosongkan seat
+            if (!this._isRestoring) {
+              try { await this.updateRoomCount(roomName); } catch(e) {}
+            }
+
             return true;
           }
 
           const username = seatData.namauser;
 
+          // === HAPUS USER DARI ROOM LAIN (pindah room) ===
           await this._ensureCacheInitialized();
           const roomsData = this._storageCache?.roomsData || {};
 
@@ -1586,6 +1580,7 @@ export class ChatServer {
             }
           }
 
+          // === SET SEAT BARU ===
           const oldSeat = roomBucket.seat?.[seatNumber];
           const finalSeatData = { ...seatData };
           if (oldSeat?.isMulti === true && finalSeatData.isMulti !== true) {
@@ -1603,6 +1598,11 @@ export class ChatServer {
             if (!isNaN(noimg) && noimg > 0) {
               await this._setUserNoimgCache(finalSeatData.namauser, noimg);
             }
+          }
+
+          // ✅ UPDATE ROOM COUNT setelah set seat baru
+          if (!this._isRestoring) {
+            try { await this.updateRoomCount(roomName); } catch(e) {}
           }
 
           return true;
@@ -2175,9 +2175,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ MULTI JOIN 2 — SAMA PERSIS multiJoin, TANPA HAPUS SEAT LAMA
-  // ============================================================
   async _handleMultiJoin2(ws, multiUsername, multiRoomname) {
     try {
       if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
@@ -2196,8 +2193,6 @@ export class ChatServer {
   async _handleMultiJoin2Internal(ws, multiUsername, multiRoomname) {
     try {
       await this._ensureCacheInitialized();
-
-      // ❌ TIDAK ada _removeAllSeatsForUser — seat lama tetap aman
 
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
@@ -3709,7 +3704,7 @@ export class ChatServer {
         }
 
         // ============================================================
-        // ✅ multiJoin2 — SAMA PERSIS SEPERTI multiJoin, CUMA BEDA NAMA
+        // ✅ multiJoin2 — AUTO SET ACTIVE MULTI2
         // ============================================================
         case "multiJoin2": {
           const multiUsername2 = args[0];
@@ -3720,6 +3715,8 @@ export class ChatServer {
           if (!result2) break;
 
           const { room, seat } = result2;
+
+          try { this.wsActiveMulti?.set(ws, { username: multiUsername2, room: room }); } catch(e) {}
 
           let connections = this.userConnections?.get(multiUsername2);
           if (!connections) connections = new Set();
@@ -3733,19 +3730,22 @@ export class ChatServer {
             });
           } catch(e) {}
 
+          ws.username = multiUsername2;
+          ws.idtarget = multiUsername2;
+          ws.room = room;
+          ws.roomname = room;
           ws._username = multiUsername2;
           ws._room = room;
-
-          try { this.wsActiveMulti?.set(ws, { username: multiUsername2, room: room }); } catch(e) {}
 
           for (const [otherRoom, clients] of (this.roomClients || new Map())) {
             if (otherRoom !== room && clients) {
               try { clients.delete(ws); } catch(e) {}
             }
           }
-
           const roomClients = this.roomClients?.get(room);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
+
+          if (!this.wsSet?.has(ws)) try { this.wsSet?.add(ws); } catch(e) {}
 
           this.safeSend(ws, ["rooMasukMulti2", seat, room]);
           await this.updateRoomCount(room);
@@ -3765,29 +3765,6 @@ export class ChatServer {
             }
             this._removeUserIndex(targetUsername);
           } catch(e) {}
-          break;
-        }
-
-        case "exitMulti2": {
-          const targetUsername2 = args[0];
-          if (!targetUsername2) break;
-
-          try {
-            const found2 = await this._findUserInAnyRoom(targetUsername2);
-
-            if (found2 && found2.room && found2.seat) {
-              await this._deleteSeatInRoom(found2.room, found2.seat, true);
-            }
-
-            try {
-              const active = this.wsActiveMulti?.get(ws);
-              if (active && active.username === targetUsername2) {
-                this.wsActiveMulti.delete(ws);
-              }
-            } catch (e) {}
-
-            this._removeUserIndex(targetUsername2);
-          } catch (e) {}
           break;
         }
 
