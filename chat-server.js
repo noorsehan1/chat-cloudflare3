@@ -3743,6 +3743,9 @@ export class ChatServer {
           break;
         }
 
+        // ============================================================
+        // ✅ multiJoin2 — JOIN + AUTO SET ACTIVE MULTI2
+        // ============================================================
         case "multiJoin2": {
           const multiUsername2 = args[0];
           const multiRoomname2 = args[1];
@@ -3753,11 +3756,24 @@ export class ChatServer {
 
           const { room, seat } = result2;
 
+          // === AUTO SET ACTIVE MULTI2 ===
+          try { this.wsActiveMulti?.set(ws, { username: multiUsername2, room: room }); } catch(e) {}
+
+          // === Set identity WS ===
+          ws.username = multiUsername2;
+          ws.idtarget = multiUsername2;
+          ws.room = room;
+          ws.roomname = room;
+          ws._username = multiUsername2;
+          ws._room = room;
+
+          // === userConnections ===
           let connections = this.userConnections?.get(multiUsername2);
           if (!connections) connections = new Set();
           if (!connections.has(ws)) try { connections.add(ws); } catch(e) {}
           try { this.userConnections?.set(multiUsername2, connections); } catch(e) {}
 
+          // === serializeAttachment ===
           try {
             ws.serializeAttachment({
               username: multiUsername2,
@@ -3765,20 +3781,19 @@ export class ChatServer {
             });
           } catch(e) {}
 
-          ws._username = multiUsername2;
-          ws._room = room;
-
-          try { this.wsActiveMulti?.set(ws, { username: multiUsername2, room: room }); } catch(e) {}
-
+          // === Pindah roomClients ===
           for (const [otherRoom, clients] of (this.roomClients || new Map())) {
             if (otherRoom !== room && clients) {
               try { clients.delete(ws); } catch(e) {}
             }
           }
-
           const roomClients = this.roomClients?.get(room);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
 
+          // === Pastikan wsSet ===
+          if (!this.wsSet?.has(ws)) try { this.wsSet?.add(ws); } catch(e) {}
+
+          // === Kirim balasan ===
           this.safeSend(ws, ["rooMasukMulti2", seat, room]);
           await this.updateRoomCount(room);
           break;
