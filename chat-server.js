@@ -1268,7 +1268,6 @@ export class ChatServer {
                     key, seat: seatNumber, room: roomName, isMulti
                   });
                   roomsData[roomName].seat[seatNumber] = value;
-                } else {
                 }
               } else {
                 userSeatMap.set(uname, {
@@ -2216,7 +2215,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ MULTI JOIN 2 — LOGIKA SAMA multiJoin, TANPA HAPUS SEAT LAMA
+  // MULTI JOIN 2 — TANPA HAPUS SEAT LAMA
   // ============================================================
   async _handleMultiJoin2(ws, multiUsername, multiRoomname) {
     try {
@@ -2236,8 +2235,6 @@ export class ChatServer {
   async _handleMultiJoin2Internal(ws, multiUsername, multiRoomname) {
     try {
       await this._ensureCacheInitialized();
-
-      // ❌ TIDAK ada _removeAllSeatsForUser — seat lama tetap aman
 
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
@@ -2289,6 +2286,8 @@ export class ChatServer {
           }
         }
       } catch(e) {}
+
+      this._setUserIndex(multiUsername, multiRoomname, seat, true);
 
       try {
         const st = this._getMultyState(multiRoomname);
@@ -3772,9 +3771,6 @@ export class ChatServer {
           break;
         }
 
-        // ============================================================
-        // ✅ multiJoin2 — SAMA PERSIS multiJoin, TANPA HAPUS SEAT LAMA
-        // ============================================================
         case "multiJoin2": {
           const multiUsername2 = args[0];
           const multiRoomname2 = args[1];
@@ -3799,6 +3795,10 @@ export class ChatServer {
 
           ws._username = multiUsername2;
           ws._room = room;
+          ws.username = multiUsername2;
+          ws.idtarget = multiUsername2;
+          ws.room = room;
+          ws.roomname = room;
 
           try { this.wsActiveMulti?.set(ws, { username: multiUsername2, room: room }); } catch(e) {}
 
@@ -3810,6 +3810,8 @@ export class ChatServer {
 
           const roomClients = this.roomClients?.get(room);
           if (roomClients && !roomClients.has(ws)) try { roomClients.add(ws); } catch(e) {}
+
+          if (!this.wsSet?.has(ws)) try { this.wsSet?.add(ws); } catch(e) {}
 
           this.safeSend(ws, ["rooMasukMulti2", seat, room]);
           await this.updateRoomCount(room);
@@ -3828,6 +3830,22 @@ export class ChatServer {
               await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
             this._removeUserIndex(targetUsername);
+          } catch(e) {}
+          break;
+        }
+
+        case "exitMulti2": {
+          const targetUsername2 = args[0];
+          if (!targetUsername2) break;
+          try {
+            const found = await this._findUserInAnyRoom(targetUsername2);
+            const roomName = found?.room;
+            const seatNumber = found?.seat;
+
+            if (roomName && seatNumber) {
+              await this._deleteSeatInRoom(roomName, seatNumber, true);
+            }
+            this._removeUserIndex(targetUsername2);
           } catch(e) {}
           break;
         }
