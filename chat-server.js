@@ -3814,7 +3814,6 @@ export class ChatServer {
               await this._deleteUserNoimgCache(targetUsername2);
             } catch(e) {}
 
-            this.safeSend(ws, ["exitMulti2Success", targetUsername2]);
           } catch(e) {}
           break;
         }
