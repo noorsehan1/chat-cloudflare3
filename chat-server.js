@@ -80,7 +80,6 @@ export class ChatServer {
       this._userIndex = new Map();
       this._userNoimgCache = new Map();
 
-      // === LOCK HIERARCHY (urutan: global → room → roomWrite → user) ===
       this._globalLocks = new Map();
       this._roomLocks = new Map();
       this._roomWriteLocks = new Map();
@@ -88,7 +87,6 @@ export class ChatServer {
       this._kursiLocks = new Map();
       this._wsLock = null;
 
-      // === JOIN COOLDOWN (anti spam) ===
       this._joinCooldown = new Map();
 
       this.currentNumber = 1;
@@ -1311,7 +1309,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // D1 WRITE HELPERS (WAJIB AWAIT — write-through)
+  // D1 WRITE HELPERS
   // ============================================================
   async _saveSeat(roomName, seatNumber, seatData) {
     if (!this.db) return;
@@ -1437,9 +1435,7 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ FIND SEAT USER DI ROOM TERTENTU (untuk multiJoin2)
-  // ============================================================
+  // ✅ FIND SEAT USER DI ROOM TERTENTU (untuk multiJoin2 / exitMulti2)
   async _findAllSeatsForUserInRoom(username, roomName) {
     try {
       if (!username || !roomName) return null;
@@ -1458,7 +1454,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // DELETE SEAT (write-through: D1 dulu, cache kemudian)
+  // DELETE SEAT
   // ============================================================
   async _deleteSeatInRoom(roomName, seatNumber, force = false) {
     return await this._withLock(
@@ -1508,7 +1504,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // REMOVE ALL SEATS (write-through + global lock)
+  // REMOVE ALL SEATS
   // ============================================================
   async _removeAllSeatsForUser(username, options = {}) {
     if (!username) return 0;
@@ -1568,7 +1564,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // UPDATE SEAT (write-through + roomWrite lock)
+  // UPDATE SEAT
   // ============================================================
   async _updateSeatInRoom(roomName, seatNumber, seatData) {
     return await this._withLock(
@@ -1693,7 +1689,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ROOM DATA / COUNT (dari cache — real-time sinkron)
+  // ROOM DATA / COUNT
   // ============================================================
   async _getRoomData(roomName) {
     try {
@@ -1831,7 +1827,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // KURSI UPDATE (per-seat lock)
+  // KURSI UPDATE
   // ============================================================
   async _updateKursi(roomName, seat, data) {
     try {
@@ -1933,7 +1929,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // JOIN (LOCK: user → room, dengan idempotency + cooldown)
+  // JOIN
   // ============================================================
   async _handleJoin(ws, roomName) {
     try {
@@ -2143,7 +2139,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // MULTI JOIN (LOCK: user)
+  // MULTI JOIN (LAMA — hapus semua seat)
   // ============================================================
   async _handleMultiJoin(ws, multiUsername, multiRoomname) {
     try {
@@ -2238,7 +2234,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ MULTI JOIN 2 (TANPA HAPUS SEAT LAMA — BISA MULTI DI BANYAK ROOM)
+  // ✅ MULTI JOIN 2 — TANPA HAPUS SEAT LAMA
   // ============================================================
   async _handleMultiJoin2(ws, multiUsername, multiRoomname) {
     try {
@@ -2271,7 +2267,6 @@ export class ChatServer {
       }
       if (!roomBucket.seat) roomBucket.seat = {};
 
-      // === Cek apakah user sudah punya seat multi di room ini ===
       let seat = null;
       for (const [s, data] of Object.entries(roomBucket.seat)) {
         if (data?.namauser === multiUsername && data.isMulti === true) {
@@ -2280,7 +2275,6 @@ export class ChatServer {
         }
       }
 
-      // === Kalau belum ada, cari seat kosong ===
       if (!seat) {
         const seatCount = Object.values(roomBucket.seat).filter(s => s?.namauser).length;
         if (seatCount >= C.MAX_SEATS) {
@@ -2308,7 +2302,6 @@ export class ChatServer {
         await this._updateSeatInRoom(multiRoomname, seat, newSeat);
       }
 
-      // === Simpan noimg user ke cache multi ===
       try {
         const currentSeat = roomBucket.seat?.[seat];
         if (currentSeat?.namauser === multiUsername) {
@@ -2319,7 +2312,6 @@ export class ChatServer {
         }
       } catch (e) {}
 
-      // === Set WS sebagai multi aktif untuk room ini ===
       try {
         const existing = this.wsActiveMulti?.get(ws);
         if (existing) {
@@ -2329,13 +2321,11 @@ export class ChatServer {
         }
       } catch (e) {}
 
-      // === Pastikan WS terdaftar di room clients ===
       const roomClients = this.roomClients?.get(multiRoomname);
       if (roomClients && !roomClients.has(ws)) {
         try { roomClients.add(ws); } catch (e) {}
       }
 
-      // === Pastikan userConnections terisi ===
       let connections = this.userConnections?.get(multiUsername);
       if (!connections) {
         connections = new Set();
@@ -2345,7 +2335,6 @@ export class ChatServer {
         try { connections.add(ws); } catch (e) {}
       }
 
-      // === Broadcast multy status kalau running ===
       try {
         const st = this._getMultyState(multiRoomname);
         if (st.running) {
@@ -2533,7 +2522,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // WS MESSAGE QUEUE (per-WS serial)
+  // WS MESSAGE QUEUE
   // ============================================================
   async webSocketMessage(ws, msg) {
     try {
@@ -2915,7 +2904,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ORPHAN CLEANUP (saat alarm — bukan periodik cache reload)
+  // ORPHAN CLEANUP
   // ============================================================
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
@@ -3829,7 +3818,7 @@ export class ChatServer {
         }
 
         // ============================================================
-        // ✅ multiJoin2 — TANPA HAPUS SEAT LAMA + NOTIF KE USER LAIN
+        // ✅ multiJoin2 — TANPA HAPUS SEAT LAMA
         // ============================================================
         case "multiJoin2": {
           const multiUsername2 = args[0];
@@ -3840,7 +3829,6 @@ export class ChatServer {
             break;
           }
 
-          // === VALIDASI: hanya boleh untuk dirinya sendiri ===
           const wsOwner = ws.username || ws._username;
           if (!wsOwner) {
             this.safeSend(ws, ["error", "multiJoin2: belum setId"]);
@@ -3860,7 +3848,6 @@ export class ChatServer {
 
           const { room: room2, seat: seat2 } = result2;
 
-          // === Set identity WS ===
           ws._username = multiUsername2;
           ws._room = room2;
           ws.username = multiUsername2;
@@ -3875,47 +3862,15 @@ export class ChatServer {
             });
           } catch (e) {}
 
-          // === Balas ke WS pengirim ===
           this.safeSend(ws, ["rooMasukMulti2", seat2, room2]);
           this.safeSend(ws, ["multyRoom", room2]);
           this.safeSend(ws, ["numberKursiSaya", seat2]);
           this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
-          // === Kirim state room ke WS pengirim ===
           try {
             await this.sendAllStateTo(ws, room2, true);
           } catch (e) {}
 
-          // === ✅ NOTIF KE USER LAIN (semua koneksi username yang sama) ===
-          try {
-            const targetConns = this.userConnections?.get(multiUsername2);
-            if (targetConns) {
-              for (const targetWs of targetConns) {
-                if (targetWs !== ws && targetWs?.readyState === 1) {
-                  this.safeSend(targetWs, [
-                    "multiJoinedNotify",
-                    multiUsername2,
-                    seat2,
-                    room2,
-                    Date.now()
-                  ]);
-                }
-              }
-            }
-          } catch (e) {}
-
-          // === ✅ NOTIF KE SEMUA USER DI ROOM ===
-          try {
-            this.broadcast(room2, [
-              "userJoinedMulti",
-              multiUsername2,
-              seat2,
-              room2,
-              Date.now()
-            ]);
-          } catch (e) {}
-
-          // === Update room count ===
           await this.updateRoomCount(room2);
           break;
         }
@@ -3955,10 +3910,7 @@ export class ChatServer {
                 this.wsActiveMulti.delete(ws);
               }
             } catch (e) {}
-            this.safeSend(ws, ["exitMulti2Success", targetRoom2]);
-          } catch (e) {
-            this.safeSend(ws, ["error", "exitMulti2 gagal"]);
-          }
+          } catch (e) {}
           break;
         }
 
