@@ -1418,7 +1418,6 @@ export class ChatServer {
             continue;
           }
 
-          // Kalau ada keepRoom/keepSeat → hapus D1 per seat (karena 1 query tidak bisa exclude)
           if (keepRoom || keepSeat) {
             if (this.db) {
               try {
@@ -1970,7 +1969,6 @@ export class ChatServer {
       }
 
       if (existing) {
-        // ✅ RINGAN: pakai versi 1 query D1
         await this._lightDeleteAllSeatsForUser(username);
         this._cleanupMultiTracking(username, existing.room, ws);
       }
@@ -2125,7 +2123,6 @@ export class ChatServer {
     try {
       await this._ensureCacheInitialized();
 
-      // ✅ RINGAN
       await this._lightDeleteAllSeatsForUser(multiUsername);
       this._cleanupMultiTracking(multiUsername, null, ws);
 
@@ -2401,7 +2398,6 @@ export class ChatServer {
         }
       }
 
-      // ✅ RINGAN: pakai _lightDeleteAllSeatsForUser
       if (username && !stillConnected && !this._isRestoring) {
         try { await this._forceDeleteFromD1(username); } catch (e) {}
         try { await this._lightDeleteAllSeatsForUser(username); } catch (e) {}
@@ -2873,7 +2869,6 @@ export class ChatServer {
         if (!roomBucket?.seat) continue;
 
         for (const [seatStr, seatData] of Object.entries(roomBucket.seat)) {
-          // ✅ SAMPLING: cek 1 dari 3
           if (counter++ % 3 !== 0) continue;
 
           if (!seatData?.namauser) continue;
@@ -2924,8 +2919,6 @@ export class ChatServer {
       this._isRestoring = true;
       this._restoreRemovedSeats = [];
       this._hasBroadcastRemoveKursi = new Set();
-
-      // ❌ DIHAPUS: query DELETE duplikat
 
       try {
         await this._loadFromStorage();
@@ -3252,7 +3245,6 @@ export class ChatServer {
             return { skip: true };
           }
 
-          // ✅ RINGAN
           await this._lightDeleteAllSeatsForUser(username);
 
           return { skip: false };
@@ -3793,10 +3785,33 @@ export class ChatServer {
           break;
         }
 
+        // ============================================================
+        // ✅ exitMulti2 — SAMA SEPERTI exitMulti, tapi hapus SEMUA seat user
+        //    Broadcast removeKursi per seat ASLI user (nomor kursi user itu)
+        // ============================================================
         case "exitMulti2": {
           const targetUsername2 = args[0];
           if (!targetUsername2) break;
           try {
+            // === 1. Kumpulkan semua seat user + hapus dari cache ===
+            const roomsData = this._storageCache?.roomsData || {};
+            const removedSeats = []; // [{ room, seat }]
+
+            for (const [roomName, roomBucket] of Object.entries(roomsData)) {
+              if (!roomBucket?.seat) continue;
+              for (const [seatStr, data] of Object.entries(roomBucket.seat)) {
+                if (data?.namauser === targetUsername2) {
+                  const seatNum = parseInt(seatStr);
+                  if (!isNaN(seatNum)) {
+                    removedSeats.push({ room: roomName, seat: seatNum });
+                  }
+                  delete roomBucket.seat[seatStr];
+                  if (roomBucket.point) delete roomBucket.point[seatStr];
+                }
+              }
+            }
+
+            // === 2. Hapus SEMUA seat user di D1 (1 query) ===
             if (this.db) {
               try {
                 await this.db.prepare(`
@@ -3816,27 +3831,23 @@ export class ChatServer {
               } catch(e) {}
             }
 
-            const roomsData = this._storageCache?.roomsData || {};
+            // === 3. Broadcast removeKursi PER SEAT (persis exitMulti) ===
             const affectedRooms = new Set();
-
-            for (const [roomName, roomBucket] of Object.entries(roomsData)) {
-              if (!roomBucket?.seat) continue;
-              for (const [seatStr, data] of Object.entries(roomBucket.seat)) {
-                if (data?.namauser === targetUsername2) {
-                  delete roomBucket.seat[seatStr];
-                  if (roomBucket.point) delete roomBucket.point[seatStr];
-                  affectedRooms.add(roomName);
-                }
-              }
+            for (const item of removedSeats) {
+              try {
+                this.broadcast(item.room, ["removeKursi", item.room, item.seat]);
+                affectedRooms.add(item.room);
+              } catch(e) {}
             }
 
+            // === 4. Update count per room ===
             for (const roomName of affectedRooms) {
               try {
-                this.broadcast(roomName, ["removeKursi", roomName, -1]);
                 await this.updateRoomCount(roomName);
               } catch(e) {}
             }
 
+            // === 5. Hapus dari tracking ===
             try {
               const active = this.wsActiveMulti?.get(ws);
               if (active && active.username === targetUsername2) {
@@ -3872,7 +3883,6 @@ export class ChatServer {
           const seatNumber = found.seat;
 
           if (allSeats.length > 1) {
-            // ✅ RINGAN dengan keepRoom/keepSeat
             await this._lightDeleteAllSeatsForUser(targetUsername, {
               keepRoom: roomName,
               keepSeat: seatNumber
