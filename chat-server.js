@@ -996,6 +996,9 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // ✅ NEXT MULTY CHAT — HAPUS DATA DI D1 & CACHE KALAU HABIS
+  // ============================================================
   async _nextMultyChat(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     const st = this._getMultyState(r);
@@ -1007,6 +1010,7 @@ export class ChatServer {
         return false;
       }
 
+      // === CHAT HABIS / KOSONG → HAPUS DATA DI D1 & CACHE ===
       if (!Array.isArray(st.chatList) || st.chatList.length === 0 || st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
@@ -1087,6 +1091,7 @@ export class ChatServer {
 
       this._saveMultyIndexToTable(r, st.index).catch(() => {});
 
+      // === CHAT HABIS SETELAH INCREMENT → HAPUS DATA DI D1 & CACHE ===
       if (st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
@@ -2202,6 +2207,9 @@ export class ChatServer {
     }
   }
 
+  // ============================================================
+  // ✅ MULTI JOIN 2 — LOGIKA SAMA multiJoin, TANPA HAPUS SEAT LAMA
+  // ============================================================
   async _handleMultiJoin2(ws, multiUsername, multiRoomname) {
     try {
       if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
@@ -2220,6 +2228,8 @@ export class ChatServer {
   async _handleMultiJoin2Internal(ws, multiUsername, multiRoomname) {
     try {
       await this._ensureCacheInitialized();
+
+      // ❌ TIDAK ada _removeAllSeatsForUser — seat lama tetap aman
 
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
@@ -3730,6 +3740,9 @@ export class ChatServer {
           break;
         }
 
+        // ============================================================
+        // ✅ multiJoin2 — JOIN + AUTO SET ACTIVE MULTI2
+        // ============================================================
         case "multiJoin2": {
           const multiUsername2 = args[0];
           const multiRoomname2 = args[1];
@@ -3776,6 +3789,9 @@ export class ChatServer {
           break;
         }
 
+        // ============================================================
+        // ✅ exitMulti — SAMA SEPERTI KODE AWAL (hapus 1 seat)
+        // ============================================================
         case "exitMulti": {
           const targetUsername = args[0];
           if (!targetUsername) break;
@@ -3793,7 +3809,7 @@ export class ChatServer {
         }
 
         // ============================================================
-        // ✅ exitMulti2 — HAPUS SEMUA SEAT USER (di semua room)
+        // ✅ exitMulti2 — HAPUS SEMUA SEAT USER
         // ============================================================
         case "exitMulti2": {
           const targetUsername2 = args[0];
@@ -3814,6 +3830,7 @@ export class ChatServer {
               await this._deleteUserNoimgCache(targetUsername2);
             } catch(e) {}
 
+            this.safeSend(ws, ["exitMulti2Success", targetUsername2]);
           } catch(e) {}
           break;
         }
