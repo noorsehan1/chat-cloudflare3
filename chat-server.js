@@ -1359,10 +1359,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // ✅ RINGAN: hapus semua seat user via 1 query D1 + loop cache
-  //    Opsi keepRoom/keepSeat untuk skip seat tertentu
-  // ============================================================
   async _lightDeleteAllSeatsForUser(username, options = {}) {
     if (!username) return 0;
 
@@ -1967,7 +1963,7 @@ export class ChatServer {
 
       if (existing) {
         await this._lightDeleteAllSeatsForUser(username);
-        this._cleanupMultiTracking(username, existing.room, ws);
+        // ❌ TIDAK cleanupMultiTracking — WS lama dibiarkan hidup
       }
 
       await this._ensureCacheInitialized();
@@ -2046,10 +2042,6 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      if (!wasMulti) {
-        this.wsActiveMulti.delete(ws);
-      }
-
       const muteStatus = roomBucket.mute || false;
 
       this.safeSend(ws, ["rooMasuk", seat, roomName]);
@@ -2121,7 +2113,7 @@ export class ChatServer {
       await this._ensureCacheInitialized();
 
       await this._lightDeleteAllSeatsForUser(multiUsername);
-      this._cleanupMultiTracking(multiUsername, null, ws);
+      // ❌ TIDAK cleanupMultiTracking — WS lama dibiarkan hidup
 
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
@@ -2211,6 +2203,8 @@ export class ChatServer {
   async _handleMultiJoin2Internal(ws, multiUsername, multiRoomname) {
     try {
       await this._ensureCacheInitialized();
+
+      // ❌ TIDAK cleanupMultiTracking — WS lama dibiarkan hidup
 
       let roomBucket = this._storageCache?.roomsData?.[multiRoomname];
       if (!roomBucket) {
@@ -3261,7 +3255,7 @@ export class ChatServer {
       }
       if (!connections.has(ws)) try { connections.add(ws); } catch(e) {}
       if (!this.wsSet?.has(ws)) try { this.wsSet?.add(ws); } catch(e) {}
-      try { this.wsActiveMulti?.delete(ws); } catch(e) {}
+      // ❌ TIDAK hapus wsActiveMulti — WS lama dibiarkan hidup
 
       if (isNewUser) {
         this.safeSend(ws, ["joinroomawal"]);
@@ -3754,9 +3748,6 @@ export class ChatServer {
           break;
         }
 
-        // ============================================================
-        // ✅ exitMulti — hapus 1 seat user
-        // ============================================================
         case "exitMulti": {
           const targetUsername = args[0];
           if (!targetUsername) break;
@@ -3773,9 +3764,6 @@ export class ChatServer {
           break;
         }
 
-        // ============================================================
-        // ✅ exitMulti2 — SAMA PERSIS exitMulti (hapus 1 seat saja)
-        // ============================================================
         case "exitMulti2": {
           const targetUsername2 = args[0];
           if (!targetUsername2) break;
@@ -3815,43 +3803,8 @@ export class ChatServer {
             });
           }
 
-          let existingWs = null;
-          for (const [wsKey, data] of (this.wsActiveMulti || new Map())) {
-            if (data?.username === targetUsername) {
-              existingWs = wsKey;
-              break;
-            }
-          }
-          if (existingWs && existingWs !== ws) {
-            const oldRoom = this.wsActiveMulti?.get(existingWs)?.room;
-            if (oldRoom) {
-              const rc = this.roomClients?.get(oldRoom);
-              if (rc) try { rc.delete(existingWs); } catch(e) {}
-            }
-            const conns = this.userConnections?.get(targetUsername);
-            if (conns) {
-              try { conns.delete(existingWs); } catch(e) {}
-              if (conns.size === 0) {
-                try { this.userConnections?.delete(targetUsername); } catch(e) {}
-              }
-            }
-            try {
-              existingWs.serializeAttachment({});
-              existingWs.username = null;
-              existingWs.room = null;
-              existingWs.roomname = null;
-              existingWs.idtarget = null;
-              existingWs._username = null;
-              existingWs._room = null;
-            } catch(e) {}
-            try { this.wsSet?.delete(existingWs); } catch(e) {}
-            try { this.wsActiveMulti?.delete(existingWs); } catch(e) {}
-            try {
-              if (existingWs.readyState === 1) {
-                existingWs.close(1000, "Replaced by new connection");
-              }
-            } catch(e) {}
-          }
+          // ❌ TIDAK hapus WS lama — biarkan hidup
+
           try { this.wsActiveMulti?.set(ws, { username: targetUsername, room: roomName }); } catch(e) {}
           for (const [otherRoom, clients] of (this.roomClients || new Map())) {
             if (otherRoom !== roomName && clients) {
