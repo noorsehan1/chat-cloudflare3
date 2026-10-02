@@ -1373,7 +1373,6 @@ export class ChatServer {
     let removedCount = 0;
 
     try {
-      // === 1. Kalau TIDAK ada keepRoom/keepSeat → 1 query D1 hapus semua ===
       if (!keepRoom && !keepSeat) {
         if (this.db) {
           try {
@@ -1404,7 +1403,6 @@ export class ChatServer {
         }
       }
 
-      // === 2. Update cache ===
       const roomsData = this._storageCache?.roomsData || {};
       for (const [roomName, roomBucket] of Object.entries(roomsData)) {
         if (!roomBucket?.seat) continue;
@@ -1436,7 +1434,6 @@ export class ChatServer {
         }
       }
 
-      // === 3. Broadcast & update count ===
       for (const roomName of affectedRooms) {
         try {
           this.broadcast(roomName, ["removeKursi", roomName, -1]);
@@ -2196,9 +2193,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ MULTI JOIN 2 — TANPA HAPUS SEAT LAMA, RINGAN
-  // ============================================================
   async _handleMultiJoin2(ws, multiUsername, multiRoomname) {
     try {
       if (!multiUsername || !multiRoomname || !ROOMS_SET.has(multiRoomname)) return false;
@@ -2288,9 +2282,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ _cleanupUserCompletely — RINGAN
-  // ============================================================
   async _cleanupUserCompletely(ws, options = {}) {
     const result = { removedSeats: [] };
 
@@ -2831,9 +2822,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============================================================
-  // ✅ _verifyAndCleanupOrphanSeats — SAMPLING 1 dari 3
-  // ============================================================
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
       if (this._isRestoring) return 0;
@@ -2911,9 +2899,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ _restoreAllState — tanpa query hapus duplikat
-  // ============================================================
   async _restoreAllState() {
     try {
       this._isRestoring = true;
@@ -3769,6 +3754,9 @@ export class ChatServer {
           break;
         }
 
+        // ============================================================
+        // ✅ exitMulti — hapus 1 seat user
+        // ============================================================
         case "exitMulti": {
           const targetUsername = args[0];
           if (!targetUsername) break;
@@ -3786,82 +3774,20 @@ export class ChatServer {
         }
 
         // ============================================================
-        // ✅ exitMulti2 — SAMA SEPERTI exitMulti, tapi hapus SEMUA seat user
-        //    Broadcast removeKursi per seat ASLI user (nomor kursi user itu)
+        // ✅ exitMulti2 — SAMA PERSIS exitMulti (hapus 1 seat saja)
         // ============================================================
         case "exitMulti2": {
           const targetUsername2 = args[0];
           if (!targetUsername2) break;
           try {
-            // === 1. Kumpulkan semua seat user + hapus dari cache ===
-            const roomsData = this._storageCache?.roomsData || {};
-            const removedSeats = []; // [{ room, seat }]
+            const found = await this._findUserInAnyRoom(targetUsername2);
+            const roomName = found?.room;
+            const seatNumber = found?.seat;
 
-            for (const [roomName, roomBucket] of Object.entries(roomsData)) {
-              if (!roomBucket?.seat) continue;
-              for (const [seatStr, data] of Object.entries(roomBucket.seat)) {
-                if (data?.namauser === targetUsername2) {
-                  const seatNum = parseInt(seatStr);
-                  if (!isNaN(seatNum)) {
-                    removedSeats.push({ room: roomName, seat: seatNum });
-                  }
-                  delete roomBucket.seat[seatStr];
-                  if (roomBucket.point) delete roomBucket.point[seatStr];
-                }
-              }
+            if (roomName && seatNumber) {
+              await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
-
-            // === 2. Hapus SEMUA seat user di D1 (1 query) ===
-            if (this.db) {
-              try {
-                await this.db.prepare(`
-                  DELETE FROM ${TABLE_NAME}
-                  WHERE key LIKE 'seat_%'
-                  AND json_valid(value)
-                  AND json_extract(value, '$.namauser') = ?
-                `).bind(targetUsername2).run();
-              } catch(e) {}
-              try {
-                await this.db.prepare(`
-                  DELETE FROM ${TABLE_NAME}
-                  WHERE key LIKE 'point_%'
-                  AND json_valid(value)
-                  AND json_extract(value, '$.namauser') = ?
-                `).bind(targetUsername2).run();
-              } catch(e) {}
-            }
-
-            // === 3. Broadcast removeKursi PER SEAT (persis exitMulti) ===
-            const affectedRooms = new Set();
-            for (const item of removedSeats) {
-              try {
-                this.broadcast(item.room, ["removeKursi", item.room, item.seat]);
-                affectedRooms.add(item.room);
-              } catch(e) {}
-            }
-
-            // === 4. Update count per room ===
-            for (const roomName of affectedRooms) {
-              try {
-                await this.updateRoomCount(roomName);
-              } catch(e) {}
-            }
-
-            // === 5. Hapus dari tracking ===
-            try {
-              const active = this.wsActiveMulti?.get(ws);
-              if (active && active.username === targetUsername2) {
-                this.wsActiveMulti.delete(ws);
-              }
-            } catch(e) {}
-
             this._removeUserIndex(targetUsername2);
-
-            try {
-              await this._deleteUserNoimgCache(targetUsername2);
-            } catch(e) {}
-
-            this.safeSend(ws, ["exitMulti2Success", targetUsername2]);
           } catch(e) {}
           break;
         }
