@@ -1,4 +1,7 @@
- const C = {
+// ==================== CHAT-SERVER.JS ====================
+// VERSION: 4.0.0
+
+const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 500000,
@@ -1381,12 +1384,10 @@ export class ChatServer {
           const seatNum = parseInt(seatStr);
           if (isNaN(seatNum)) continue;
 
-          // Skip seat yang mau di-keep
           if (keepRoom && keepSeat && roomName === keepRoom && seatNum === keepSeat) {
             continue;
           }
 
-          // ✅ Skip seat multi (kecuali forceMulti = true)
           if (!forceMulti && data.isMulti === true) {
             continue;
           }
@@ -1397,10 +1398,8 @@ export class ChatServer {
 
       if (seatsToDelete.length === 0) return 0;
 
-      // === Hapus dari D1 ===
       if (this.db) {
         if (!keepRoom && !keepSeat) {
-          // Hapus semua seat non-multi user sekaligus
           try {
             await this.db.prepare(`
               DELETE FROM ${TABLE_NAME}
@@ -1420,7 +1419,6 @@ export class ChatServer {
             } catch(e2) {}
           }
         } else {
-          // Hapus per-seat (karena ada yang di-keep)
           for (const item of seatsToDelete) {
             try {
               await this.db
@@ -1432,7 +1430,6 @@ export class ChatServer {
         }
       }
 
-      // === Update cache + broadcast removeKursi PER-SEAT ===
       let removedCount = 0;
       for (const item of seatsToDelete) {
         const { roomName, seatNum, seatStr } = item;
@@ -1442,7 +1439,6 @@ export class ChatServer {
         delete roomBucket.seat[seatStr];
         if (roomBucket.point) delete roomBucket.point[seatStr];
 
-        // ✅ Broadcast dengan seat number yang benar (1-45)
         if (!this._isRestoring) {
           this.broadcast(roomName, ["removeKursi", roomName, seatNum]);
         }
@@ -1450,7 +1446,6 @@ export class ChatServer {
         removedCount++;
       }
 
-      // Update room count untuk room yang terpengaruh
       const affectedRooms = new Set(seatsToDelete.map(s => s.roomName));
       for (const roomName of affectedRooms) {
         try {
@@ -1602,7 +1597,6 @@ export class ChatServer {
 
               if (rName === roomName && sNum === seatNumber) continue;
 
-              // ✅ Skip seat multi — jangan hapus
               if (data.isMulti === true) continue;
 
               if (this.db) {
@@ -2373,7 +2367,6 @@ export class ChatServer {
 
       const isMulti = this.wsActiveMulti?.has(ws) || false;
 
-      // ✅ Cek apakah user BENAR-BENAR multi (punya seat isMulti:true di cache)
       let userIsActuallyMulti = false;
       if (username) {
         try {
@@ -2392,13 +2385,10 @@ export class ChatServer {
         } catch(e) {}
       }
 
-      // ✅ Kalau WS ini terdaftar di wsActiveMulti TAPI user BUKAN multi asli
-      // → tetap cleanup normal (hapus seat)
       if (isMulti && !userIsActuallyMulti) {
         try { this.wsActiveMulti?.delete(ws); } catch (e) {}
       }
 
-      // ✅ Kalau WS ini multi ASLI → skip hapus seat
       if (userIsActuallyMulti) {
         if (username) {
           const conns = this.userConnections?.get(username);
@@ -2420,7 +2410,6 @@ export class ChatServer {
         return result;
       }
 
-      // === Cleanup normal (bukan multi asli) ===
       let stillConnected = false;
       if (username) {
         const conns = this.userConnections?.get(username);
