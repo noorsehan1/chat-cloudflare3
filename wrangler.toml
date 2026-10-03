@@ -18,4 +18,4 @@ bindings = [
 # Migrations
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatServer", "GameServer"]
+new_sqlite_classes = ["ChatServer", "GameServer"]
