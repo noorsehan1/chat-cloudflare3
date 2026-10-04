@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 4.1.0
+// VERSION: 4.2.0
 
 const C = {
   MAX_SEATS: 45,
@@ -217,7 +217,7 @@ export class ChatServer {
   }
 
   // ============================================================
-  // ✅ HELPER BARU: kelola multiUsers di attachment WS
+  // HELPER: kelola multiUsers di attachment WS
   // ============================================================
   _getAttachment(ws) {
     try {
@@ -981,6 +981,19 @@ export class ChatServer {
     }
   }
 
+  async _deleteMultyChatFromTable(room) {
+    const r = room || DEFAULT_MULTY_ROOM;
+    try {
+      if (!this.db) return false;
+      await this.db.prepare(`
+        DELETE FROM ${TABLE_MULTY} WHERE key = ?
+      `).bind(K_CHAT(r)).run();
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
   _startMultyLoop(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     const st = this._getMultyState(r);
@@ -1060,12 +1073,19 @@ export class ChatServer {
         return false;
       }
 
+      // === CHAT KOSONG ATAU HABIS → hapus D1 chat_multy_<room> + reset state ===
       if (!Array.isArray(st.chatList) || st.chatList.length === 0 || st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
+        st.chatList = [];
+        st.numberNext = 1;
         this._stopMultyLoop(r);
+
+        this._deleteMultyChatFromTable(r).catch(() => {});
         this._saveMultyRunningToTable(r, false).catch(() => {});
         this._saveMultyIndexToTable(r, 0).catch(() => {});
+        this._saveMultyNumberToTable(r, 1).catch(() => {});
+
         this.broadcast(r, ["multyStop", r]);
         return false;
       }
@@ -1118,12 +1138,19 @@ export class ChatServer {
 
       this._saveMultyIndexToTable(r, st.index).catch(() => {});
 
+      // === CHAT HABIS SETELAH INCREMENT → hapus D1 chat_multy_<room> + reset state ===
       if (st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
+        st.chatList = [];
+        st.numberNext = 1;
         this._stopMultyLoop(r);
+
+        this._deleteMultyChatFromTable(r).catch(() => {});
         this._saveMultyRunningToTable(r, false).catch(() => {});
         this._saveMultyIndexToTable(r, 0).catch(() => {});
+        this._saveMultyNumberToTable(r, 1).catch(() => {});
+
         this.broadcast(r, ["multyStop", r]);
         return false;
       }
@@ -3620,6 +3647,7 @@ export class ChatServer {
             st.running = false;
             this._stopMultyLoop(stopRoom);
 
+            // stopMulty TIDAK hapus D1, hanya simpan flag
             this._saveMultyRunningToTable(stopRoom, false).catch(() => {});
             this._saveMultyIndexToTable(stopRoom, st.index).catch(() => {});
 
