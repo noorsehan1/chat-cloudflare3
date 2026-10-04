@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 4.3.1
+// VERSION: 4.4.0
 
 const C = {
   MAX_SEATS: 45,
@@ -27,6 +27,7 @@ const C = {
   MAX_MULTY_NUMBER: 9999,
   HISTORY_LIMIT: 100,
   HISTORY_MAX_AGE_MS: 3 * 60 * 60 * 1000,
+  ORPHAN_CLEANUP_GRACE_MS: 60000, // ✅ grace period 60 detik
 };
 
 const ROOMS = [
@@ -1073,7 +1074,6 @@ export class ChatServer {
         return false;
       }
 
-      // === CHAT KOSONG ATAU HABIS → hapus D1 chat_multy_<room> + reset state ===
       if (!Array.isArray(st.chatList) || st.chatList.length === 0 || st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
@@ -1138,7 +1138,6 @@ export class ChatServer {
 
       this._saveMultyIndexToTable(r, st.index).catch(() => {});
 
-      // === CHAT HABIS SETELAH INCREMENT → hapus D1 chat_multy_<room> + reset state ===
       if (st.index >= st.chatList.length) {
         st.running = false;
         st.index = 0;
@@ -1268,6 +1267,8 @@ export class ChatServer {
       let currentNumber = 1;
       const results = result?.results || [];
 
+      // ✅ userSeatMap hanya untuk tracking prioritas (multi > non-multi),
+      //    TIDAK untuk skip seat. Semua seat dimasukkan ke roomsData.
       const userSeatMap = new Map();
 
       for (const row of results) {
@@ -1312,22 +1313,15 @@ export class ChatServer {
               const uname = value.namauser;
               const isMulti = value.isMulti === true;
 
+              // ✅ Masukkan SEMUA seat, jangan skip seat kedua
+              roomsData[roomName].seat[seatNumber] = value;
+
+              // track prioritas multi untuk _userIndex (multi > non-multi)
               const prev = userSeatMap.get(uname);
-              if (prev) {
-                if (isMulti && !prev.isMulti) {
-                  delete roomsData[prev.room].seat[prev.seat];
-                  if (roomsData[prev.room].point) delete roomsData[prev.room].point[prev.seat];
-                  userSeatMap.set(uname, {
-                    key, seat: seatNumber, room: roomName, isMulti
-                  });
-                  roomsData[roomName].seat[seatNumber] = value;
-                } else {
-                }
-              } else {
+              if (!prev || (isMulti && !prev.isMulti)) {
                 userSeatMap.set(uname, {
                   key, seat: seatNumber, room: roomName, isMulti
                 });
-                roomsData[roomName].seat[seatNumber] = value;
               }
             }
           } else if (type === 'point') {
@@ -2057,18 +2051,16 @@ export class ChatServer {
         return true;
       }
 
-      // ✅ PINDAH ROOM → hapus SEMUA seat (non-multi & multi) di room lama
+      // PINDAH ROOM → hapus SEMUA seat (non-multi & multi) di room lama
       if (existing) {
         const oldRoom = existing.room;
 
         await this._lightDeleteAllSeatsForUser(username, { forceMulti: true });
 
-        // pastikan count room lama berkurang (walau seatsToDelete kosong)
         if (oldRoom && oldRoom !== roomName) {
           try { await this.updateRoomCount(oldRoom); } catch(e) {}
         }
 
-        // update attachment: user sudah tidak di room lama
         try {
           const att = this._getAttachment(ws);
           if (att?.seatInfo?.room === oldRoom) {
@@ -2144,7 +2136,6 @@ export class ChatServer {
         this._setAttachment(ws, att);
       } catch(e) {}
 
-      // ✅ kalau user multi pindah room → update wsActiveMulti ke room baru
       if (wasMulti) {
         try { this.wsActiveMulti.set(ws, { username, room: roomName }); } catch(e) {}
       }
@@ -2953,9 +2944,19 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ✅ DIPERBAIKI: grace period + skip kalau liveWsList kosong
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
       if (this._isRestoring) return 0;
+
+      // ✅ 1. Jangan bersihkan kalau baru start (< grace period)
+      const elapsed = Date.now() - this._startTime;
+      if (elapsed < C.ORPHAN_CLEANUP_GRACE_MS) return 0;
+
+      // ✅ 2. Jangan bersihkan kalau tidak ada WS hidup sama sekali
+      //       (mungkin client belum reconnect / isolate baru hidup)
+      const hasLiveWs = Array.isArray(liveWsList) && liveWsList.length > 0;
+      if (!hasLiveWs) return 0;
 
       await this._ensureCacheInitialized();
       const roomsData = this._storageCache?.roomsData || {};
@@ -3700,7 +3701,6 @@ export class ChatServer {
             st.running = false;
             this._stopMultyLoop(stopRoom);
 
-            // stopMulty TIDAK hapus D1, hanya simpan flag
             this._saveMultyRunningToTable(stopRoom, false).catch(() => {});
             this._saveMultyIndexToTable(stopRoom, st.index).catch(() => {});
 
@@ -4600,6 +4600,7 @@ export class ChatServer {
             totalSeatsInCache: totalSeats,
             cacheInitialized: this._cacheInitialized,
             restoreFailed: this._restoreFailed,
+            uptimeMs: Date.now() - this._startTime,
           }), {
             status: 200,
             headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" }
@@ -4674,23 +4675,12 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // ✅ DIPERBAIKI: tidak hapus seat non-multi & point dari D1
   async destroy() {
     if (this.isDestroyed) return;
     this.closing = true;
 
     this._stopAllMultyLoops();
-
-    const normalUsers = new Set();
-    try {
-      await this._ensureCacheInitialized();
-      const roomsData = this._storageCache?.roomsData || {};
-      for (const rBucket of Object.values(roomsData)) {
-        if (!rBucket?.seat) continue;
-        for (const data of Object.values(rBucket.seat)) {
-          if (data?.namauser && data.isMulti !== true) normalUsers.add(data.namauser);
-        }
-      }
-    } catch (e) {}
 
     const wsCopy = Array.from(this.wsSet || new Set());
     for (const ws of wsCopy) {
@@ -4708,19 +4698,8 @@ export class ChatServer {
       }
     }
 
-    if (this.db && normalUsers.size > 0) {
-      try {
-        await this.db
-          .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE 'seat_%' AND value NOT LIKE '%"isMulti":true%'`)
-          .run();
-      } catch (e) {}
-
-      try {
-        await this.db
-          .prepare(`DELETE FROM ${TABLE_NAME} WHERE key LIKE 'point_%'`)
-          .run();
-      } catch (e) {}
-    }
+    // ✅ TIDAK hapus seat non-multi & point dari D1.
+    //    Biarkan _verifyAndCleanupOrphanSeats yang bersihkan (dengan grace period).
 
     if (this.userConnections) {
       for (const [username, conns] of this.userConnections) {
