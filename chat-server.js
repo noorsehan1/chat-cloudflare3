@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 4.0.0
+// VERSION: 4.1.0
 
 const C = {
   MAX_SEATS: 45,
@@ -213,6 +213,56 @@ export class ChatServer {
       for (const room of ROOMS) {
         this.roomClients.set(room, new Set());
       }
+    }
+  }
+
+  // ============================================================
+  // ✅ HELPER BARU: kelola multiUsers di attachment WS
+  // ============================================================
+  _getAttachment(ws) {
+    try {
+      return ws?.deserializeAttachment?.() || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  _setAttachment(ws, att) {
+    try {
+      ws?.serializeAttachment?.(att || {});
+    } catch (e) {}
+  }
+
+  _addMultiUserToAttachment(ws, username) {
+    if (!ws || !username) return;
+    try {
+      const att = this._getAttachment(ws);
+      if (!Array.isArray(att.multiUsers)) att.multiUsers = [];
+      if (!att.multiUsers.includes(username)) att.multiUsers.push(username);
+      att.username = att.username || username;
+      this._setAttachment(ws, att);
+    } catch (e) {}
+  }
+
+  _removeMultiUserFromAttachment(ws, username) {
+    if (!ws || !username) return;
+    try {
+      const att = this._getAttachment(ws);
+      if (Array.isArray(att.multiUsers)) {
+        att.multiUsers = att.multiUsers.filter(u => u !== username);
+      }
+      this._setAttachment(ws, att);
+    } catch (e) {}
+  }
+
+  _getMultiUsersFromAttachment(ws) {
+    try {
+      const att = this._getAttachment(ws);
+      if (Array.isArray(att.multiUsers)) return att.multiUsers;
+      if (att.username) return [att.username];
+      return [];
+    } catch (e) {
+      return [];
     }
   }
 
@@ -1362,9 +1412,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // ✅ LIGHT DELETE — broadcast removeKursi PER-SEAT + skip seat multi
-  // ============================================================
   async _lightDeleteAllSeatsForUser(username, options = {}) {
     if (!username) return 0;
 
@@ -2290,9 +2337,6 @@ export class ChatServer {
     }
   }
 
-  // ============================================================
-  // ✅ CLEANUP — cek user BENAR-BENAR multi sebelum skip
-  // ============================================================
   async _cleanupUserCompletely(ws, options = {}) {
     const result = { removedSeats: [] };
 
@@ -3147,41 +3191,95 @@ export class ChatServer {
         return;
       }
 
-      const found = await this._findUserInAnyRoom(attachment.username);
+      const multiUsers = Array.isArray(attachment.multiUsers)
+        ? attachment.multiUsers.slice()
+        : (attachment.username ? [attachment.username] : []);
 
-      let finalRoom = found?.room;
-      let finalSeat = found?.seat;
+      let finalRoom = null;
+      let finalSeat = null;
+      let finalUser = null;
+      let finalIsMulti = false;
 
-      if (!finalRoom) {
-        const attRoom = attachment.seatInfo?.room || attachment.room;
-        if (attRoom && ROOMS_SET.has(attRoom)) {
-          finalRoom = attRoom;
-          finalSeat = attachment.seatInfo?.seat || null;
-          try {
-            const roomBucket = await this._getRoomBucket(attRoom);
-            if (roomBucket?.seat && finalSeat) {
-              const seatData = roomBucket.seat[finalSeat];
-              if (!seatData || seatData.namauser !== attachment.username) {
-                try { ws.close(1000, "User not in seat"); } catch(e) {}
-                return;
-              }
-            }
-          } catch(e) {}
+      for (const u of multiUsers) {
+        const f = await this._findUserInAnyRoom(u);
+        if (f) {
+          finalUser = u;
+          finalRoom = f.room;
+          finalSeat = f.seat;
+          finalIsMulti = f.isMulti === true;
+          break;
+        }
+      }
+
+      if (!finalRoom && attachment.username) {
+        const f = await this._findUserInAnyRoom(attachment.username);
+        if (f) {
+          finalUser = attachment.username;
+          finalRoom = f.room;
+          finalSeat = f.seat;
+          finalIsMulti = f.isMulti === true;
         }
       }
 
       if (!finalRoom) {
+        const wasMulti = this.wsActiveMulti?.has(ws) || multiUsers.length > 0;
+
+        if (wasMulti) {
+          ws.username = attachment.username || null;
+          ws._username = ws.username;
+          ws.room = null;
+          ws._room = null;
+          ws.roomname = null;
+          ws.idtarget = ws.username;
+          ws._closing = false;
+          ws._cleaning = false;
+          ws._wsId = Date.now() + Math.random();
+
+          const state = _wsCleanupState.get(ws);
+          if (state) {
+            state.cleanupDone = false;
+            state.cleaning = false;
+          } else {
+            _wsCleanupState.set(ws, { cleanupDone: false, cleaning: false });
+          }
+
+          for (const u of multiUsers) {
+            let conns = this.userConnections?.get(u);
+            if (!conns) {
+              conns = new Set();
+              try { this.userConnections?.set(u, conns); } catch(e) {}
+            }
+            if (!conns.has(ws)) {
+              try { conns.add(ws); } catch(e) {}
+            }
+          }
+
+          if (!this.wsSet?.has(ws)) {
+            try { this.wsSet?.add(ws); } catch(e) {}
+          }
+
+          try {
+            const att2 = this._getAttachment(ws);
+            att2.username = attachment.username || null;
+            att2.multiUsers = multiUsers;
+            att2.seatInfo = null;
+            this._setAttachment(ws, att2);
+          } catch(e) {}
+
+          return;
+        }
+
         try { ws.close(1000, "User not found"); } catch(e) {}
         return;
       }
 
-      ws.username = attachment.username;
+      ws.username = finalUser;
       ws.room = finalRoom;
       ws.roomname = finalRoom;
-      ws.idtarget = attachment.username;
+      ws.idtarget = finalUser;
       ws._closing = false;
       ws._cleaning = false;
-      ws._username = attachment.username;
+      ws._username = finalUser;
       ws._room = finalRoom;
       ws._wsId = Date.now() + Math.random();
 
@@ -3198,13 +3296,26 @@ export class ChatServer {
         try { roomClients.add(ws); } catch(e) {}
       }
 
-      let conns = this.userConnections?.get(attachment.username);
-      if (!conns) {
-        conns = new Set();
-        try { this.userConnections?.set(attachment.username, conns); } catch(e) {}
+      for (const u of multiUsers) {
+        let conns = this.userConnections?.get(u);
+        if (!conns) {
+          conns = new Set();
+          try { this.userConnections?.set(u, conns); } catch(e) {}
+        }
+        if (!conns.has(ws)) {
+          try { conns.add(ws); } catch(e) {}
+        }
       }
-      if (!conns.has(ws)) {
-        try { conns.add(ws); } catch(e) {}
+
+      if (finalUser) {
+        let conns = this.userConnections?.get(finalUser);
+        if (!conns) {
+          conns = new Set();
+          try { this.userConnections?.set(finalUser, conns); } catch(e) {}
+        }
+        if (!conns.has(ws)) {
+          try { conns.add(ws); } catch(e) {}
+        }
       }
 
       if (!this.wsSet?.has(ws)) {
@@ -3212,13 +3323,11 @@ export class ChatServer {
       }
 
       if (finalRoom && finalSeat) {
-        const foundInfo = await this._findUserInAnyRoom(attachment.username);
-        const isMultiUser = foundInfo?.isMulti === true;
-        this._setUserIndex(attachment.username, finalRoom, finalSeat, isMultiUser);
+        this._setUserIndex(finalUser, finalRoom, finalSeat, finalIsMulti);
 
-        if (isMultiUser) {
+        if (finalIsMulti) {
           try {
-            this.wsActiveMulti?.set(ws, { username: attachment.username, room: finalRoom });
+            this.wsActiveMulti?.set(ws, { username: finalUser, room: finalRoom });
           } catch(e) {}
         }
       }
@@ -3231,10 +3340,11 @@ export class ChatServer {
       } catch(e) {}
 
       try {
-        ws.serializeAttachment({
-          username: attachment.username,
-          seatInfo: { room: finalRoom, seat: finalSeat }
-        });
+        const att2 = this._getAttachment(ws);
+        att2.username = finalUser;
+        att2.multiUsers = multiUsers.length > 0 ? multiUsers : [finalUser];
+        att2.seatInfo = { room: finalRoom, seat: finalSeat };
+        this._setAttachment(ws, att2);
       } catch(e) {}
     } catch(e) {}
   }
@@ -3722,12 +3832,15 @@ export class ChatServer {
           if (!connections) connections = new Set();
           if (!connections.has(ws)) try { connections.add(ws); } catch(e) {}
           try { this.userConnections?.set(multiUsername, connections); } catch(e) {}
+
+          this._addMultiUserToAttachment(ws, multiUsername);
           try {
-            ws.serializeAttachment({
-              username: multiUsername,
-              seatInfo: { room: room, seat: seat }
-            });
+            const att2 = this._getAttachment(ws);
+            att2.username = multiUsername;
+            att2.seatInfo = { room: room, seat: seat };
+            this._setAttachment(ws, att2);
           } catch(e) {}
+
           ws._username = multiUsername;
           ws._room = room;
           try { this.wsActiveMulti?.set(ws, { username: multiUsername, room: room }); } catch(e) {}
@@ -3765,11 +3878,12 @@ export class ChatServer {
           if (!connections.has(ws)) try { connections.add(ws); } catch(e) {}
           try { this.userConnections?.set(multiUsername2, connections); } catch(e) {}
 
+          this._addMultiUserToAttachment(ws, multiUsername2);
           try {
-            ws.serializeAttachment({
-              username: multiUsername2,
-              seatInfo: { room: room, seat: seat }
-            });
+            const att2 = this._getAttachment(ws);
+            att2.username = multiUsername2;
+            att2.seatInfo = { room: room, seat: seat };
+            this._setAttachment(ws, att2);
           } catch(e) {}
 
           for (const [otherRoom, clients] of (this.roomClients || new Map())) {
@@ -3799,6 +3913,34 @@ export class ChatServer {
               await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
             this._removeUserIndex(targetUsername);
+
+            this._removeMultiUserFromAttachment(ws, targetUsername);
+
+            const att2 = this._getAttachment(ws);
+            if (att2.username === targetUsername) {
+              const remaining = Array.isArray(att2.multiUsers) ? att2.multiUsers : [];
+              const next = remaining[0] || null;
+              att2.username = next;
+              if (next) {
+                const nf = await this._findUserInAnyRoom(next);
+                if (nf) {
+                  ws.username = next;
+                  ws._username = next;
+                  ws.room = nf.room;
+                  ws._room = nf.room;
+                  ws.roomname = nf.room;
+                  ws.idtarget = next;
+                  att2.seatInfo = { room: nf.room, seat: nf.seat };
+                  this.wsActiveMulti.set(ws, { username: next, room: nf.room });
+                }
+              } else {
+                this.wsActiveMulti.delete(ws);
+                ws.username = null;
+                ws._username = null;
+                att2.seatInfo = null;
+              }
+            }
+            this._setAttachment(ws, att2);
           } catch(e) {}
           break;
         }
@@ -3815,6 +3957,34 @@ export class ChatServer {
               await this._deleteSeatInRoom(roomName, seatNumber, true);
             }
             this._removeUserIndex(targetUsername2);
+
+            this._removeMultiUserFromAttachment(ws, targetUsername2);
+
+            const att2 = this._getAttachment(ws);
+            if (att2.username === targetUsername2) {
+              const remaining = Array.isArray(att2.multiUsers) ? att2.multiUsers : [];
+              const next = remaining[0] || null;
+              att2.username = next;
+              if (next) {
+                const nf = await this._findUserInAnyRoom(next);
+                if (nf) {
+                  ws.username = next;
+                  ws._username = next;
+                  ws.room = nf.room;
+                  ws._room = nf.room;
+                  ws.roomname = nf.room;
+                  ws.idtarget = next;
+                  att2.seatInfo = { room: nf.room, seat: nf.seat };
+                  this.wsActiveMulti.set(ws, { username: next, room: nf.room });
+                }
+              } else {
+                this.wsActiveMulti.delete(ws);
+                ws.username = null;
+                ws._username = null;
+                att2.seatInfo = null;
+              }
+            }
+            this._setAttachment(ws, att2);
           } catch(e) {}
           break;
         }
@@ -3857,12 +4027,15 @@ export class ChatServer {
           ws.roomname = roomName;
           ws._username = targetUsername;
           ws._room = roomName;
+
+          this._addMultiUserToAttachment(ws, targetUsername);
           try {
-            ws.serializeAttachment({
-              username: targetUsername,
-              seatInfo: found
-            });
+            const att2 = this._getAttachment(ws);
+            att2.username = targetUsername;
+            att2.seatInfo = found;
+            this._setAttachment(ws, att2);
           } catch(e) {}
+
           let connections = this.userConnections?.get(targetUsername);
           if (!connections) {
             connections = new Set();
@@ -4370,7 +4543,7 @@ export class ChatServer {
         server._username = null;
         server._room = null;
         server._wsId = Date.now() + Math.random();
-        try { server.serializeAttachment({}); } catch(e) {}
+        try { server.serializeAttachment({ multiUsers: [] }); } catch(e) {}
 
         try {
           _wsCleanupState.set(server, { cleanupDone: false, cleaning: false });
