@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 4.2.0
+// VERSION: 4.3.1
 
 const C = {
   MAX_SEATS: 45,
@@ -2035,15 +2035,19 @@ export class ChatServer {
         ws._username = username;
 
         try {
-          ws.serializeAttachment({
-            username: username,
-            seatInfo: { room: roomName, seat: existing.seat }
-          });
+          const att = this._getAttachment(ws);
+          att.username = username;
+          att.seatInfo = { room: roomName, seat: existing.seat };
+          this._setAttachment(ws, att);
         } catch(e) {}
 
         const roomClients = this.roomClients.get(roomName);
         if (roomClients && !roomClients.has(ws)) {
           try { roomClients.add(ws); } catch(e) {}
+        }
+
+        if (wasMulti) {
+          try { this.wsActiveMulti.set(ws, { username, room: roomName }); } catch(e) {}
         }
 
         this.safeSend(ws, ["rooMasuk", existing.seat, roomName]);
@@ -2053,8 +2057,25 @@ export class ChatServer {
         return true;
       }
 
+      // ✅ PINDAH ROOM → hapus SEMUA seat (non-multi & multi) di room lama
       if (existing) {
-        await this._lightDeleteAllSeatsForUser(username);
+        const oldRoom = existing.room;
+
+        await this._lightDeleteAllSeatsForUser(username, { forceMulti: true });
+
+        // pastikan count room lama berkurang (walau seatsToDelete kosong)
+        if (oldRoom && oldRoom !== roomName) {
+          try { await this.updateRoomCount(oldRoom); } catch(e) {}
+        }
+
+        // update attachment: user sudah tidak di room lama
+        try {
+          const att = this._getAttachment(ws);
+          if (att?.seatInfo?.room === oldRoom) {
+            att.seatInfo = null;
+          }
+          this._setAttachment(ws, att);
+        } catch(e) {}
       }
 
       await this._ensureCacheInitialized();
@@ -2117,11 +2138,16 @@ export class ChatServer {
       ws._username = username;
 
       try {
-        ws.serializeAttachment({
-          username: username,
-          seatInfo: { room: roomName, seat: seat }
-        });
+        const att = this._getAttachment(ws);
+        att.username = username;
+        att.seatInfo = { room: roomName, seat: seat };
+        this._setAttachment(ws, att);
       } catch(e) {}
+
+      // ✅ kalau user multi pindah room → update wsActiveMulti ke room baru
+      if (wasMulti) {
+        try { this.wsActiveMulti.set(ws, { username, room: roomName }); } catch(e) {}
+      }
 
       for (const [otherRoom, clients] of this.roomClients) {
         if (otherRoom !== roomName && clients) {
@@ -2158,22 +2184,22 @@ export class ChatServer {
       await this.updateRoomCount(roomName);
 
       try {
-        const att = ws.deserializeAttachment?.() || {};
+        const att = this._getAttachment(ws);
         att.pendingStateSend = Date.now();
         att.pendingStateRoom = roomName;
         att.pendingStateUsername = username;
-        ws.serializeAttachment(att);
+        this._setAttachment(ws, att);
       } catch(e) {}
 
       setTimeout(async () => {
         try {
           if (!ws || ws.readyState !== 1) return;
-          const att = ws.deserializeAttachment?.() || {};
+          const att = this._getAttachment(ws);
           if (!att.pendingStateSend) return;
           att.pendingStateSend = null;
           att.pendingStateRoom = null;
           att.pendingStateUsername = null;
-          try { ws.serializeAttachment(att); } catch(e) {}
+          this._setAttachment(ws, att);
           await this.sendAllStateTo(ws, roomName, true);
         } catch(e) {}
       }, 1000);
@@ -2392,7 +2418,7 @@ export class ChatServer {
 
       if (!username || !roomName) {
         try {
-          const att = ws.deserializeAttachment?.();
+          const att = this._getAttachment(ws);
           if (att?.username) {
             username = username || att.username;
             ws.username = ws.username || att.username;
@@ -2579,7 +2605,7 @@ export class ChatServer {
 
       if ((!ws.username && !ws._username) || (!ws.room && !ws.roomname && !ws._room)) {
         try {
-          const att = ws.deserializeAttachment?.();
+          const att = this._getAttachment(ws);
           if (att?.username) {
             const found = await this._findUserInAnyRoom(att.username);
             if (found) {
@@ -2686,7 +2712,7 @@ export class ChatServer {
 
               try {
                 if (evt.attachment) {
-                  ws.serializeAttachment(evt.attachment);
+                  this._setAttachment(ws, evt.attachment);
                   if (evt.attachment.username) {
                     ws.username = evt.attachment.username;
                     ws._username = evt.attachment.username;
@@ -3153,6 +3179,14 @@ export class ChatServer {
 
       this._rebuildUserIndex();
 
+      // ✅ Hitung ulang jumlah kursi per room & broadcast ke client
+      for (const room of ROOMS) {
+        try {
+          const count = await this._getRoomCount(room);
+          this.broadcast(room, ["roomUserCount", room, count]);
+        } catch (e) {}
+      }
+
       if (!this.isDestroyed) {
         try {
           if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
@@ -3183,6 +3217,14 @@ export class ChatServer {
 
       this._restoreRemovedSeats = [];
       this._hasBroadcastRemoveKursi = new Set();
+
+      // ✅ tetap broadcast count walau restore gagal
+      for (const room of ROOMS) {
+        try {
+          const count = await this._getRoomCount(room);
+          this.broadcast(room, ["roomUserCount", room, count]);
+        } catch (e) {}
+      }
 
       if (!this.isDestroyed) {
         try {
@@ -3393,7 +3435,13 @@ export class ChatServer {
             ws.username = username;
             ws.idtarget = username;
             ws._username = username;
-            try { ws.serializeAttachment({ username: username }); } catch(e) {}
+            try {
+              const att = this._getAttachment(ws);
+              att.username = username;
+              if (!Array.isArray(att.multiUsers)) att.multiUsers = [];
+              if (!att.multiUsers.includes(username)) att.multiUsers.push(username);
+              this._setAttachment(ws, att);
+            } catch(e) {}
             return { skip: true };
           }
 
@@ -3423,7 +3471,12 @@ export class ChatServer {
       ws._username = username;
       ws._room = null;
 
-      try { ws.serializeAttachment({ username: username }); } catch(e) {}
+      try {
+        const att = this._getAttachment(ws);
+        att.username = username;
+        if (!Array.isArray(att.multiUsers)) att.multiUsers = [];
+        this._setAttachment(ws, att);
+      } catch(e) {}
 
       let connections = this.userConnections?.get(username);
       if (!connections) {
@@ -3457,13 +3510,13 @@ export class ChatServer {
       }
 
       try {
-        const att = ws.deserializeAttachment?.();
+        const att = this._getAttachment(ws);
         if (att?.pendingStateSend && (Date.now() - att.pendingStateSend) >= 1000) {
           const pendingRoom = att.pendingStateRoom;
           att.pendingStateSend = null;
           att.pendingStateRoom = null;
           att.pendingStateUsername = null;
-          try { ws.serializeAttachment(att); } catch(e) {}
+          this._setAttachment(ws, att);
           if (pendingRoom) {
             this.sendAllStateTo(ws, pendingRoom, true).catch(() => {});
           }
