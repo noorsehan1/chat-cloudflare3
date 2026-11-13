@@ -1,12 +1,31 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 4.6.1-JOIN-FAST
-// - Perbaikan join lambat (berdasarkan v4.6.0)
-// - [J1] JOIN_COOLDOWN_MS 800 -> 200
-// - [J2] USER_JOIN_LOCK_TIMEOUT 10000 -> 4000, ROOM_LOCK_TIMEOUT 15000 -> 6000
-// - [J3] _wipeUserEverywhere: seat by namauser, point HANYA kursi user, batch per 50
-// - [J4] _updateSeatInRoom: hapus kursi lama user via batch per room
-// - [J5] _joinInternal: setTimeout 1000 -> 150 sebelum sendAllStateTo
-// - [J6] _joinInternal: jalur "sudah di room" juga kirim sendAllStateTo setelah 150ms
+// VERSION: 4.6.0-FULL-HARDENED
+// - KODE v4.5.9 DIPERTAHANKAN 100%
+// - Fix 100% (tambahan dari v4.5.9):
+//   [H1]  _cleanupUserCompletely: timeout D1 (forceDelete + lightDelete)
+//   [H2]  _updateNumber: batch broadcast + yield (anti CPU spike)
+//   [H3]  broadcast: JSON.stringify aman (anti circular/BigInt throw)
+//   [H4]  _restoreAllState: batch broadcast akhir + yield
+//   [H5]  _nextMultyChat: hapus double D1 write number (redundan)
+//   [H6]  _ensureHistoryTable: guard D1 error (anti retry spam)
+//   [H7]  _saveHistoryChat: timeout D1 (anti hang)
+//   [H8]  _loadHistoryChat: timeout D1
+//   [H9]  _checkAndResetHistory: timeout D1
+//   [H10] _loadMultyFromTable: timeout D1 per query
+//   [H11] _forceDeleteFromD1: timeout D1
+//   [H12] _lightDeleteAllSeatsForUser: timeout D1
+//   [H13] _wipeUserEverywhere: timeout D1
+//   [H14] _saveSeat/_savePoint/_saveMute/_saveCurrentNumber: timeout D1
+//   [H15] _updateSeatInRoom: timeout D1 delete loop
+//   [H16] _deleteSeatInRoom: timeout D1
+//   [H17] _verifyAndCleanupOrphanSeats: timeout D1
+//   [H18] _saveUserNoimgCache/_saveUserColorCache: timeout D1
+//   [H19] _loadUserNoimgCache/_loadUserColorCache: timeout D1
+//   [H20] _saveMultyChatToTable/_saveMultyNumberToTable/_saveMultyIndexToTable/_saveMultyRunningToTable/_deleteMultyChatFromTable: timeout D1
+//   [H21] _restoreAllState: getAlarm optional chain aman
+//   [H22] fetch: guard isDestroyed tambahan
+//   [H23] _withLock: cleanup lock jika fn throw (anti deadlock)
+//   [H24] _cleanupUserCompletely: guard isDestroyed di close
 
 const C = {
   MAX_SEATS: 45,
@@ -14,12 +33,12 @@ const C = {
   MAX_MESSAGE_SIZE: 500000,
   NUMBER_INTERVAL_MS: 15 * 60 * 1000,
   MAX_NUMBER: 6,
-  LOCK_TIMEOUT: 2000,
-  USER_JOIN_LOCK_TIMEOUT: 4000,
-  ROOM_LOCK_TIMEOUT: 6000,
+  LOCK_TIMEOUT: 5000,
+  USER_JOIN_LOCK_TIMEOUT: 10000,
+  ROOM_LOCK_TIMEOUT: 15000,
   GLOBAL_LOCK_TIMEOUT: 20000,
-  JOIN_COOLDOWN_MS: 200,
-  CACHE_LOAD_TIMEOUT: 5000,
+  JOIN_COOLDOWN_MS: 800,
+  CACHE_LOAD_TIMEOUT: 15000,
   MAX_PENDING_EVENTS: 100,
   MAX_EVENT_QUEUE_SIZE: 50,
   PROCESS_BATCH_SIZE: 50,
@@ -37,15 +56,18 @@ const C = {
   ORPHAN_CLEANUP_GRACE_MS: 60000,
   JOIN_CLEANUP_GRACE_MS: 5000,
   ORPHAN_WS_MIN_AGE_MS: 60000,
+  // RESTORE FIX
   D1_QUERY_TIMEOUT_MS: 5000,
   RESTORE_TOTAL_TIMEOUT_MS: 25000,
   RESTORE_BATCH_SIZE: 10,
   RESTORE_WS_TIMEOUT_MS: 3000,
   PENDING_PROCESS_TIMEOUT_MS: 3000,
   WS_MSG_TIMEOUT_MS: 12000,
+  // FIX v4.5.9
   MAX_WS_MSG_QUEUE: 50,
   JOIN_COOLDOWN_TTL_MS: 60000,
   HISTORY_COLLISION_MAX: 100,
+  // FIX v4.6.0
   D1_WRITE_TIMEOUT_MS: 5000,
   D1_DELETE_TIMEOUT_MS: 5000,
   HISTORY_TIMEOUT_MS: 5000,
@@ -54,8 +76,9 @@ const C = {
 };
 
 const ROOMS = [
-  "LowCard", "Quiz", "General", "BESTIES", "Sweet Memories", "Noxxeliverothcifsa", "Lounge Talk"
-  , "Happy Vibes", "LOVE BIRDS", "Desi Mahal", "Relax & Chat",
+  "LowCard", "Quiz", "General", "BESTIES","Sweet Memories", "Noxxeliverothcifsa","Lounge Talk"
+ , "Happy Vibes","LOVE BIRDS","Desi Mahal", "Relax & Chat",
+  
   "The Chatter Room"
 ];
 
@@ -78,6 +101,7 @@ const K_HISTORY_TABLE = (room) => `chat_history_${String(room).replace(/[^a-zA-Z
 
 const _wsCleanupState = new WeakMap();
 
+// FIX F1: _withTimeout clear timer di finally (anti timer leak)
 function _withTimeout(promise, ms, label = 'operation') {
   let timer = null;
   const timeoutPromise = new Promise((_, reject) => {
@@ -97,6 +121,7 @@ function _parseColorVal(v, def) {
   return isNaN(n) ? def : n;
 }
 
+// FIX H3: safe stringify
 function _safeStringify(obj) {
   try {
     return JSON.stringify(obj);
@@ -296,6 +321,8 @@ export class ChatServer {
     }
   }
 
+  // FIX F6: _withLock backoff acak + guard isDestroyed
+  // FIX H23: cleanup lock jika fn throw (anti deadlock)
   async _withLock(lockMap, key, fn, timeout = C.LOCK_TIMEOUT) {
     try {
       if (!lockMap) return await fn();
@@ -422,6 +449,7 @@ export class ChatServer {
   // ============================================================
   // NOIMG CACHE
   // ============================================================
+  // FIX H18: timeout D1
   async _saveUserNoimgCache() {
     try {
       if (!this.db) return false;
@@ -443,6 +471,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H19: timeout D1
   async _loadUserNoimgCache() {
     try {
       if (!this.db) return false;
@@ -499,6 +528,7 @@ export class ChatServer {
   // ============================================================
   // COLOR CACHE
   // ============================================================
+  // FIX H18: timeout D1
   async _saveUserColorCache() {
     try {
       if (!this.db) return false;
@@ -520,6 +550,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H19: timeout D1
   async _loadUserColorCache() {
     try {
       if (!this.db) return false;
@@ -605,6 +636,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // FIX F3 + F5: guard isDestroyed/closing + cleanup _joinCooldown
   async alarm() {
     try {
       if (this.isDestroyed || this.closing) return;
@@ -664,6 +696,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H2: batch broadcast + yield (anti CPU spike)
   async _updateNumber() {
     try {
       if (this.isDestroyed) return;
@@ -714,6 +747,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // FIX H6: guard D1 error (anti retry spam)
   async _ensureHistoryTable(room) {
     try {
       if (!this.db) return false;
@@ -743,6 +777,8 @@ export class ChatServer {
     }
   }
 
+  // FIX F11: loop anti timestamp collision
+  // FIX H7: timeout D1
   async _saveHistoryChat(room, chatDataArray) {
     try {
       if (!this.db) return false;
@@ -806,6 +842,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H8: timeout D1
   async _loadHistoryChat(room) {
     try {
       if (!this.db) return [];
@@ -842,6 +879,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H9: timeout D1
   async _checkAndResetHistory(room) {
     try {
       if (!this.db) return false;
@@ -1079,6 +1117,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H10: timeout D1 per query
   async _loadMultyFromTable(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     try {
@@ -1169,6 +1208,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H20: timeout D1
   async _saveMultyChatToTable(room, chatList) {
     const r = room || DEFAULT_MULTY_ROOM;
     try {
@@ -1334,6 +1374,8 @@ export class ChatServer {
     }
   }
 
+  // FIX F15: await saveHistory dengan timeout
+  // FIX H5: hapus double D1 write number (redundan)
   async _nextMultyChat(room) {
     const r = room || DEFAULT_MULTY_ROOM;
     const st = this._getMultyState(r);
@@ -1420,6 +1462,7 @@ export class ChatServer {
       st.numberNext++;
       if (st.numberNext > C.MAX_MULTY_NUMBER) st.numberNext = 1;
 
+      // FIX H5: single save (tidak double)
       this._saveMultyNumberToTable(r, st.numberNext).catch(() => {});
 
       st.index++;
@@ -1448,6 +1491,7 @@ export class ChatServer {
     }
   }
 
+  // FIX F4: break jika destroy/closing
   async _restoreWithRetry() {
     let attempts = 0;
     let lastError = null;
@@ -1667,6 +1711,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H14: timeout D1
   async _saveSeat(roomName, seatNumber, seatData) {
     if (!this.db) return;
     try {
@@ -1746,6 +1791,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // FIX H11: timeout D1
   async _forceDeleteFromD1(username) {
     if (!this.db) return true;
     if (!username) return true;
@@ -1780,11 +1826,7 @@ export class ChatServer {
     return true;
   }
 
-  // ============================================================
-  // FIX J3: _wipeUserEverywhere
-  // - seat dihapus berdasarkan namauser (1 query)
-  // - point dihapus HANYA untuk kursi user (batch per 50)
-  // ============================================================
+  // FIX H13: timeout D1
   async _wipeUserEverywhere(username) {
     if (!username) return 0;
 
@@ -1795,15 +1837,18 @@ export class ChatServer {
 
     for (const [roomName, roomBucket] of Object.entries(roomsData)) {
       if (!roomBucket?.seat) continue;
+
       for (const [seatStr, data] of Object.entries(roomBucket.seat)) {
         if (data?.namauser !== username) continue;
+
         const seatNum = parseInt(seatStr);
         if (isNaN(seatNum)) continue;
+
         removedSeats.push({ roomName, seatNum, seatStr });
       }
     }
 
-    if (this.db && removedSeats.length > 0) {
+    if (this.db) {
       try {
         await _withTimeout(
           this.db.prepare(`
@@ -1827,30 +1872,16 @@ export class ChatServer {
         } catch(e2) {}
       }
 
-      const byRoom = new Map();
       for (const item of removedSeats) {
-        if (!byRoom.has(item.roomName)) byRoom.set(item.roomName, []);
-        byRoom.get(item.roomName).push(item.seatNum);
-      }
-
-      for (const [rName, seatList] of byRoom) {
-        for (let i = 0; i < seatList.length; i += 50) {
-          const chunk = seatList.slice(i, i + 50);
-          if (chunk.length === 0) continue;
-
-          const placeholders = chunk.map(() => '?').join(',');
-          const keys = chunk.map(s => `point_${rName}_${s}`);
-
-          try {
-            await _withTimeout(
-              this.db.prepare(`
-                DELETE FROM ${TABLE_NAME}
-                WHERE key IN (${placeholders})
-              `).bind(...keys).run(),
-              C.D1_DELETE_TIMEOUT_MS, 'wipePointBatch'
-            );
-          } catch(e) {}
-        }
+        try {
+          await _withTimeout(
+            this.db
+              .prepare(`DELETE FROM ${TABLE_NAME} WHERE key = ?`)
+              .bind(`point_${item.roomName}_${item.seatNum}`)
+              .run(),
+            C.D1_DELETE_TIMEOUT_MS, 'wipePoint'
+          );
+        } catch(e) {}
       }
     }
 
@@ -1889,6 +1920,7 @@ export class ChatServer {
     return removedSeats.length;
   }
 
+  // FIX H12: timeout D1
   async _lightDeleteAllSeatsForUser(username, options = {}) {
     if (!username) return 0;
 
@@ -2039,6 +2071,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H16: timeout D1
   async _deleteSeatInRoom(roomName, seatNumber, force = false) {
     return await this._withLock(
       this._roomWriteLocks,
@@ -2090,10 +2123,7 @@ export class ChatServer {
     );
   }
 
-  // ============================================================
-  // FIX J4: _updateSeatInRoom
-  // - hapus kursi lama user di room lain via batch per room
-  // ============================================================
+  // FIX H15: timeout D1 delete loop
   async _updateSeatInRoom(roomName, seatNumber, seatData) {
     return await this._withLock(
       this._roomWriteLocks,
@@ -2128,48 +2158,39 @@ export class ChatServer {
           await this._ensureCacheInitialized();
           const roomsData = this._storageCache?.roomsData || {};
 
-          const toDeleteByRoom = new Map();
-
           for (const [rName, rBucket] of Object.entries(roomsData)) {
             if (!rBucket?.seat) continue;
+
             for (const [sStr, data] of Object.entries(rBucket.seat)) {
               if (data?.namauser !== username) continue;
+
               const sNum = parseInt(sStr);
               if (isNaN(sNum)) continue;
+
               if (rName === roomName && sNum === seatNumber) continue;
+
               if (data.isMulti === true) continue;
-              if (!toDeleteByRoom.has(rName)) toDeleteByRoom.set(rName, new Set());
-              toDeleteByRoom.get(rName).add(sNum);
-            }
-          }
 
-          for (const [rName, seatSet] of toDeleteByRoom) {
-            if (seatSet.size === 0) continue;
+              if (this.db) {
+                try {
+                  await _withTimeout(
+                    this.db
+                      .prepare(`DELETE FROM ${TABLE_NAME} WHERE key IN (?, ?)`)
+                      .bind(`seat_${rName}_${sNum}`, `point_${rName}_${sNum}`)
+                      .run(),
+                    C.D1_DELETE_TIMEOUT_MS, 'deleteOtherSeat'
+                  );
+                } catch(e) {}
+              }
 
-            if (this.db) {
-              try {
-                await _withTimeout(
-                  this.db.prepare(`
-                    DELETE FROM ${TABLE_NAME}
-                    WHERE key LIKE 'seat_%'
-                    AND json_valid(value)
-                    AND json_extract(value, '$.namauser') = ?
-                    AND (json_extract(value, '$.isMulti') IS NULL OR json_extract(value, '$.isMulti') != 1)
-                  `).bind(username).run(),
-                  C.D1_DELETE_TIMEOUT_MS, 'deleteOtherSeatBatch'
-                );
-              } catch(e) {}
-            }
-
-            const rBucket = roomsData[rName];
-            for (const sNum of seatSet) {
-              if (rBucket.seat) delete rBucket.seat[sNum];
+              delete rBucket.seat[sNum];
               if (rBucket.point) delete rBucket.point[sNum];
+
               if (!this._isRestoring) {
                 this.broadcast(rName, ["removeKursi", rName, sNum]);
+                this.updateRoomCount(rName).catch(() => {});
               }
             }
-            this.updateRoomCount(rName).catch(() => {});
           }
 
           const oldSeat = roomBucket.seat?.[seatNumber];
@@ -2526,14 +2547,6 @@ export class ChatServer {
         this.safeSend(ws, ["numberKursiSaya", existing.seat]);
         this.safeSend(ws, ["currentNumber", this.currentNumber]);
 
-        // FIX J6: kirim state lengkap juga di jalur "sudah di room"
-        setTimeout(async () => {
-          try {
-            if (!ws || ws.readyState !== 1) return;
-            await this.sendAllStateTo(ws, roomName, true);
-          } catch(e) {}
-        }, 150);
-
         return true;
       }
 
@@ -2660,7 +2673,6 @@ export class ChatServer {
         this._setAttachment(ws, att);
       } catch(e) {}
 
-      // FIX J5: 1000 -> 150
       setTimeout(async () => {
         try {
           if (!ws || ws.readyState !== 1) return;
@@ -2672,7 +2684,7 @@ export class ChatServer {
           this._setAttachment(ws, att);
           await this.sendAllStateTo(ws, roomName, true);
         } catch(e) {}
-      }, 150);
+      }, 1000);
 
       return true;
     } catch(e) {
@@ -2860,6 +2872,8 @@ export class ChatServer {
     }
   }
 
+  // FIX H1: timeout D1 (forceDelete + lightDelete)
+  // FIX H24: guard isDestroyed di close
   async _cleanupUserCompletely(ws, options = {}) {
     const result = { removedSeats: [] };
 
@@ -2994,6 +3008,7 @@ export class ChatServer {
       const withinGrace = ws._joinedAt && joinedAgo < C.JOIN_CLEANUP_GRACE_MS;
 
       if (username && !stillConnected && !this._isRestoring && !withinGrace) {
+        // FIX H1: timeout D1
         try {
           await _withTimeout(
             this._forceDeleteFromD1(username),
@@ -3034,6 +3049,7 @@ export class ChatServer {
       this._roomCountsCache = null;
       this._roomCountsCacheTime = 0;
 
+      // FIX H24: guard isDestroyed
       if (!this.isDestroyed) {
         try {
           if (ws.readyState === 1) ws.close(1000, "Cleanup");
@@ -3064,6 +3080,7 @@ export class ChatServer {
     } catch (e) {}
   }
 
+  // FIX F7: cap ws._msgQueueLen (anti OOM)
   async webSocketMessage(ws, msg) {
     try {
       if (!ws) return;
@@ -3296,6 +3313,7 @@ export class ChatServer {
     }
   }
 
+  // FIX H3: safe stringify
   broadcast(room, msg) {
     try {
       if (this.closing || this.isDestroyed || !room || !msg) return 0;
@@ -3478,6 +3496,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // FIX H17: timeout D1
   async _verifyAndCleanupOrphanSeats(liveWsList) {
     try {
       if (this._isRestoring) return 0;
@@ -3565,6 +3584,9 @@ export class ChatServer {
     }
   }
 
+  // FIX F8: pastikan _cacheInitialized sebelum _processPendingEvents
+  // FIX H4: batch broadcast akhir + yield
+  // FIX H21: getAlarm optional chain aman
   async _restoreAllState() {
     const startTime = Date.now();
     const MAX_RESTORE_TIME = C.RESTORE_TOTAL_TIMEOUT_MS;
@@ -3742,6 +3764,7 @@ export class ChatServer {
 
       this._rebuildUserIndex();
 
+      // FIX H4: batch broadcast + yield
       {
         let i = 0;
         for (const room of ROOMS) {
@@ -3759,6 +3782,7 @@ export class ChatServer {
       if (!this.isDestroyed) {
         try {
           if (this.ctx && this.ctx.storage && typeof this.ctx.storage.setAlarm === 'function') {
+            // FIX H21: optional chain aman
             let existing = null;
             try {
               const alarmFn = this.ctx.storage.getAlarm;
@@ -3831,6 +3855,7 @@ export class ChatServer {
     }
   }
 
+  // FIX F14: validasi anyValid user sebelum anggap multi
   async _restoreLiveWebSocket(ws) {
     try {
       if (!ws) return;
@@ -4122,7 +4147,7 @@ export class ChatServer {
 
       try {
         const att = this._getAttachment(ws);
-        if (att?.pendingStateSend && (Date.now() - att.pendingStateSend) >= 150) {
+        if (att?.pendingStateSend && (Date.now() - att.pendingStateSend) >= 1000) {
           const pendingRoom = att.pendingStateRoom;
           att.pendingStateSend = null;
           att.pendingStateRoom = null;
@@ -5134,6 +5159,8 @@ export class ChatServer {
     }
   }
 
+  // FIX F9: getAlarm optional chain aman
+  // FIX H22: guard isDestroyed tambahan
   async fetch(req) {
     try {
       if (!this._restored && !this._restorePromise) {
@@ -5342,6 +5369,7 @@ export class ChatServer {
     } catch(e) {}
   }
 
+  // FIX F2: isDestroyed = true di AWAL (anti race)
   async destroy() {
     if (this.isDestroyed) return;
     this.isDestroyed = true;
